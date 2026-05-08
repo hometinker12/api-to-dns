@@ -1,7 +1,7 @@
 import os
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Request, Form, Header, Depends
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
@@ -52,6 +52,12 @@ def set_setting(db, name: str, value: str) -> None:
     db.commit()
 
 
+def get_api_key(db, api_key: str):
+    return db.exec(
+        select(ApiKey).where(ApiKey.key == api_key, ApiKey.active == True)
+    ).first()
+
+
 def load_settings(db):
     return {
         "dns_server": get_setting(db, "dns_server"),
@@ -76,6 +82,28 @@ def startup_event():
 @app.get("/", response_class=RedirectResponse)
 def root() -> RedirectResponse:
     return RedirectResponse(url="/admin")
+
+
+@app.get("/keycheck")
+def keycheck(
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    api_key = x_api_key
+    if not api_key and authorization:
+        prefix = "Bearer "
+        if authorization.startswith(prefix):
+            api_key = authorization[len(prefix) :].strip()
+
+    if not api_key:
+        return JSONResponse(status_code=401, content={"status": "failure"})
+
+    with SessionLocal() as db:
+        key = get_api_key(db, api_key)
+        if key is None:
+            return JSONResponse(status_code=401, content={"status": "failure"})
+
+    return {"status": "success"}
 
 
 @app.get("/login", response_class=HTMLResponse)

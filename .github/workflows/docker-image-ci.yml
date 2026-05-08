@@ -1,0 +1,43 @@
+name: Docker Image CI
+
+on:
+  push:
+    branches: [ "release" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy env example for testing
+        run: cp .env.example .env
+
+      - name: Build the Docker image
+        run: |
+          IMAGE_TAG="my-image-name:$(date +%s)"
+          docker build . --file Dockerfile --tag "$IMAGE_TAG"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Run container smoke test
+        run: |
+          docker run --rm -d --name dns-api-test --env-file .env -p 8000:8000 "$IMAGE_TAG"
+          sleep 10
+          curl --fail http://localhost:8000/login
+          curl --fail -L -c /tmp/cookies -X POST http://localhost:8000/login \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "username=admin&password=your-admin-password" \
+            -o /dev/null
+          API_KEY=$(curl --fail -L -b /tmp/cookies -X POST http://localhost:8000/api-keys \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "label=smoke-test" | grep -oP 'API key created: \K[^<]+' )
+          echo "Generated API key: $API_KEY"
+          if [ -z "$API_KEY" ]; then
+            echo "API key generation failed"
+            exit 1
+          fi
+          curl --fail -H "X-API-Key: $API_KEY" http://localhost:8000/keycheck
+          docker stop dns-api-test
+        env:
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
