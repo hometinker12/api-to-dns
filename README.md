@@ -44,11 +44,29 @@ http://localhost:8000/login
 
 Create a `.env` file using `.env.example` and configure the following values:
 
-- `SECRET_KEY` — session signing secret
-- `ENCRYPTION_KEY` — encryption key for settings stored in the database
+- `SECRET_KEY` — session signing secret (use a random string)
+- `ENCRYPTION_KEY` — encryption key for settings stored in the database (must be a valid Fernet key)
 - `ADMIN_USER` — initial admin username
 - `ADMIN_PASSWORD` — initial admin password
 - `DATABASE_URL` — optional database URL (default: `sqlite:///./data/app.db`)
+
+### Generating the ENCRYPTION_KEY
+
+The `ENCRYPTION_KEY` must be a 32-byte URL-safe base64-encoded key for Fernet encryption. You can generate one using Python:
+
+```bash
+# Using Python
+python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+
+# Or using Python in a script
+python3 -c "
+from cryptography.fernet import Fernet
+key = Fernet.generate_key().decode()
+print(f'ENCRYPTION_KEY={key}')
+"
+```
+
+**Important:** Never use the placeholder value `change-me-before-production` in production. Always generate a unique key for each deployment.
 
 Optional Azure provider values:
 
