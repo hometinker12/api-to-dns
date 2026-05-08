@@ -19,9 +19,11 @@ jobs:
           python3 -c "
           from cryptography.fernet import Fernet
           key = Fernet.generate_key().decode()
-          sed -i \"s/ENCRYPTION_KEY=.*/ENCRYPTION_KEY=$key/\" .env
+          print(f'ENCRYPTION_KEY={key}')
+          " > temp_key.txt
+          sed -i "s/ENCRYPTION_KEY=.*/$(cat temp_key.txt)/" .env
+          rm temp_key.txt
           echo 'Generated encryption key for testing'
-          "
 
       - name: Build the Docker image
         run: |
