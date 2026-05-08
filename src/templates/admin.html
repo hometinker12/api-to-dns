@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>DNS Admin Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="page">
+    <header>
+      <h1>DNS Admin Dashboard</h1>
+      <p>Signed in as {{ user }}</p>
+      <a class="button secondary" href="/logout">Logout</a>
+    </header>
+
+    <nav class="nav-links">
+      <a class="button" href="/settings">DNS Settings</a>
+      <a class="button" href="/api-keys">API Keys</a>
+    </nav>
+
+    <section>
+      <h2>Current configuration</h2>
+      <dl>
+        <dt>Target DNS Server</dt>
+        <dd>{{ settings.dns_server or "Not configured" }}</dd>
+        <dt>Target DNS Zone</dt>
+        <dd>{{ settings.dns_zone or "Not configured" }}</dd>
+        <dt>Microsoft DNS username</dt>
+        <dd>{{ settings.dns_username or "Not configured" }}</dd>
+      </dl>
+    </section>
+
+    <section>
+      <h2>Active API Keys</h2>
+      <ul>
+        {% for key in api_keys %}
+          <li>{{ key.label }} — {{ key.key[:8] }}... — {{ "active" if key.active else "revoked" }}</li>
+        {% else %}
+          <li>No API keys configured yet.</li>
+        {% endfor %}
+      </ul>
+    </section>
+  </div>
+</body>
+</html>

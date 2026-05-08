@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>DNS Settings</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="page">
+    <header>
+      <h1>DNS Settings</h1>
+      <nav class="nav-links">
+        <a class="button" href="/admin">Dashboard</a>
+        <a class="button" href="/api-keys">API Keys</a>
+      </nav>
+    </header>
+
+    {% if message %}
+      <div class="alert success">{{ message }}</div>
+    {% endif %}
+
+    <form action="/settings" method="post">
+      <label>Target DNS Server
+        <input type="text" name="dns_server" value="{{ settings.dns_server or '' }}" placeholder="dns.example.local" />
+      </label>
+      <label>Target DNS Zone
+        <input type="text" name="dns_zone" value="{{ settings.dns_zone or '' }}" placeholder="example.com" />
+      </label>
+      <label>Microsoft DNS Username
+        <input type="text" name="dns_username" value="{{ settings.dns_username or '' }}" />
+      </label>
+      <label>Microsoft DNS Password
+        <input type="password" name="dns_password" value="{{ settings.dns_password or '' }}" />
+      </label>
+      <button type="submit">Save Settings</button>
+    </form>
+  </div>
+</body>
+</html>
