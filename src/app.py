@@ -151,7 +151,8 @@ def logout() -> RedirectResponse:
 def admin(request: Request, user: str = Depends(get_current_user)):
     with SessionLocal() as db:
         settings = load_settings(db)
-        api_keys = db.exec(select(ApiKey).order_by(ApiKey.created_at.desc())).all()
+        api_keys = db.exec(select(ApiKey)).all()
+        api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
     return templates.TemplateResponse(
         "admin.html",
         {"request": request, "user": user, "settings": settings, "api_keys": api_keys},
@@ -193,7 +194,8 @@ def save_settings(
 @app.get("/api-keys", response_class=HTMLResponse)
 def api_keys_page(request: Request, user: str = Depends(get_current_user)):
     with SessionLocal() as db:
-        api_keys = db.exec(select(ApiKey).order_by(ApiKey.created_at.desc())).all()
+        api_keys = db.exec(select(ApiKey)).all()
+        api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
     return templates.TemplateResponse(
         "api_keys.html",
         {"request": request, "api_keys": api_keys, "message": None},
@@ -207,7 +209,8 @@ def create_api_key_route(request: Request, label: str = Form(...), user: str = D
         api_key = ApiKey(label=label, key=new_key)
         db.add(api_key)
         db.commit()
-        api_keys = db.exec(select(ApiKey).order_by(ApiKey.created_at.desc())).all()
+        api_keys = db.exec(select(ApiKey)).all()
+        api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
 
     return templates.TemplateResponse(
         "api_keys.html",
@@ -223,11 +226,13 @@ def revoke_api_key(request: Request, key_id: int = Form(...), user: str = Depend
             api_key.active = False
             db.add(api_key)
             db.commit()
-        api_keys = db.exec(select(ApiKey).order_by(ApiKey.created_at.desc())).all()
+        api_keys = db.exec(select(ApiKey)).all()
+        api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
 
     return templates.TemplateResponse(
         "api_keys.html",
         {"request": request, "api_keys": api_keys, "message": "API key revoked."},
+
     )
 
 
