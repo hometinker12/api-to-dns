@@ -23,8 +23,18 @@ jobs:
       - name: Run container smoke test
         run: |
           docker run --rm -d --name dns-api-test --env-file .env -p 8000:8000 "$IMAGE_TAG"
-          sleep 10
-          curl --fail http://localhost:8000/login
+          echo "Container started, waiting for startup..."
+          sleep 15
+          
+          # Check if container is still running
+          if ! docker ps | grep -q dns-api-test; then
+            echo "Container exited prematurely. Logs:"
+            docker logs dns-api-test
+            exit 1
+          fi
+          
+          echo "Container is running, testing endpoints..."
+          curl --fail --max-time 10 http://localhost:8000/login
           curl --fail -L -c /tmp/cookies -X POST http://localhost:8000/login \
             -H "Content-Type: application/x-www-form-urlencoded" \
             -d "username=admin&password=your-admin-password" \
