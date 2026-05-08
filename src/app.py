@@ -10,7 +10,6 @@ from sqlmodel import select
 
 from .auth import create_session_cookie, get_current_user
 from .db import SessionLocal, init_db
-from .dns_client import AzureDnsClient
 from .models import ApiKey, DnsRecordRequest, DnsRecordResponse, Setting, User
 from .security import decrypt_value, encrypt_value, generate_api_key, hash_password, verify_password
 
@@ -29,7 +28,22 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="src/static"), name="static")
 templates = Jinja2Templates(directory="src/templates")
-client = AzureDnsClient()
+
+
+def get_azure_client():
+    """Lazy-loaded Azure DNS client to avoid authentication during app startup."""
+    import os
+
+    # Check if Azure credentials are configured
+    required_vars = ['AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET', 'AZURE_TENANT_ID']
+    if not all(os.getenv(var) for var in required_vars):
+        raise HTTPException(
+            status_code=400,
+            detail="Azure DNS functionality is not configured. Please set AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, and AZURE_TENANT_ID environment variables."
+        )
+
+    from .dns_client import AzureDnsClient
+    return AzureDnsClient()
 
 
 def get_db():
@@ -243,7 +257,7 @@ def upsert_dns_record(
             raise HTTPException(status_code=400, detail="Zone name is required")
 
         try:
-            existed = client.create_or_update_record(payload)
+            existed = get_azure_client().create_or_update_record(payload)
             action = "updated" if existed else "created"
             return DnsRecordResponse(
                 status="success",
