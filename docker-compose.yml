@@ -2,6 +2,7 @@ version: '3.9'
 
 services:
   dns-api:
+    image: hometinker12/api-to-dns:v0.10
     build: .
     ports:
       - "8000:8000"
