@@ -1,7 +1,9 @@
+import html
 import os
+import traceback
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Request, Form, Header, Depends
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,7 +12,6 @@ from sqlmodel import select
 
 from .auth import create_session_cookie, get_current_user
 from .db import SessionLocal, init_db
-from .dns_client import AzureDnsClient
 from .models import ApiKey, DnsRecordRequest, DnsRecordResponse, Setting, User
 from .security import decrypt_value, encrypt_value, generate_api_key, hash_password, verify_password
 
@@ -29,7 +30,36 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="src/static"), name="static")
 templates = Jinja2Templates(directory="src/templates")
-client = AzureDnsClient()
+
+
+def _render_error_response(request: Request, error: Exception, status_code: int = 500):
+    traceback_text = traceback.format_exc()
+    print("Application error:", error)
+    print(traceback_text)
+    content = (
+        "<html><body><h1>Application error</h1>"
+        f"<p>{html.escape(str(error))}</p>"
+        "<pre>"
+        f"{html.escape(traceback_text)}"
+        "</pre></body></html>"
+    )
+    return HTMLResponse(content=content, status_code=status_code)
+
+
+def get_azure_client():
+    """Lazy-loaded Azure DNS client to avoid authentication during app startup."""
+    import os
+
+    # Check if Azure credentials are configured
+    required_vars = ['AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET', 'AZURE_TENANT_ID']
+    if not all(os.getenv(var) for var in required_vars):
+        raise HTTPException(
+            status_code=400,
+            detail="Azure DNS functionality is not configured. Please set AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, and AZURE_TENANT_ID environment variables."
+        )
+
+    from .dns_client import AzureDnsClient
+    return AzureDnsClient()
 
 
 def get_db():
@@ -50,6 +80,12 @@ def set_setting(db, name: str, value: str) -> None:
     else:
         db.add(Setting(name=name, value=encrypted))
     db.commit()
+
+
+def get_api_key(db, api_key: str):
+    return db.exec(
+        select(ApiKey).where(ApiKey.key == api_key, ApiKey.active == True)
+    ).first()
 
 
 def load_settings(db):
@@ -78,9 +114,38 @@ def root() -> RedirectResponse:
     return RedirectResponse(url="/admin")
 
 
+@app.get("/keycheck")
+def keycheck(
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    api_key = x_api_key
+    if not api_key and authorization:
+        prefix = "Bearer "
+        if authorization.startswith(prefix):
+            api_key = authorization[len(prefix) :].strip()
+
+    if not api_key:
+        return JSONResponse(status_code=401, content={"status": "failure"})
+
+    with SessionLocal() as db:
+        key = get_api_key(db, api_key)
+        if key is None:
+            return JSONResponse(status_code=401, content={"status": "failure"})
+
+    return {"status": "success"}
+
+
 @app.get("/login", response_class=HTMLResponse)
 def login_form(request: Request):
-    return templates.TemplateResponse("login.html", {"request": request, "error": None})
+    try:
+        return templates.TemplateResponse(
+            request=request,
+            name="login.html",
+            context={"error": None}
+        )
+    except Exception as exc:
+        return _render_error_response(request, exc)
 
 
 @app.post("/login", response_class=HTMLResponse)
@@ -89,10 +154,9 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
         user = db.exec(select(User).where(User.username == username)).first()
         if not user or not verify_password(password, user.password_hash):
             return templates.TemplateResponse(
-                "login.html",
-                {"request": request, "error": "Invalid credentials."},
-            )
-
+                request=request, 
+                name="login.html", 
+                context={"error": "Invalid credentials."})
     response = RedirectResponse(url="/admin", status_code=HTTP_303_SEE_OTHER)
     response.set_cookie("session", create_session_cookie(username), httponly=True)
     return response
@@ -107,22 +171,24 @@ def logout() -> RedirectResponse:
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin(request: Request, user: str = Depends(get_current_user)):
-    with SessionLocal() as db:
-        settings = load_settings(db)
-        api_keys = db.exec(select(ApiKey).order_by(ApiKey.created_at.desc())).all()
-    return templates.TemplateResponse(
-        "admin.html",
-        {"request": request, "user": user, "settings": settings, "api_keys": api_keys},
-    )
+    try:
+        with SessionLocal() as db:
+            settings = load_settings(db)
+            api_keys = db.exec(select(ApiKey)).all()
+            api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
+        return templates.TemplateResponse(request=request, name="admin.html", 
+            context={"request": request, "user": user, "settings": settings, "api_keys": api_keys})
+
+    except Exception as exc:
+        return _render_error_response(request, exc)
 
 
 @app.get("/settings", response_class=HTMLResponse)
 def settings_page(request: Request, user: str = Depends(get_current_user)):
     with SessionLocal() as db:
         settings = load_settings(db)
-    return templates.TemplateResponse(
-        "settings.html",
-        {"request": request, "settings": settings, "message": None},
+    return templates.TemplateResponse(request=request, name="settings.html",
+        context={"request": request, "settings": settings, "message": None},
     )
 
 
@@ -142,51 +208,63 @@ def save_settings(
         set_setting(db, "dns_password", dns_password)
         settings = load_settings(db)
 
-    return templates.TemplateResponse(
-        "settings.html",
-        {"request": request, "settings": settings, "message": "Settings saved successfully."},
+    return templates.TemplateResponse(request=request, name="settings.html",
+        context={"request": request, "settings": settings, "message": "Settings saved successfully."},
     )
 
 
 @app.get("/api-keys", response_class=HTMLResponse)
 def api_keys_page(request: Request, user: str = Depends(get_current_user)):
-    with SessionLocal() as db:
-        api_keys = db.exec(select(ApiKey).order_by(ApiKey.created_at.desc())).all()
-    return templates.TemplateResponse(
-        "api_keys.html",
-        {"request": request, "api_keys": api_keys, "message": None},
-    )
+    try:
+        with SessionLocal() as db:
+            api_keys = db.exec(select(ApiKey)).all()
+            api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
+        return templates.TemplateResponse(
+            request=request,
+            name="api_keys.html",
+            context={"request": request, "api_keys": api_keys, "message": None},
+        )
+    except Exception as exc:
+        return _render_error_response(request, exc)
 
 
 @app.post("/api-keys", response_class=HTMLResponse)
 def create_api_key_route(request: Request, label: str = Form(...), user: str = Depends(get_current_user)):
-    new_key = generate_api_key()
-    with SessionLocal() as db:
-        api_key = ApiKey(label=label, key=new_key)
-        db.add(api_key)
-        db.commit()
-        api_keys = db.exec(select(ApiKey).order_by(ApiKey.created_at.desc())).all()
+    try:
+        new_key = generate_api_key()
+        with SessionLocal() as db:
+            api_key = ApiKey(label=label, key=new_key)
+            db.add(api_key)
+            db.commit()
+            api_keys = db.exec(select(ApiKey)).all()
+            api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
 
-    return templates.TemplateResponse(
-        "api_keys.html",
-        {"request": request, "api_keys": api_keys, "message": f"API key created: {new_key}"},
-    )
+        return templates.TemplateResponse(request=request, name="api_keys.html",
+            context={"request": request, "api_keys": api_keys, "message": f"API key created: {new_key}"},
+        )
+    except Exception as exc:
+        return _render_error_response(request, exc)
 
 
 @app.post("/api-keys/revoke", response_class=HTMLResponse)
 def revoke_api_key(request: Request, key_id: int = Form(...), user: str = Depends(get_current_user)):
-    with SessionLocal() as db:
-        api_key = db.get(ApiKey, key_id)
-        if api_key:
-            api_key.active = False
-            db.add(api_key)
-            db.commit()
-        api_keys = db.exec(select(ApiKey).order_by(ApiKey.created_at.desc())).all()
+    try:
+        with SessionLocal() as db:
+            api_key = db.get(ApiKey, key_id)
+            if api_key:
+                api_key.active = False
+                db.add(api_key)
+                db.commit()
+            api_keys = db.exec(select(ApiKey)).all()
+            api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
 
-    return templates.TemplateResponse(
-        "api_keys.html",
-        {"request": request, "api_keys": api_keys, "message": "API key revoked."},
-    )
+        return templates.TemplateResponse(
+            request=request,
+            name="api_keys.html",
+            context={"request": request, "api_keys": api_keys, "message": "API key revoked."},
+        )
+    except Exception as exc:
+        return _render_error_response(request, exc)
 
 
 @app.post("/dns-record", response_model=DnsRecordResponse)
@@ -215,7 +293,7 @@ def upsert_dns_record(
             raise HTTPException(status_code=400, detail="Zone name is required")
 
         try:
-            existed = client.create_or_update_record(payload)
+            existed = get_azure_client().create_or_update_record(payload)
             action = "updated" if existed else "created"
             return DnsRecordResponse(
                 status="success",

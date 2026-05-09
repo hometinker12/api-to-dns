@@ -3,7 +3,7 @@ import secrets
 from passlib.context import CryptContext
 from cryptography.fernet import Fernet
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 if ENCRYPTION_KEY is None:
     ENCRYPTION_KEY = Fernet.generate_key().decode()
