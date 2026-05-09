@@ -50,10 +50,11 @@ jobs:
           
           echo "Container is running, testing endpoints..."
           curl --fail --max-time 10 http://localhost:8000/login
-          curl --fail -L -c /tmp/cookies -X POST http://localhost:8000/login \
+          curl --fail -c /tmp/cookies -X POST http://localhost:8000/login \
             -H "Content-Type: application/x-www-form-urlencoded" \
             -d "username=admin&password=your-admin-password" \
-            -o /dev/null
+            -o /dev/null 
+          curl --fail -b /tmp/cookies http://localhost:8000/admin | grep -q "Admin Dashboard"
           API_KEY=$(curl --fail -L -b /tmp/cookies -X POST http://localhost:8000/api-keys \
             -H "Content-Type: application/x-www-form-urlencoded" \
             -d "label=smoke-test" | grep -oP 'API key created: \K[^<]+' )
