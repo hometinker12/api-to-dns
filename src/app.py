@@ -1,4 +1,6 @@
+import html
 import os
+import traceback
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Request, Form, Header, Depends
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
@@ -28,6 +30,20 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="src/static"), name="static")
 templates = Jinja2Templates(directory="src/templates")
+
+
+def _render_error_response(request: Request, error: Exception, status_code: int = 500):
+    traceback_text = traceback.format_exc()
+    print("Application error:", error)
+    print(traceback_text)
+    content = (
+        "<html><body><h1>Application error</h1>"
+        f"<p>{html.escape(str(error))}</p>"
+        "<pre>"
+        f"{html.escape(traceback_text)}"
+        "</pre></body></html>"
+    )
+    return HTMLResponse(content=content, status_code=status_code)
 
 
 def get_azure_client():
@@ -149,14 +165,17 @@ def logout() -> RedirectResponse:
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin(request: Request, user: str = Depends(get_current_user)):
-    with SessionLocal() as db:
-        settings = load_settings(db)
-        api_keys = db.exec(select(ApiKey)).all()
-        api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
-    return templates.TemplateResponse(
-        "admin.html",
-        {"request": request, "user": user, "settings": settings, "api_keys": api_keys},
-    )
+    try:
+        with SessionLocal() as db:
+            settings = load_settings(db)
+            api_keys = db.exec(select(ApiKey)).all()
+            api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
+        return templates.TemplateResponse(
+            "admin.html",
+            {"request": request, "user": user, "settings": settings, "api_keys": api_keys},
+        )
+    except Exception as exc:
+        return _render_error_response(request, exc)
 
 
 @app.get("/settings", response_class=HTMLResponse)
@@ -193,47 +212,56 @@ def save_settings(
 
 @app.get("/api-keys", response_class=HTMLResponse)
 def api_keys_page(request: Request, user: str = Depends(get_current_user)):
-    with SessionLocal() as db:
-        api_keys = db.exec(select(ApiKey)).all()
-        api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
-    return templates.TemplateResponse(
-        "api_keys.html",
-        {"request": request, "api_keys": api_keys, "message": None},
-    )
+    try:
+        with SessionLocal() as db:
+            api_keys = db.exec(select(ApiKey)).all()
+            api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
+        return templates.TemplateResponse(
+            "api_keys.html",
+            {"request": request, "api_keys": api_keys, "message": None},
+        )
+    except Exception as exc:
+        return _render_error_response(request, exc)
 
 
 @app.post("/api-keys", response_class=HTMLResponse)
 def create_api_key_route(request: Request, label: str = Form(...), user: str = Depends(get_current_user)):
-    new_key = generate_api_key()
-    with SessionLocal() as db:
-        api_key = ApiKey(label=label, key=new_key)
-        db.add(api_key)
-        db.commit()
-        api_keys = db.exec(select(ApiKey)).all()
-        api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
+    try:
+        new_key = generate_api_key()
+        with SessionLocal() as db:
+            api_key = ApiKey(label=label, key=new_key)
+            db.add(api_key)
+            db.commit()
+            api_keys = db.exec(select(ApiKey)).all()
+            api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
 
-    return templates.TemplateResponse(
-        "api_keys.html",
-        {"request": request, "api_keys": api_keys, "message": f"API key created: {new_key}"},
-    )
+        return templates.TemplateResponse(
+            "api_keys.html",
+            {"request": request, "api_keys": api_keys, "message": f"API key created: {new_key}"},
+        )
+    except Exception as exc:
+        return _render_error_response(request, exc)
 
 
 @app.post("/api-keys/revoke", response_class=HTMLResponse)
 def revoke_api_key(request: Request, key_id: int = Form(...), user: str = Depends(get_current_user)):
-    with SessionLocal() as db:
-        api_key = db.get(ApiKey, key_id)
-        if api_key:
-            api_key.active = False
-            db.add(api_key)
-            db.commit()
-        api_keys = db.exec(select(ApiKey)).all()
-        api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
+    try:
+        with SessionLocal() as db:
+            api_key = db.get(ApiKey, key_id)
+            if api_key:
+                api_key.active = False
+                db.add(api_key)
+                db.commit()
+            api_keys = db.exec(select(ApiKey)).all()
+            api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
 
-    return templates.TemplateResponse(
-        "api_keys.html",
-        {"request": request, "api_keys": api_keys, "message": "API key revoked."},
+        return templates.TemplateResponse(
+            "api_keys.html",
+            {"request": request, "api_keys": api_keys, "message": "API key revoked."},
 
-    )
+        )
+    except Exception as exc:
+        return _render_error_response(request, exc)
 
 
 @app.post("/dns-record", response_model=DnsRecordResponse)
