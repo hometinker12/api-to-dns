@@ -153,8 +153,10 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
     with SessionLocal() as db:
         user = db.exec(select(User).where(User.username == username)).first()
         if not user or not verify_password(password, user.password_hash):
-            return templates.TemplateResponse(request=request, name="login.html", 
-                context={"request": request, "error": "Invalid credentials."})
+            return templates.TemplateResponse(
+                request=request, 
+                name="login.html", 
+                context={"error": "Invalid credentials."})
     response = RedirectResponse(url="/admin", status_code=HTTP_303_SEE_OTHER)
     response.set_cookie("session", create_session_cookie(username), httponly=True)
     return response
