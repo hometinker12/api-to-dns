@@ -138,7 +138,14 @@ def keycheck(
 
 @app.get("/login", response_class=HTMLResponse)
 def login_form(request: Request):
-    return templates.TemplateResponse("login.html", {"request": request, "error": None})
+    try:
+        return templates.TemplateResponse(
+            request=request,
+            name="login.html",
+            context={"error": None}
+        )
+    except Exception as exc:
+        return _render_error_response(request, exc)
 
 
 @app.post("/login", response_class=HTMLResponse)
@@ -146,11 +153,8 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
     with SessionLocal() as db:
         user = db.exec(select(User).where(User.username == username)).first()
         if not user or not verify_password(password, user.password_hash):
-            return templates.TemplateResponse(
-                "login.html",
-                {"request": request, "error": "Invalid credentials."},
-            )
-
+            return templates.TemplateResponse(request=request, name="login.html", 
+                context={"request": request, "error": "Invalid credentials."})
     response = RedirectResponse(url="/admin", status_code=HTTP_303_SEE_OTHER)
     response.set_cookie("session", create_session_cookie(username), httponly=True)
     return response
@@ -170,10 +174,9 @@ def admin(request: Request, user: str = Depends(get_current_user)):
             settings = load_settings(db)
             api_keys = db.exec(select(ApiKey)).all()
             api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
-        return templates.TemplateResponse(
-            "admin.html",
-            {"request": request, "user": user, "settings": settings, "api_keys": api_keys},
-        )
+        return templates.TemplateResponse(request=request, name="admin.html", 
+            context={"request": request, "user": user, "settings": settings, "api_keys": api_keys})
+
     except Exception as exc:
         return _render_error_response(request, exc)
 
@@ -182,9 +185,8 @@ def admin(request: Request, user: str = Depends(get_current_user)):
 def settings_page(request: Request, user: str = Depends(get_current_user)):
     with SessionLocal() as db:
         settings = load_settings(db)
-    return templates.TemplateResponse(
-        "settings.html",
-        {"request": request, "settings": settings, "message": None},
+    return templates.TemplateResponse(request=request, name="settings.html",
+        context={"request": request, "settings": settings, "message": None},
     )
 
 
@@ -204,9 +206,8 @@ def save_settings(
         set_setting(db, "dns_password", dns_password)
         settings = load_settings(db)
 
-    return templates.TemplateResponse(
-        "settings.html",
-        {"request": request, "settings": settings, "message": "Settings saved successfully."},
+    return templates.TemplateResponse(request=request, name="settings.html",
+        context={"request": request, "settings": settings, "message": "Settings saved successfully."},
     )
 
 
@@ -217,8 +218,9 @@ def api_keys_page(request: Request, user: str = Depends(get_current_user)):
             api_keys = db.exec(select(ApiKey)).all()
             api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
         return templates.TemplateResponse(
-            "api_keys.html",
-            {"request": request, "api_keys": api_keys, "message": None},
+            request=request,
+            name="api_keys.html",
+            context={"request": request, "api_keys": api_keys, "message": None},
         )
     except Exception as exc:
         return _render_error_response(request, exc)
@@ -235,9 +237,8 @@ def create_api_key_route(request: Request, label: str = Form(...), user: str = D
             api_keys = db.exec(select(ApiKey)).all()
             api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
 
-        return templates.TemplateResponse(
-            "api_keys.html",
-            {"request": request, "api_keys": api_keys, "message": f"API key created: {new_key}"},
+        return templates.TemplateResponse(request=request, name="api_keys.html",
+            context={"request": request, "api_keys": api_keys, "message": f"API key created: {new_key}"},
         )
     except Exception as exc:
         return _render_error_response(request, exc)
@@ -256,9 +257,9 @@ def revoke_api_key(request: Request, key_id: int = Form(...), user: str = Depend
             api_keys = sorted(api_keys, key=lambda key: key.created_at, reverse=True)
 
         return templates.TemplateResponse(
-            "api_keys.html",
-            {"request": request, "api_keys": api_keys, "message": "API key revoked."},
-
+            request=request,
+            name="api_keys.html",
+            context={"request": request, "api_keys": api_keys, "message": "API key revoked."},
         )
     except Exception as exc:
         return _render_error_response(request, exc)
