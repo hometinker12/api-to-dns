@@ -1,4 +1,4 @@
-# Microsoft DNS REST Service
+# DNS REST Service
 
 [![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/) [![Python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/) [![Release](https://img.shields.io/badge/release-0.2.0-blue)](VERSION)
 
