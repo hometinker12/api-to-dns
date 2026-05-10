@@ -43,12 +43,33 @@ label {
   margin-bottom: 1rem;
 }
 input[type="text"],
-input[type="password"] {
+input[type="password"],
+select {
   width: 100%;
   margin-top: 0.4rem;
   padding: 0.75rem 0.9rem;
   border-radius: 8px;
   border: 1px solid #cbd5e1;
+}
+input[type="checkbox"] {
+  margin-right: 0.5rem;
+}
+h2 {
+  margin-top: 1.5rem;
+  margin-bottom: 0.5rem;
+  font-size: 1.1rem;
+}
+.help {
+  font-size: 0.9rem;
+  color: #475569;
+  margin: 0 0 1rem;
+  line-height: 1.45;
+}
+.help code {
+  font-size: 0.85em;
+  background: #f1f5f9;
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
 }
 table {
   width: 100%;

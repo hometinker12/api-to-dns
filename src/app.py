@@ -46,20 +46,11 @@ def _render_error_response(request: Request, error: Exception, status_code: int 
     return HTMLResponse(content=content, status_code=status_code)
 
 
-def get_azure_client():
-    """Lazy-loaded Azure DNS client to avoid authentication during app startup."""
-    import os
+def get_dns_client_from_settings(settings: dict):
+    """Build a DNS provider client from encrypted application settings."""
+    from .dns_client import create_dns_client
 
-    # Check if Azure credentials are configured
-    required_vars = ['AZURE_CLIENT_ID', 'AZURE_CLIENT_SECRET', 'AZURE_TENANT_ID']
-    if not all(os.getenv(var) for var in required_vars):
-        raise HTTPException(
-            status_code=400,
-            detail="Azure DNS functionality is not configured. Please set AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, and AZURE_TENANT_ID environment variables."
-        )
-
-    from .dns_client import AzureDnsClient
-    return AzureDnsClient()
+    return create_dns_client(settings)
 
 
 def get_db():
@@ -90,10 +81,18 @@ def get_api_key(db, api_key: str):
 
 def load_settings(db):
     return {
+        "dns_provider_type": get_setting(db, "dns_provider_type"),
         "dns_server": get_setting(db, "dns_server"),
         "dns_zone": get_setting(db, "dns_zone"),
         "dns_username": get_setting(db, "dns_username"),
         "dns_password": get_setting(db, "dns_password"),
+        "dns_tsig_algorithm": get_setting(db, "dns_tsig_algorithm"),
+        "dns_winrm_ssl": get_setting(db, "dns_winrm_ssl"),
+        "azure_tenant_id": get_setting(db, "azure_tenant_id"),
+        "azure_client_id": get_setting(db, "azure_client_id"),
+        "azure_client_secret": get_setting(db, "azure_client_secret"),
+        "azure_subscription_id": get_setting(db, "azure_subscription_id"),
+        "azure_resource_group": get_setting(db, "azure_resource_group"),
     }
 
 
@@ -195,17 +194,33 @@ def settings_page(request: Request, user: str = Depends(get_current_user)):
 @app.post("/settings", response_class=HTMLResponse)
 def save_settings(
     request: Request,
+    dns_provider_type: str = Form("azure"),
     dns_server: str = Form(""),
     dns_zone: str = Form(""),
     dns_username: str = Form(""),
     dns_password: str = Form(""),
+    dns_tsig_algorithm: str = Form(""),
+    dns_winrm_ssl: str = Form(""),
+    azure_tenant_id: str = Form(""),
+    azure_client_id: str = Form(""),
+    azure_client_secret: str = Form(""),
+    azure_subscription_id: str = Form(""),
+    azure_resource_group: str = Form(""),
     user: str = Depends(get_current_user),
 ):
     with SessionLocal() as db:
+        set_setting(db, "dns_provider_type", dns_provider_type)
         set_setting(db, "dns_server", dns_server)
         set_setting(db, "dns_zone", dns_zone)
         set_setting(db, "dns_username", dns_username)
         set_setting(db, "dns_password", dns_password)
+        set_setting(db, "dns_tsig_algorithm", dns_tsig_algorithm)
+        set_setting(db, "dns_winrm_ssl", dns_winrm_ssl)
+        set_setting(db, "azure_tenant_id", azure_tenant_id)
+        set_setting(db, "azure_client_id", azure_client_id)
+        set_setting(db, "azure_client_secret", azure_client_secret)
+        set_setting(db, "azure_subscription_id", azure_subscription_id)
+        set_setting(db, "azure_resource_group", azure_resource_group)
         settings = load_settings(db)
 
     return templates.TemplateResponse(request=request, name="settings.html",
@@ -292,8 +307,34 @@ def upsert_dns_record(
         if not payload.zone_name:
             raise HTTPException(status_code=400, detail="Zone name is required")
 
+        settings = load_settings(db)
+        provider = (settings.get("dns_provider_type") or "azure").strip().lower()
+        if provider == "azure":
+            updates = {}
+            if not payload.subscription_id and settings.get("azure_subscription_id"):
+                updates["subscription_id"] = settings["azure_subscription_id"]
+            if not payload.resource_group and settings.get("azure_resource_group"):
+                updates["resource_group"] = settings["azure_resource_group"]
+            if updates:
+                payload = payload.model_copy(update=updates)
+            if not payload.subscription_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="subscription_id is required for Azure DNS (save a default in settings or include it in the request).",
+                )
+            if not payload.resource_group:
+                raise HTTPException(
+                    status_code=400,
+                    detail="resource_group is required for Azure DNS (save a default in settings or include it in the request).",
+                )
+
         try:
-            existed = get_azure_client().create_or_update_record(payload)
+            client = get_dns_client_from_settings(settings)
+            existed = client.create_or_update_record(
+                payload,
+                dns_server=settings.get("dns_server"),
+                dns_zone=settings.get("dns_zone"),
+            )
             action = "updated" if existed else "created"
             return DnsRecordResponse(
                 status="success",

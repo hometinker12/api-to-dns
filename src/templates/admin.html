@@ -21,12 +21,16 @@
     <section>
       <h2>Current configuration</h2>
       <dl>
+        <dt>DNS server type</dt>
+        <dd>{{ settings.dns_provider_type or "Not configured" }}</dd>
         <dt>Target DNS Server</dt>
         <dd>{{ settings.dns_server or "Not configured" }}</dd>
         <dt>Target DNS Zone</dt>
         <dd>{{ settings.dns_zone or "Not configured" }}</dd>
-        <dt>Microsoft DNS username</dt>
+        <dt>Username / TSIG key name</dt>
         <dd>{{ settings.dns_username or "Not configured" }}</dd>
+        <dt>Azure tenant (if using Azure DNS)</dt>
+        <dd>{{ settings.azure_tenant_id or "Not configured" }}</dd>
       </dl>
     </section>
 

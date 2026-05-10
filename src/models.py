@@ -4,9 +4,18 @@ from pydantic import BaseModel, Field
 from sqlmodel import Field as SQLField, SQLModel
 
 class DnsRecordRequest(BaseModel):
-    subscription_id: Optional[str] = Field(None, description="Azure subscription ID")
-    resource_group: Optional[str] = Field(None, description="Azure resource group containing the DNS zone")
-    zone_name: Optional[str] = Field(None, description="DNS zone name, e.g. example.com")
+    subscription_id: Optional[str] = Field(
+        None,
+        description="Azure subscription ID (optional if a default is saved in admin settings; not used for BIND or Microsoft WinRM).",
+    )
+    resource_group: Optional[str] = Field(
+        None,
+        description="Azure resource group containing the DNS zone (optional if a default is saved in settings).",
+    )
+    zone_name: Optional[str] = Field(
+        None,
+        description="DNS zone name (optional if Target DNS Zone is configured in settings).",
+    )
     record_type: str = Field(..., description="DNS record type, e.g. A, AAAA, CNAME, TXT")
     record_name: str = Field(..., description="Record name relative to the zone, e.g. www")
     ttl: Optional[int] = Field(300, description="Time to live in seconds")
