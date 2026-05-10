@@ -127,9 +127,83 @@ curl -sS -X POST "http://localhost:8000/dns-record" \
   }'
 ```
 
+### Microsoft DNS (WinRM): create and update an A record
+
+In **DNS Settings**, set **DNS server type** to **Microsoft (WinRM)**, then **Target DNS Server** (the host that accepts WinRM, often your DNS / DC), **Target DNS Zone**, and domain credentials (**username** / **password**). Turn on **HTTPS WinRM** if you use port **5986**.
+
+Requests **do not** use `subscription_id` or `resource_group`. You may omit **`zone_name`** if you saved **Target DNS Zone** in settings.
+
+**Create** (first `A` for `api` in `corp.example`):
+
+```bash
+curl -sS -X POST "http://localhost:8000/dns-record" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -d '{
+    "zone_name": "corp.example",
+    "record_type": "A",
+    "record_name": "api",
+    "ttl": 300,
+    "values": ["192.0.2.10"]
+  }'
+```
+
+**Update** (same name and type, new addresses / TTL):
+
+```bash
+curl -sS -X POST "http://localhost:8000/dns-record" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -d '{
+    "zone_name": "corp.example",
+    "record_type": "A",
+    "record_name": "api",
+    "ttl": 600,
+    "values": ["192.0.2.20"]
+  }'
+```
+
+### BIND (TSIG): create and update an A record
+
+In **DNS Settings**, set **DNS server type** to **BIND / TSIG**, **Target DNS Server** (primary that accepts RFC 2136 updates), **Target DNS Zone**, **TSIG key name** (username field), **TSIG secret in base64** (password field, same encoding as in `named.conf`), and optionally **TSIG algorithm** (default `hmac-sha256`).
+
+The JSON body is the same shape as for Microsoft: no Azure fields.
+
+**Create**:
+
+```bash
+curl -sS -X POST "http://localhost:8000/dns-record" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -d '{
+    "zone_name": "example.com",
+    "record_type": "A",
+    "record_name": "dyn",
+    "ttl": 300,
+    "values": ["192.0.2.10"]
+  }'
+```
+
+**Update**:
+
+```bash
+curl -sS -X POST "http://localhost:8000/dns-record" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -d '{
+    "zone_name": "example.com",
+    "record_type": "A",
+    "record_name": "dyn",
+    "ttl": 600,
+    "values": ["192.0.2.30"]
+  }'
+```
+
 ### Delete a record (all providers)
 
 Use **`record_type": "DELETE"`**. The first entry in **`values`** must be the DNS RR type to remove: **`A`**, **`AAAA`**, **`CNAME`**, or **`TXT`**.
+
+**Microsoft / BIND** — same as above; include **`zone_name`** unless it is set as **Target DNS Zone** in DNS Settings. No Azure fields.
 
 ```bash
 curl -sS -X POST "http://localhost:8000/dns-record" \
@@ -138,10 +212,35 @@ curl -sS -X POST "http://localhost:8000/dns-record" \
   -d '{
     "zone_name": "example.com",
     "record_type": "DELETE",
+    "record_name": "dyn",
+    "values": ["A"]
+  }'
+```
+
+**Azure DNS** — include **`subscription_id`** and **`resource_group`** on the delete request as well, unless both are saved as defaults in DNS Settings.
+
+```bash
+curl -sS -X POST "http://localhost:8000/dns-record" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -d '{
+    "subscription_id": "11111111-1111-1111-1111-111111111111",
+    "resource_group": "my-dns-rg",
+    "zone_name": "example.com",
+    "record_type": "DELETE",
     "record_name": "www",
     "values": ["A"]
   }'
 ```
+
+**Responses (short)**
+
+- Create / update success: HTTP **200**, `"status": "success"`, `"action": "created"` or `"updated"`.
+- Delete removed a record: **200**, `"status": "success"`, `"action": "deleted"`.
+- Delete when nothing matched: **404**, `"status": "error"`, `"action": "not_found"`.
+- Validation or provider failure: **400**, **502**, **503**, or **500** with JSON `detail` (for example `{"detail": {"error": "dns_provider_failed", "message": "..."}}`).
+
+> **PowerShell:** `Invoke-RestMethod` treats HTTP **404** as a terminating error by default. For a DELETE that returns `not_found`, use `Invoke-RestMethod ... -SkipHttpErrorCheck` (PowerShell 7+) or `Invoke-WebRequest` and read the body.
 
 ## License
 
