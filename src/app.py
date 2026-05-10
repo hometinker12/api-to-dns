@@ -7,7 +7,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.status import HTTP_303_SEE_OTHER
+from starlette.status import HTTP_303_SEE_OTHER, HTTP_404_NOT_FOUND
 from sqlmodel import select
 
 from .auth import create_session_cookie, get_current_user
@@ -51,6 +51,31 @@ def get_dns_client_from_settings(settings: dict):
     from .dns_client import create_dns_client
 
     return create_dns_client(settings)
+
+
+def _http_exception_from_dns_error(exc: Exception) -> HTTPException:
+    """Map provider/configuration errors to HTTP errors with structured detail."""
+    if isinstance(exc, HTTPException):
+        return exc
+    if isinstance(exc, ValueError):
+        return HTTPException(
+            status_code=400,
+            detail={"error": "invalid_request", "message": str(exc)},
+        )
+    if isinstance(exc, RuntimeError):
+        return HTTPException(
+            status_code=502,
+            detail={"error": "dns_provider_failed", "message": str(exc)},
+        )
+    if isinstance(exc, ImportError):
+        return HTTPException(
+            status_code=503,
+            detail={"error": "dependency_unavailable", "message": str(exc)},
+        )
+    return HTTPException(
+        status_code=500,
+        detail={"error": "unexpected", "message": str(exc)},
+    )
 
 
 def get_db():
@@ -282,7 +307,19 @@ def revoke_api_key(request: Request, key_id: int = Form(...), user: str = Depend
         return _render_error_response(request, exc)
 
 
-@app.post("/dns-record", response_model=DnsRecordResponse)
+@app.post(
+    "/dns-record",
+    response_model=DnsRecordResponse,
+    responses={
+        HTTP_404_NOT_FOUND: {
+            "description": "DELETE: no matching record in the zone.",
+            "model": DnsRecordResponse,
+        },
+        400: {"description": "Invalid request or configuration."},
+        502: {"description": "DNS provider reported a failure (e.g. WinRM or dynamic update)."},
+        503: {"description": "A required component is not installed or misconfigured."},
+    },
+)
 def upsert_dns_record(
     payload: DnsRecordRequest,
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
@@ -335,14 +372,25 @@ def upsert_dns_record(
                 dns_server=settings.get("dns_server"),
                 dns_zone=settings.get("dns_zone"),
             )
-            action = "updated" if existed else "created"
-            return DnsRecordResponse(
-                status="success",
+            op = payload.record_type.strip().upper()
+            if op == "DELETE":
+                action = "deleted" if existed else "not_found"
+                status = "success" if existed else "error"
+            else:
+                action = "updated" if existed else "created"
+                status = "success"
+            body = DnsRecordResponse(
+                status=status,
                 action=action,
                 zone_name=payload.zone_name,
                 record_name=payload.record_name,
                 record_type=payload.record_type,
                 values=payload.values,
             )
+            if op == "DELETE" and not existed:
+                return JSONResponse(status_code=HTTP_404_NOT_FOUND, content=body.model_dump())
+            return body
+        except HTTPException:
+            raise
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
+            raise _http_exception_from_dns_error(exc) from exc

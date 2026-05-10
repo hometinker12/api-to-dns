@@ -16,6 +16,12 @@ def _ps_single_quoted(s: str) -> str:
     return "'" + s.replace("'", "''") + "'"
 
 
+def _winrm_rr_type(upper_rr: str) -> str:
+    """RR type string expected by DnsServer PowerShell cmdlets."""
+    u = upper_rr.strip().upper()
+    return "Txt" if u == "TXT" else u
+
+
 def _dns_relative_name(zone_name: str, record_name: str) -> str:
     z = zone_name.strip().rstrip(".")
     r = record_name.strip().rstrip(".")
@@ -94,6 +100,28 @@ class AzureDnsClient:
         record_set_name = payload.record_name.strip(".") or "@"
         record_type = payload.record_type.upper()
 
+        if record_type == "DELETE":
+            inner = payload.values[0].strip().upper()
+            existing = self._get_existing_record_set(
+                client,
+                payload.resource_group,
+                payload.zone_name,
+                record_set_name,
+                inner,
+            )
+            if existing is None:
+                return False
+            try:
+                client.record_sets.delete(
+                    payload.resource_group,
+                    payload.zone_name,
+                    record_set_name,
+                    inner,
+                )
+            except self.ResourceNotFoundError:
+                return False
+            return True
+
         existing = self._get_existing_record_set(
             client,
             payload.resource_group,
@@ -171,6 +199,18 @@ class BindTsigDnsClient:
         relative = _dns_relative_name(zone_name, payload.record_name)
         origin = dns.name.from_text(zone_name)
 
+        if record_type == "DELETE":
+            inner = payload.values[0].strip().upper()
+            rdtype = dns.rdatatype.from_text(inner)
+            existed = _record_existed_before_update(dns_server, zone_name, relative, rdtype)
+            update = dns.update.Update(origin, keyring=self._keyring, keyname=self._keyname)
+            node = relative if relative not in ("@", "") else "@"
+            update.delete(node, rdtype)
+            response = dns.query.tcp(update, dns_server, timeout=15)
+            if response.rcode() != dns.rcode.NOERROR:
+                raise RuntimeError(f"DNS UPDATE failed: {dns.rcode.to_text(response.rcode())}")
+            return existed
+
         rdtype = dns.rdatatype.from_text(record_type)
         existed = _record_existed_before_update(dns_server, zone_name, relative, rdtype)
 
@@ -243,7 +283,32 @@ class MicrosoftWinRmDnsClient:
             name_at = name
 
         session = self._session(dns_server)
-        existed = self._record_exists(session, dns_server, zone, name_at, record_type)
+
+        if record_type == "DELETE":
+            inner = payload.values[0].strip().upper()
+            ps_rr = _winrm_rr_type(inner)
+            existed = self._record_exists(session, dns_server, zone, name_at, ps_rr)
+            lines: List[str] = [
+                "$ErrorActionPreference = 'Stop'",
+                f"$ComputerName = {_ps_single_quoted(dns_server)}",
+                f"$ZoneName = {_ps_single_quoted(zone)}",
+                f"$Name = {_ps_single_quoted(name_at)}",
+                "Import-Module DnsServer -ErrorAction Stop",
+            ]
+            lines.append(
+                f"Get-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName "
+                f"-Name $Name -RRType {_ps_single_quoted(ps_rr)} -ErrorAction SilentlyContinue | "
+                "Remove-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName -Force"
+            )
+            script = "\n".join(lines)
+            result = session.run_ps(script)
+            if result.status_code != 0:
+                stderr = (result.std_err or b"").decode(errors="replace")
+                stdout = (result.std_out or b"").decode(errors="replace")
+                raise RuntimeError(f"WinRM/PowerShell failed ({result.status_code}): {stderr or stdout}")
+            return existed
+
+        existed = self._record_exists(session, dns_server, zone, name_at, _winrm_rr_type(record_type))
 
         lines: List[str] = [
             "$ErrorActionPreference = 'Stop'",
@@ -257,7 +322,8 @@ class MicrosoftWinRmDnsClient:
         if record_type == "A":
             lines.append(
                 "Get-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName "
-                "-Name $Name -RRType A -ErrorAction SilentlyContinue | Remove-DnsServerResourceRecord -Force"
+                "-Name $Name -RRType A -ErrorAction SilentlyContinue | "
+                "Remove-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName -Force"
             )
             for v in payload.values:
                 lines.append(
@@ -268,7 +334,8 @@ class MicrosoftWinRmDnsClient:
         elif record_type == "AAAA":
             lines.append(
                 "Get-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName "
-                "-Name $Name -RRType AAAA -ErrorAction SilentlyContinue | Remove-DnsServerResourceRecord -Force"
+                "-Name $Name -RRType AAAA -ErrorAction SilentlyContinue | "
+                "Remove-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName -Force"
             )
             for v in payload.values:
                 lines.append(
@@ -282,7 +349,8 @@ class MicrosoftWinRmDnsClient:
             target = payload.values[0]
             lines.append(
                 "Get-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName "
-                "-Name $Name -RRType CNAME -ErrorAction SilentlyContinue | Remove-DnsServerResourceRecord -Force"
+                "-Name $Name -RRType CNAME -ErrorAction SilentlyContinue | "
+                "Remove-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName -Force"
             )
             lines.append(
                 "Add-DnsServerResourceRecordCName -ComputerName $ComputerName -ZoneName $ZoneName "
@@ -291,8 +359,9 @@ class MicrosoftWinRmDnsClient:
             )
         elif record_type == "TXT":
             lines.append(
-                "Get-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName "
-                "-Name $Name -RRType Txt -ErrorAction SilentlyContinue | Remove-DnsServerResourceRecord -Force"
+                f"Get-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName "
+                f"-Name $Name -RRType {_ps_single_quoted(_winrm_rr_type('TXT'))} -ErrorAction SilentlyContinue | "
+                "Remove-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName -Force"
             )
             for v in payload.values:
                 lines.append(
