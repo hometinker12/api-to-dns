@@ -20,18 +20,56 @@
     {% endif %}
 
     <form action="/settings" method="post">
+      <label>DNS server type
+        <select name="dns_provider_type">
+          <option value="azure" {% if (settings.dns_provider_type or 'azure') == 'azure' %}selected{% endif %}>Azure DNS (REST API)</option>
+          <option value="microsoft" {% if settings.dns_provider_type == 'microsoft' %}selected{% endif %}>Microsoft DNS (on-premises, WinRM)</option>
+          <option value="bind" {% if settings.dns_provider_type == 'bind' %}selected{% endif %}>BIND / RFC 2136 (TSIG)</option>
+        </select>
+      </label>
+
+      <h2>Connection</h2>
+      <p class="help">For Azure DNS, leave Target DNS Server blank. For Microsoft or BIND, set the server that accepts updates (primary or allowed secondary).</p>
       <label>Target DNS Server
-        <input type="text" name="dns_server" value="{{ settings.dns_server or '' }}" placeholder="dns.example.local" />
+        <input type="text" name="dns_server" value="{{ settings.dns_server or '' }}" placeholder="dc01.corp.local or 192.0.2.10" />
       </label>
       <label>Target DNS Zone
         <input type="text" name="dns_zone" value="{{ settings.dns_zone or '' }}" placeholder="example.com" />
       </label>
-      <label>Microsoft DNS Username
-        <input type="text" name="dns_username" value="{{ settings.dns_username or '' }}" />
+
+      <h2>Credentials</h2>
+      <p class="help"><strong>Microsoft (WinRM):</strong> domain account with rights to manage DNS on the server (for example CORP\dnsadmin). <strong>BIND (TSIG):</strong> key name from <code>named.conf</code> and the shared secret in <strong>base64</strong> (same encoding as in the key statement).</p>
+      <label id="cred-user-label">Username / TSIG key name
+        <input type="text" name="dns_username" value="{{ settings.dns_username or '' }}" autocomplete="off" />
       </label>
-      <label>Microsoft DNS Password
-        <input type="password" name="dns_password" value="{{ settings.dns_password or '' }}" />
+      <label id="cred-pass-label">Password / TSIG secret (base64 for BIND)
+        <input type="password" name="dns_password" value="{{ settings.dns_password or '' }}" autocomplete="new-password" />
       </label>
+      <label>TSIG algorithm (BIND only, optional)
+        <input type="text" name="dns_tsig_algorithm" value="{{ settings.dns_tsig_algorithm or '' }}" placeholder="hmac-sha256" />
+      </label>
+      <label>Use HTTPS WinRM (port 5986) for Microsoft
+        <input type="checkbox" name="dns_winrm_ssl" value="true" {% if settings.dns_winrm_ssl %}checked{% endif %} />
+      </label>
+
+      <h2>Azure DNS (service principal)</h2>
+      <p class="help">Used only when DNS server type is Azure DNS. Values are stored encrypted in the database.</p>
+      <label>Azure tenant ID
+        <input type="text" name="azure_tenant_id" value="{{ settings.azure_tenant_id or '' }}" autocomplete="off" />
+      </label>
+      <label>Azure client ID (application ID)
+        <input type="text" name="azure_client_id" value="{{ settings.azure_client_id or '' }}" autocomplete="off" />
+      </label>
+      <label>Azure client secret
+        <input type="password" name="azure_client_secret" value="{{ settings.azure_client_secret or '' }}" autocomplete="new-password" />
+      </label>
+      <label>Default subscription ID (optional if every API request sends <code>subscription_id</code>)
+        <input type="text" name="azure_subscription_id" value="{{ settings.azure_subscription_id or '' }}" autocomplete="off" />
+      </label>
+      <label>Default resource group (optional if every request sends <code>resource_group</code>)
+        <input type="text" name="azure_resource_group" value="{{ settings.azure_resource_group or '' }}" autocomplete="off" />
+      </label>
+
       <button type="submit">Save Settings</button>
     </form>
   </div>

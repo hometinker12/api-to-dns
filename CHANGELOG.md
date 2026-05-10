@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.2.0] - 2026-05-09
+
+### Added
+
+- DNS provider choice in admin **DNS Settings**: **Azure DNS**, **on-premises Microsoft DNS (WinRM)**, and **BIND** (RFC 2136 dynamic updates with **TSIG**)
+- Azure service principal and optional default **subscription** / **resource group** stored encrypted in the database (configured in the UI, not via `AZURE_*` environment variables)
+- **`DELETE`** support on `POST /dns-record`: set `record_type` to `DELETE` and put the RR type to remove (`A`, `AAAA`, `CNAME`, or `TXT`) in `values[0]`
+- Structured API errors: `HTTPException` responses with a `detail` object (`invalid_request`, `dns_provider_failed`, `dependency_unavailable`, `unexpected`) and HTTP **400** / **502** / **503** / **500** as appropriate instead of a single generic **500** for all failures
+- **DELETE** when no matching record: HTTP **404** with `status: "error"` and `action: "not_found"`; successful delete returns **200** with `status: "success"` and `action: "deleted"`
+- Dependencies: **dnspython**, **pywinrm**
+- Tests: `tests/conftest.py` for isolated SQLite; expanded `tests/test_app.py` (auth, mocked upsert, DELETE not found, provider `RuntimeError` → **502**)
+
+### Changed
+
+- **`.env.example`**: removed optional `AZURE_*` variables; Azure is configured only through **DNS Settings**
+- **`README.md`**: environment documentation, **curl** examples for create, update, and delete, response and error behavior, PowerShell note for **404** on DELETE
+- **`src/dns_client.py`**: Azure uses `ClientSecretCredential` from settings; BIND TSIG updates; Microsoft WinRM + DnsServer PowerShell for A, AAAA, CNAME, TXT; explicit **`-ComputerName`** / **`-ZoneName`** on `Remove-DnsServerResourceRecord` when piping from `Get-DnsServerResourceRecord`; TXT RR type normalized for PowerShell (`Txt`); upsert behavior for Microsoft (remove then add) and BIND (`replace`)
+
+### Fixed
+
+- WinRM pipeline errors when removing existing records (`Remove-DnsServerResourceRecord` missing mandatory **ZoneName** / **ComputerName** on some DnsServer module versions)
+
 ## [0.1.0] - Initial Release
 
 ### Added
