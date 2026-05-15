@@ -32,7 +32,9 @@ function Invoke-FormPost {
     [Parameter(Mandatory)] [string] $Uri,
     $WebSession,
     [Parameter(Mandatory)] [hashtable] $Form,
-    [int] $MaximumRedirection = 0
+    # FastAPI form handlers often return 303 See Other (PRG). PS7 treats 0 as "no redirects allowed"
+    # and fails with "maximum redirection count has been exceeded" on the first 303.
+    [int] $MaximumRedirection = 10
   )
   $pairs = $Form.GetEnumerator() | ForEach-Object {
     '{0}={1}' -f $_.Key, [uri]::EscapeDataString([string]$_.Value)
