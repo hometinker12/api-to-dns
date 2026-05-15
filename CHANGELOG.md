@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.0] - 2026-05-10
+
+### Added
+
+- **Multiple DNS zones**: each zone name is unique; each row stores its own provider type, connection, and encrypted credentials (`DnsZoneConfig`).
+- **API key zone permissions**: `ApiKeyAllowedZone` links keys to allowed zones; create key requires at least one zone; **Edit** on an API key updates label and allowed zones.
+- **`POST /dns-record` authorization**: `zone_name` is always required; must match a configured zone **and** be allowed for the API key; otherwise **403** with `detail.error` **`access_denied`** (same message whether the zone is unknown or the key lacks permission).
+
+### Changed
+
+- Replaced single **DNS Settings** form with **DNS zones** list (`/settings`), **Add zone** (`/zones/new`), **Edit zone** (`/zones/{id}/edit`), and **Delete zone**.
+- Startup **migration**: if legacy flat `Setting` DNS keys exist and no zones exist yet, one zone row is created and **all active API keys** are granted access to it; legacy settings rows are removed.
+
+### Removed
+
+- Global single-zone DNS settings form (replaced by per-zone configuration).
+
 ## [0.2.0] - 2026-05-09
 
 ### Added
