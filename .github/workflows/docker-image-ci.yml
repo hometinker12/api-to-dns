@@ -61,32 +61,34 @@ jobs:
           tsig_name = sys.argv[2]
           tsig_secret = sys.argv[3]
 
-          named_conf = f'''key "{tsig_name}" {{
-            algorithm hmac-sha256;
-            secret "{tsig_secret}";
-          }};
-
-          options {{
-            directory "/bind";
-            listen-on port 53 {{ any; }};
-            listen-on-v6 {{ none; }};
-            allow-query {{ any; }};
-            recursion no;
-            dnssec-validation no;
-          }};
-
-          zone "smoke.test" {{
-            type master;
-            file "/bind/db.smoke.test";
-            allow-update {{ key "{tsig_name}"; }};
-          }};
-
-          zone "denied.test" {{
-            type master;
-            file "/bind/db.denied.test";
-            allow-update {{ key "{tsig_name}"; }};
-          }};
-          '''
+          # Build named.conf without literal brace pairs in YAML — Actions can rewrite those in run: blocks.
+          named_conf = (
+              'key "' + tsig_name + '" {\n'
+              "  algorithm hmac-sha256;\n"
+              '  secret "' + tsig_secret + '";\n'
+              "};\n"
+              "\n"
+              "options {\n"
+              '  directory "/bind";\n'
+              "  listen-on port 53 { any; };\n"
+              "  listen-on-v6 { none; };\n"
+              "  allow-query { any; };\n"
+              "  recursion no;\n"
+              "  dnssec-validation no;\n"
+              "};\n"
+              "\n"
+              'zone "smoke.test" {\n'
+              "  type master;\n"
+              '  file "/bind/db.smoke.test";\n'
+              '  allow-update { key "' + tsig_name + '"; };\n'
+              "};\n"
+              "\n"
+              'zone "denied.test" {\n'
+              "  type master;\n"
+              '  file "/bind/db.denied.test";\n'
+              '  allow-update { key "' + tsig_name + '"; };\n'
+              "};\n"
+          )
 
           zone_smoke = """$TTL 300
           @ IN SOA ns.smoke.test. hostmaster.smoke.test. (
@@ -262,17 +264,7 @@ jobs:
               exit 1
             fi
 
-            python3 - "${output}" "${expected_action}" <<'PY'
-            import json
-            import sys
-
-            body = json.load(open(sys.argv[1], encoding='utf-8'))
-            expected_action = sys.argv[2]
-            if expected_action == "access_denied":
-                assert body["detail"]["error"] == "access_denied", body
-            else:
-                assert body["action"] == expected_action, body
-            PY
+            python3 -c "import json,sys;b=json.load(open(sys.argv[1],encoding='utf-8'));e=sys.argv[2];assert((e=='access_denied' and b['detail']['error']=='access_denied') or (b['action']==e)),b" "${output}" "${expected_action}"
           }
 
           wait_for_record_value() {
