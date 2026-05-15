@@ -1,11 +1,13 @@
-# Manual smoke on **develop**: (1) BIND + Docker API on **ubuntu-latest** — same as release CI.
-# (2) Hosted Microsoft DNS + **native Python** API on **windows-2025** — GitHub Windows Docker is
-# **Windows-only** and cannot load/run Linux images ("cannot load linux image on windows"), so the
-# API runs in a venv + uvicorn; WinRM targets **127.0.0.1** for local DnsServer cmdlets.
+# Manual smoke on **develop**:
+# - **build-linux-image**: build Linux API image on ubuntu (same Dockerfile as release).
+# - **bind-smoke-linux**: download image tarball, docker load, BIND in Docker + API smoke (bash).
+# - **microsoft-dns-smoke-windows**: docker load, DNS Server role + local zones, API container,
+#   smoke via **PowerShell** (`scripts/windows-ms-smoke.ps1` — Invoke-WebRequest / Invoke-RestMethod).
 #
-# Optional remote lab (secrets): MICROSOFT_DNS_WINRM_HOST, USER, PASSWORD, SSL, QUERY_HOST
+# Requires Docker **Linux container mode** on the Windows runner (`docker version` Server OS = linux).
+# If the engine is Windows-only, the Windows job fails fast with a clear script error; BIND still runs on Ubuntu.
 #
-# Run from branch `develop`. Workflow file must exist on the default branch to appear in the UI.
+# Optional remote lab secrets: MICROSOFT_DNS_WINRM_HOST, USER, PASSWORD, SSL, QUERY_HOST
 
 name: Microsoft DNS manual smoke (develop)
 
@@ -26,12 +28,42 @@ on:
         default: ""
 
 jobs:
-  bind-smoke-linux:
-    name: BIND smoke (ubuntu + Docker)
+  build-linux-image:
+    name: Build Linux API image
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/develop'
     steps:
       - uses: actions/checkout@v4
+
+      - name: Docker build and save image
+        run: |
+          set -euo pipefail
+          docker build . --file Dockerfile --tag api-to-dns-smoke:linux-ci
+          docker save api-to-dns-smoke:linux-ci | gzip -1 > api-to-dns-image.tar.gz
+          ls -lh api-to-dns-image.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: api-to-dns-linux-image
+          path: api-to-dns-image.tar.gz
+          retention-days: 2
+
+  bind-smoke-linux:
+    name: BIND smoke (ubuntu + Docker)
+    needs: build-linux-image
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux API image
+        uses: actions/download-artifact@v4
+        with:
+          name: api-to-dns-linux-image
+          path: ${{ runner.temp }}/docker-image
+
+      - name: Load image into Docker
+        run: gunzip -c "${RUNNER_TEMP}/docker-image/api-to-dns-image.tar.gz" | docker load
 
       - name: Copy env example for testing
         run: cp .env.example .env
@@ -48,15 +80,9 @@ jobs:
           sed -i "s|ENCRYPTION_KEY=.*|ENCRYPTION_KEY=${KEY}|" .env
           echo 'Generated encryption key for testing'
 
-      - name: Build the Docker image
-        run: |
-          IMAGE_TAG="api-to-dns-bind-smoke:$(date +%s)"
-          docker build . --file Dockerfile --tag "$IMAGE_TAG"
-          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
-
       - name: Run BIND-backed smoke test
         env:
-          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          IMAGE_TAG: api-to-dns-smoke:linux-ci
         run: |
           set -euo pipefail
 
@@ -317,12 +343,10 @@ jobs:
           echo "BIND smoke on Linux completed successfully."
 
   microsoft-dns-smoke-windows:
-    name: Local + remote Microsoft (windows, native API)
+    name: Local + remote Microsoft (windows, Docker API + PowerShell)
+    needs: build-linux-image
     runs-on: windows-2025
     if: github.ref == 'refs/heads/develop'
-    defaults:
-      run:
-        shell: bash
 
     steps:
       - uses: actions/checkout@v4
@@ -367,23 +391,28 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "LOCAL_ALLOWED_ZONE=local-smoke.test"
           Add-Content -Path $env:GITHUB_ENV -Value "LOCAL_DENIED_ZONE=local-denied.test"
 
-      - name: Copy env example for testing
-        run: cp .env.example .env
-
-      - name: Generate encryption key for testing
+      - name: Prepare .env with Fernet encryption key
+        shell: pwsh
         run: |
-          KEY="$(python - <<'PY'
-          import base64
-          import os
+          $ErrorActionPreference = 'Stop'
+          Copy-Item -Force .env.example .env
+          $key = (& python -c "import base64,os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())").Trim()
+          $text = (Get-Content .env -Raw) -replace 'ENCRYPTION_KEY=.*', "ENCRYPTION_KEY=$key"
+          $utf8 = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) '.env'), $text, $utf8)
 
-          print(base64.urlsafe_b64encode(os.urandom(32)).decode())
-          PY
-          )"
-          sed -i.bak "s|ENCRYPTION_KEY=.*|ENCRYPTION_KEY=${KEY}|" .env
-          rm -f .env.bak
-          echo 'Generated encryption key for testing'
+      - name: Download Linux API image
+        uses: actions/download-artifact@v4
+        with:
+          name: api-to-dns-linux-image
+          path: ${{ runner.temp }}/docker-image
 
-      - name: Install deps, start API (uvicorn), run Microsoft smoke
+      - name: Load Linux image (Git Bash)
+        shell: bash
+        run: gunzip -c "${RUNNER_TEMP}/docker-image/api-to-dns-image.tar.gz" | docker load
+
+      - name: Microsoft smoke (PowerShell HTTP + Docker API)
+        shell: pwsh
         env:
           REMOTE_WINRM_HOST: ${{ secrets.MICROSOFT_DNS_WINRM_HOST }}
           REMOTE_WINRM_USER: ${{ secrets.MICROSOFT_DNS_WINRM_USER }}
@@ -393,337 +422,4 @@ jobs:
           REMOTE_ALLOWED_ZONE: ${{ github.event.inputs.allowed_zone }}
           REMOTE_DENIED_ZONE: ${{ github.event.inputs.denied_zone }}
           INPUT_QUERY_SERVER: ${{ github.event.inputs.dns_query_server }}
-        run: |
-          set -euo pipefail
-
-          cleanup() {
-            if [ -f /tmp/uvicorn.pid ]; then
-              kill "$(cat /tmp/uvicorn.pid)" 2>/dev/null || true
-              rm -f /tmp/uvicorn.pid
-            fi
-          }
-          trap cleanup EXIT
-
-          python -m venv .venv
-          # shellcheck source=/dev/null
-          source .venv/Scripts/activate
-          pip install -q -r requirements.txt
-
-          echo "Starting uvicorn (native Windows Python; --env-file .env for ADMIN_* / SECRET_KEY / ENCRYPTION_KEY; WinRM to 127.0.0.1 for local DNS)..."
-          uvicorn src.app:app --host 127.0.0.1 --port 8000 --env-file .env >/tmp/uvicorn.log 2>&1 &
-          echo $! > /tmp/uvicorn.pid
-
-          for i in $(seq 1 60); do
-            if curl --fail --silent --max-time 5 http://127.0.0.1:8000/login >/dev/null; then
-              break
-            fi
-            if ! kill -0 "$(cat /tmp/uvicorn.pid)" 2>/dev/null; then
-              echo "uvicorn exited early"
-              cat /tmp/uvicorn.log || true
-              exit 1
-            fi
-            sleep 2
-          done
-
-          curl --fail --silent -c /tmp/cookies -X POST http://127.0.0.1:8000/login \
-            -H "Content-Type: application/x-www-form-urlencoded" \
-            -d "username=admin&password=your-admin-password" \
-            -o /dev/null
-          curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/admin \
-            | python -c "import sys; assert 'DNS Admin Dashboard' in sys.stdin.read()"
-
-          call_dns_api() {
-            local api_key="$1"
-            local expected_status="$2"
-            local expected_action="$3"
-            local body="$4"
-            local output="/tmp/dns-response-${expected_action}-$$.json"
-            local status
-
-            status="$(curl --silent --show-error -o "${output}" -w "%{http_code}" \
-              -X POST http://127.0.0.1:8000/dns-record \
-              -H "Content-Type: application/json" \
-              -H "X-API-Key: ${api_key}" \
-              -d "${body}")"
-
-            echo "${expected_action}: HTTP ${status}"
-            cat "${output}"
-            echo
-
-            if [ "${status}" != "${expected_status}" ]; then
-              echo "Expected HTTP ${expected_status}, got ${status}"
-              exit 1
-            fi
-
-            python -c "import json,sys;b=json.load(open(sys.argv[1],encoding='utf-8'));e=sys.argv[2];assert((e=='access_denied' and b['detail']['error']=='access_denied') or (b['action']==e)),b" "${output}" "${expected_action}"
-          }
-
-          LOCAL_WINRM_TARGET="127.0.0.1"
-          LOCAL_DIG_SERVER="127.0.0.1"
-          resolve_a_local() {
-            export CHECK_FQDN="$1"
-            export CHECK_SERVER="$2"
-            POWERSHELL_TELEMETRY_OPTOUT=1 pwsh -NoProfile -Command \
-              '$r = Resolve-DnsName -Name $env:CHECK_FQDN -Type A -DnsOnly -Server $env:CHECK_SERVER -ErrorAction SilentlyContinue |
-                Where-Object { $_.IPAddress } | Select-Object -First 1
-              if ($null -eq $r) { "" } else { $r.IPAddress }' | tr -d '\r'
-          }
-
-          wait_local_a() {
-            local fqdn="$1"
-            local expected="$2"
-            local value=""
-            for i in $(seq 1 30); do
-              value="$(resolve_a_local "${fqdn}" "${LOCAL_DIG_SERVER}" | tail -n 1 || true)"
-              if [ "${value}" = "${expected}" ]; then
-                return 0
-              fi
-              sleep 2
-            done
-            echo "Expected ${fqdn} on local Microsoft DNS to resolve to ${expected}; got '${value}'"
-            exit 1
-          }
-
-          wait_local_absent() {
-            local fqdn="$1"
-            local value=""
-            for i in $(seq 1 30); do
-              value="$(resolve_a_local "${fqdn}" "${LOCAL_DIG_SERVER}" | tail -n 1 || true)"
-              if [ -z "${value}" ]; then
-                return 0
-              fi
-              sleep 2
-            done
-            echo "Expected ${fqdn} absent on local Microsoft DNS; got '${value}'"
-            exit 1
-          }
-
-          echo "=== Local Microsoft DNS (WinRM -> ${LOCAL_WINRM_TARGET}) ==="
-          LOCAL_USER_PRINCIPAL=".\\${LOCAL_WINRM_USER}"
-          for zone in "${LOCAL_ALLOWED_ZONE}" "${LOCAL_DENIED_ZONE}"; do
-            curl --fail --silent -b /tmp/cookies -X POST http://127.0.0.1:8000/zones \
-              -H "Content-Type: application/x-www-form-urlencoded" \
-              --data-urlencode "zone_name=${zone}" \
-              --data-urlencode "dns_provider_type=microsoft" \
-              --data-urlencode "dns_server=${LOCAL_WINRM_TARGET}" \
-              --data-urlencode "dns_username=${LOCAL_USER_PRINCIPAL}" \
-              --data-urlencode "dns_password=${LOCAL_WINRM_PASSWORD}" \
-              -o /dev/null
-          done
-
-          curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/api-keys -o /tmp/api-keys.html
-          LOCAL_ZONE_ID="$(LOCAL_ALLOWED_ZONE="${LOCAL_ALLOWED_ZONE}" python - <<'PY'
-          import os
-          import re
-
-          html = open("/tmp/api-keys.html", encoding="utf-8").read()
-          zone = os.environ["LOCAL_ALLOWED_ZONE"]
-          escaped = re.escape(zone)
-          match = re.search(
-              r'name="zone_ids" value="(\d+)"\s*/>\s*<code>' + escaped + r"</code>",
-              html,
-              re.DOTALL,
-          )
-          if not match:
-              raise SystemExit(f"Could not find zone ID for {zone!r}")
-          print(match.group(1))
-          PY
-          )"
-
-          curl --fail --silent -L -b /tmp/cookies -X POST http://127.0.0.1:8000/api-keys \
-            -H "Content-Type: application/x-www-form-urlencoded" \
-            --data-urlencode "label=ms-local-smoke" \
-            --data-urlencode "zone_ids=${LOCAL_ZONE_ID}" \
-            -o /tmp/api-key-ms-local.html
-
-          MS_LOCAL_KEY="$(python - <<'PY'
-          import re
-
-          html = open("/tmp/api-key-ms-local.html", encoding="utf-8").read()
-          match = re.search(r"API key created:\s*([^<\s]+)", html)
-          if not match:
-              raise SystemExit("Could not extract local Microsoft API key")
-          print(match.group(1))
-          PY
-          )"
-
-          curl --fail --silent -H "X-API-Key: ${MS_LOCAL_KEY}" http://127.0.0.1:8000/keycheck \
-            | python -c "import json, sys; assert json.load(sys.stdin)['status'] == 'success'"
-
-          L_CREATE="$(LOCAL_ALLOWED_ZONE="${LOCAL_ALLOWED_ZONE}" python - <<'PY'
-          import json, os
-          z = os.environ["LOCAL_ALLOWED_ZONE"]
-          print(json.dumps({"zone_name": z, "record_type": "A", "record_name": "www", "ttl": 300, "values": ["192.0.2.10"]}))
-          PY
-          )"
-          L_UPDATE="$(LOCAL_ALLOWED_ZONE="${LOCAL_ALLOWED_ZONE}" python - <<'PY'
-          import json, os
-          z = os.environ["LOCAL_ALLOWED_ZONE"]
-          print(json.dumps({"zone_name": z, "record_type": "A", "record_name": "www", "ttl": 300, "values": ["192.0.2.20"]}))
-          PY
-          )"
-          L_DELETE="$(LOCAL_ALLOWED_ZONE="${LOCAL_ALLOWED_ZONE}" python - <<'PY'
-          import json, os
-          z = os.environ["LOCAL_ALLOWED_ZONE"]
-          print(json.dumps({"zone_name": z, "record_type": "DELETE", "record_name": "www", "values": ["A"]}))
-          PY
-          )"
-          L_DENIED="$(LOCAL_DENIED_ZONE="${LOCAL_DENIED_ZONE}" python - <<'PY'
-          import json, os
-          z = os.environ["LOCAL_DENIED_ZONE"]
-          print(json.dumps({"zone_name": z, "record_type": "A", "record_name": "blocked", "ttl": 300, "values": ["192.0.2.55"]}))
-          PY
-          )"
-
-          L_WWW="www.${LOCAL_ALLOWED_ZONE}"
-          call_dns_api "${MS_LOCAL_KEY}" 200 created "${L_CREATE}"
-          wait_local_a "${L_WWW}" 192.0.2.10
-          call_dns_api "${MS_LOCAL_KEY}" 200 updated "${L_UPDATE}"
-          wait_local_a "${L_WWW}" 192.0.2.20
-          call_dns_api "${MS_LOCAL_KEY}" 200 deleted "${L_DELETE}"
-          wait_local_absent "${L_WWW}"
-          call_dns_api "${MS_LOCAL_KEY}" 404 not_found "${L_DELETE}"
-          call_dns_api "${MS_LOCAL_KEY}" 403 access_denied "${L_DENIED}"
-
-          if [ -n "${REMOTE_WINRM_HOST:-}" ] && [ -n "${REMOTE_WINRM_USER:-}" ] && [ -n "${REMOTE_WINRM_PASSWORD:-}" ]; then
-            echo "=== Remote Microsoft DNS (secrets) ==="
-            REMOTE_CURL_SSL=()
-            if [ "${REMOTE_WINRM_SSL:-}" = "true" ] || [ "${REMOTE_WINRM_SSL:-}" = "True" ] || [ "${REMOTE_WINRM_SSL:-}" = "1" ]; then
-              REMOTE_CURL_SSL=(--data-urlencode "dns_winrm_ssl=true")
-            fi
-            REMOTE_DIG="${INPUT_QUERY_SERVER:-}"
-            if [ -z "${REMOTE_DIG}" ]; then
-              REMOTE_DIG="${REMOTE_QUERY_HOST:-}"
-            fi
-
-            resolve_a_remote() {
-              export CHECK_FQDN="$1"
-              export CHECK_SERVER="$2"
-              POWERSHELL_TELEMETRY_OPTOUT=1 pwsh -NoProfile -Command \
-                '$r = Resolve-DnsName -Name $env:CHECK_FQDN -Type A -DnsOnly -Server $env:CHECK_SERVER -ErrorAction SilentlyContinue |
-                  Where-Object { $_.IPAddress } | Select-Object -First 1
-                if ($null -eq $r) { "" } else { $r.IPAddress }' | tr -d '\r'
-            }
-
-            wait_remote_a() {
-              local fqdn="$1"
-              local expected="$2"
-              local value=""
-              if [ -z "${REMOTE_DIG}" ]; then
-                return 0
-              fi
-              for i in $(seq 1 30); do
-                value="$(resolve_a_remote "${fqdn}" "${REMOTE_DIG}" | tail -n 1 || true)"
-                if [ "${value}" = "${expected}" ]; then
-                  return 0
-                fi
-                sleep 2
-              done
-              echo "Expected ${fqdn} to resolve to ${expected} via ${REMOTE_DIG}; got '${value}'"
-              exit 1
-            }
-
-            wait_remote_absent() {
-              local fqdn="$1"
-              local value=""
-              if [ -z "${REMOTE_DIG}" ]; then
-                return 0
-              fi
-              for i in $(seq 1 30); do
-                value="$(resolve_a_remote "${fqdn}" "${REMOTE_DIG}" | tail -n 1 || true)"
-                if [ -z "${value}" ]; then
-                  return 0
-                fi
-                sleep 2
-              done
-              echo "Expected ${fqdn} absent at ${REMOTE_DIG}; got '${value}'"
-              exit 1
-            }
-
-            for zone in "${REMOTE_ALLOWED_ZONE}" "${REMOTE_DENIED_ZONE}"; do
-              curl --fail --silent -b /tmp/cookies -X POST http://127.0.0.1:8000/zones \
-                -H "Content-Type: application/x-www-form-urlencoded" \
-                --data-urlencode "zone_name=${zone}" \
-                --data-urlencode "dns_provider_type=microsoft" \
-                --data-urlencode "dns_server=${REMOTE_WINRM_HOST}" \
-                --data-urlencode "dns_username=${REMOTE_WINRM_USER}" \
-                --data-urlencode "dns_password=${REMOTE_WINRM_PASSWORD}" \
-                "${REMOTE_CURL_SSL[@]}" \
-                -o /dev/null
-            done
-
-            curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/api-keys -o /tmp/api-keys-remote.html
-            R_ZONE_ID="$(REMOTE_ALLOWED_ZONE="${REMOTE_ALLOWED_ZONE}" python - <<'PY'
-          import os
-          import re
-
-          html = open("/tmp/api-keys-remote.html", encoding="utf-8").read()
-          zone = os.environ["REMOTE_ALLOWED_ZONE"]
-          escaped = re.escape(zone)
-          match = re.search(
-              r'name="zone_ids" value="(\d+)"\s*/>\s*<code>' + escaped + r"</code>",
-              html,
-              re.DOTALL,
-          )
-          if not match:
-              raise SystemExit(f"Could not find remote zone ID for {zone!r}")
-          print(match.group(1))
-          PY
-          )"
-
-            curl --fail --silent -L -b /tmp/cookies -X POST http://127.0.0.1:8000/api-keys \
-              -H "Content-Type: application/x-www-form-urlencoded" \
-              --data-urlencode "label=ms-remote-smoke" \
-              --data-urlencode "zone_ids=${R_ZONE_ID}" \
-              -o /tmp/api-key-ms-remote.html
-
-            MS_REMOTE_KEY="$(python - <<'PY'
-          import re
-
-          html = open("/tmp/api-key-ms-remote.html", encoding="utf-8").read()
-          match = re.search(r"API key created:\s*([^<\s]+)", html)
-          if not match:
-              raise SystemExit("Could not extract remote Microsoft API key")
-          print(match.group(1))
-          PY
-          )"
-
-            R_CREATE="$(REMOTE_ALLOWED_ZONE="${REMOTE_ALLOWED_ZONE}" python - <<'PY'
-          import json, os
-          z = os.environ["REMOTE_ALLOWED_ZONE"]
-          print(json.dumps({"zone_name": z, "record_type": "A", "record_name": "www", "ttl": 300, "values": ["192.0.2.10"]}))
-          PY
-          )"
-            R_UPDATE="$(REMOTE_ALLOWED_ZONE="${REMOTE_ALLOWED_ZONE}" python - <<'PY'
-          import json, os
-          z = os.environ["REMOTE_ALLOWED_ZONE"]
-          print(json.dumps({"zone_name": z, "record_type": "A", "record_name": "www", "ttl": 300, "values": ["192.0.2.20"]}))
-          PY
-          )"
-            R_DELETE="$(REMOTE_ALLOWED_ZONE="${REMOTE_ALLOWED_ZONE}" python - <<'PY'
-          import json, os
-          z = os.environ["REMOTE_ALLOWED_ZONE"]
-          print(json.dumps({"zone_name": z, "record_type": "DELETE", "record_name": "www", "values": ["A"]}))
-          PY
-          )"
-            R_DENIED="$(REMOTE_DENIED_ZONE="${REMOTE_DENIED_ZONE}" python - <<'PY'
-          import json, os
-          z = os.environ["REMOTE_DENIED_ZONE"]
-          print(json.dumps({"zone_name": z, "record_type": "A", "record_name": "blocked", "ttl": 300, "values": ["192.0.2.55"]}))
-          PY
-          )"
-
-            R_WWW="www.${REMOTE_ALLOWED_ZONE}"
-            call_dns_api "${MS_REMOTE_KEY}" 200 created "${R_CREATE}"
-            wait_remote_a "${R_WWW}" 192.0.2.10
-            call_dns_api "${MS_REMOTE_KEY}" 200 updated "${R_UPDATE}"
-            wait_remote_a "${R_WWW}" 192.0.2.20
-            call_dns_api "${MS_REMOTE_KEY}" 200 deleted "${R_DELETE}"
-            wait_remote_absent "${R_WWW}"
-            call_dns_api "${MS_REMOTE_KEY}" 404 not_found "${R_DELETE}"
-            call_dns_api "${MS_REMOTE_KEY}" 403 access_denied "${R_DENIED}"
-          else
-            echo "=== Remote Microsoft DNS skipped (set MICROSOFT_DNS_WINRM_* secrets to enable) ==="
-          fi
-
-          echo "Microsoft smoke on Windows completed successfully."
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File "${{ github.workspace }}/scripts/windows-ms-smoke.ps1"
