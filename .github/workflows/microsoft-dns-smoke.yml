@@ -111,8 +111,10 @@ jobs:
 
       - name: Build the Docker image
         run: |
+          # Windows Docker defaults to Windows OS; this Dockerfile is Linux (python:3.12-slim).
+          export DOCKER_DEFAULT_PLATFORM=linux/amd64
           IMAGE_TAG="api-to-dns-microsoft-smoke:$(date +%s)"
-          docker build . --file Dockerfile --tag "$IMAGE_TAG"
+          docker build --platform linux/amd64 . --file Dockerfile --tag "$IMAGE_TAG"
           echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
 
       - name: Local Microsoft + optional remote Microsoft + BIND smoke
@@ -127,6 +129,8 @@ jobs:
           INPUT_QUERY_SERVER: ${{ github.event.inputs.dns_query_server }}
         run: |
           set -euo pipefail
+          # Ensure pulls/runs use Linux images on the windows-2025 Docker host.
+          export DOCKER_DEFAULT_PLATFORM=linux/amd64
 
           NETWORK_NAME="dns-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           BIND_DIR="${RUNNER_TEMP}/bind-smoke"
