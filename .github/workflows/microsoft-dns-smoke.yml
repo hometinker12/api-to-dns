@@ -1,12 +1,12 @@
 # Manual smoke on **develop**:
 # - **bind-smoke-linux**: checkout on ubuntu, `docker build`, BIND + API in Docker (bash), same idea as release CI.
-# - **microsoft-dns-smoke-windows**: checkout on windows-2025, install DNS + WinRM user, **`docker build` on the
-#   runner** (Linux Dockerfile / `python:3.12-slim` requires Docker **Linux container mode** + `--platform linux/amd64`),
-#   then `scripts/windows-ms-smoke.ps1` (Invoke-WebRequest / Invoke-RestMethod).
+# - **build-linux-image**: same Dockerfile on **ubuntu** → `docker save` tarball → artifact (tag `api-to-dns-smoke:linux-ci`).
+# - **microsoft-dns-smoke-windows**: `docker load` that tarball on windows-2025, then `scripts/windows-ms-smoke.ps1`.
 #
-# Checkout is enough for the **context**; images still come from the registry during `docker build`, and the **daemon**
-# must be able to pull/run **Linux** layers. GitHub **windows-2025** images ship the **Docker CLI** (and engine when
-# Linux containers are enabled). Self-hosted Windows runners must install **Docker Desktop** or **Docker Engine** yourself.
+# Why not `docker build` on the Windows runner: the official Python image **does** publish `linux/amd64`, but a Windows
+# daemon without a working Linux backend often fails with **"no matching manifest for linux/amd64"** on pull. WSL2 may
+# be present on the image without a usable default distro / Linux Docker context; building on Ubuntu avoids that pull
+# on Windows. Self-hosted Windows still needs a Linux-capable Docker to **run** the loaded image.
 #
 # Optional remote lab secrets: MICROSOFT_DNS_WINRM_HOST, USER, PASSWORD, SSL, QUERY_HOST
 
@@ -29,6 +29,26 @@ on:
         default: ""
 
 jobs:
+  build-linux-image:
+    name: Build Linux API image (for Windows smoke)
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker build and save image
+        run: |
+          set -euo pipefail
+          docker build . --file Dockerfile --tag api-to-dns-smoke:linux-ci
+          docker save api-to-dns-smoke:linux-ci | gzip -1 > api-to-dns-image.tar.gz
+          ls -lh api-to-dns-image.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: api-to-dns-linux-image
+          path: api-to-dns-image.tar.gz
+          retention-days: 2
+
   bind-smoke-linux:
     name: BIND smoke (ubuntu + Docker)
     runs-on: ubuntu-latest
@@ -321,6 +341,7 @@ jobs:
 
   microsoft-dns-smoke-windows:
     name: Local + remote Microsoft (windows, Docker API + PowerShell)
+    needs: build-linux-image
     runs-on: windows-2025
     if: github.ref == 'refs/heads/develop'
 
@@ -390,13 +411,15 @@ jobs:
           $utf8 = [System.Text.UTF8Encoding]::new($false)
           [System.IO.File]::WriteAllText((Join-Path (Get-Location) '.env'), $text, $utf8)
 
-      - name: Build Linux API image on Windows (same Dockerfile as Ubuntu)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Set-Location $env:GITHUB_WORKSPACE
-          $env:DOCKER_DEFAULT_PLATFORM = 'linux/amd64'
-          docker build --platform linux/amd64 --file Dockerfile --tag api-to-dns-smoke:linux-ci .
+      - name: Download Linux API image
+        uses: actions/download-artifact@v4
+        with:
+          name: api-to-dns-linux-image
+          path: ${{ runner.temp }}/docker-image
+
+      - name: Load Linux image (Git Bash)
+        shell: bash
+        run: gunzip -c "${RUNNER_TEMP}/docker-image/api-to-dns-image.tar.gz" | docker load
 
       - name: Microsoft smoke (PowerShell HTTP + Docker API)
         shell: pwsh
