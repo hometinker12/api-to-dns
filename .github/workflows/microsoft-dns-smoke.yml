@@ -409,8 +409,8 @@ jobs:
           source .venv/Scripts/activate
           pip install -q -r requirements.txt
 
-          echo "Starting uvicorn (native Windows Python; WinRM to 127.0.0.1 for local DNS)..."
-          uvicorn src.app:app --host 127.0.0.1 --port 8000 >/tmp/uvicorn.log 2>&1 &
+          echo "Starting uvicorn (native Windows Python; --env-file .env for ADMIN_* / SECRET_KEY / ENCRYPTION_KEY; WinRM to 127.0.0.1 for local DNS)..."
+          uvicorn src.app:app --host 127.0.0.1 --port 8000 --env-file .env >/tmp/uvicorn.log 2>&1 &
           echo $! > /tmp/uvicorn.pid
 
           for i in $(seq 1 60); do
