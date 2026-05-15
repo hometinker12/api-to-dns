@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Edit API key</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="page">
+    <header>
+      <h1>Edit API key</h1>
+      <nav class="nav-links">
+        <a class="button" href="/api-keys">Back to API keys</a>
+        <a class="button" href="/settings">DNS zones</a>
+      </nav>
+    </header>
+
+    {% if message %}
+      <div class="alert success">{{ message }}</div>
+    {% endif %}
+
+    <p><strong>Label:</strong> {{ api_key_row.label }} &nbsp;|&nbsp; <strong>Key prefix:</strong> <code>{{ api_key_row.key[:12] }}…</code></p>
+
+    <form action="/api-keys/{{ api_key_row.id }}" method="post">
+      <label>Label
+        <input type="text" name="label" required value="{{ api_key_row.label }}" />
+      </label>
+      <fieldset>
+        <legend>Allowed DNS zones</legend>
+        {% if all_zones %}
+          {% for z in all_zones %}
+            <label class="inline-check">
+              <input type="checkbox" name="zone_ids" value="{{ z.id }}" {% if z.id in allowed_ids %}checked{% endif %} />
+              <code>{{ z.zone_name }}</code>
+            </label>
+          {% endfor %}
+        {% else %}
+          <p>No zones configured. <a href="/zones/new">Add a DNS zone</a> first.</p>
+        {% endif %}
+      </fieldset>
+      <button type="submit" {% if not all_zones %}disabled{% endif %}>Save</button>
+    </form>
+  </div>
+</body>
+</html>
