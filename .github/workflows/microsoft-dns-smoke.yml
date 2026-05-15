@@ -1,0 +1,347 @@
+# Manual Microsoft DNS (WinRM) smoke for branch `develop`.
+#
+# Target (recommended): Ubuntu runner + Docker API container + WinRM/pywinrm to a lab
+# Windows Server with Microsoft DNS — same model as production. Do not install the DNS
+# Server role on GitHub-hosted runners for this workflow.
+#
+# Image handoff: single `ubuntu-latest` job rebuilds the image in-place (no registry).
+#
+# Repository secrets (Settings → Secrets and variables → Actions):
+#   MICROSOFT_DNS_WINRM_HOST   — WinRM endpoint (hostname or IP; often same as DnsServer -ComputerName)
+#   MICROSOFT_DNS_WINRM_USER   — Domain account with rights to modify the test zones
+#   MICROSOFT_DNS_WINRM_PASSWORD
+# Optional:
+#   MICROSOFT_DNS_WINRM_SSL    — Set to `true` to use HTTPS WinRM (port 5986)
+#
+# Optional DNS verification from the Linux job (UDP/TCP 53 must be reachable from GitHub):
+#   MICROSOFT_DNS_QUERY_HOST   — e.g. lab DNS IP; enables `dig @host` after API mutations
+#
+# Prerequisites on the lab server: two existing primary zones matching workflow inputs
+# `allowed_zone` and `denied_zone` (the API adds/removes records; it does not create zones).
+#
+# Run: Actions → "Microsoft DNS manual smoke (develop)" → Run workflow → select branch `develop`.
+
+name: Microsoft DNS manual smoke (develop)
+
+on:
+  workflow_dispatch:
+    inputs:
+      allowed_zone:
+        description: "Existing Microsoft DNS primary zone FQDN for create/update/delete tests"
+        required: true
+        default: "smoke.ms.lab"
+      denied_zone:
+        description: "Second primary zone FQDN for the API-key denied-zone test"
+        required: true
+        default: "denied.ms.lab"
+      dns_query_server:
+        description: "Optional dig -@ server (IP or hostname). Leave empty to skip dig checks."
+        required: false
+        default: ""
+      run_windows_resolver_check:
+        description: "After the Linux smoke job, run Resolve-DnsName SOA on windows-2025 (optional connectivity check)"
+        type: boolean
+        default: false
+
+jobs:
+  microsoft-dns-smoke:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    outputs:
+      smoke_executed: ${{ steps.finish.outputs.executed }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: gate
+        name: Gate (secrets + branch)
+        env:
+          WINRM_HOST: ${{ secrets.MICROSOFT_DNS_WINRM_HOST }}
+        run: |
+          if [ -z "${WINRM_HOST}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::MICROSOFT_DNS_WINRM_HOST is not set — skipping Microsoft DNS smoke (set repo secrets to enable)."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Copy env example for testing
+        if: steps.gate.outputs.skip == 'false'
+        run: cp .env.example .env
+
+      - name: Generate encryption key for testing
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          KEY="$(python3 - <<'PY'
+          import base64
+          import os
+
+          print(base64.urlsafe_b64encode(os.urandom(32)).decode())
+          PY
+          )"
+          sed -i "s|ENCRYPTION_KEY=.*|ENCRYPTION_KEY=${KEY}|" .env
+          echo 'Generated encryption key for testing'
+
+      - name: Build the Docker image
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          IMAGE_TAG="api-to-dns-microsoft-smoke:$(date +%s)"
+          docker build . --file Dockerfile --tag "$IMAGE_TAG"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+
+      - name: Run Microsoft DNS smoke (API + WinRM)
+        id: smoke
+        if: steps.gate.outputs.skip == 'false'
+        env:
+          WINRM_HOST: ${{ secrets.MICROSOFT_DNS_WINRM_HOST }}
+          WINRM_USER: ${{ secrets.MICROSOFT_DNS_WINRM_USER }}
+          WINRM_PASSWORD: ${{ secrets.MICROSOFT_DNS_WINRM_PASSWORD }}
+          WINRM_SSL: ${{ secrets.MICROSOFT_DNS_WINRM_SSL }}
+          QUERY_HOST: ${{ secrets.MICROSOFT_DNS_QUERY_HOST }}
+          ALLOWED_ZONE: ${{ github.event.inputs.allowed_zone }}
+          DENIED_ZONE: ${{ github.event.inputs.denied_zone }}
+          INPUT_QUERY_SERVER: ${{ github.event.inputs.dns_query_server }}
+        run: |
+          set -euo pipefail
+
+          cleanup() {
+            echo "Collecting API container logs..."
+            docker logs dns-api-test 2>/dev/null || true
+            docker rm -f dns-api-test 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          CURL_SSL_FLAG=()
+          if [ "${WINRM_SSL:-}" = "true" ] || [ "${WINRM_SSL:-}" = "True" ] || [ "${WINRM_SSL:-}" = "1" ]; then
+            CURL_SSL_FLAG=(--data-urlencode "dns_winrm_ssl=true")
+          fi
+
+          DIG_SERVER="${INPUT_QUERY_SERVER:-}"
+          if [ -z "${DIG_SERVER}" ]; then
+            DIG_SERVER="${QUERY_HOST:-}"
+          fi
+
+          if [ -n "${DIG_SERVER}" ]; then
+            echo "Installing dnsutils for dig-based verification against ${DIG_SERVER}..."
+            sudo apt-get update -qq
+            sudo apt-get install -qq -y dnsutils
+          else
+            echo "No MICROSOFT_DNS_QUERY_HOST or workflow dns_query_server — skipping dig verification (WinRM/API assertions only)."
+          fi
+
+          echo "Starting API container..."
+          docker run -d --name dns-api-test --env-file .env -p 8000:8000 "${IMAGE_TAG}"
+
+          echo "Waiting for API login page..."
+          for i in $(seq 1 60); do
+            if curl --fail --silent --max-time 5 http://localhost:8000/login >/dev/null; then
+              break
+            fi
+            if [ -z "$(docker ps -q -f name=dns-api-test -f status=running)" ]; then
+              echo "API container exited before becoming ready"
+              exit 1
+            fi
+            sleep 2
+          done
+
+          curl --fail --silent -c /tmp/cookies -X POST http://localhost:8000/login \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "username=admin&password=your-admin-password" \
+            -o /dev/null
+          curl --fail --silent -b /tmp/cookies http://localhost:8000/admin \
+            | python3 -c "import sys; assert 'DNS Admin Dashboard' in sys.stdin.read()"
+
+          echo "Configuring Microsoft DNS zones in the app..."
+          for zone in "${ALLOWED_ZONE}" "${DENIED_ZONE}"; do
+            curl --fail --silent -b /tmp/cookies -X POST http://localhost:8000/zones \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              --data-urlencode "zone_name=${zone}" \
+              --data-urlencode "dns_provider_type=microsoft" \
+              --data-urlencode "dns_server=${WINRM_HOST}" \
+              --data-urlencode "dns_username=${WINRM_USER}" \
+              --data-urlencode "dns_password=${WINRM_PASSWORD}" \
+              "${CURL_SSL_FLAG[@]}" \
+              -o /dev/null
+          done
+
+          curl --fail --silent -b /tmp/cookies http://localhost:8000/api-keys -o /tmp/api-keys.html
+          SMOKE_ZONE_ID="$(ALLOWED_ZONE="${ALLOWED_ZONE}" python3 - <<'PY'
+          import os
+          import re
+
+          html = open("/tmp/api-keys.html", encoding="utf-8").read()
+          zone = os.environ["ALLOWED_ZONE"]
+          escaped = re.escape(zone)
+          match = re.search(
+              r'name="zone_ids" value="(\d+)"\s*/>\s*<code>' + escaped + r"</code>",
+              html,
+              re.DOTALL,
+          )
+          if not match:
+              raise SystemExit(f"Could not find zone ID for {zone!r}")
+          print(match.group(1))
+          PY
+          )"
+          echo "${ALLOWED_ZONE} zone id: ${SMOKE_ZONE_ID}"
+
+          curl --fail --silent -L -b /tmp/cookies -X POST http://localhost:8000/api-keys \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "label=microsoft-dns-smoke" \
+            --data-urlencode "zone_ids=${SMOKE_ZONE_ID}" \
+            -o /tmp/api-key-create.html
+
+          API_KEY="$(python3 - <<'PY'
+          import re
+
+          html = open("/tmp/api-key-create.html", encoding="utf-8").read()
+          match = re.search(r"API key created:\s*([^<\s]+)", html)
+          if not match:
+              raise SystemExit("Could not extract API key")
+          print(match.group(1))
+          PY
+          )"
+
+          curl --fail --silent -H "X-API-Key: ${API_KEY}" http://localhost:8000/keycheck \
+            | python3 -c "import json, sys; assert json.load(sys.stdin)['status'] == 'success'"
+
+          call_dns_api() {
+            local expected_status="$1"
+            local expected_action="$2"
+            local body="$3"
+            local output="/tmp/dns-response-${expected_action}.json"
+            local status
+
+            status="$(curl --silent --show-error -o "${output}" -w "%{http_code}" \
+              -X POST http://localhost:8000/dns-record \
+              -H "Content-Type: application/json" \
+              -H "X-API-Key: ${API_KEY}" \
+              -d "${body}")"
+
+            echo "${expected_action}: HTTP ${status}"
+            cat "${output}"
+            echo
+
+            if [ "${status}" != "${expected_status}" ]; then
+              echo "Expected HTTP ${expected_status}, got ${status}"
+              exit 1
+            fi
+
+            python3 -c "import json,sys;b=json.load(open(sys.argv[1],encoding='utf-8'));e=sys.argv[2];assert((e=='access_denied' and b['detail']['error']=='access_denied') or (b['action']==e)),b" "${output}" "${expected_action}"
+          }
+
+          wait_for_record_value() {
+            local fqdn="$1"
+            local expected="$2"
+            local value=""
+            if [ -z "${DIG_SERVER}" ]; then
+              return 0
+            fi
+            for i in $(seq 1 30); do
+              value="$(dig @"${DIG_SERVER}" "${fqdn}" A +short | tr -d '\r' | tail -n 1 || true)"
+              if [ "${value}" = "${expected}" ]; then
+                return 0
+              fi
+              sleep 2
+            done
+            echo "Expected ${fqdn} to resolve to ${expected} via ${DIG_SERVER}; got '${value}'"
+            exit 1
+          }
+
+          wait_for_record_absent() {
+            local fqdn="$1"
+            local value=""
+            if [ -z "${DIG_SERVER}" ]; then
+              return 0
+            fi
+            for i in $(seq 1 30); do
+              value="$(dig @"${DIG_SERVER}" "${fqdn}" A +short | tr -d '\r' || true)"
+              if [ -z "${value}" ]; then
+                return 0
+              fi
+              sleep 2
+            done
+            echo "Expected ${fqdn} to be absent at ${DIG_SERVER}; got '${value}'"
+            exit 1
+          }
+
+          CREATE_BODY="$(python3 - <<PY
+          import json
+          import os
+          z = os.environ["ALLOWED_ZONE"]
+          print(json.dumps({"zone_name": z, "record_type": "A", "record_name": "www", "ttl": 300, "values": ["192.0.2.10"]}))
+          PY
+          )"
+          UPDATE_BODY="$(python3 - <<PY
+          import json
+          import os
+          z = os.environ["ALLOWED_ZONE"]
+          print(json.dumps({"zone_name": z, "record_type": "A", "record_name": "www", "ttl": 300, "values": ["192.0.2.20"]}))
+          PY
+          )"
+          DELETE_BODY="$(python3 - <<PY
+          import json
+          import os
+          z = os.environ["ALLOWED_ZONE"]
+          print(json.dumps({"zone_name": z, "record_type": "DELETE", "record_name": "www", "values": ["A"]}))
+          PY
+          )"
+          DELETE_MISSING_BODY="${DELETE_BODY}"
+          DENIED_BODY="$(python3 - <<PY
+          import json
+          import os
+          z = os.environ["DENIED_ZONE"]
+          print(json.dumps({"zone_name": z, "record_type": "A", "record_name": "blocked", "ttl": 300, "values": ["192.0.2.55"]}))
+          PY
+          )"
+
+          WWW_FQDN="www.${ALLOWED_ZONE}"
+
+          echo "Creating record..."
+          call_dns_api 200 created "${CREATE_BODY}"
+          wait_for_record_value "${WWW_FQDN}" 192.0.2.10
+
+          echo "Updating record..."
+          call_dns_api 200 updated "${UPDATE_BODY}"
+          wait_for_record_value "${WWW_FQDN}" 192.0.2.20
+
+          echo "Deleting record..."
+          call_dns_api 200 deleted "${DELETE_BODY}"
+          wait_for_record_absent "${WWW_FQDN}"
+
+          echo "Deleting nonexistent record (expected 404)..."
+          call_dns_api 404 not_found "${DELETE_MISSING_BODY}"
+
+          echo "Accessing a configured zone that this API key cannot use (expected 403)..."
+          call_dns_api 403 access_denied "${DENIED_BODY}"
+
+      - id: finish
+        name: Record smoke outcome for downstream jobs
+        if: always() && steps.gate.outputs.skip == 'false'
+        run: |
+          if [ "${{ steps.smoke.outcome }}" = "success" ]; then
+            echo "executed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "executed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  windows-dns-soa-probe:
+    name: Optional SOA probe (windows-2025)
+    needs: microsoft-dns-smoke
+    runs-on: windows-2025
+    if: >-
+      github.ref == 'refs/heads/develop' &&
+      github.event.inputs.run_windows_resolver_check == 'true' &&
+      needs.microsoft-dns-smoke.outputs.smoke_executed == 'true'
+
+    steps:
+      - name: Resolve-DnsName SOA against lab DNS
+        shell: pwsh
+        env:
+          ZONE: ${{ github.event.inputs.allowed_zone }}
+          SERVER: ${{ github.event.inputs.dns_query_server }}
+        run: |
+          $server = $env:SERVER
+          if ([string]::IsNullOrWhiteSpace($server)) {
+            throw "Set workflow input dns_query_server (DNS IP/hostname) when using run_windows_resolver_check."
+          }
+          Resolve-DnsName -Name $env:ZONE -Type SOA -DnsOnly -Server $server -ErrorAction Stop | Format-Table -AutoSize
