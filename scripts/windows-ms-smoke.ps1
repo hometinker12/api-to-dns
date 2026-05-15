@@ -54,7 +54,8 @@ function Get-ZoneIdFromApiKeysHtml {
 
 function Get-ApiKeyFromCreateHtml {
   param([string] $Html)
-  $m = [regex]::Match($Html, 'API key created:\s*(\S+)')
+  # Must not use \S+ here: the next character after the key is often '<' from </div>, which \S+ would swallow.
+  $m = [regex]::Match($Html, 'API key created:\s*([^<\s]+)')
   if (-not $m.Success) { throw 'Could not extract API key from HTML' }
   return $m.Groups[1].Value
 }

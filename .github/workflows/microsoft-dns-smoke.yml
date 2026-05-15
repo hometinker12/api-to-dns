@@ -320,7 +320,7 @@ jobs:
           echo "BIND smoke on Linux completed successfully."
 
   microsoft-dns-smoke-windows:
-    name: Local + remote Microsoft (windows, native API + PowerShell)
+    name: Local Microsoft DNS WinRM smoke (windows, native API + PowerShell)
     runs-on: windows-2025
     if: github.ref == 'refs/heads/develop'
 
