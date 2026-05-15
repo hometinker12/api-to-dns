@@ -1,7 +1,7 @@
 #Requires -Version 7.2
 <#
-  After docker load of api-to-dns-smoke:linux-ci, start API container, WinRM via Docker gateway IP,
-  smoke local + optional remote Microsoft zones using Invoke-WebRequest / Invoke-RestMethod.
+  Start API natively on Windows, then smoke local + optional remote Microsoft zones using
+  Invoke-WebRequest / Invoke-RestMethod.
 
   Env: GITHUB_WORKSPACE, LOCAL_ALLOWED_ZONE, LOCAL_DENIED_ZONE, LOCAL_WINRM_USER,
   LOCAL_WINRM_PASSWORD; optional REMOTE_*, INPUT_QUERY_SERVER.
@@ -10,11 +10,10 @@ $ErrorActionPreference = 'Stop'
 $workspace = $env:GITHUB_WORKSPACE
 Set-Location $workspace
 
-$apiImage = 'api-to-dns-smoke:linux-ci'
-$netName = "dns-ms-$($env:GITHUB_RUN_ID)-$($env:GITHUB_RUN_ATTEMPT)"
 $base = 'http://localhost:8000'
-$networkCreated = $false
-$containerStarted = $false
+$apiProcess = $null
+$apiOut = Join-Path $env:RUNNER_TEMP 'api-to-dns-uvicorn.out.log'
+$apiErr = Join-Path $env:RUNNER_TEMP 'api-to-dns-uvicorn.err.log'
 
 function Wait-LoginPage {
   param([int]$MaxAttempts = 60)
@@ -131,26 +130,17 @@ function Wait-RemoteAbsent {
 }
 
 try {
-  $dockerOs = (docker version -f '{{.Server.Os}}' 2>$null).Trim()
-  if ($dockerOs -ne 'linux') {
-    throw "Docker server OS is '$dockerOs' (expected 'linux'). Use Linux container mode / WSL2 to run api-to-dns-smoke:linux-ci."
-  }
-
-  docker network rm $netName 2>$null | Out-Null
-  docker network create $netName | Out-Null
-  $networkCreated = $true
-
-  $gw = (docker run --rm --network $netName alpine:3.19 sh -c "ip route 2>/dev/null | awk '/default/ {print `$3; exit}'" 2>$null).Trim()
-  if ([string]::IsNullOrWhiteSpace($gw)) {
-    $gw = (docker network inspect $netName -f '{{(index .IPAM.Config 0).Gateway}}').Trim()
-  }
-  if ([string]::IsNullOrWhiteSpace($gw)) { throw 'Could not determine Docker bridge gateway for WinRM target' }
-  Write-Host "Using Docker gateway $gw as WinRM/DnsServer target from the API container."
-
+  $python = (Get-Command python -ErrorAction Stop).Source
   $envFile = Join-Path $workspace '.env'
-  docker rm -f dns-api-test 2>$null | Out-Null
-  docker run -d --name dns-api-test --network $netName --env-file $envFile -p 8000:8000 $apiImage | Out-Null
-  $containerStarted = $true
+  $apiArgs = @(
+    '-m', 'uvicorn', 'src.app:app',
+    '--host', '127.0.0.1',
+    '--port', '8000',
+    '--env-file', $envFile
+  )
+  $apiProcess = Start-Process -FilePath $python -ArgumentList $apiArgs -WorkingDirectory $workspace `
+    -RedirectStandardOutput $apiOut -RedirectStandardError $apiErr -PassThru
+  Write-Host "Started native API process $($apiProcess.Id)."
 
   Wait-LoginPage
 
@@ -172,12 +162,13 @@ try {
   $localPass = $env:LOCAL_WINRM_PASSWORD
   $la = $env:LOCAL_ALLOWED_ZONE
   $ld = $env:LOCAL_DENIED_ZONE
+  $localDnsServer = '127.0.0.1'
 
   foreach ($z in @($la, $ld)) {
     $null = Invoke-FormPost -Uri "$base/zones" -WebSession $WebSession -Form @{
       zone_name           = $z
       dns_provider_type   = 'microsoft'
-      dns_server          = $gw
+      dns_server          = $localDnsServer
       dns_username        = $localUser
       dns_password        = $localPass
     }
@@ -273,14 +264,16 @@ try {
     Write-Host '=== Remote Microsoft DNS skipped (set MICROSOFT_DNS_WINRM_* secrets) ==='
   }
 
-  Write-Host 'Microsoft smoke (Docker API + PowerShell HTTP) completed successfully.'
+  Write-Host 'Microsoft smoke (native API + PowerShell HTTP) completed successfully.'
 }
 finally {
-  if ($containerStarted) {
-    docker logs dns-api-test 2>$null | Write-Host
-    docker rm -f dns-api-test 2>$null | Out-Null
+  if ($apiProcess -and -not $apiProcess.HasExited) {
+    Stop-Process -Id $apiProcess.Id -Force -ErrorAction SilentlyContinue
   }
-  if ($networkCreated) {
-    docker network rm $netName 2>$null | Out-Null
+  foreach ($log in @($apiOut, $apiErr)) {
+    if (Test-Path $log) {
+      Write-Host "=== $log ==="
+      Get-Content $log | Write-Host
+    }
   }
 }
