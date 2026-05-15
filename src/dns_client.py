@@ -220,20 +220,17 @@ class BindTsigDnsClient:
         update = dns.update.Update(origin, keyring=self._keyring, keyname=self._keyname)
         node = relative if relative not in ("@", "") else "@"
 
+        # replace() accepts (ttl, rdtype, *text_values) or (ttl, *rdata_objects) — not (ttl, rdtype, *rdata).
         if record_type == "A":
-            rdata = [dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.A, v) for v in payload.values]
-            update.replace(node, ttl, dns.rdatatype.A, *rdata)
+            update.replace(node, ttl, dns.rdatatype.A, *payload.values)
         elif record_type == "AAAA":
-            rdata = [dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.AAAA, v) for v in payload.values]
-            update.replace(node, ttl, dns.rdatatype.AAAA, *rdata)
+            update.replace(node, ttl, dns.rdatatype.AAAA, *payload.values)
         elif record_type == "CNAME":
             if len(payload.values) != 1:
                 raise ValueError("CNAME requires exactly one value.")
-            target = dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.CNAME, payload.values[0])
-            update.replace(node, ttl, dns.rdatatype.CNAME, target)
+            update.replace(node, ttl, dns.rdatatype.CNAME, payload.values[0])
         elif record_type == "TXT":
-            rdata = [dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.TXT, v) for v in payload.values]
-            update.replace(node, ttl, dns.rdatatype.TXT, *rdata)
+            update.replace(node, ttl, dns.rdatatype.TXT, *payload.values)
         else:
             raise ValueError(f"Unsupported record type for BIND: {record_type}")
 
