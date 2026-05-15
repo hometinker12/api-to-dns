@@ -9,7 +9,8 @@
 #   MICROSOFT_DNS_WINRM_HOST, MICROSOFT_DNS_WINRM_USER, MICROSOFT_DNS_WINRM_PASSWORD
 #   MICROSOFT_DNS_WINRM_SSL, MICROSOFT_DNS_QUERY_HOST
 #
-# Run from branch `develop`. Workflow file must exist on the default branch to appear in the UI.
+# The Linux API image is built on **ubuntu-latest** and loaded on the Windows job — Windows
+# Docker on hosted runners often cannot pull/build linux/amd64 bases (manifest errors).
 
 name: Microsoft DNS manual smoke (develop)
 
@@ -30,7 +31,28 @@ on:
         default: ""
 
 jobs:
+  build-api-image-linux:
+    name: Build Linux API image (ubuntu)
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker build and save image
+        run: |
+          set -euo pipefail
+          docker build . --file Dockerfile --tag api-to-dns-smoke:linux-ci
+          docker save api-to-dns-smoke:linux-ci | gzip -1 > api-to-dns-image.tar.gz
+          ls -lh api-to-dns-image.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: api-to-dns-linux-image
+          path: api-to-dns-image.tar.gz
+          retention-days: 2
+
   microsoft-dns-smoke:
+    needs: build-api-image-linux
     runs-on: windows-2025
     if: github.ref == 'refs/heads/develop'
     defaults:
@@ -109,13 +131,18 @@ jobs:
           rm -f .env.bak
           echo 'Generated encryption key for testing'
 
-      - name: Build the Docker image
+      - name: Download Linux API image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: api-to-dns-linux-image
+          path: ${{ runner.temp }}/docker-image
+
+      - name: Load Linux API image into Windows Docker
         run: |
-          # Windows Docker defaults to Windows OS; this Dockerfile is Linux (python:3.12-slim).
-          export DOCKER_DEFAULT_PLATFORM=linux/amd64
-          IMAGE_TAG="api-to-dns-microsoft-smoke:$(date +%s)"
-          docker build --platform linux/amd64 . --file Dockerfile --tag "$IMAGE_TAG"
-          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+          set -euo pipefail
+          gunzip -c "${RUNNER_TEMP}/docker-image/api-to-dns-image.tar.gz" | docker load
+          echo "IMAGE_TAG=api-to-dns-smoke:linux-ci" >> "$GITHUB_ENV"
+          docker image ls api-to-dns-smoke:linux-ci
 
       - name: Local Microsoft + optional remote Microsoft + BIND smoke
         env:
