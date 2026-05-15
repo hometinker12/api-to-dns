@@ -11,7 +11,7 @@
       <h1>API Keys</h1>
       <nav class="nav-links">
         <a class="button" href="/admin">Dashboard</a>
-        <a class="button" href="/settings">DNS Settings</a>
+        <a class="button" href="/settings">DNS zones</a>
       </nav>
     </header>
 
@@ -23,23 +23,45 @@
       <label>Label
         <input type="text" name="label" required placeholder="Example key" />
       </label>
-      <button type="submit">Create API Key</button>
+      <fieldset>
+        <legend>Allowed DNS zones</legend>
+        <p class="help">The key may only call <code>/dns-record</code> for zones you select here.</p>
+        {% if all_zones %}
+          {% for z in all_zones %}
+            <label class="inline-check">
+              <input type="checkbox" name="zone_ids" value="{{ z.id }}" />
+              <code>{{ z.zone_name }}</code>
+            </label>
+          {% endfor %}
+        {% else %}
+          <p>No zones configured. <a href="/zones/new">Add a DNS zone</a> first.</p>
+        {% endif %}
+      </fieldset>
+      <button type="submit" {% if not all_zones %}disabled{% endif %}>Create API Key</button>
     </form>
 
     <section>
       <h2>Existing API keys</h2>
       <table>
         <thead>
-          <tr><th>Label</th><th>Key</th><th>Status</th><th>Action</th></tr>
+          <tr><th>Label</th><th>Key</th><th>Allowed zones</th><th>Status</th><th>Actions</th></tr>
         </thead>
         <tbody>
           {% for key in api_keys %}
             <tr>
               <td>{{ key.label }}</td>
               <td>{{ key.key[:12] }}...</td>
+              <td>
+                {% if key_zones[key.id] %}
+                  {% for zn in key_zones[key.id] %}<code>{{ zn }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+                {% else %}
+                  <em>none</em>
+                {% endif %}
+              </td>
               <td>{{ "active" if key.active else "revoked" }}</td>
               <td>
                 {% if key.active %}
+                  <a class="button secondary" href="/api-keys/{{ key.id }}/edit">Edit</a>
                   <form action="/api-keys/revoke" method="post" style="display:inline">
                     <input type="hidden" name="key_id" value="{{ key.id }}" />
                     <button type="submit">Revoke</button>
@@ -50,7 +72,7 @@
               </td>
             </tr>
           {% else %}
-            <tr><td colspan="4">No API keys available</td></tr>
+            <tr><td colspan="5">No API keys available</td></tr>
           {% endfor %}
         </tbody>
       </table>

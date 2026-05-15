@@ -1,6 +1,8 @@
 from datetime import datetime
 from typing import List, Optional
+
 from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import UniqueConstraint
 from sqlmodel import Field as SQLField, SQLModel
 
 _ALLOWED_DELETE_RR = frozenset({"A", "AAAA", "CNAME", "TXT"})
@@ -9,15 +11,15 @@ _ALLOWED_DELETE_RR = frozenset({"A", "AAAA", "CNAME", "TXT"})
 class DnsRecordRequest(BaseModel):
     subscription_id: Optional[str] = Field(
         None,
-        description="Azure subscription ID (optional if a default is saved in admin settings; not used for BIND or Microsoft WinRM).",
+        description="Azure subscription ID (optional if saved on the zone; not used for BIND or Microsoft WinRM).",
     )
     resource_group: Optional[str] = Field(
         None,
-        description="Azure resource group containing the DNS zone (optional if a default is saved in settings).",
+        description="Azure resource group (optional if saved on the zone).",
     )
     zone_name: Optional[str] = Field(
         None,
-        description="DNS zone name (optional if Target DNS Zone is configured in settings).",
+        description="DNS zone name (required). Must match a configured zone and be allowed for this API key.",
     )
     record_type: str = Field(
         ...,
@@ -45,6 +47,7 @@ class DnsRecordRequest(BaseModel):
             raise ValueError("values is required for this record type.")
         return self
 
+
 class DnsRecordResponse(BaseModel):
     status: str = Field(..., description='Outcome: "success" or "error" (e.g. DELETE when the record does not exist).')
     action: str
@@ -53,10 +56,12 @@ class DnsRecordResponse(BaseModel):
     record_type: str
     values: List[str]
 
+
 class User(SQLModel, table=True):
     id: Optional[int] = SQLField(default=None, primary_key=True)
     username: str = SQLField(index=True, unique=True)
     password_hash: str
+
 
 class ApiKey(SQLModel, table=True):
     id: Optional[int] = SQLField(default=None, primary_key=True)
@@ -64,6 +69,28 @@ class ApiKey(SQLModel, table=True):
     key: str = SQLField(index=True, unique=True)
     active: bool = SQLField(default=True)
     created_at: datetime = SQLField(default_factory=datetime.utcnow)
+
+
+class DnsZoneConfig(SQLModel, table=True):
+    """One row per DNS zone; zone_name is the unique key (normalized). Provider settings stored encrypted."""
+
+    __tablename__ = "dns_zone_config"
+
+    id: Optional[int] = SQLField(default=None, primary_key=True)
+    zone_name: str = SQLField(index=True, unique=True)
+    encrypted_config: str
+
+
+class ApiKeyAllowedZone(SQLModel, table=True):
+    """Which configured zones an API key may modify."""
+
+    __tablename__ = "api_key_allowed_zone"
+    __table_args__ = (UniqueConstraint("api_key_id", "dns_zone_config_id", name="uq_api_key_zone"),)
+
+    id: Optional[int] = SQLField(default=None, primary_key=True)
+    api_key_id: int = SQLField(foreign_key="apikey.id", index=True)
+    dns_zone_config_id: int = SQLField(foreign_key="dns_zone_config.id", index=True)
+
 
 class Setting(SQLModel, table=True):
     id: Optional[int] = SQLField(default=None, primary_key=True)

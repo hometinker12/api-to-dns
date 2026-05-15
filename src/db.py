@@ -18,4 +18,6 @@ SessionLocal = sessionmaker(class_=Session, autoflush=False, bind=engine)
 
 
 def init_db() -> None:
+    from . import models  # noqa: F401 — register SQLModel subclasses before create_all
+
     SQLModel.metadata.create_all(engine)

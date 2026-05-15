@@ -14,31 +14,33 @@
     </header>
 
     <nav class="nav-links">
-      <a class="button" href="/settings">DNS Settings</a>
+      <a class="button" href="/settings">DNS zones</a>
       <a class="button" href="/api-keys">API Keys</a>
     </nav>
 
     <section>
-      <h2>Current configuration</h2>
-      <dl>
-        <dt>DNS server type</dt>
-        <dd>{{ settings.dns_provider_type or "Not configured" }}</dd>
-        <dt>Target DNS Server</dt>
-        <dd>{{ settings.dns_server or "Not configured" }}</dd>
-        <dt>Target DNS Zone</dt>
-        <dd>{{ settings.dns_zone or "Not configured" }}</dd>
-        <dt>Username / TSIG key name</dt>
-        <dd>{{ settings.dns_username or "Not configured" }}</dd>
-        <dt>Azure tenant (if using Azure DNS)</dt>
-        <dd>{{ settings.azure_tenant_id or "Not configured" }}</dd>
-      </dl>
+      <h2>DNS zones</h2>
+      {% if zones %}
+        <ul>
+          {% for z in zones %}
+            <li><code>{{ z.zone_name }}</code> — <a href="/zones/{{ z.id }}/edit">Edit</a></li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p>No zones configured. <a href="/zones/new">Add a DNS zone</a>.</p>
+      {% endif %}
     </section>
 
     <section>
       <h2>Active API Keys</h2>
       <ul>
         {% for key in api_keys %}
-          <li>{{ key.label }} — {{ key.key[:8] }}... — {{ "active" if key.active else "revoked" }}</li>
+          <li>
+            {{ key.label }} — {{ key.key[:8] }}... — {{ "active" if key.active else "revoked" }}
+            {% if key_zones[key.id] %}
+              — zones: {% for zn in key_zones[key.id] %}<code>{{ zn }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+            {% endif %}
+          </li>
         {% else %}
           <li>No API keys configured yet.</li>
         {% endfor %}

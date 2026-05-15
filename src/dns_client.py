@@ -1,4 +1,7 @@
 import base64
+import ipaddress
+import socket
+import time
 from typing import Any, Dict, List, Optional
 
 import dns.message
@@ -33,6 +36,25 @@ def _dns_relative_name(zone_name: str, record_name: str) -> str:
     return r
 
 
+def _tcp_endpoint_host(host: str) -> str:
+    """Resolve *host* for dns.query.tcp — dnspython passes *where* through inet.af_for_address (no name lookup)."""
+    h = (host or "").strip()
+    if not h:
+        return h
+    try:
+        ipaddress.ip_address(h)
+        return h
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(h, None, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise ValueError(f"Could not resolve DNS server hostname {h!r}: {e}") from e
+    if not infos:
+        raise ValueError(f"DNS server hostname {h!r} resolved to no addresses.")
+    return infos[0][4][0]
+
+
 def _record_existed_before_update(
     server: str,
     zone_name: str,
@@ -46,7 +68,7 @@ def _record_existed_before_update(
         qname = dns.name.from_text(f"{relative_name}.{z}")
     q = dns.message.make_query(qname, rdtype)
     try:
-        resp = dns.query.tcp(q, server, timeout=10)
+        resp = dns.query.tcp(q, _tcp_endpoint_host(server), timeout=10)
     except Exception:
         return False
     return bool(resp.answer)
@@ -203,13 +225,15 @@ class BindTsigDnsClient:
             inner = payload.values[0].strip().upper()
             rdtype = dns.rdatatype.from_text(inner)
             existed = _record_existed_before_update(dns_server, zone_name, relative, rdtype)
+            if not existed:
+                return False
             update = dns.update.Update(origin, keyring=self._keyring, keyname=self._keyname)
             node = relative if relative not in ("@", "") else "@"
             update.delete(node, rdtype)
-            response = dns.query.tcp(update, dns_server, timeout=15)
+            response = dns.query.tcp(update, _tcp_endpoint_host(dns_server), timeout=15)
             if response.rcode() != dns.rcode.NOERROR:
                 raise RuntimeError(f"DNS UPDATE failed: {dns.rcode.to_text(response.rcode())}")
-            return existed
+            return True
 
         rdtype = dns.rdatatype.from_text(record_type)
         existed = _record_existed_before_update(dns_server, zone_name, relative, rdtype)
@@ -217,24 +241,21 @@ class BindTsigDnsClient:
         update = dns.update.Update(origin, keyring=self._keyring, keyname=self._keyname)
         node = relative if relative not in ("@", "") else "@"
 
+        # replace() accepts (ttl, rdtype, *text_values) or (ttl, *rdata_objects) — not (ttl, rdtype, *rdata).
         if record_type == "A":
-            rdata = [dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.A, v) for v in payload.values]
-            update.replace(node, ttl, dns.rdatatype.A, *rdata)
+            update.replace(node, ttl, dns.rdatatype.A, *payload.values)
         elif record_type == "AAAA":
-            rdata = [dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.AAAA, v) for v in payload.values]
-            update.replace(node, ttl, dns.rdatatype.AAAA, *rdata)
+            update.replace(node, ttl, dns.rdatatype.AAAA, *payload.values)
         elif record_type == "CNAME":
             if len(payload.values) != 1:
                 raise ValueError("CNAME requires exactly one value.")
-            target = dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.CNAME, payload.values[0])
-            update.replace(node, ttl, dns.rdatatype.CNAME, target)
+            update.replace(node, ttl, dns.rdatatype.CNAME, payload.values[0])
         elif record_type == "TXT":
-            rdata = [dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.TXT, v) for v in payload.values]
-            update.replace(node, ttl, dns.rdatatype.TXT, *rdata)
+            update.replace(node, ttl, dns.rdatatype.TXT, *payload.values)
         else:
             raise ValueError(f"Unsupported record type for BIND: {record_type}")
 
-        response = dns.query.tcp(update, dns_server, timeout=15)
+        response = dns.query.tcp(update, _tcp_endpoint_host(dns_server), timeout=15)
         if response.rcode() != dns.rcode.NOERROR:
             raise RuntimeError(f"DNS UPDATE failed: {dns.rcode.to_text(response.rcode())}")
         return existed
@@ -243,12 +264,33 @@ class BindTsigDnsClient:
 class MicrosoftWinRmDnsClient:
     """On-premises Microsoft DNS via WinRM and DnsServer PowerShell cmdlets."""
 
+    _WINRM_MAX_ATTEMPTS = 3
+    _WINRM_RETRY_DELAY_SEC = 5
+    _ACCESS_DENIED_MARKERS = (
+        "access is denied",
+        "access denied",
+        "logon failure",
+        "unknown user name or bad password",
+        "the user name or password is incorrect",
+        "authorization failed",
+        "authentication failed",
+        "fault code 5",
+        "fault_code>5<",
+        "permission denied",
+        "denied access",
+    )
+
     def __init__(self, username: str, password: str, use_ssl: bool = False):
         if not username or not password:
             raise ValueError("Microsoft DNS (WinRM) requires username and password in settings.")
         self.username = username
         self.password = password
         self.use_ssl = use_ssl
+
+    @classmethod
+    def _looks_like_access_denied(cls, text: str) -> bool:
+        t = text.lower()
+        return any(m in t for m in cls._ACCESS_DENIED_MARKERS)
 
     def _session(self, server: str):
         try:
@@ -261,6 +303,44 @@ class MicrosoftWinRmDnsClient:
         if self.use_ssl:
             kwargs["server_cert_validation"] = "ignore"
         return winrm.Session(server, (self.username, self.password), **kwargs)
+
+    def _run_ps_with_retry(self, server: str, script: str):
+        """Run PowerShell on the WinRM target; retry on transient failures (not access denied)."""
+        for attempt in range(self._WINRM_MAX_ATTEMPTS):
+            try:
+                session = self._session(server)
+                result = session.run_ps(script)
+                stderr = (result.std_err or b"").decode(errors="replace")
+                stdout = (result.std_out or b"").decode(errors="replace")
+                combined = f"{stderr}\n{stdout}"
+                if result.status_code != 0:
+                    if self._looks_like_access_denied(combined):
+                        raise RuntimeError(
+                            f"WinRM/PowerShell failed ({result.status_code}): {stderr or stdout}"
+                        )
+                    if attempt + 1 < self._WINRM_MAX_ATTEMPTS:
+                        time.sleep(self._WINRM_RETRY_DELAY_SEC)
+                        continue
+                    raise RuntimeError(
+                        f"WinRM/PowerShell failed ({result.status_code}): {stderr or stdout}"
+                    )
+                return result
+            except ImportError:
+                raise
+            except RuntimeError as e:
+                if self._looks_like_access_denied(str(e)):
+                    raise
+                if attempt + 1 < self._WINRM_MAX_ATTEMPTS:
+                    time.sleep(self._WINRM_RETRY_DELAY_SEC)
+                    continue
+                raise
+            except Exception as e:
+                if self._looks_like_access_denied(str(e)):
+                    raise RuntimeError(f"WinRM access denied: {e}") from e
+                if attempt + 1 < self._WINRM_MAX_ATTEMPTS:
+                    time.sleep(self._WINRM_RETRY_DELAY_SEC)
+                    continue
+                raise RuntimeError(f"WinRM failed after {self._WINRM_MAX_ATTEMPTS} attempts: {e}") from e
 
     def create_or_update_record(
         self,
@@ -282,12 +362,12 @@ class MicrosoftWinRmDnsClient:
         else:
             name_at = name
 
-        session = self._session(dns_server)
-
         if record_type == "DELETE":
             inner = payload.values[0].strip().upper()
             ps_rr = _winrm_rr_type(inner)
-            existed = self._record_exists(session, dns_server, zone, name_at, ps_rr)
+            existed = self._record_exists(dns_server, zone, name_at, ps_rr)
+            if not existed:
+                return False
             lines: List[str] = [
                 "$ErrorActionPreference = 'Stop'",
                 f"$ComputerName = {_ps_single_quoted(dns_server)}",
@@ -301,14 +381,10 @@ class MicrosoftWinRmDnsClient:
                 "Remove-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName -Force"
             )
             script = "\n".join(lines)
-            result = session.run_ps(script)
-            if result.status_code != 0:
-                stderr = (result.std_err or b"").decode(errors="replace")
-                stdout = (result.std_out or b"").decode(errors="replace")
-                raise RuntimeError(f"WinRM/PowerShell failed ({result.status_code}): {stderr or stdout}")
-            return existed
+            self._run_ps_with_retry(dns_server, script)
+            return True
 
-        existed = self._record_exists(session, dns_server, zone, name_at, _winrm_rr_type(record_type))
+        existed = self._record_exists(dns_server, zone, name_at, _winrm_rr_type(record_type))
 
         lines: List[str] = [
             "$ErrorActionPreference = 'Stop'",
@@ -373,15 +449,11 @@ class MicrosoftWinRmDnsClient:
             raise ValueError(f"Unsupported record type for Microsoft WinRM: {record_type}")
 
         script = "\n".join(lines)
-        result = session.run_ps(script)
-        if result.status_code != 0:
-            stderr = (result.std_err or b"").decode(errors="replace")
-            stdout = (result.std_out or b"").decode(errors="replace")
-            raise RuntimeError(f"WinRM/PowerShell failed ({result.status_code}): {stderr or stdout}")
+        self._run_ps_with_retry(dns_server, script)
 
         return existed
 
-    def _record_exists(self, session, computer: str, zone: str, name: str, rr_type: str) -> bool:
+    def _record_exists(self, computer: str, zone: str, name: str, rr_type: str) -> bool:
         ps = (
             "Import-Module DnsServer -ErrorAction SilentlyContinue; "
             f"$r = Get-DnsServerResourceRecord -ComputerName {_ps_single_quoted(computer)} "
@@ -389,9 +461,7 @@ class MicrosoftWinRmDnsClient:
             f"-RRType {_ps_single_quoted(rr_type)} -ErrorAction SilentlyContinue; "
             "if ($r) { 'yes' } else { 'no' }"
         )
-        result = session.run_ps(ps)
-        if result.status_code != 0:
-            return False
+        result = self._run_ps_with_retry(computer, ps)
         out = (result.std_out or b"").decode(errors="replace").strip().lower()
         return out.startswith("yes")
 

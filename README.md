@@ -1,8 +1,8 @@
 # DNS REST Service
 
-[![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/) [![Python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/) [![Release](https://img.shields.io/badge/release-0.2.0-blue)](VERSION)
+[![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/) [![Python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/) [![Release](https://img.shields.io/badge/release-0.3.0-blue)](VERSION)
 
-Current release: `0.2.0`
+Current release: `0.3.0`
 
 A Dockerized FastAPI service to manage DNS records through a protected admin web UI and secure API key authentication. Supported backends are **Azure DNS**, **on-premises Microsoft DNS (WinRM)**, and **BIND** (or other servers) using **RFC 2136 dynamic updates with TSIG**.
 
@@ -10,7 +10,7 @@ A Dockerized FastAPI service to manage DNS records through a protected admin web
 
 - Protected admin interface with username/password login
 - Generate and revoke API keys for REST access
-- Choose DNS provider (**Azure**, **Microsoft / WinRM**, **BIND / TSIG**) and store connection details and credentials **encrypted at rest** in the database
+- Choose DNS provider (**Azure**, **Microsoft / WinRM**, **BIND / TSIG**) **per zone** and store connection details and credentials **encrypted at rest**
 - Create, update, or **delete** DNS records via `POST /dns-record`
 - Structured JSON errors (for example **404** when a DELETE finds no record, **502** when the DNS provider fails)
 - Docker Compose-ready deployment
@@ -40,7 +40,7 @@ Open the admin UI at:
 http://localhost:8000/login
 ```
 
-After login, open **DNS Settings** and configure your provider, zone, and credentials. **Azure service principal fields are no longer set via environment variables**; they are saved in the UI (encrypted in the database).
+After login, open **DNS zones** to add one row per zone (each row is a unique zone name with its own provider and credentials). Then open **API Keys**: when you create or edit a key, select which zones that key may use. **`POST /dns-record` always requires `zone_name`** in the JSON body; it must match a configured zone **and** be allowed for that API key, or the API returns **403** with `error: access_denied`.
 
 ## Configuration
 
@@ -54,7 +54,7 @@ Create a `.env` file using `.env.example` and configure the following values:
 | `ADMIN_PASSWORD` | Initial admin password |
 | `DATABASE_URL` | Optional database URL (default: `sqlite:///./data/app.db`) |
 
-**Azure DNS** is configured in the **DNS Settings** page (tenant ID, client ID, client secret, optional default subscription and resource group). Those values are **not** read from `AZURE_*` environment variables.
+**Azure DNS** (per zone): tenant ID, client ID, client secret, and optional default subscription and resource group are stored on that zone’s row in **DNS zones** (encrypted). They are **not** read from `AZURE_*` environment variables.
 
 ### Generating the ENCRYPTION_KEY
 
@@ -79,9 +79,8 @@ print(f'ENCRYPTION_KEY={key}')
 The web interface allows you to:
 
 - Sign in with admin credentials
-- Choose **DNS server type** (Azure, Microsoft WinRM, or BIND / TSIG)
-- Set target DNS server and zone, credentials, and (for Azure) service principal defaults
-- Create and revoke API keys
+- Add and edit **DNS zones** (each zone name is unique; each has its own provider type, server, and credentials)
+- Create and revoke **API keys**, and **edit** keys to change their label or **allowed zones**
 
 ## API Usage
 
@@ -89,9 +88,11 @@ Authenticate with **`X-API-Key: <key>`** or **`Authorization: Bearer <key>`**.
 
 All examples use `POST http://localhost:8000/dns-record` with `Content-Type: application/json`.
 
+**`zone_name` is required** on every request and must match a zone you configured under **DNS zones**. The API key must include that zone in its **allowed zones** list (see **API Keys** in the admin UI). If the zone is missing or the key is not allowed, the response is **403** with `{"detail":{"error":"access_denied","message":"..."}}`.
+
 ### Azure DNS: create a new A record
 
-If you saved default **subscription** and **resource group** in DNS Settings, you can omit them from the JSON.
+If you saved default **subscription** and **resource group** on that zone’s configuration, you can omit them from the JSON.
 
 ```bash
 curl -sS -X POST "http://localhost:8000/dns-record" \
@@ -129,9 +130,9 @@ curl -sS -X POST "http://localhost:8000/dns-record" \
 
 ### Microsoft DNS (WinRM): create and update an A record
 
-In **DNS Settings**, set **DNS server type** to **Microsoft (WinRM)**, then **Target DNS Server** (the host that accepts WinRM, often your DNS / DC), **Target DNS Zone**, and domain credentials (**username** / **password**). Turn on **HTTPS WinRM** if you use port **5986**.
+For a zone such as `corp.example`, add a **DNS zones** row with zone name **`corp.example`**, set **Microsoft (WinRM)**, **Target DNS Server**, and credentials. Grant your API key access to that zone under **API Keys**.
 
-Requests **do not** use `subscription_id` or `resource_group`. You may omit **`zone_name`** if you saved **Target DNS Zone** in settings.
+Requests **do not** use `subscription_id` or `resource_group`. **`zone_name` in JSON must match** the configured zone (case-insensitive).
 
 **Create** (first `A` for `api` in `corp.example`):
 
@@ -165,9 +166,7 @@ curl -sS -X POST "http://localhost:8000/dns-record" \
 
 ### BIND (TSIG): create and update an A record
 
-In **DNS Settings**, set **DNS server type** to **BIND / TSIG**, **Target DNS Server** (primary that accepts RFC 2136 updates), **Target DNS Zone**, **TSIG key name** (username field), **TSIG secret in base64** (password field, same encoding as in `named.conf`), and optionally **TSIG algorithm** (default `hmac-sha256`).
-
-The JSON body is the same shape as for Microsoft: no Azure fields.
+Add a **DNS zones** row for the zone (for example **`example.com`**) with **BIND / TSIG**, **Target DNS Server**, TSIG key name, base64 secret, and optional algorithm. Grant the API key access to that zone.
 
 **Create**:
 
@@ -203,7 +202,7 @@ curl -sS -X POST "http://localhost:8000/dns-record" \
 
 Use **`record_type": "DELETE"`**. The first entry in **`values`** must be the DNS RR type to remove: **`A`**, **`AAAA`**, **`CNAME`**, or **`TXT`**.
 
-**Microsoft / BIND** — same as above; include **`zone_name`** unless it is set as **Target DNS Zone** in DNS Settings. No Azure fields.
+**Microsoft / BIND** — include **`zone_name`** that matches a configured zone your key may access.
 
 ```bash
 curl -sS -X POST "http://localhost:8000/dns-record" \
@@ -217,7 +216,7 @@ curl -sS -X POST "http://localhost:8000/dns-record" \
   }'
 ```
 
-**Azure DNS** — include **`subscription_id`** and **`resource_group`** on the delete request as well, unless both are saved as defaults in DNS Settings.
+**Azure DNS** — include **`subscription_id`** and **`resource_group`** unless both are saved on that zone’s configuration.
 
 ```bash
 curl -sS -X POST "http://localhost:8000/dns-record" \
@@ -238,6 +237,7 @@ curl -sS -X POST "http://localhost:8000/dns-record" \
 - Create / update success: HTTP **200**, `"status": "success"`, `"action": "created"` or `"updated"`.
 - Delete removed a record: **200**, `"status": "success"`, `"action": "deleted"`.
 - Delete when nothing matched: **404**, `"status": "error"`, `"action": "not_found"`.
+- Zone missing or API key not allowed for that zone: **403**, `"detail": { "error": "access_denied", "message": "..." }`.
 - Validation or provider failure: **400**, **502**, **503**, or **500** with JSON `detail` (for example `{"detail": {"error": "dns_provider_failed", "message": "..."}}`).
 
 > **PowerShell:** `Invoke-RestMethod` treats HTTP **404** as a terminating error by default. For a DELETE that returns `not_found`, use `Invoke-RestMethod ... -SkipHttpErrorCheck` (PowerShell 7+) or `Invoke-WebRequest` and read the body.
