@@ -16,13 +16,14 @@ jobs:
 
       - name: Generate encryption key for testing
         run: |
-          python3 -c "
-          from cryptography.fernet import Fernet
-          key = Fernet.generate_key().decode()
-          print(f'ENCRYPTION_KEY={key}')
-          " > temp_key.txt
-          sed -i "s/ENCRYPTION_KEY=.*/$(cat temp_key.txt)/" .env
-          rm temp_key.txt
+          KEY="$(python3 - <<'PY'
+          import base64
+          import os
+
+          print(base64.urlsafe_b64encode(os.urandom(32)).decode())
+          PY
+          )"
+          sed -i "s|ENCRYPTION_KEY=.*|ENCRYPTION_KEY=${KEY}|" .env
           echo 'Generated encryption key for testing'
 
       - name: Build the Docker image
@@ -31,39 +32,246 @@ jobs:
           docker build . --file Dockerfile --tag "$IMAGE_TAG"
           echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
 
-      - name: Run container smoke test
+      - name: Run BIND-backed smoke test
         run: |
-          echo "Testing container startup..."
-          timeout 10s docker run --rm --name dns-api-test --env-file .env -p 8000:8000 "$IMAGE_TAG" || true
-          
-          echo "Starting container in background..."
-          docker run --rm -d --name dns-api-test --env-file .env -p 8000:8000 "$IMAGE_TAG"
-          echo "Container started, waiting for startup..."
-          sleep 15
-          
-          # Check if container is still running
-          if ! docker ps | grep -q dns-api-test; then
-            echo "Container exited prematurely. Checking recent logs..."
-            docker logs dns-api-test 2>/dev/null || echo "No logs available - container may have failed to start"
-            exit 1
-          fi
-          
-          echo "Container is running, testing endpoints..."
-          curl --fail --max-time 10 http://localhost:8000/login
-          curl --fail -c /tmp/cookies -X POST http://localhost:8000/login \
+          set -euo pipefail
+
+          NETWORK_NAME="dns-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          BIND_DIR="${RUNNER_TEMP}/bind-smoke"
+          TSIG_NAME="api-to-dns."
+          TSIG_SECRET="smokeSecretForCiOnly1234567890=="
+
+          cleanup() {
+            echo "Collecting container logs..."
+            docker logs dns-api-test 2>/dev/null || true
+            docker logs bind-test 2>/dev/null || true
+            docker rm -f dns-api-test bind-test 2>/dev/null || true
+            docker network rm "${NETWORK_NAME}" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          mkdir -p "${BIND_DIR}"
+          cat > "${BIND_DIR}/named.conf" <<EOF
+          key "${TSIG_NAME}" {
+            algorithm hmac-sha256;
+            secret "${TSIG_SECRET}";
+          };
+
+          options {
+            directory "/bind";
+            listen-on port 53 { any; };
+            listen-on-v6 { none; };
+            allow-query { any; };
+            recursion no;
+            dnssec-validation no;
+          };
+
+          zone "smoke.test" {
+            type master;
+            file "/bind/db.smoke.test";
+            allow-update { key "${TSIG_NAME}"; };
+          };
+
+          zone "denied.test" {
+            type master;
+            file "/bind/db.denied.test";
+            allow-update { key "${TSIG_NAME}"; };
+          };
+          EOF
+
+          cat > "${BIND_DIR}/db.smoke.test" <<'EOF'
+          $TTL 300
+          @ IN SOA ns.smoke.test. hostmaster.smoke.test. (
+            1 ; serial
+            300 ; refresh
+            300 ; retry
+            300 ; expire
+            300 ; minimum
+          )
+          @ IN NS ns.smoke.test.
+          ns IN A 127.0.0.1
+          EOF
+
+          cat > "${BIND_DIR}/db.denied.test" <<'EOF'
+          $TTL 300
+          @ IN SOA ns.denied.test. hostmaster.denied.test. (
+            1 ; serial
+            300 ; refresh
+            300 ; retry
+            300 ; expire
+            300 ; minimum
+          )
+          @ IN NS ns.denied.test.
+          ns IN A 127.0.0.1
+          EOF
+
+          docker network create "${NETWORK_NAME}"
+
+          echo "Starting BIND test container..."
+          docker run -d --name bind-test --network "${NETWORK_NAME}" \
+            -v "${BIND_DIR}:/bind" \
+            ubuntu:22.04 \
+            bash -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y bind9 dnsutils >/tmp/bind-install.log && named -g -c /bind/named.conf"
+
+          echo "Waiting for BIND to answer..."
+          for i in {1..60}; do
+            if docker exec bind-test dig @127.0.0.1 smoke.test SOA +short >/tmp/bind-soa.txt 2>/dev/null && [ -s /tmp/bind-soa.txt ]; then
+              break
+            fi
+            if ! docker ps --format '{{.Names}}' | awk '$0 == "bind-test" { found = 1 } END { exit !found }'; then
+              echo "BIND container exited before becoming ready"
+              exit 1
+            fi
+            sleep 2
+          done
+          docker exec bind-test dig @127.0.0.1 smoke.test SOA +short
+
+          echo "Starting API container..."
+          docker run -d --name dns-api-test --network "${NETWORK_NAME}" --env-file .env -p 8000:8000 "$IMAGE_TAG"
+
+          echo "Waiting for API login page..."
+          for i in {1..60}; do
+            if curl --fail --silent --max-time 5 http://localhost:8000/login >/dev/null; then
+              break
+            fi
+            if ! docker ps --format '{{.Names}}' | awk '$0 == "dns-api-test" { found = 1 } END { exit !found }'; then
+              echo "API container exited before becoming ready"
+              exit 1
+            fi
+            sleep 2
+          done
+
+          curl --fail --silent -c /tmp/cookies -X POST http://localhost:8000/login \
             -H "Content-Type: application/x-www-form-urlencoded" \
             -d "username=admin&password=your-admin-password" \
-            -o /dev/null 
-          curl --fail -b /tmp/cookies http://localhost:8000/admin | grep -q "Admin Dashboard"
-          API_KEY=$(curl --fail -L -b /tmp/cookies -X POST http://localhost:8000/api-keys \
+            -o /dev/null
+          curl --fail --silent -b /tmp/cookies http://localhost:8000/admin | python3 -c "import sys; assert 'DNS Admin Dashboard' in sys.stdin.read()"
+
+          echo "Configuring BIND zones in the app..."
+          for zone in smoke.test denied.test; do
+            curl --fail --silent -b /tmp/cookies -X POST http://localhost:8000/zones \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              --data-urlencode "zone_name=${zone}" \
+              --data-urlencode "dns_provider_type=bind" \
+              --data-urlencode "dns_server=bind-test" \
+              --data-urlencode "dns_username=${TSIG_NAME}" \
+              --data-urlencode "dns_password=${TSIG_SECRET}" \
+              --data-urlencode "dns_tsig_algorithm=hmac-sha256" \
+              -o /dev/null
+          done
+
+          curl --fail --silent -b /tmp/cookies http://localhost:8000/api-keys -o /tmp/api-keys.html
+          SMOKE_ZONE_ID="$(python3 - <<'PY'
+          import re
+
+          html = open('/tmp/api-keys.html', encoding='utf-8').read()
+          match = re.search(r'name="zone_ids" value="(\d+)" />\s*<code>smoke\.test</code>', html)
+          if not match:
+              raise SystemExit("Could not find smoke.test zone ID")
+          print(match.group(1))
+          PY
+          )"
+          echo "smoke.test zone id: ${SMOKE_ZONE_ID}"
+
+          curl --fail --silent -L -b /tmp/cookies -X POST http://localhost:8000/api-keys \
             -H "Content-Type: application/x-www-form-urlencoded" \
-            -d "label=smoke-test" | grep -oP 'API key created: \K[^<]+' )
+            --data-urlencode "label=bind-smoke-test" \
+            --data-urlencode "zone_ids=${SMOKE_ZONE_ID}" \
+            -o /tmp/api-key-create.html
+
+          API_KEY="$(python3 - <<'PY'
+          import re
+
+          html = open('/tmp/api-key-create.html', encoding='utf-8').read()
+          match = re.search(r'API key created:\s*([^<\s]+)', html)
+          if not match:
+              raise SystemExit("Could not extract API key")
+          print(match.group(1))
+          PY
+          )"
           echo "Generated API key: $API_KEY"
-          if [ -z "$API_KEY" ]; then
-            echo "API key generation failed"
+
+          curl --fail --silent -H "X-API-Key: $API_KEY" http://localhost:8000/keycheck \
+            | python3 -c "import json, sys; assert json.load(sys.stdin)['status'] == 'success'"
+
+          call_dns_api() {
+            local expected_status="$1"
+            local expected_action="$2"
+            local body="$3"
+            local output="/tmp/dns-response-${expected_action}.json"
+            local status
+
+            status="$(curl --silent --show-error -o "${output}" -w "%{http_code}" \
+              -X POST http://localhost:8000/dns-record \
+              -H "Content-Type: application/json" \
+              -H "X-API-Key: ${API_KEY}" \
+              -d "${body}")"
+
+            echo "${expected_action}: HTTP ${status}"
+            cat "${output}"
+            echo
+
+            if [ "${status}" != "${expected_status}" ]; then
+              echo "Expected HTTP ${expected_status}, got ${status}"
+              exit 1
+            fi
+
+            python3 - "${output}" "${expected_action}" <<'PY'
+            import json
+            import sys
+
+            body = json.load(open(sys.argv[1], encoding='utf-8'))
+            expected_action = sys.argv[2]
+            if expected_action == "access_denied":
+                assert body["detail"]["error"] == "access_denied", body
+            else:
+                assert body["action"] == expected_action, body
+            PY
+          }
+
+          wait_for_record_value() {
+            local fqdn="$1"
+            local expected="$2"
+            for i in {1..20}; do
+              value="$(docker exec bind-test dig @127.0.0.1 "${fqdn}" A +short | tr -d '\r' | tail -n 1 || true)"
+              if [ "${value}" = "${expected}" ]; then
+                return 0
+              fi
+              sleep 1
+            done
+            echo "Expected ${fqdn} to resolve to ${expected}; got '${value}'"
             exit 1
-          fi
-          curl --fail -H "X-API-Key: $API_KEY" http://localhost:8000/keycheck
-          docker stop dns-api-test
+          }
+
+          wait_for_record_absent() {
+            local fqdn="$1"
+            for i in {1..20}; do
+              value="$(docker exec bind-test dig @127.0.0.1 "${fqdn}" A +short | tr -d '\r' || true)"
+              if [ -z "${value}" ]; then
+                return 0
+              fi
+              sleep 1
+            done
+            echo "Expected ${fqdn} to be absent; got '${value}'"
+            exit 1
+          }
+
+          echo "Creating record..."
+          call_dns_api 200 created '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.10"]}'
+          wait_for_record_value www.smoke.test 192.0.2.10
+
+          echo "Updating record..."
+          call_dns_api 200 updated '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.20"]}'
+          wait_for_record_value www.smoke.test 192.0.2.20
+
+          echo "Deleting record..."
+          call_dns_api 200 deleted '{"zone_name":"smoke.test","record_type":"DELETE","record_name":"www","values":["A"]}'
+          wait_for_record_absent www.smoke.test
+
+          echo "Deleting nonexistent record (expected 404)..."
+          call_dns_api 404 not_found '{"zone_name":"smoke.test","record_type":"DELETE","record_name":"www","values":["A"]}'
+
+          echo "Accessing a configured zone that this API key cannot use (expected 403)..."
+          call_dns_api 403 access_denied '{"zone_name":"denied.test","record_type":"A","record_name":"blocked","ttl":300,"values":["192.0.2.55"]}'
         env:
           IMAGE_TAG: ${{ env.IMAGE_TAG }}
