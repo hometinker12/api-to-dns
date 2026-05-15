@@ -1,4 +1,6 @@
 import base64
+import ipaddress
+import socket
 import time
 from typing import Any, Dict, List, Optional
 
@@ -34,6 +36,25 @@ def _dns_relative_name(zone_name: str, record_name: str) -> str:
     return r
 
 
+def _tcp_endpoint_host(host: str) -> str:
+    """Resolve *host* for dns.query.tcp — dnspython passes *where* through inet.af_for_address (no name lookup)."""
+    h = (host or "").strip()
+    if not h:
+        return h
+    try:
+        ipaddress.ip_address(h)
+        return h
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(h, None, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise ValueError(f"Could not resolve DNS server hostname {h!r}: {e}") from e
+    if not infos:
+        raise ValueError(f"DNS server hostname {h!r} resolved to no addresses.")
+    return infos[0][4][0]
+
+
 def _record_existed_before_update(
     server: str,
     zone_name: str,
@@ -47,7 +68,7 @@ def _record_existed_before_update(
         qname = dns.name.from_text(f"{relative_name}.{z}")
     q = dns.message.make_query(qname, rdtype)
     try:
-        resp = dns.query.tcp(q, server, timeout=10)
+        resp = dns.query.tcp(q, _tcp_endpoint_host(server), timeout=10)
     except Exception:
         return False
     return bool(resp.answer)
@@ -209,7 +230,7 @@ class BindTsigDnsClient:
             update = dns.update.Update(origin, keyring=self._keyring, keyname=self._keyname)
             node = relative if relative not in ("@", "") else "@"
             update.delete(node, rdtype)
-            response = dns.query.tcp(update, dns_server, timeout=15)
+            response = dns.query.tcp(update, _tcp_endpoint_host(dns_server), timeout=15)
             if response.rcode() != dns.rcode.NOERROR:
                 raise RuntimeError(f"DNS UPDATE failed: {dns.rcode.to_text(response.rcode())}")
             return True
@@ -234,7 +255,7 @@ class BindTsigDnsClient:
         else:
             raise ValueError(f"Unsupported record type for BIND: {record_type}")
 
-        response = dns.query.tcp(update, dns_server, timeout=15)
+        response = dns.query.tcp(update, _tcp_endpoint_host(dns_server), timeout=15)
         if response.rcode() != dns.rcode.NOERROR:
             raise RuntimeError(f"DNS UPDATE failed: {dns.rcode.to_text(response.rcode())}")
         return existed

@@ -90,7 +90,7 @@ def _http_exception_from_dns_error(exc: Exception) -> HTTPException:
     if isinstance(exc, ValueError):
         return HTTPException(
             status_code=400,
-            detail={"error": "invalid_request", "message": str(exc)},
+            detail={"error": "invalid_request", "message": str(exc) or "invalid request"},
         )
     if isinstance(exc, RuntimeError):
         return HTTPException(
