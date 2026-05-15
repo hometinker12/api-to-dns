@@ -39,7 +39,8 @@ jobs:
           NETWORK_NAME="dns-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           BIND_DIR="${RUNNER_TEMP}/bind-smoke"
           TSIG_NAME="api-to-dns."
-          TSIG_SECRET="smokeSecretForCiOnly1234567890=="
+          # Deterministic base64 secret (32 raw bytes). BIND 9.18 rejects some syntactically valid base64 strings here.
+          TSIG_SECRET="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 
           cleanup() {
             echo "Collecting container logs..."
@@ -51,36 +52,43 @@ jobs:
           trap cleanup EXIT
 
           mkdir -p "${BIND_DIR}"
-          cat > "${BIND_DIR}/named.conf" <<EOF
-          key "${TSIG_NAME}" {
-            algorithm hmac-sha256;
-            secret "${TSIG_SECRET}";
-          };
+          # Write configs without YAML-indented heredoc lines (BIND rejects leading spaces in zone files).
+          python3 - "${BIND_DIR}" "${TSIG_NAME}" "${TSIG_SECRET}" <<'PY'
+          import sys
+          from pathlib import Path
 
-          options {
+          bind_dir = Path(sys.argv[1])
+          tsig_name = sys.argv[2]
+          tsig_secret = sys.argv[3]
+
+          named_conf = f'''key "{tsig_name}" {{
+            algorithm hmac-sha256;
+            secret "{tsig_secret}";
+          }};
+
+          options {{
             directory "/bind";
-            listen-on port 53 { any; };
-            listen-on-v6 { none; };
-            allow-query { any; };
+            listen-on port 53 {{ any; }};
+            listen-on-v6 {{ none; }};
+            allow-query {{ any; }};
             recursion no;
             dnssec-validation no;
-          };
+          }};
 
-          zone "smoke.test" {
+          zone "smoke.test" {{
             type master;
             file "/bind/db.smoke.test";
-            allow-update { key "${TSIG_NAME}"; };
-          };
+            allow-update {{ key "{tsig_name}"; }};
+          }};
 
-          zone "denied.test" {
+          zone "denied.test" {{
             type master;
             file "/bind/db.denied.test";
-            allow-update { key "${TSIG_NAME}"; };
-          };
-          EOF
+            allow-update {{ key "{tsig_name}"; }};
+          }};
+          '''
 
-          cat > "${BIND_DIR}/db.smoke.test" <<'EOF'
-          $TTL 300
+          zone_smoke = """$TTL 300
           @ IN SOA ns.smoke.test. hostmaster.smoke.test. (
             1 ; serial
             300 ; refresh
@@ -90,10 +98,9 @@ jobs:
           )
           @ IN NS ns.smoke.test.
           ns IN A 127.0.0.1
-          EOF
+          """
 
-          cat > "${BIND_DIR}/db.denied.test" <<'EOF'
-          $TTL 300
+          zone_denied = """$TTL 300
           @ IN SOA ns.denied.test. hostmaster.denied.test. (
             1 ; serial
             300 ; refresh
@@ -103,7 +110,15 @@ jobs:
           )
           @ IN NS ns.denied.test.
           ns IN A 127.0.0.1
-          EOF
+          """
+
+          def _unindent(s: str) -> str:
+            return "\n".join(line.lstrip() for line in s.splitlines()).strip() + "\n"
+
+          (bind_dir / "named.conf").write_text(_unindent(named_conf), newline="\n")
+          (bind_dir / "db.smoke.test").write_text(_unindent(zone_smoke), newline="\n")
+          (bind_dir / "db.denied.test").write_text(_unindent(zone_denied), newline="\n")
+          PY
 
           docker network create "${NETWORK_NAME}"
 
