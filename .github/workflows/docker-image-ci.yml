@@ -120,25 +120,56 @@ jobs:
           (bind_dir / "db.denied.test").write_text(_unindent(zone_denied), newline="\n")
           PY
 
+          # Dynamic zones need a writable directory for journals; CI volume is owned by the runner user.
+          chmod -R a+rwX "${BIND_DIR}"
+
           docker network create "${NETWORK_NAME}"
 
-          echo "Starting BIND test container..."
+          echo "Starting BIND test container (prebuilt image; no apt in container)..."
           docker run -d --name bind-test --network "${NETWORK_NAME}" \
-            -v "${BIND_DIR}:/bind" \
-            ubuntu:22.04 \
-            bash -lc "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y bind9 dnsutils >/tmp/bind-install.log && named -g -c /bind/named.conf"
+            -e BIND9_USER=root \
+            -v "${BIND_DIR}:/bind:rw" \
+            ubuntu/bind9:9.18-22.04_edge \
+            -c /bind/named.conf
 
-          echo "Waiting for BIND to answer..."
+          echo "Waiting for BIND to listen on UDP/TCP 53..."
           for i in {1..60}; do
-            if docker exec bind-test dig @127.0.0.1 smoke.test SOA +short >/tmp/bind-soa.txt 2>/dev/null && [ -s /tmp/bind-soa.txt ]; then
+            if docker exec bind-test ss -lun 2>/dev/null | grep -q ':53'; then
               break
             fi
-            if ! docker ps --format '{{.Names}}' | awk '$0 == "bind-test" { found = 1 } END { exit !found }'; then
+            if [ -z "$(docker ps -q -f name=bind-test -f status=running)" ]; then
               echo "BIND container exited before becoming ready"
+              docker logs bind-test 2>&1 | tail -n 200 || true
               exit 1
             fi
             sleep 2
           done
+          if ! docker exec bind-test ss -lun 2>/dev/null | grep -q ':53'; then
+            echo "BIND did not open port 53 in time"
+            docker logs bind-test 2>&1 | tail -n 200 || true
+            exit 1
+          fi
+
+          echo "Installing dnsutils in BIND container for dig-based checks..."
+          docker exec bind-test bash -lc 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -qq -y dnsutils'
+
+          echo "Waiting for BIND to answer queries..."
+          for i in {1..30}; do
+            if docker exec bind-test dig @127.0.0.1 smoke.test SOA +short >/tmp/bind-soa.txt 2>/dev/null && [ -s /tmp/bind-soa.txt ]; then
+              break
+            fi
+            if [ -z "$(docker ps -q -f name=bind-test -f status=running)" ]; then
+              echo "BIND container exited during dnsutils install or query wait"
+              docker logs bind-test 2>&1 | tail -n 200 || true
+              exit 1
+            fi
+            sleep 2
+          done
+          if [ ! -s /tmp/bind-soa.txt ]; then
+            echo "dig did not return SOA for smoke.test"
+            docker logs bind-test 2>&1 | tail -n 200 || true
+            exit 1
+          fi
           docker exec bind-test dig @127.0.0.1 smoke.test SOA +short
 
           echo "Starting API container..."
@@ -149,7 +180,7 @@ jobs:
             if curl --fail --silent --max-time 5 http://localhost:8000/login >/dev/null; then
               break
             fi
-            if ! docker ps --format '{{.Names}}' | awk '$0 == "dns-api-test" { found = 1 } END { exit !found }'; then
+            if [ -z "$(docker ps -q -f name=dns-api-test -f status=running)" ]; then
               echo "API container exited before becoming ready"
               exit 1
             fi
