@@ -16,7 +16,6 @@ on:
   push:
     branches:
       - release
-  workflow_dispatch:
 
 jobs:
   bind-smoke-linux:
