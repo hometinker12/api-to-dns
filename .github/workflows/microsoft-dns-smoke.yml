@@ -30,14 +30,15 @@ jobs:
 
       - name: Generate encryption key for testing
         run: |
-          KEY="$(python3 - <<'PY'
+          KEY="$(python - <<'PY'
           import base64
           import os
 
           print(base64.urlsafe_b64encode(os.urandom(32)).decode())
           PY
           )"
-          sed -i "s|ENCRYPTION_KEY=.*|ENCRYPTION_KEY=${KEY}|" .env
+          sed -i.bak "s|ENCRYPTION_KEY=.*|ENCRYPTION_KEY=${KEY}|" .env
+          rm -f .env.bak
           echo 'Generated encryption key for testing'
 
       - name: Build the Docker image
@@ -229,13 +230,13 @@ jobs:
             --data-urlencode "zone_ids=${SMOKE_ZONE_ID}" \
             -o /tmp/api-key-create.html
 
-          API_KEY="$(python3 - <<'PY'
+          MS_LOCAL_KEY="$(python - <<'PY'
           import re
 
           html = open('/tmp/api-key-create.html', encoding='utf-8').read()
           match = re.search(r'API key created:\s*([^<\s]+)', html)
           if not match:
-              raise SystemExit("Could not extract API key")
+              raise SystemExit("Could not extract local Microsoft API key")
           print(match.group(1))
           PY
           )"
@@ -243,26 +244,48 @@ jobs:
           curl --fail --silent -H "X-API-Key: $API_KEY" http://localhost:8000/keycheck \
             | python3 -c "import json, sys; assert json.load(sys.stdin)['status'] == 'success'"
 
-          call_dns_api() {
-            local expected_status="$1"
-            local expected_action="$2"
-            local body="$3"
-            local output="/tmp/dns-response-${expected_action}.json"
-            local status
+          L_CREATE="$(LOCAL_ALLOWED_ZONE="${LOCAL_ALLOWED_ZONE}" python - <<'PY'
+          import json, os
+          z = os.environ["LOCAL_ALLOWED_ZONE"]
+          print(json.dumps({"zone_name": z, "record_type": "A", "record_name": "www", "ttl": 300, "values": ["192.0.2.10"]}))
+          PY
+          )"
+          L_UPDATE="$(LOCAL_ALLOWED_ZONE="${LOCAL_ALLOWED_ZONE}" python - <<'PY'
+          import json, os
+          z = os.environ["LOCAL_ALLOWED_ZONE"]
+          print(json.dumps({"zone_name": z, "record_type": "A", "record_name": "www", "ttl": 300, "values": ["192.0.2.20"]}))
+          PY
+          )"
+          L_DELETE="$(LOCAL_ALLOWED_ZONE="${LOCAL_ALLOWED_ZONE}" python - <<'PY'
+          import json, os
+          z = os.environ["LOCAL_ALLOWED_ZONE"]
+          print(json.dumps({"zone_name": z, "record_type": "DELETE", "record_name": "www", "values": ["A"]}))
+          PY
+          )"
+          L_DENIED="$(LOCAL_DENIED_ZONE="${LOCAL_DENIED_ZONE}" python - <<'PY'
+          import json, os
+          z = os.environ["LOCAL_DENIED_ZONE"]
+          print(json.dumps({"zone_name": z, "record_type": "A", "record_name": "blocked", "ttl": 300, "values": ["192.0.2.55"]}))
+          PY
+          )"
 
-            status="$(curl --silent --show-error -o "${output}" -w "%{http_code}" \
-              -X POST http://localhost:8000/dns-record \
-              -H "Content-Type: application/json" \
-              -H "X-API-Key: ${API_KEY}" \
-              -d "${body}")"
+          L_WWW="www.${LOCAL_ALLOWED_ZONE}"
+          echo "Local Microsoft: create / update / delete / 404 / 403"
+          call_dns_api "${MS_LOCAL_KEY}" 200 created "${L_CREATE}"
+          wait_local_a "${L_WWW}" 192.0.2.10
+          call_dns_api "${MS_LOCAL_KEY}" 200 updated "${L_UPDATE}"
+          wait_local_a "${L_WWW}" 192.0.2.20
+          call_dns_api "${MS_LOCAL_KEY}" 200 deleted "${L_DELETE}"
+          wait_local_absent "${L_WWW}"
+          call_dns_api "${MS_LOCAL_KEY}" 404 not_found "${L_DELETE}"
+          call_dns_api "${MS_LOCAL_KEY}" 403 access_denied "${L_DENIED}"
 
-            echo "${expected_action}: HTTP ${status}"
-            cat "${output}"
-            echo
-
-            if [ "${status}" != "${expected_status}" ]; then
-              echo "Expected HTTP ${expected_status}, got ${status}"
-              exit 1
+          # --- Optional remote Microsoft lab ---
+          if [ -n "${REMOTE_WINRM_HOST:-}" ] && [ -n "${REMOTE_WINRM_USER:-}" ] && [ -n "${REMOTE_WINRM_PASSWORD:-}" ]; then
+            echo "=== Phase 2: Remote Microsoft DNS (secrets) ==="
+            REMOTE_CURL_SSL=()
+            if [ "${REMOTE_WINRM_SSL:-}" = "true" ] || [ "${REMOTE_WINRM_SSL:-}" = "True" ] || [ "${REMOTE_WINRM_SSL:-}" = "1" ]; then
+              REMOTE_CURL_SSL=(--data-urlencode "dns_winrm_ssl=true")
             fi
 
             python3 -c "import json,sys;b=json.load(open(sys.argv[1],encoding='utf-8'));e=sys.argv[2];assert((e=='access_denied' and b['detail']['error']=='access_denied') or (b['action']==e)),b" "${output}" "${expected_action}"
