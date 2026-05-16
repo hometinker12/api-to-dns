@@ -358,6 +358,15 @@ jobs:
 
           # NTLM to 127.0.0.1 from a non-domain client requires TrustedHosts.
           Set-Item -Path WSMan:\localhost\Client\TrustedHosts -Value '127.0.0.1,localhost' -Force
+
+          # KB 896861: disable NTLM loopback check (anti-reflection) so NTLM auth
+          # to 127.0.0.1 / localhost / non-canonical names does not fail with
+          # AccessDenied (wsmanfault 5). Required when the URL hostname differs
+          # from the machine's actual NetBIOS name.
+          New-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' `
+            -Name DisableLoopbackCheck -PropertyType DWord -Value 1 -Force | Out-Null
+
           Restart-Service WinRM
 
           $userName = 'gh-dns-smoke'
@@ -581,11 +590,19 @@ jobs:
             $localPass = $env:LOCAL_WINRM_PASSWORD
             $la = $env:LOCAL_ALLOWED_ZONE
             $ld = $env:LOCAL_DENIED_ZONE
-            $localDnsServer = '127.0.0.1'
+            # Use the machine's NetBIOS name (not 127.0.0.1) so NTLM SPN matches and
+            # the loopback check (KB 896861) is not triggered.
+            $localDnsServer = $env:COMPUTERNAME
 
             # #region agent diagnostics (keep until WinRM smoke is confirmed green)
             Write-Host "Local WinRM user (sanitized): $($env:COMPUTERNAME)\<user>"
             Write-Host "Local WinRM user backslash count: $((($localUser -split '\\').Count - 1))"
+            Write-Host "Local DNS/WinRM target = $localDnsServer"
+            $tokenPolicy = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name LocalAccountTokenFilterPolicy -ErrorAction SilentlyContinue).LocalAccountTokenFilterPolicy
+            $loopback   = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name DisableLoopbackCheck -ErrorAction SilentlyContinue).DisableLoopbackCheck
+            Write-Host "LocalAccountTokenFilterPolicy = $tokenPolicy ; DisableLoopbackCheck = $loopback"
+            Write-Host "TrustedHosts = $((Get-Item WSMan:\localhost\Client\TrustedHosts).Value)"
+            try { Test-WSMan -ComputerName $localDnsServer -ErrorAction Stop | Out-Null; Write-Host "Test-WSMan $localDnsServer : OK" } catch { Write-Host "Test-WSMan $localDnsServer failed: $($_.Exception.Message)" }
             # #endregion agent diagnostics
 
             foreach ($z in @($la, $ld)) {
