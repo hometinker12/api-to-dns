@@ -46,8 +46,8 @@ LEGACY_DNS_SETTING_NAMES = [
 ]
 
 app = FastAPI(
-    title="Microsoft DNS Record Service",
-    description="Create or update Microsoft DNS records via REST and manage API keys through a protected web UI.",
+    title="api-to-dns Service",
+    description="Create or update DNS records via REST and manage API keys through a protected web UI.",
     version="0.3.0",
 )
 
@@ -60,6 +60,26 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="src/static"), name="static")
 templates = Jinja2Templates(directory="src/templates")
+
+AUTH_REDIRECT_DETAILS = {"Authentication required", "Invalid or expired session"}
+WEB_AUTH_PATH_PREFIXES = (
+    "/admin",
+    "/settings",
+    "/zones",
+    "/api-keys",
+)
+
+
+@app.exception_handler(HTTPException)
+def http_exception_handler(request: Request, exc: HTTPException):
+    """Redirect unauthenticated browser pages while preserving JSON API errors."""
+    if (
+        exc.status_code == 401
+        and exc.detail in AUTH_REDIRECT_DETAILS
+        and request.url.path.startswith(WEB_AUTH_PATH_PREFIXES)
+    ):
+        return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
 def _render_error_response(request: Request, error: Exception, status_code: int = 500):
@@ -195,7 +215,13 @@ def api_key_allowed_zone_names(db, api_key_id: int) -> List[str]:
 
 def dns_zone_public_dict(z: DnsZoneConfig) -> Dict[str, Any]:
     """Safe to use after the Session closes (plain dict)."""
-    return {"id": z.id, "zone_name": z.zone_name}
+    cfg = decode_zone_config(z)
+    return {
+        "id": z.id,
+        "zone_name": z.zone_name,
+        "dns_provider_type": cfg.get("dns_provider_type", "") or "azure",
+        "dns_server": cfg.get("dns_server", "") or "",
+    }
 
 
 def api_key_public_dict(k: ApiKey) -> Dict[str, Any]:
@@ -256,7 +282,11 @@ def startup_event():
 
 
 @app.get("/", response_class=RedirectResponse)
-def root() -> RedirectResponse:
+def root(request: Request) -> RedirectResponse:
+    try:
+        get_current_user(request)
+    except HTTPException:
+        return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/admin")
 
 
@@ -577,9 +607,61 @@ def create_api_key_route(
     request: Request,
     label: str = Form(...),
     zone_ids: List[int] = Form(default_factory=list),
+    key_id: Optional[int] = Form(None),
     user: str = Depends(get_current_user),
 ):
     try:
+        if key_id is not None:
+            with SessionLocal() as db:
+                row = db.get(ApiKey, key_id)
+                if not row:
+                    return RedirectResponse(url="/api-keys", status_code=HTTP_303_SEE_OTHER)
+                if not zone_ids:
+                    api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda k: k.created_at, reverse=True)
+                    key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
+                    all_zones = list_dns_zones(db)
+                    api_keys_view = [api_key_public_dict(k) for k in api_keys]
+                    all_zones_view = [dns_zone_public_dict(z) for z in all_zones]
+                    return templates.TemplateResponse(
+                        request=request,
+                        name="api_keys.html",
+                        context={
+                            "request": request,
+                            "api_keys": api_keys_view,
+                            "key_zones": key_zones,
+                            "all_zones": all_zones_view,
+                            "message": None,
+                            "edit_key_error_id": key_id,
+                            "edit_key_error": "Select at least one DNS zone.",
+                            "edit_key_label": label,
+                            "edit_key_selected_zone_ids": zone_ids,
+                        },
+                    )
+                row.label = label
+                db.add(row)
+                for link in db.exec(select(ApiKeyAllowedZone).where(ApiKeyAllowedZone.api_key_id == key_id)).all():
+                    db.delete(link)
+                db.commit()
+                for zid in zone_ids:
+                    if db.get(DnsZoneConfig, zid):
+                        db.add(ApiKeyAllowedZone(api_key_id=key_id, dns_zone_config_id=zid))
+                db.commit()
+                api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda k: k.created_at, reverse=True)
+                key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
+                all_zones = list_dns_zones(db)
+                api_keys_view = [api_key_public_dict(k) for k in api_keys]
+                all_zones_view = [dns_zone_public_dict(z) for z in all_zones]
+            return templates.TemplateResponse(
+                request=request,
+                name="api_keys.html",
+                context={
+                    "request": request,
+                    "api_keys": api_keys_view,
+                    "key_zones": key_zones,
+                    "all_zones": all_zones_view,
+                    "message": "API key updated.",
+                },
+            )
         if not zone_ids:
             with SessionLocal() as db:
                 api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda k: k.created_at, reverse=True)
@@ -595,7 +677,9 @@ def create_api_key_route(
                     "api_keys": api_keys_view,
                     "key_zones": key_zones,
                     "all_zones": all_zones_view,
-                    "message": "Select at least one DNS zone for this API key.",
+                    "message": None,
+                    "create_key_error": "Select at least one DNS zone for this API key.",
+                    "create_key_label": label,
                 },
             )
         new_key = generate_api_key()

@@ -7,44 +7,33 @@
 </head>
 <body>
   <div class="page">
-    <header>
-      <h1>DNS Admin Dashboard</h1>
-      <p>Signed in as {{ user }}</p>
-      <a class="button secondary" href="/logout">Logout</a>
+    <header class="page-header">
+      <div>
+        <h1>DNS Admin Dashboard</h1>
+        <p class="help">Signed in as {{ user }}</p>
+      </div>
+      <nav class="nav-links">
+        <a class="button" href="/settings">DNS Zones</a>
+        <a class="button" href="/api-keys">API Keys</a>
+        <a class="button danger" href="/logout">Logout</a>
+      </nav>
     </header>
-
     <nav class="nav-links">
-      <a class="button" href="/settings">DNS zones</a>
-      <a class="button" href="/api-keys">API Keys</a>
+      <a class="button" href="/docs#/">API Docs</a>
     </nav>
-
     <section>
       <h2>DNS zones</h2>
       {% if zones %}
-        <ul>
+        <ul class="summary-list">
           {% for z in zones %}
-            <li><code>{{ z.zone_name }}</code> — <a href="/zones/{{ z.id }}/edit">Edit</a></li>
+            <li>
+              <code>{{ z.zone_name }}</code>
+            </li>
           {% endfor %}
         </ul>
       {% else %}
-        <p>No zones configured. <a href="/zones/new">Add a DNS zone</a>.</p>
+        <p>No zones configured.</p>
       {% endif %}
-    </section>
-
-    <section>
-      <h2>Active API Keys</h2>
-      <ul>
-        {% for key in api_keys %}
-          <li>
-            {{ key.label }} — {{ key.key[:8] }}... — {{ "active" if key.active else "revoked" }}
-            {% if key_zones[key.id] %}
-              — zones: {% for zn in key_zones[key.id] %}<code>{{ zn }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
-            {% endif %}
-          </li>
-        {% else %}
-          <li>No API keys configured yet.</li>
-        {% endfor %}
-      </ul>
     </section>
   </div>
 </body>
