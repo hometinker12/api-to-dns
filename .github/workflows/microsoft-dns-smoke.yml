@@ -383,6 +383,12 @@ jobs:
             }
           }
           Add-LocalGroupMember -Group 'Remote Management Users' -Member $userName -ErrorAction Stop
+          # pywinrm calls the WS-Man Shell URI; its RootSDDL only grants
+          # BUILTIN\Administrators by default. Remote Management Users covers
+          # the PSRemoting endpoint but not the raw Shell endpoint. Add the
+          # ephemeral CI user to Administrators so it can create a shell.
+          # LocalAccountTokenFilterPolicy=1 ensures it gets a full token.
+          Add-LocalGroupMember -Group 'Administrators' -Member $userName -ErrorAction SilentlyContinue
 
           Import-Module DnsServer
           foreach ($z in @('local-smoke.test', 'local-denied.test')) {
@@ -400,7 +406,18 @@ jobs:
           Write-Host "WinRM service status = $((Get-Service WinRM).Status)"
           (Get-LocalGroupMember -Group 'Remote Management Users' -ErrorAction SilentlyContinue) | ForEach-Object { Write-Host "RemoteMgmt member: $($_.Name)" }
           (Get-LocalGroupMember -Group 'DnsAdmins' -ErrorAction SilentlyContinue) | ForEach-Object { Write-Host "DnsAdmins member: $($_.Name)" }
+          (Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue) | ForEach-Object { Write-Host "Administrators member: $($_.Name)" }
           try { Test-WSMan -ComputerName 127.0.0.1 -ErrorAction Stop | Out-Null; Write-Host 'Test-WSMan 127.0.0.1: OK' } catch { Write-Host "Test-WSMan 127.0.0.1 failed: $($_.Exception.Message)" }
+          # Authenticated PSRemoting probe with the same creds pywinrm will use.
+          # If this prints the user, NTLM auth + WinRM shell creation work; any
+          # subsequent failure must be in pywinrm transport or DNS cmdlet rights.
+          try {
+            $probeCred = New-Object System.Management.Automation.PSCredential(("$($env:COMPUTERNAME)\$userName"), $sec)
+            $who = Invoke-Command -ComputerName $env:COMPUTERNAME -Credential $probeCred -Authentication Negotiate -ScriptBlock { whoami } -ErrorAction Stop
+            Write-Host "Invoke-Command (as gh-dns-smoke) whoami: $who"
+          } catch {
+            Write-Host "Invoke-Command (as gh-dns-smoke) failed: $($_.Exception.Message)"
+          }
           # #endregion agent diagnostics
 
           Write-Output "::add-mask::$plain"
