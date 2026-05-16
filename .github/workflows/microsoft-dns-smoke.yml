@@ -30,14 +30,15 @@ jobs:
 
       - name: Generate encryption key for testing
         run: |
-          KEY="$(python3 - <<'PY'
+          KEY="$(python - <<'PY'
           import base64
           import os
 
           print(base64.urlsafe_b64encode(os.urandom(32)).decode())
           PY
           )"
-          sed -i "s|ENCRYPTION_KEY=.*|ENCRYPTION_KEY=${KEY}|" .env
+          sed -i.bak "s|ENCRYPTION_KEY=.*|ENCRYPTION_KEY=${KEY}|" .env
+          rm -f .env.bak
           echo 'Generated encryption key for testing'
 
       - name: Build the Docker image
