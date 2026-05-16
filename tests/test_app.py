@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 from sqlmodel import select
 
 from src.app import app, encode_zone_config_dict, normalize_zone_name
+from src.auth import create_session_cookie
 from src.db import SessionLocal, init_db
 from src.models import ApiKey, ApiKeyAllowedZone, DnsZoneConfig
 
@@ -57,6 +58,107 @@ def client(api_key_value: str) -> TestClient:
     return TestClient(app)
 
 
+def test_root_redirects_to_login_without_session(client: TestClient) -> None:
+    response = client.get("/", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
+
+
+def test_admin_redirects_to_login_without_session(client: TestClient) -> None:
+    response = client.get("/admin", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
+
+
+def test_api_auth_failure_still_returns_json(client: TestClient) -> None:
+    response = client.post(
+        "/dns-record",
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "www",
+            "ttl": 300,
+            "values": ["192.0.2.1"],
+        },
+    )
+    assert response.status_code == 401
+    assert response.json()["detail"] == "API key is required"
+
+
+def test_authenticated_web_pages_render(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        zone = db.exec(select(DnsZoneConfig)).first()
+        api_key = db.exec(select(ApiKey)).first()
+        assert zone is not None
+        assert api_key is not None
+    for path in (
+        "/admin",
+        "/settings",
+        "/api-keys",
+        "/zones/new",
+        f"/zones/{zone.id}/edit",
+        f"/api-keys/{api_key.id}/edit",
+    ):
+        response = client.get(path)
+        assert response.status_code == 200
+
+
+def test_settings_page_displays_zone_provider_metadata(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/settings")
+    assert response.status_code == 200
+    assert "Type" in response.text
+    assert "Target DNS Server" in response.text
+    assert "Azure" in response.text
+    assert "&mdash;" in response.text
+
+
+def test_create_api_key_without_zone_keeps_error_in_popup(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post("/api-keys", data={"label": "missing-zone"})
+    assert response.status_code == 200
+    assert '<dialog id="create-key-dialog"' in response.text
+    assert 'data-auto-open="true"' in response.text
+    assert '<div class="alert error">Select at least one DNS zone for this API key.</div>' in response.text
+    assert 'value="missing-zone"' in response.text
+    assert "createDialog?.showModal();" in response.text
+
+
+def test_edit_api_key_posts_to_api_keys_page(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        api_key = db.exec(select(ApiKey)).first()
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert api_key is not None
+        assert zone is not None
+
+    response = client.post(
+        "/api-keys",
+        data={"key_id": str(api_key.id), "label": "renamed-key", "zone_ids": str(zone.id)},
+    )
+
+    assert response.status_code == 200
+    assert str(response.url).endswith("/api-keys")
+    assert "API key updated." in response.text
+    assert "renamed-key" in response.text
+
+
+def test_edit_api_key_without_zone_keeps_error_in_popup(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        api_key = db.exec(select(ApiKey)).first()
+        assert api_key is not None
+
+    response = client.post("/api-keys", data={"key_id": str(api_key.id), "label": "bad-edit"})
+
+    assert response.status_code == 200
+    assert str(response.url).endswith("/api-keys")
+    assert 'data-auto-open="true"' in response.text
+    assert '<div class="alert error">Select at least one DNS zone.</div>' in response.text
+    assert 'value="bad-edit"' in response.text
+
+
 def test_dns_record_requires_api_key(client: TestClient) -> None:
     response = client.post(
         "/dns-record",
@@ -80,8 +182,6 @@ def test_dns_record_with_mock_client(client: TestClient, api_key_value: str, mon
         "/dns-record",
         headers={"X-API-Key": api_key_value},
         json={
-            "subscription_id": "00000000-0000-0000-0000-000000000001",
-            "resource_group": "rg-test",
             "zone_name": "example.com",
             "record_type": "A",
             "record_name": "www",
@@ -105,8 +205,6 @@ def test_dns_record_delete_with_mock_client(client: TestClient, api_key_value: s
         "/dns-record",
         headers={"X-API-Key": api_key_value},
         json={
-            "subscription_id": "00000000-0000-0000-0000-000000000001",
-            "resource_group": "rg-test",
             "zone_name": "example.com",
             "record_type": "DELETE",
             "record_name": "www",
@@ -131,8 +229,6 @@ def test_dns_record_delete_not_found_returns_404(
         "/dns-record",
         headers={"X-API-Key": api_key_value},
         json={
-            "subscription_id": "00000000-0000-0000-0000-000000000001",
-            "resource_group": "rg-test",
             "zone_name": "example.com",
             "record_type": "DELETE",
             "record_name": "missing",
@@ -156,8 +252,6 @@ def test_dns_record_provider_runtime_error_returns_502(
         "/dns-record",
         headers={"X-API-Key": api_key_value},
         json={
-            "subscription_id": "00000000-0000-0000-0000-000000000001",
-            "resource_group": "rg-test",
             "zone_name": "example.com",
             "record_type": "A",
             "record_name": "www",
@@ -169,6 +263,13 @@ def test_dns_record_provider_runtime_error_returns_502(
     detail = response.json()["detail"]
     assert detail["error"] == "dns_provider_failed"
     assert "WinRM" in detail["message"]
+
+
+def test_dns_record_schema_excludes_azure_zone_settings(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    request_schema = schema["components"]["schemas"]["DnsRecordRequest"]
+    assert "subscription_id" not in request_schema["properties"]
+    assert "resource_group" not in request_schema["properties"]
 
 
 def test_dns_record_access_denied_unknown_zone(client: TestClient, api_key_value: str) -> None:

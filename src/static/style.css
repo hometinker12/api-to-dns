@@ -3,11 +3,16 @@
   background: #f3f6fb;
   color: #1f2937;
 }
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
 body {
   margin: 0;
 }
 .page {
-  max-width: 900px;
+  width: min(900px, calc(100% - 32px));
   margin: 32px auto;
   padding: 24px;
   background: white;
@@ -20,23 +25,110 @@ header {
   align-items: center;
   gap: 16px;
 }
-.nav-links {
+.nav-links,
+.actions {
   margin: 20px 0;
   display: flex;
   gap: 12px;
 }
+.nav-links {
+  flex-wrap: nowrap;
+}
+.actions {
+  flex-wrap: wrap;
+}
+.button,
 button,
 input[type="submit"] {
-  padding: 0.85rem 1.3rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.68rem 1.04rem;
   border: 0;
   border-radius: 8px;
   background: #2563eb;
   color: white;
   cursor: pointer;
+  font: inherit;
+  font-size: 0.8em;
+  text-decoration: none;
+  line-height: 1.1;
+  min-height: 35px;
+  white-space: nowrap;
+}
+.button:hover,
+button:hover,
+input[type="submit"]:hover {
+  background: #1d4ed8;
 }
 button.secondary,
 .button.secondary {
   background: #64748b;
+  color: white;
+}
+button.secondary:hover,
+.button.secondary:hover {
+  background: #475569;
+}
+button.danger,
+.button.danger {
+  background: #fee2e2;
+  color: #991b1b;
+}
+button.danger:hover,
+.button.danger:hover {
+  background: #fecaca;
+}
+button:disabled,
+input[type="submit"]:disabled {
+  background: #cbd5e1;
+  color: #64748b;
+  cursor: not-allowed;
+}
+.header-stack {
+  align-items: flex-start;
+  flex-direction: column;
+}
+.page-header {
+  align-items: flex-start;
+}
+.page-header h1,
+.header-stack h1 {
+  margin-bottom: 0;
+}
+.section-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 1.5rem;
+}
+.section-title-row h2 {
+  margin: 0;
+}
+.summary-list {
+  list-style: none;
+  padding: 0;
+}
+.summary-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 0;
+  border-bottom: 1px solid #e2e8f0;
+}
+.action-cell {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+.actions-column {
+  text-align: right;
+}
+.action-cell form {
+  margin: 0;
 }
 label {
   display: block;
@@ -44,12 +136,17 @@ label {
 }
 input[type="text"],
 input[type="password"],
+input[type="url"],
+input[type="email"],
+textarea,
 select {
   width: 100%;
+  box-sizing: border-box;
   margin-top: 0.4rem;
   padding: 0.75rem 0.9rem;
   border-radius: 8px;
   border: 1px solid #cbd5e1;
+  background: white;
 }
 input[type="checkbox"] {
   margin-right: 0.5rem;
@@ -91,6 +188,27 @@ label.inline-check input {
   width: auto;
   margin-top: 0;
 }
+.form-card,
+.provider-panel {
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 1rem 1.25rem;
+  margin: 1rem 0;
+  background: #f8fafc;
+}
+.provider-panel[hidden] {
+  display: none;
+}
+.provider-panel h2,
+.form-card h2 {
+  margin-top: 0;
+}
+.table-wrap {
+  overflow-x: auto;
+}
+.table-wrap table {
+  min-width: 640px;
+}
 table {
   width: 100%;
   border-collapse: collapse;
@@ -109,4 +227,64 @@ td, th {
 }
 .alert.success {
   background: #d1fae5;
+}
+.alert.error {
+  background: #fee2e2;
+  color: #991b1b;
+}
+dialog {
+  width: min(640px, calc(100% - 2rem));
+  max-height: calc(100vh - 4rem);
+  border: 0;
+  border-radius: 16px;
+  padding: 0;
+  overflow: hidden;
+  box-sizing: border-box;
+  box-shadow: 0 20px 60px rgba(15, 23, 42, 0.24);
+}
+dialog::backdrop {
+  background: rgba(15, 23, 42, 0.62);
+}
+.dialog-content {
+  padding: 1.5rem;
+  overflow-x: hidden;
+  overflow-y: auto;
+  max-height: calc(100vh - 4rem);
+  box-sizing: border-box;
+}
+.dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+.dialog-header h2 {
+  margin: 0;
+}
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+@media (max-width: 640px) {
+  header,
+  .page-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .section-title-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .summary-list li {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .button,
+  button,
+  input[type="submit"] {
+    width: 100%;
+  }
 }

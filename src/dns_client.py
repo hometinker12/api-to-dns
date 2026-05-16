@@ -80,11 +80,17 @@ class AzureDnsClient:
         tenant_id: str,
         client_id: str,
         client_secret: str,
+        subscription_id: str,
+        resource_group: str,
     ):
         if not tenant_id or not client_id or not client_secret:
             raise ValueError(
                 "Azure DNS requires tenant id, client id, and client secret in application settings."
             )
+        if not subscription_id:
+            raise ValueError("Azure DNS requires subscription id in zone settings.")
+        if not resource_group:
+            raise ValueError("Azure DNS requires resource group in zone settings.")
         try:
             from azure.identity import ClientSecretCredential
             from azure.mgmt.dns import DnsManagementClient
@@ -100,6 +106,8 @@ class AzureDnsClient:
         self.DnsManagementClient = DnsManagementClient
         self.RecordSet = RecordSet
         self.ResourceNotFoundError = ResourceNotFoundError
+        self.subscription_id = subscription_id
+        self.resource_group = resource_group
 
     def create_or_update_record(
         self,
@@ -108,17 +116,12 @@ class AzureDnsClient:
         dns_zone: Optional[str] = None,
     ) -> bool:
         if dns_server:
-            raise ValueError("Azure DNS ignores per-server host settings; use zone and Azure fields on the request.")
+            raise ValueError("Azure DNS ignores per-server host settings; use Azure fields on the zone configuration.")
 
-        subscription_id = payload.subscription_id
-        if not subscription_id:
-            raise ValueError("subscription_id is required for Azure DNS (set a default in settings or send it in the API payload).")
-        if not payload.resource_group:
-            raise ValueError("resource_group is required for Azure DNS.")
         if not payload.zone_name:
             raise ValueError("zone_name is required for Azure DNS.")
 
-        client = self.DnsManagementClient(self.credential, subscription_id)
+        client = self.DnsManagementClient(self.credential, self.subscription_id)
         record_set_name = payload.record_name.strip(".") or "@"
         record_type = payload.record_type.upper()
 
@@ -126,7 +129,7 @@ class AzureDnsClient:
             inner = payload.values[0].strip().upper()
             existing = self._get_existing_record_set(
                 client,
-                payload.resource_group,
+                self.resource_group,
                 payload.zone_name,
                 record_set_name,
                 inner,
@@ -135,7 +138,7 @@ class AzureDnsClient:
                 return False
             try:
                 client.record_sets.delete(
-                    payload.resource_group,
+                    self.resource_group,
                     payload.zone_name,
                     record_set_name,
                     inner,
@@ -146,7 +149,7 @@ class AzureDnsClient:
 
         existing = self._get_existing_record_set(
             client,
-            payload.resource_group,
+            self.resource_group,
             payload.zone_name,
             record_set_name,
             record_type,
@@ -154,7 +157,7 @@ class AzureDnsClient:
         record_set = self._build_record_set(record_type, payload.values, payload.ttl or 300)
 
         client.record_sets.create_or_update(
-            payload.resource_group,
+            self.resource_group,
             payload.zone_name,
             record_set_name,
             record_type,
@@ -473,6 +476,8 @@ def create_dns_client(settings: Dict[str, Optional[str]]) -> Any:
             tenant_id=settings.get("azure_tenant_id") or "",
             client_id=settings.get("azure_client_id") or "",
             client_secret=settings.get("azure_client_secret") or "",
+            subscription_id=settings.get("azure_subscription_id") or "",
+            resource_group=settings.get("azure_resource_group") or "",
         )
     if provider == "bind":
         return BindTsigDnsClient(

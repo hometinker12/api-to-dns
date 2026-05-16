@@ -92,15 +92,13 @@ All examples use `POST http://localhost:8000/dns-record` with `Content-Type: app
 
 ### Azure DNS: create a new A record
 
-If you saved default **subscription** and **resource group** on that zone’s configuration, you can omit them from the JSON.
+Save the Azure **subscription ID** and **resource group** on the zone configuration. Requests only include the DNS operation fields.
 
 ```bash
 curl -sS -X POST "http://localhost:8000/dns-record" \
   -H "Content-Type: application/json" \
   -H "X-API-Key: YOUR_API_KEY" \
   -d '{
-    "subscription_id": "11111111-1111-1111-1111-111111111111",
-    "resource_group": "my-dns-rg",
     "zone_name": "example.com",
     "record_type": "A",
     "record_name": "www",
@@ -118,8 +116,6 @@ curl -sS -X POST "http://localhost:8000/dns-record" \
   -H "Content-Type: application/json" \
   -H "X-API-Key: YOUR_API_KEY" \
   -d '{
-    "subscription_id": "11111111-1111-1111-1111-111111111111",
-    "resource_group": "my-dns-rg",
     "zone_name": "example.com",
     "record_type": "A",
     "record_name": "www",
@@ -216,15 +212,13 @@ curl -sS -X POST "http://localhost:8000/dns-record" \
   }'
 ```
 
-**Azure DNS** — include **`subscription_id`** and **`resource_group`** unless both are saved on that zone’s configuration.
+**Azure DNS** — use the same request shape. The Azure subscription ID and resource group come from the saved zone configuration.
 
 ```bash
 curl -sS -X POST "http://localhost:8000/dns-record" \
   -H "Content-Type: application/json" \
   -H "X-API-Key: YOUR_API_KEY" \
   -d '{
-    "subscription_id": "11111111-1111-1111-1111-111111111111",
-    "resource_group": "my-dns-rg",
     "zone_name": "example.com",
     "record_type": "DELETE",
     "record_name": "www",

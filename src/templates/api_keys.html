@@ -11,7 +11,8 @@
       <h1>API Keys</h1>
       <nav class="nav-links">
         <a class="button" href="/admin">Dashboard</a>
-        <a class="button" href="/settings">DNS zones</a>
+        <a class="button" href="/settings">DNS Zones</a>
+        <a class="button danger" href="/logout">Logout</a>
       </nav>
     </header>
 
@@ -19,64 +20,153 @@
       <div class="alert success">{{ message }}</div>
     {% endif %}
 
-    <form action="/api-keys" method="post">
-      <label>Label
-        <input type="text" name="label" required placeholder="Example key" />
-      </label>
-      <fieldset>
-        <legend>Allowed DNS zones</legend>
-        <p class="help">The key may only call <code>/dns-record</code> for zones you select here.</p>
-        {% if all_zones %}
-          {% for z in all_zones %}
-            <label class="inline-check">
-              <input type="checkbox" name="zone_ids" value="{{ z.id }}" />
-              <code>{{ z.zone_name }}</code>
-            </label>
-          {% endfor %}
-        {% else %}
-          <p>No zones configured. <a href="/zones/new">Add a DNS zone</a> first.</p>
-        {% endif %}
-      </fieldset>
-      <button type="submit" {% if not all_zones %}disabled{% endif %}>Create API Key</button>
-    </form>
-
     <section>
-      <h2>Existing API keys</h2>
-      <table>
-        <thead>
-          <tr><th>Label</th><th>Key</th><th>Allowed zones</th><th>Status</th><th>Actions</th></tr>
-        </thead>
-        <tbody>
-          {% for key in api_keys %}
-            <tr>
-              <td>{{ key.label }}</td>
-              <td>{{ key.key[:12] }}...</td>
-              <td>
-                {% if key_zones[key.id] %}
-                  {% for zn in key_zones[key.id] %}<code>{{ zn }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
-                {% else %}
-                  <em>none</em>
-                {% endif %}
-              </td>
-              <td>{{ "active" if key.active else "revoked" }}</td>
-              <td>
-                {% if key.active %}
-                  <a class="button secondary" href="/api-keys/{{ key.id }}/edit">Edit</a>
-                  <form action="/api-keys/revoke" method="post" style="display:inline">
-                    <input type="hidden" name="key_id" value="{{ key.id }}" />
-                    <button type="submit">Revoke</button>
-                  </form>
-                {% else %}
-                  <span>revoked</span>
-                {% endif %}
-              </td>
-            </tr>
-          {% else %}
-            <tr><td colspan="5">No API keys available</td></tr>
-          {% endfor %}
-        </tbody>
-      </table>
+      <div class="section-title-row">
+        <h2>Existing API keys</h2>
+        <button type="button" id="open-create-key" {% if not all_zones %}disabled{% endif %}>Create API Key</button>
+      </div>
+      {% if not all_zones %}
+        <p class="help">No zones configured. Add a DNS zone first.</p>
+      {% endif %}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Label</th><th>Key</th><th>Allowed zones</th><th>Status</th><th class="actions-column">Actions</th></tr>
+          </thead>
+          <tbody>
+            {% for key in api_keys %}
+              <tr>
+                <td>{{ key.label }}</td>
+                <td>{{ key.key[:12] }}...</td>
+                <td>
+                  {% if key_zones[key.id] %}
+                    {% for zn in key_zones[key.id] %}<code>{{ zn }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+                  {% else %}
+                    <em>none</em>
+                  {% endif %}
+                </td>
+                <td>{{ "active" if key.active else "revoked" }}</td>
+                <td class="actions-column">
+                  {% if key.active %}
+                    <div class="action-cell">
+                      <button type="button" data-open-edit-key="{{ key.id }}">Edit</button>
+                      <form action="/api-keys/revoke" method="post" onsubmit="return confirm('Revoke this API key? Existing clients using it will lose access.');">
+                        <input type="hidden" name="key_id" value="{{ key.id }}" />
+                        <button type="submit" class="danger">Revoke</button>
+                      </form>
+                    </div>
+                  {% else %}
+                    <span>revoked</span>
+                  {% endif %}
+                </td>
+              </tr>
+            {% else %}
+              <tr><td colspan="5">No API keys available</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
     </section>
+
+    <dialog id="create-key-dialog" data-auto-open="{% if create_key_error %}true{% else %}false{% endif %}">
+      <div class="dialog-content">
+        <div class="dialog-header">
+          <h2>Create API Key</h2>
+          <button type="button" class="danger" id="close-create-key">Close</button>
+        </div>
+        {% if create_key_error %}
+          <div class="alert error">{{ create_key_error }}</div>
+        {% endif %}
+        <form action="/api-keys" method="post">
+          <label>Label
+            <input type="text" name="label" required placeholder="Example key" value="{{ create_key_label or '' }}" />
+          </label>
+          <fieldset>
+            <legend>Allowed DNS zones</legend>
+            <p class="help">The key may only call <code>/dns-record</code> for zones you select here.</p>
+            {% for z in all_zones %}
+              <label class="inline-check">
+                <input type="checkbox" name="zone_ids" value="{{ z.id }}" />
+                <code>{{ z.zone_name }}</code>
+              </label>
+            {% endfor %}
+          </fieldset>
+          <div class="dialog-actions">
+            <button type="button" class="secondary" id="cancel-create-key">Cancel</button>
+            <button type="submit">Create API Key</button>
+          </div>
+        </form>
+      </div>
+    </dialog>
+
+    {% for key in api_keys %}
+      {% if key.active %}
+        <dialog id="edit-key-dialog-{{ key.id }}" data-auto-open="{% if edit_key_error_id == key.id %}true{% else %}false{% endif %}">
+          <div class="dialog-content">
+            <div class="dialog-header">
+              <h2>Edit API Key</h2>
+              <button type="button" class="danger" data-close-edit-key="{{ key.id }}">Close</button>
+            </div>
+            {% if edit_key_error_id == key.id and edit_key_error %}
+              <div class="alert error">{{ edit_key_error }}</div>
+            {% endif %}
+            <p class="help">Key prefix: <code>{{ key.key[:12] }}...</code></p>
+            <form action="/api-keys" method="post">
+              <input type="hidden" name="key_id" value="{{ key.id }}" />
+              <label>Label
+                <input type="text" name="label" required value="{% if edit_key_error_id == key.id %}{{ edit_key_label }}{% else %}{{ key.label }}{% endif %}" />
+              </label>
+              <fieldset>
+                <legend>Allowed DNS zones</legend>
+                <p class="help">The key may only call <code>/dns-record</code> for zones you select here.</p>
+                {% for z in all_zones %}
+                  <label class="inline-check">
+                    <input type="checkbox" name="zone_ids" value="{{ z.id }}" {% if edit_key_error_id == key.id %}{% if z.id in edit_key_selected_zone_ids %}checked{% endif %}{% elif z.zone_name in key_zones[key.id] %}checked{% endif %} />
+                    <code>{{ z.zone_name }}</code>
+                  </label>
+                {% endfor %}
+              </fieldset>
+              <div class="dialog-actions">
+                <button type="button" class="secondary" data-close-edit-key="{{ key.id }}">Cancel</button>
+                <button type="submit" {% if not all_zones %}disabled{% endif %}>Save API Key</button>
+              </div>
+            </form>
+          </div>
+        </dialog>
+      {% endif %}
+    {% endfor %}
+
+    <script>
+      const createDialog = document.getElementById("create-key-dialog");
+      const openCreateKey = document.getElementById("open-create-key");
+      const closeCreateKey = document.getElementById("close-create-key");
+      const cancelCreateKey = document.getElementById("cancel-create-key");
+
+      openCreateKey?.addEventListener("click", () => createDialog?.showModal());
+      closeCreateKey?.addEventListener("click", () => createDialog?.close());
+      cancelCreateKey?.addEventListener("click", () => createDialog?.close());
+      if (createDialog?.dataset.autoOpen === "true") {
+        createDialog?.showModal();
+      }
+
+      document.querySelectorAll("[data-open-edit-key]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const dialog = document.getElementById(`edit-key-dialog-${button.dataset.openEditKey}`);
+          dialog?.showModal();
+        });
+      });
+      document.querySelectorAll("[data-close-edit-key]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const dialog = document.getElementById(`edit-key-dialog-${button.dataset.closeEditKey}`);
+          dialog?.close();
+        });
+      });
+      document.querySelectorAll("dialog[data-auto-open='true']").forEach((dialog) => {
+        if (!dialog.open) {
+          dialog.showModal();
+        }
+      });
+    </script>
   </div>
 </body>
 </html>
