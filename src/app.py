@@ -853,27 +853,20 @@ def upsert_dns_record(
         settings = decode_zone_config(zone_row)
         provider = (settings.get("dns_provider_type") or "azure").strip().lower()
         if provider == "azure":
-            updates: Dict[str, Any] = {}
-            if not payload.subscription_id and settings.get("azure_subscription_id"):
-                updates["subscription_id"] = settings["azure_subscription_id"]
-            if not payload.resource_group and settings.get("azure_resource_group"):
-                updates["resource_group"] = settings["azure_resource_group"]
-            if updates:
-                payload = payload.model_copy(update=updates)
-            if not payload.subscription_id:
+            if not settings.get("azure_subscription_id"):
                 raise HTTPException(
                     status_code=400,
                     detail={
                         "error": "invalid_request",
-                        "message": "subscription_id is required for Azure DNS (save a default on the zone or include it in the request).",
+                        "message": "Azure subscription ID is required on the zone configuration.",
                     },
                 )
-            if not payload.resource_group:
+            if not settings.get("azure_resource_group"):
                 raise HTTPException(
                     status_code=400,
                     detail={
                         "error": "invalid_request",
-                        "message": "resource_group is required for Azure DNS (save a default on the zone or include it in the request).",
+                        "message": "Azure resource group is required on the zone configuration.",
                     },
                 )
 

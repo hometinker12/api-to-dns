@@ -182,8 +182,6 @@ def test_dns_record_with_mock_client(client: TestClient, api_key_value: str, mon
         "/dns-record",
         headers={"X-API-Key": api_key_value},
         json={
-            "subscription_id": "00000000-0000-0000-0000-000000000001",
-            "resource_group": "rg-test",
             "zone_name": "example.com",
             "record_type": "A",
             "record_name": "www",
@@ -207,8 +205,6 @@ def test_dns_record_delete_with_mock_client(client: TestClient, api_key_value: s
         "/dns-record",
         headers={"X-API-Key": api_key_value},
         json={
-            "subscription_id": "00000000-0000-0000-0000-000000000001",
-            "resource_group": "rg-test",
             "zone_name": "example.com",
             "record_type": "DELETE",
             "record_name": "www",
@@ -233,8 +229,6 @@ def test_dns_record_delete_not_found_returns_404(
         "/dns-record",
         headers={"X-API-Key": api_key_value},
         json={
-            "subscription_id": "00000000-0000-0000-0000-000000000001",
-            "resource_group": "rg-test",
             "zone_name": "example.com",
             "record_type": "DELETE",
             "record_name": "missing",
@@ -258,8 +252,6 @@ def test_dns_record_provider_runtime_error_returns_502(
         "/dns-record",
         headers={"X-API-Key": api_key_value},
         json={
-            "subscription_id": "00000000-0000-0000-0000-000000000001",
-            "resource_group": "rg-test",
             "zone_name": "example.com",
             "record_type": "A",
             "record_name": "www",
@@ -271,6 +263,13 @@ def test_dns_record_provider_runtime_error_returns_502(
     detail = response.json()["detail"]
     assert detail["error"] == "dns_provider_failed"
     assert "WinRM" in detail["message"]
+
+
+def test_dns_record_schema_excludes_azure_zone_settings(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    request_schema = schema["components"]["schemas"]["DnsRecordRequest"]
+    assert "subscription_id" not in request_schema["properties"]
+    assert "resource_group" not in request_schema["properties"]
 
 
 def test_dns_record_access_denied_unknown_zone(client: TestClient, api_key_value: str) -> None:
