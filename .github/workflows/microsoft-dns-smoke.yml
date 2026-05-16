@@ -1,76 +1,34 @@
-# Manual Microsoft DNS (WinRM) smoke for branch `develop`.
+# Smoke tests: push to **release** (no inputs; remote lab zones are fixed below).
+# - **bind-smoke-linux**: checkout on ubuntu, `docker build`, BIND + API in Docker (bash), same idea as release CI.
+# - **microsoft-dns-smoke-windows**: install DNS Server on windows-2025, run the API natively with Python/uvicorn,
+#   then inline PowerShell (Invoke-WebRequest / Invoke-RestMethod) exercises local + optional remote Microsoft DNS.
 #
-# Target (recommended): Ubuntu runner + Docker API container + WinRM/pywinrm to a lab
-# Windows Server with Microsoft DNS — same model as production. Do not install the DNS
-# Server role on GitHub-hosted runners for this workflow.
+# Why not `docker build` on the Windows runner: the official Python image **does** publish `linux/amd64`, but a Windows
+# daemon without a working Linux backend often fails with **"no matching manifest for linux/amd64"** on pull. WSL2 may
+# be present on the image without a usable default distro / Linux Docker context. Running the API natively on Windows
+# avoids Linux Docker/WSL for the Microsoft DNS smoke; BIND parity remains covered on Ubuntu.
 #
-# Image handoff: single `ubuntu-latest` job rebuilds the image in-place (no registry).
-#
-# Repository secrets (Settings → Secrets and variables → Actions):
-#   MICROSOFT_DNS_WINRM_HOST   — WinRM endpoint (hostname or IP; often same as DnsServer -ComputerName)
-#   MICROSOFT_DNS_WINRM_USER   — Domain account with rights to modify the test zones
-#   MICROSOFT_DNS_WINRM_PASSWORD
-# Optional:
-#   MICROSOFT_DNS_WINRM_SSL    — Set to `true` to use HTTPS WinRM (port 5986)
-#
-# Optional DNS verification from the Linux job (UDP/TCP 53 must be reachable from GitHub):
-#   MICROSOFT_DNS_QUERY_HOST   — e.g. lab DNS IP; enables `dig @host` after API mutations
-#
-# Prerequisites on the lab server: two existing primary zones matching workflow inputs
-# `allowed_zone` and `denied_zone` (the API adds/removes records; it does not create zones).
-#
-# Run: Actions → "Microsoft DNS manual smoke (develop)" → Run workflow → select branch `develop`.
+# Optional remote lab secrets: MICROSOFT_DNS_WINRM_HOST, USER, PASSWORD, SSL, QUERY_HOST
 
-name: Microsoft DNS manual smoke (develop)
+name: Docker image + Bind + Microsoft DNS smoke test ( release)
 
 on:
-  workflow_dispatch:
-    inputs:
-      allowed_zone:
-        description: "Existing Microsoft DNS primary zone FQDN for create/update/delete tests"
-        required: true
-        default: "smoke.ms.lab"
-      denied_zone:
-        description: "Second primary zone FQDN for the API-key denied-zone test"
-        required: true
-        default: "denied.ms.lab"
-      dns_query_server:
-        description: "Optional dig -@ server (IP or hostname). Leave empty to skip dig checks."
-        required: false
-        default: ""
-      run_windows_resolver_check:
-        description: "After the Linux smoke job, run Resolve-DnsName SOA on windows-2025 (optional connectivity check)"
-        type: boolean
-        default: false
+  push:
+    branches:
+      - release
 
 jobs:
-  microsoft-dns-smoke:
+  bind-smoke-linux:
+    name: BIND and Docker image smoke (ubuntu + Docker)
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/develop'
-    outputs:
-      smoke_executed: ${{ steps.finish.outputs.executed }}
-
+    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/release'
     steps:
-      - uses: actions/checkout@v4
-
-      - id: gate
-        name: Gate (secrets + branch)
-        env:
-          WINRM_HOST: ${{ secrets.MICROSOFT_DNS_WINRM_HOST }}
-        run: |
-          if [ -z "${WINRM_HOST}" ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::MICROSOFT_DNS_WINRM_HOST is not set — skipping Microsoft DNS smoke (set repo secrets to enable)."
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
+      - uses: actions/checkout@v6
 
       - name: Copy env example for testing
-        if: steps.gate.outputs.skip == 'false'
         run: cp .env.example .env
 
       - name: Generate encryption key for testing
-        if: steps.gate.outputs.skip == 'false'
         run: |
           KEY="$(python3 - <<'PY'
           import base64
@@ -83,56 +41,147 @@ jobs:
           echo 'Generated encryption key for testing'
 
       - name: Build the Docker image
-        if: steps.gate.outputs.skip == 'false'
         run: |
-          IMAGE_TAG="api-to-dns-microsoft-smoke:$(date +%s)"
+          IMAGE_TAG="api-to-dns-bind-smoke:$(date +%s)"
           docker build . --file Dockerfile --tag "$IMAGE_TAG"
-          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
 
-      - name: Run Microsoft DNS smoke (API + WinRM)
-        id: smoke
-        if: steps.gate.outputs.skip == 'false'
+      - name: Run BIND-backed smoke test
         env:
-          WINRM_HOST: ${{ secrets.MICROSOFT_DNS_WINRM_HOST }}
-          WINRM_USER: ${{ secrets.MICROSOFT_DNS_WINRM_USER }}
-          WINRM_PASSWORD: ${{ secrets.MICROSOFT_DNS_WINRM_PASSWORD }}
-          WINRM_SSL: ${{ secrets.MICROSOFT_DNS_WINRM_SSL }}
-          QUERY_HOST: ${{ secrets.MICROSOFT_DNS_QUERY_HOST }}
-          ALLOWED_ZONE: ${{ github.event.inputs.allowed_zone }}
-          DENIED_ZONE: ${{ github.event.inputs.denied_zone }}
-          INPUT_QUERY_SERVER: ${{ github.event.inputs.dns_query_server }}
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
         run: |
           set -euo pipefail
 
+          NETWORK_NAME="dns-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          BIND_DIR="${RUNNER_TEMP}/bind-smoke"
+          TSIG_NAME="api-to-dns."
+          TSIG_SECRET="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+
           cleanup() {
-            echo "Collecting API container logs..."
+            echo "Collecting container logs..."
             docker logs dns-api-test 2>/dev/null || true
-            docker rm -f dns-api-test 2>/dev/null || true
+            docker logs bind-test 2>/dev/null || true
+            docker rm -f dns-api-test bind-test 2>/dev/null || true
+            docker network rm "${NETWORK_NAME}" 2>/dev/null || true
           }
           trap cleanup EXIT
 
-          CURL_SSL_FLAG=()
-          if [ "${WINRM_SSL:-}" = "true" ] || [ "${WINRM_SSL:-}" = "True" ] || [ "${WINRM_SSL:-}" = "1" ]; then
-            CURL_SSL_FLAG=(--data-urlencode "dns_winrm_ssl=true")
+          mkdir -p "${BIND_DIR}"
+          python3 - "${BIND_DIR}" "${TSIG_NAME}" "${TSIG_SECRET}" <<'PY'
+          import sys
+          from pathlib import Path
+
+          bind_dir = Path(sys.argv[1])
+          tsig_name = sys.argv[2]
+          tsig_secret = sys.argv[3]
+
+          named_conf = (
+              'key "' + tsig_name + '" {\n'
+              "  algorithm hmac-sha256;\n"
+              '  secret "' + tsig_secret + '";\n'
+              "};\n"
+              "\n"
+              "options {\n"
+              '  directory "/bind";\n'
+              "  listen-on port 53 { any; };\n"
+              "  listen-on-v6 { none; };\n"
+              "  allow-query { any; };\n"
+              "  recursion no;\n"
+              "  dnssec-validation no;\n"
+              "};\n"
+              "\n"
+              'zone "smoke.test" {\n'
+              "  type master;\n"
+              '  file "/bind/db.smoke.test";\n'
+              '  allow-update { key "' + tsig_name + '"; };\n'
+              "};\n"
+              "\n"
+              'zone "denied.test" {\n'
+              "  type master;\n"
+              '  file "/bind/db.denied.test";\n'
+              '  allow-update { key "' + tsig_name + '"; };\n'
+              "};\n"
+          )
+
+          zone_smoke = """$TTL 300
+          @ IN SOA ns.smoke.test. hostmaster.smoke.test. (
+            1 ; serial
+            300 ; refresh
+            300 ; retry
+            300 ; expire
+            300 ; minimum
+          )
+          @ IN NS ns.smoke.test.
+          ns IN A 127.0.0.1
+          """
+
+          zone_denied = """$TTL 300
+          @ IN SOA ns.denied.test. hostmaster.denied.test. (
+            1 ; serial
+            300 ; refresh
+            300 ; retry
+            300 ; expire
+            300 ; minimum
+          )
+          @ IN NS ns.denied.test.
+          ns IN A 127.0.0.1
+          """
+
+          def _unindent(s: str) -> str:
+              return "\n".join(line.lstrip() for line in s.splitlines()).strip() + "\n"
+
+          (bind_dir / "named.conf").write_text(_unindent(named_conf), newline="\n")
+          (bind_dir / "db.smoke.test").write_text(_unindent(zone_smoke), newline="\n")
+          (bind_dir / "db.denied.test").write_text(_unindent(zone_denied), newline="\n")
+          PY
+
+          chmod -R a+rwX "${BIND_DIR}"
+          docker network create "${NETWORK_NAME}"
+
+          docker run -d --name bind-test --network "${NETWORK_NAME}" \
+            -e BIND9_USER=root \
+            -v "${BIND_DIR}:/bind:rw" \
+            ubuntu/bind9:9.18-22.04_edge \
+            -c /bind/named.conf
+
+          for i in $(seq 1 60); do
+            if docker exec bind-test ss -lun 2>/dev/null | grep -q ':53'; then
+              break
+            fi
+            if [ -z "$(docker ps -q -f name=bind-test -f status=running)" ]; then
+              echo "BIND container exited before becoming ready"
+              docker logs bind-test 2>&1 | tail -n 200 || true
+              exit 1
+            fi
+            sleep 2
+          done
+          if ! docker exec bind-test ss -lun 2>/dev/null | grep -q ':53'; then
+            echo "BIND did not open port 53 in time"
+            docker logs bind-test 2>&1 | tail -n 200 || true
+            exit 1
           fi
 
-          DIG_SERVER="${INPUT_QUERY_SERVER:-}"
-          if [ -z "${DIG_SERVER}" ]; then
-            DIG_SERVER="${QUERY_HOST:-}"
+          docker exec bind-test bash -lc 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && apt-get install -qq -y dnsutils'
+
+          for i in $(seq 1 30); do
+            if docker exec bind-test dig @127.0.0.1 smoke.test SOA +short >/tmp/bind-soa.txt 2>/dev/null && [ -s /tmp/bind-soa.txt ]; then
+              break
+            fi
+            if [ -z "$(docker ps -q -f name=bind-test -f status=running)" ]; then
+              echo "BIND container exited during dnsutils install or query wait"
+              docker logs bind-test 2>&1 | tail -n 200 || true
+              exit 1
+            fi
+            sleep 2
+          done
+          if [ ! -s /tmp/bind-soa.txt ]; then
+            echo "dig did not return SOA for smoke.test"
+            docker logs bind-test 2>&1 | tail -n 200 || true
+            exit 1
           fi
 
-          if [ -n "${DIG_SERVER}" ]; then
-            echo "Installing dnsutils for dig-based verification against ${DIG_SERVER}..."
-            sudo apt-get update -qq
-            sudo apt-get install -qq -y dnsutils
-          else
-            echo "No MICROSOFT_DNS_QUERY_HOST or workflow dns_query_server — skipping dig verification (WinRM/API assertions only)."
-          fi
+          docker run -d --name dns-api-test --network "${NETWORK_NAME}" --env-file .env -p 8000:8000 "$IMAGE_TAG"
 
-          echo "Starting API container..."
-          docker run -d --name dns-api-test --env-file .env -p 8000:8000 "${IMAGE_TAG}"
-
-          echo "Waiting for API login page..."
           for i in $(seq 1 60); do
             if curl --fail --silent --max-time 5 http://localhost:8000/login >/dev/null; then
               break
@@ -148,60 +197,50 @@ jobs:
             -H "Content-Type: application/x-www-form-urlencoded" \
             -d "username=admin&password=your-admin-password" \
             -o /dev/null
-          curl --fail --silent -b /tmp/cookies http://localhost:8000/admin \
-            | python3 -c "import sys; assert 'DNS Admin Dashboard' in sys.stdin.read()"
+          curl --fail --silent -b /tmp/cookies http://localhost:8000/admin | python3 -c "import sys; assert 'DNS Admin Dashboard' in sys.stdin.read()"
 
-          echo "Configuring Microsoft DNS zones in the app..."
-          for zone in "${ALLOWED_ZONE}" "${DENIED_ZONE}"; do
+          for zone in smoke.test denied.test; do
             curl --fail --silent -b /tmp/cookies -X POST http://localhost:8000/zones \
               -H "Content-Type: application/x-www-form-urlencoded" \
               --data-urlencode "zone_name=${zone}" \
-              --data-urlencode "dns_provider_type=microsoft" \
-              --data-urlencode "dns_server=${WINRM_HOST}" \
-              --data-urlencode "dns_username=${WINRM_USER}" \
-              --data-urlencode "dns_password=${WINRM_PASSWORD}" \
-              "${CURL_SSL_FLAG[@]}" \
+              --data-urlencode "dns_provider_type=bind" \
+              --data-urlencode "dns_server=bind-test" \
+              --data-urlencode "dns_username=${TSIG_NAME}" \
+              --data-urlencode "dns_password=${TSIG_SECRET}" \
+              --data-urlencode "dns_tsig_algorithm=hmac-sha256" \
               -o /dev/null
           done
 
           curl --fail --silent -b /tmp/cookies http://localhost:8000/api-keys -o /tmp/api-keys.html
-          SMOKE_ZONE_ID="$(ALLOWED_ZONE="${ALLOWED_ZONE}" python3 - <<'PY'
-          import os
+          SMOKE_ZONE_ID="$(python3 - <<'PY'
           import re
 
-          html = open("/tmp/api-keys.html", encoding="utf-8").read()
-          zone = os.environ["ALLOWED_ZONE"]
-          escaped = re.escape(zone)
-          match = re.search(
-              r'name="zone_ids" value="(\d+)"\s*/>\s*<code>' + escaped + r"</code>",
-              html,
-              re.DOTALL,
-          )
+          html = open('/tmp/api-keys.html', encoding='utf-8').read()
+          match = re.search(r'name="zone_ids" value="(\d+)"\s*/>\s*<code>smoke\.test</code>', html, re.DOTALL)
           if not match:
-              raise SystemExit(f"Could not find zone ID for {zone!r}")
+              raise SystemExit("Could not find smoke.test zone ID")
           print(match.group(1))
           PY
           )"
-          echo "${ALLOWED_ZONE} zone id: ${SMOKE_ZONE_ID}"
 
           curl --fail --silent -L -b /tmp/cookies -X POST http://localhost:8000/api-keys \
             -H "Content-Type: application/x-www-form-urlencoded" \
-            --data-urlencode "label=microsoft-dns-smoke" \
+            --data-urlencode "label=bind-smoke-test" \
             --data-urlencode "zone_ids=${SMOKE_ZONE_ID}" \
             -o /tmp/api-key-create.html
 
           API_KEY="$(python3 - <<'PY'
           import re
 
-          html = open("/tmp/api-key-create.html", encoding="utf-8").read()
-          match = re.search(r"API key created:\s*([^<\s]+)", html)
+          html = open('/tmp/api-key-create.html', encoding='utf-8').read()
+          match = re.search(r'API key created:\s*([^<\s]+)', html)
           if not match:
               raise SystemExit("Could not extract API key")
           print(match.group(1))
           PY
           )"
 
-          curl --fail --silent -H "X-API-Key: ${API_KEY}" http://localhost:8000/keycheck \
+          curl --fail --silent -H "X-API-Key: $API_KEY" http://localhost:8000/keycheck \
             | python3 -c "import json, sys; assert json.load(sys.stdin)['status'] == 'success'"
 
           call_dns_api() {
@@ -233,115 +272,455 @@ jobs:
             local fqdn="$1"
             local expected="$2"
             local value=""
-            if [ -z "${DIG_SERVER}" ]; then
-              return 0
-            fi
-            for i in $(seq 1 30); do
-              value="$(dig @"${DIG_SERVER}" "${fqdn}" A +short | tr -d '\r' | tail -n 1 || true)"
+            for i in $(seq 1 20); do
+              value="$(docker exec bind-test dig @127.0.0.1 "${fqdn}" A +short | tr -d '\r' | tail -n 1 || true)"
               if [ "${value}" = "${expected}" ]; then
                 return 0
               fi
-              sleep 2
+              sleep 1
             done
-            echo "Expected ${fqdn} to resolve to ${expected} via ${DIG_SERVER}; got '${value}'"
+            echo "Expected ${fqdn} to resolve to ${expected}; got '${value}'"
             exit 1
           }
 
           wait_for_record_absent() {
             local fqdn="$1"
             local value=""
-            if [ -z "${DIG_SERVER}" ]; then
-              return 0
-            fi
-            for i in $(seq 1 30); do
-              value="$(dig @"${DIG_SERVER}" "${fqdn}" A +short | tr -d '\r' || true)"
+            for i in $(seq 1 20); do
+              value="$(docker exec bind-test dig @127.0.0.1 "${fqdn}" A +short | tr -d '\r' || true)"
               if [ -z "${value}" ]; then
                 return 0
               fi
-              sleep 2
+              sleep 1
             done
-            echo "Expected ${fqdn} to be absent at ${DIG_SERVER}; got '${value}'"
+            echo "Expected ${fqdn} to be absent; got '${value}'"
             exit 1
           }
 
-          CREATE_BODY="$(python3 - <<PY
-          import json
-          import os
-          z = os.environ["ALLOWED_ZONE"]
-          print(json.dumps({"zone_name": z, "record_type": "A", "record_name": "www", "ttl": 300, "values": ["192.0.2.10"]}))
-          PY
-          )"
-          UPDATE_BODY="$(python3 - <<PY
-          import json
-          import os
-          z = os.environ["ALLOWED_ZONE"]
-          print(json.dumps({"zone_name": z, "record_type": "A", "record_name": "www", "ttl": 300, "values": ["192.0.2.20"]}))
-          PY
-          )"
-          DELETE_BODY="$(python3 - <<PY
-          import json
-          import os
-          z = os.environ["ALLOWED_ZONE"]
-          print(json.dumps({"zone_name": z, "record_type": "DELETE", "record_name": "www", "values": ["A"]}))
-          PY
-          )"
-          DELETE_MISSING_BODY="${DELETE_BODY}"
-          DENIED_BODY="$(python3 - <<PY
-          import json
-          import os
-          z = os.environ["DENIED_ZONE"]
-          print(json.dumps({"zone_name": z, "record_type": "A", "record_name": "blocked", "ttl": 300, "values": ["192.0.2.55"]}))
-          PY
-          )"
+          call_dns_api 200 created '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.10"]}'
+          wait_for_record_value www.smoke.test 192.0.2.10
+          call_dns_api 200 updated '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.20"]}'
+          wait_for_record_value www.smoke.test 192.0.2.20
+          call_dns_api 200 deleted '{"zone_name":"smoke.test","record_type":"DELETE","record_name":"www","values":["A"]}'
+          wait_for_record_absent www.smoke.test
+          call_dns_api 404 not_found '{"zone_name":"smoke.test","record_type":"DELETE","record_name":"www","values":["A"]}'
+          call_dns_api 403 access_denied '{"zone_name":"denied.test","record_type":"A","record_name":"blocked","ttl":300,"values":["192.0.2.55"]}'
 
-          WWW_FQDN="www.${ALLOWED_ZONE}"
+          echo "BIND smoke on Linux completed successfully."
 
-          echo "Creating record..."
-          call_dns_api 200 created "${CREATE_BODY}"
-          wait_for_record_value "${WWW_FQDN}" 192.0.2.10
-
-          echo "Updating record..."
-          call_dns_api 200 updated "${UPDATE_BODY}"
-          wait_for_record_value "${WWW_FQDN}" 192.0.2.20
-
-          echo "Deleting record..."
-          call_dns_api 200 deleted "${DELETE_BODY}"
-          wait_for_record_absent "${WWW_FQDN}"
-
-          echo "Deleting nonexistent record (expected 404)..."
-          call_dns_api 404 not_found "${DELETE_MISSING_BODY}"
-
-          echo "Accessing a configured zone that this API key cannot use (expected 403)..."
-          call_dns_api 403 access_denied "${DENIED_BODY}"
-
-      - id: finish
-        name: Record smoke outcome for downstream jobs
-        if: always() && steps.gate.outputs.skip == 'false'
-        run: |
-          if [ "${{ steps.smoke.outcome }}" = "success" ]; then
-            echo "executed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "executed=false" >> "$GITHUB_OUTPUT"
-          fi
-
-  windows-dns-soa-probe:
-    name: Optional SOA probe (windows-2025)
-    needs: microsoft-dns-smoke
+  microsoft-dns-smoke-windows:
+    name: Local Microsoft DNS WinRM smoke (windows, native API + PowerShell)
     runs-on: windows-2025
-    if: >-
-      github.ref == 'refs/heads/develop' &&
-      github.event.inputs.run_windows_resolver_check == 'true' &&
-      needs.microsoft-dns-smoke.outputs.smoke_executed == 'true'
+    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/release'
 
     steps:
-      - name: Resolve-DnsName SOA against lab DNS
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Install Microsoft DNS on runner and prepare local WinRM test user
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host 'Installing DNS Server role...'
+          Install-WindowsFeature -Name DNS -IncludeManagementTools | Out-Null
+
+          Write-Host 'Enabling WinRM / PS remoting...'
+          Enable-PSRemoting -Force -SkipNetworkProfileCheck
+          winrm quickconfig -quiet -force
+
+          # Required so a non-built-in local admin / DnsAdmins member gets a full token
+          # over the network. Without this WSMan returns w:AccessDenied (wsmanfault 5)
+          # even when NTLM auth itself succeeds.
+          New-ItemProperty `
+            -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' `
+            -Name LocalAccountTokenFilterPolicy -PropertyType DWord -Value 1 -Force | Out-Null
+
+          # NTLM to 127.0.0.1 from a non-domain client requires TrustedHosts.
+          Set-Item -Path WSMan:\localhost\Client\TrustedHosts -Value '127.0.0.1,localhost' -Force
+
+          # KB 896861: disable NTLM loopback check (anti-reflection) so NTLM auth
+          # to 127.0.0.1 / localhost / non-canonical names does not fail with
+          # AccessDenied (wsmanfault 5). Required when the URL hostname differs
+          # from the machine's actual NetBIOS name.
+          New-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' `
+            -Name DisableLoopbackCheck -PropertyType DWord -Value 1 -Force | Out-Null
+
+          Restart-Service WinRM
+
+          $userName = 'gh-dns-smoke'
+          Remove-LocalUser -Name $userName -ErrorAction SilentlyContinue
+          $plain = -join ((48..57 + 65..90 + 97..122) | Get-Random -Count 28 | ForEach-Object { [char]$_ })
+          $sec = ConvertTo-SecureString $plain -AsPlainText -Force
+          New-LocalUser -Name $userName -Password $sec -AccountNeverExpires -PasswordNeverExpires `
+            -UserMayNotChangePassword -ErrorAction Stop
+          foreach ($g in @('DnsAdmins', 'DNSAdmins')) {
+            $lg = Get-LocalGroup -Name $g -ErrorAction SilentlyContinue
+            if ($lg) {
+              Add-LocalGroupMember -Group $g -Member $userName -ErrorAction Stop
+              break
+            }
+          }
+          Add-LocalGroupMember -Group 'Remote Management Users' -Member $userName -ErrorAction Stop
+          # pywinrm calls the WS-Man Shell URI; its RootSDDL only grants
+          # BUILTIN\Administrators by default. Remote Management Users covers
+          # the PSRemoting endpoint but not the raw Shell endpoint. Add the
+          # ephemeral CI user to Administrators so it can create a shell.
+          # LocalAccountTokenFilterPolicy=1 ensures it gets a full token.
+          Add-LocalGroupMember -Group 'Administrators' -Member $userName -ErrorAction SilentlyContinue
+
+          Import-Module DnsServer
+          foreach ($z in @('local-smoke.test', 'local-denied.test')) {
+            if (Get-DnsServerZone -Name $z -ErrorAction SilentlyContinue) {
+              Remove-DnsServerZone -Name $z -Force
+            }
+            Add-DnsServerPrimaryZone -Name $z -ZoneFile "$z.dns" -ErrorAction Stop
+          }
+
+          # #region agent diagnostics (keep until WinRM smoke is confirmed green)
+          Write-Host '--- WinRM diagnostics ---'
+          $tokenPolicy = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name LocalAccountTokenFilterPolicy -ErrorAction SilentlyContinue).LocalAccountTokenFilterPolicy
+          Write-Host "LocalAccountTokenFilterPolicy = $tokenPolicy"
+          Write-Host "TrustedHosts = $((Get-Item WSMan:\localhost\Client\TrustedHosts).Value)"
+          Write-Host "WinRM service status = $((Get-Service WinRM).Status)"
+          (Get-LocalGroupMember -Group 'Remote Management Users' -ErrorAction SilentlyContinue) | ForEach-Object { Write-Host "RemoteMgmt member: $($_.Name)" }
+          (Get-LocalGroupMember -Group 'DnsAdmins' -ErrorAction SilentlyContinue) | ForEach-Object { Write-Host "DnsAdmins member: $($_.Name)" }
+          (Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue) | ForEach-Object { Write-Host "Administrators member: $($_.Name)" }
+          try { Test-WSMan -ComputerName 127.0.0.1 -ErrorAction Stop | Out-Null; Write-Host 'Test-WSMan 127.0.0.1: OK' } catch { Write-Host "Test-WSMan 127.0.0.1 failed: $($_.Exception.Message)" }
+          # Authenticated PSRemoting probe with the same creds pywinrm will use.
+          # If this prints the user, NTLM auth + WinRM shell creation work; any
+          # subsequent failure must be in pywinrm transport or DNS cmdlet rights.
+          try {
+            $probeCred = New-Object System.Management.Automation.PSCredential(("$($env:COMPUTERNAME)\$userName"), $sec)
+            $who = Invoke-Command -ComputerName $env:COMPUTERNAME -Credential $probeCred -Authentication Negotiate -ScriptBlock { whoami } -ErrorAction Stop
+            Write-Host "Invoke-Command (as gh-dns-smoke) whoami: $who"
+          } catch {
+            Write-Host "Invoke-Command (as gh-dns-smoke) failed: $($_.Exception.Message)"
+          }
+          # #endregion agent diagnostics
+
+          Write-Output "::add-mask::$plain"
+          Add-Content -Path $env:GITHUB_ENV -Value "LOCAL_WINRM_USER=$userName"
+          Add-Content -Path $env:GITHUB_ENV -Value "LOCAL_WINRM_PASSWORD=$plain"
+          Add-Content -Path $env:GITHUB_ENV -Value "LOCAL_ALLOWED_ZONE=local-smoke.test"
+          Add-Content -Path $env:GITHUB_ENV -Value "LOCAL_DENIED_ZONE=local-denied.test"
+
+      - name: Prepare .env with Fernet encryption key
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Copy-Item -Force .env.example .env
+          $key = (& python -c "import base64,os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())").Trim()
+          $text = (Get-Content .env -Raw) -replace 'ENCRYPTION_KEY=.*', "ENCRYPTION_KEY=$key"
+          $utf8 = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllText((Join-Path (Get-Location) '.env'), $text, $utf8)
+
+      - name: Microsoft smoke (PowerShell HTTP + native API)
         shell: pwsh
         env:
-          ZONE: ${{ github.event.inputs.allowed_zone }}
-          SERVER: ${{ github.event.inputs.dns_query_server }}
+          REMOTE_WINRM_HOST: ${{ secrets.MICROSOFT_DNS_WINRM_HOST }}
+          REMOTE_WINRM_USER: ${{ secrets.MICROSOFT_DNS_WINRM_USER }}
+          REMOTE_WINRM_PASSWORD: ${{ secrets.MICROSOFT_DNS_WINRM_PASSWORD }}
+          REMOTE_WINRM_SSL: ${{ secrets.MICROSOFT_DNS_WINRM_SSL }}
+          REMOTE_QUERY_HOST: ${{ secrets.MICROSOFT_DNS_QUERY_HOST }}
+          REMOTE_ALLOWED_ZONE: smoke.ms.lab
+          REMOTE_DENIED_ZONE: denied.ms.lab
+          INPUT_QUERY_SERVER: ''
         run: |
-          $server = $env:SERVER
-          if ([string]::IsNullOrWhiteSpace($server)) {
-            throw "Set workflow input dns_query_server (DNS IP/hostname) when using run_windows_resolver_check."
+          $ErrorActionPreference = 'Stop'
+          $workspace = $env:GITHUB_WORKSPACE
+          Set-Location $workspace
+
+          $base = 'http://localhost:8000'
+          $apiProcess = $null
+          $apiOut = Join-Path $env:RUNNER_TEMP 'api-to-dns-uvicorn.out.log'
+          $apiErr = Join-Path $env:RUNNER_TEMP 'api-to-dns-uvicorn.err.log'
+
+          function Wait-LoginPage {
+            param([int]$MaxAttempts = 60)
+            for ($i = 0; $i -lt $MaxAttempts; $i++) {
+              try {
+                $null = Invoke-WebRequest -Uri "$base/login" -UseBasicParsing -TimeoutSec 5
+                return
+              }
+              catch { Start-Sleep -Seconds 2 }
+            }
+            throw 'API did not become ready on :8000/login'
           }
-          Resolve-DnsName -Name $env:ZONE -Type SOA -DnsOnly -Server $server -ErrorAction Stop | Format-Table -AutoSize
+
+          function Invoke-FormPost {
+            param(
+              [Parameter(Mandatory)] [string] $Uri,
+              $WebSession,
+              [Parameter(Mandatory)] [hashtable] $Form,
+              [int] $MaximumRedirection = 10
+            )
+            $pairs = $Form.GetEnumerator() | ForEach-Object {
+              '{0}={1}' -f $_.Key, [uri]::EscapeDataString([string]$_.Value)
+            }
+            $body = $pairs -join '&'
+            return Invoke-WebRequest -Uri $Uri -WebSession $WebSession -Method Post -Body $body `
+              -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing -MaximumRedirection $MaximumRedirection -SkipHttpErrorCheck
+          }
+
+          function Get-ZoneIdFromApiKeysHtml {
+            param([string] $Html, [string] $ZoneFqdn)
+            $esc = [regex]::Escape($ZoneFqdn)
+            $m = [regex]::Match($Html, "name=`"zone_ids`" value=`"(\d+)`"\s*/>\s*<code>$esc</code>", 'Singleline,IgnoreCase')
+            if (-not $m.Success) { throw "Could not find zone id for $ZoneFqdn" }
+            return [int]$m.Groups[1].Value
+          }
+
+          function Get-ApiKeyFromCreateHtml {
+            param([string] $Html)
+            $m = [regex]::Match($Html, 'API key created:\s*([^<\s]+)')
+            if (-not $m.Success) { throw 'Could not extract API key from HTML' }
+            return $m.Groups[1].Value
+          }
+
+          function Invoke-DnsRecord {
+            param(
+              [string] $ApiKey,
+              [int] $ExpectedStatus,
+              [hashtable] $JsonBody
+            )
+            $json = $JsonBody | ConvertTo-Json -Compress -Depth 6
+            $resp = Invoke-WebRequest -Uri "$base/dns-record" -Method Post `
+              -Headers @{ 'X-API-Key' = $ApiKey } -Body $json -ContentType 'application/json' `
+              -UseBasicParsing -SkipHttpErrorCheck
+            if ([int]$resp.StatusCode -ne $ExpectedStatus) {
+              throw "dns-record expected HTTP $ExpectedStatus got $($resp.StatusCode): $($resp.Content)"
+            }
+            return $resp.Content | ConvertFrom-Json
+          }
+
+          function Assert-DnsRecordAction {
+            param($Json, [string] $ExpectedAction)
+            if ($ExpectedAction -eq 'access_denied') {
+              if ($Json.detail.error -ne 'access_denied') { throw "expected access_denied: $($Json | ConvertTo-Json -Compress)" }
+            }
+            elseif ($Json.action -ne $ExpectedAction) {
+              throw "expected action $ExpectedAction got $($Json | ConvertTo-Json -Compress)"
+            }
+          }
+
+          function Wait-LocalA {
+            param([string] $Fqdn, [string] $ExpectedIp, [string] $DnsServer = '127.0.0.1')
+            for ($i = 0; $i -lt 30; $i++) {
+              $r = Resolve-DnsName -Name $Fqdn -Type A -DnsOnly -Server $DnsServer -ErrorAction SilentlyContinue |
+                Where-Object { $_.IPAddress } | Select-Object -First 1
+              if ($null -ne $r -and $r.IPAddress -eq $ExpectedIp) { return }
+              Start-Sleep -Seconds 2
+            }
+            throw "Expected $Fqdn -> $ExpectedIp on $DnsServer"
+          }
+
+          function Wait-LocalAbsent {
+            param([string] $Fqdn, [string] $DnsServer = '127.0.0.1')
+            for ($i = 0; $i -lt 30; $i++) {
+              $r = Resolve-DnsName -Name $Fqdn -Type A -DnsOnly -Server $DnsServer -ErrorAction SilentlyContinue |
+                Where-Object { $_.IPAddress } | Select-Object -First 1
+              if ($null -eq $r -or [string]::IsNullOrEmpty($r.IPAddress)) { return }
+              Start-Sleep -Seconds 2
+            }
+            throw "Expected $Fqdn absent on $DnsServer"
+          }
+
+          function Wait-RemoteA {
+            param([string] $Fqdn, [string] $ExpectedIp, [string] $Server)
+            if ([string]::IsNullOrWhiteSpace($Server)) { return }
+            for ($i = 0; $i -lt 30; $i++) {
+              $r = Resolve-DnsName -Name $Fqdn -Type A -DnsOnly -Server $Server -ErrorAction SilentlyContinue |
+                Where-Object { $_.IPAddress } | Select-Object -First 1
+              if ($null -ne $r -and $r.IPAddress -eq $ExpectedIp) { return }
+              Start-Sleep -Seconds 2
+            }
+            throw "Expected $Fqdn -> $ExpectedIp via $Server"
+          }
+
+          function Wait-RemoteAbsent {
+            param([string] $Fqdn, [string] $Server)
+            if ([string]::IsNullOrWhiteSpace($Server)) { return }
+            for ($i = 0; $i -lt 30; $i++) {
+              $r = Resolve-DnsName -Name $Fqdn -Type A -DnsOnly -Server $Server -ErrorAction SilentlyContinue |
+                Where-Object { $_.IPAddress } | Select-Object -First 1
+              if ($null -eq $r -or [string]::IsNullOrEmpty($r.IPAddress)) { return }
+              Start-Sleep -Seconds 2
+            }
+            throw "Expected $Fqdn absent at $Server"
+          }
+
+          try {
+            $python = (Get-Command python -ErrorAction Stop).Source
+            $envFile = Join-Path $workspace '.env'
+            $apiArgs = @(
+              '-m', 'uvicorn', 'src.app:app',
+              '--host', '127.0.0.1',
+              '--port', '8000',
+              '--env-file', $envFile
+            )
+            $apiProcess = Start-Process -FilePath $python -ArgumentList $apiArgs -WorkingDirectory $workspace `
+              -RedirectStandardOutput $apiOut -RedirectStandardError $apiErr -PassThru
+            Write-Host "Started native API process $($apiProcess.Id)."
+
+            Wait-LoginPage
+
+            $null = Invoke-WebRequest -Uri "$base/login" -UseBasicParsing -SessionVariable 'WebSession'
+            $login = Invoke-FormPost -Uri "$base/login" -WebSession $WebSession -Form @{
+              username = 'admin'
+              password = 'your-admin-password'
+            }
+            if ($login.StatusCode -notin @(200, 303)) {
+              throw "Login POST unexpected status $($login.StatusCode)"
+            }
+
+            $admin = Invoke-WebRequest -Uri "$base/admin" -WebSession $WebSession -UseBasicParsing
+            if ($admin.Content -notmatch 'DNS Admin Dashboard') {
+              throw 'Admin page did not contain expected title (session or credentials).'
+            }
+
+            # PowerShell does not treat \ as an escape, so ".\\$user" produced a literal
+            # ".\\gh-dns-smoke" (two backslashes). NTLM (requests-ntlm) needs domain\user
+            # with a single backslash; for a local account use computername\user.
+            $localUser = "$($env:COMPUTERNAME)\$($env:LOCAL_WINRM_USER)"
+            $localPass = $env:LOCAL_WINRM_PASSWORD
+            $la = $env:LOCAL_ALLOWED_ZONE
+            $ld = $env:LOCAL_DENIED_ZONE
+            # Use the machine's NetBIOS name (not 127.0.0.1) so NTLM SPN matches and
+            # the loopback check (KB 896861) is not triggered.
+            $localDnsServer = $env:COMPUTERNAME
+
+            # #region agent diagnostics (keep until WinRM smoke is confirmed green)
+            Write-Host "Local WinRM user (sanitized): $($env:COMPUTERNAME)\<user>"
+            Write-Host "Local WinRM user backslash count: $((($localUser -split '\\').Count - 1))"
+            Write-Host "Local DNS/WinRM target = $localDnsServer"
+            $tokenPolicy = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name LocalAccountTokenFilterPolicy -ErrorAction SilentlyContinue).LocalAccountTokenFilterPolicy
+            $loopback   = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' -Name DisableLoopbackCheck -ErrorAction SilentlyContinue).DisableLoopbackCheck
+            Write-Host "LocalAccountTokenFilterPolicy = $tokenPolicy ; DisableLoopbackCheck = $loopback"
+            Write-Host "TrustedHosts = $((Get-Item WSMan:\localhost\Client\TrustedHosts).Value)"
+            try { Test-WSMan -ComputerName $localDnsServer -ErrorAction Stop | Out-Null; Write-Host "Test-WSMan $localDnsServer : OK" } catch { Write-Host "Test-WSMan $localDnsServer failed: $($_.Exception.Message)" }
+            # #endregion agent diagnostics
+
+            foreach ($z in @($la, $ld)) {
+              $null = Invoke-FormPost -Uri "$base/zones" -WebSession $WebSession -Form @{
+                zone_name           = $z
+                dns_provider_type   = 'microsoft'
+                dns_server          = $localDnsServer
+                dns_username        = $localUser
+                dns_password        = $localPass
+              }
+            }
+
+            $keysHtml = (Invoke-WebRequest -Uri "$base/api-keys" -WebSession $WebSession -UseBasicParsing).Content
+            $zoneId = Get-ZoneIdFromApiKeysHtml -Html $keysHtml -ZoneFqdn $la
+
+            $createKey = Invoke-FormPost -Uri "$base/api-keys" -WebSession $WebSession -MaximumRedirection 10 -Form @{
+              label    = 'ms-local-smoke'
+              zone_ids = "$zoneId"
+            }
+            $msLocalKey = Get-ApiKeyFromCreateHtml -Html $createKey.Content
+
+            $kc = Invoke-RestMethod -Uri "$base/keycheck" -Headers @{ 'X-API-Key' = $msLocalKey }
+            if ($kc.status -ne 'success') { throw 'keycheck failed' }
+
+            $www = "www.$la"
+            $jCreate = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.10') }
+            $jUpdate = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.20') }
+            $jDelete = @{ zone_name = $la; record_type = 'DELETE'; record_name = 'www'; values = @('A') }
+            $jDenied = @{ zone_name = $ld; record_type = 'A'; record_name = 'blocked'; ttl = 300; values = @('192.0.2.55') }
+
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -JsonBody $jCreate
+            Assert-DnsRecordAction -Json $x -ExpectedAction 'created'
+            Wait-LocalA -Fqdn $www -ExpectedIp '192.0.2.10'
+
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -JsonBody $jUpdate
+            Assert-DnsRecordAction -Json $x -ExpectedAction 'updated'
+            Wait-LocalA -Fqdn $www -ExpectedIp '192.0.2.20'
+
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -JsonBody $jDelete
+            Assert-DnsRecordAction -Json $x -ExpectedAction 'deleted'
+            Wait-LocalAbsent -Fqdn $www
+
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 404 -JsonBody $jDelete
+            Assert-DnsRecordAction -Json $x -ExpectedAction 'not_found'
+
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 403 -JsonBody $jDenied
+            Assert-DnsRecordAction -Json $x -ExpectedAction 'access_denied'
+
+            if ($env:REMOTE_WINRM_HOST -and $env:REMOTE_WINRM_USER -and $env:REMOTE_WINRM_PASSWORD) {
+              Write-Host '=== Remote Microsoft DNS (secrets) ==='
+              $remoteDig = $env:INPUT_QUERY_SERVER
+              if ([string]::IsNullOrWhiteSpace($remoteDig)) { $remoteDig = $env:REMOTE_QUERY_HOST }
+
+              $ra = $env:REMOTE_ALLOWED_ZONE
+              $rd = $env:REMOTE_DENIED_ZONE
+              foreach ($z in @($ra, $rd)) {
+                $form = @{
+                  zone_name           = $z
+                  dns_provider_type   = 'microsoft'
+                  dns_server          = $env:REMOTE_WINRM_HOST
+                  dns_username        = $env:REMOTE_WINRM_USER
+                  dns_password        = $env:REMOTE_WINRM_PASSWORD
+                }
+                if ($env:REMOTE_WINRM_SSL -in @('true', 'True', '1')) {
+                  $form['dns_winrm_ssl'] = 'true'
+                }
+                $null = Invoke-FormPost -Uri "$base/zones" -WebSession $WebSession -Form $form
+              }
+
+              $keysHtml2 = (Invoke-WebRequest -Uri "$base/api-keys" -WebSession $WebSession -UseBasicParsing).Content
+              $rZoneId = Get-ZoneIdFromApiKeysHtml -Html $keysHtml2 -ZoneFqdn $ra
+              $rk = Invoke-FormPost -Uri "$base/api-keys" -WebSession $WebSession -MaximumRedirection 10 -Form @{ label = 'ms-remote-smoke'; zone_ids = "$rZoneId" }
+              $msRemoteKey = Get-ApiKeyFromCreateHtml -Html $rk.Content
+
+              $rWww = "www.$ra"
+              $rjC = @{ zone_name = $ra; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.10') }
+              $rjU = @{ zone_name = $ra; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.20') }
+              $rjD = @{ zone_name = $ra; record_type = 'DELETE'; record_name = 'www'; values = @('A') }
+              $rjX = @{ zone_name = $rd; record_type = 'A'; record_name = 'blocked'; ttl = 300; values = @('192.0.2.55') }
+
+              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 200 -JsonBody $rjC
+              Assert-DnsRecordAction -Json $x -ExpectedAction 'created'
+              Wait-RemoteA -Fqdn $rWww -ExpectedIp '192.0.2.10' -Server $remoteDig
+
+              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 200 -JsonBody $rjU
+              Assert-DnsRecordAction -Json $x -ExpectedAction 'updated'
+              Wait-RemoteA -Fqdn $rWww -ExpectedIp '192.0.2.20' -Server $remoteDig
+
+              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 200 -JsonBody $rjD
+              Assert-DnsRecordAction -Json $x -ExpectedAction 'deleted'
+              Wait-RemoteAbsent -Fqdn $rWww -Server $remoteDig
+
+              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 404 -JsonBody $rjD
+              Assert-DnsRecordAction -Json $x -ExpectedAction 'not_found'
+
+              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 403 -JsonBody $rjX
+              Assert-DnsRecordAction -Json $x -ExpectedAction 'access_denied'
+            }
+            else {
+              Write-Host '=== Remote Microsoft DNS skipped (set MICROSOFT_DNS_WINRM_* secrets) ==='
+            }
+
+            Write-Host 'Microsoft smoke (native API + PowerShell HTTP) completed successfully.'
+          }
+          finally {
+            if ($apiProcess -and -not $apiProcess.HasExited) {
+              Stop-Process -Id $apiProcess.Id -Force -ErrorAction SilentlyContinue
+            }
+            foreach ($log in @($apiOut, $apiErr)) {
+              if (Test-Path $log) {
+                Write-Host "=== $log ==="
+                Get-Content $log | Write-Host
+              }
+            }
+          }
