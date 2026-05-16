@@ -1,4 +1,4 @@
-# Manual smoke on **develop**:
+# Smoke tests: push to **release** (no inputs; remote lab zones are fixed below).
 # - **bind-smoke-linux**: checkout on ubuntu, `docker build`, BIND + API in Docker (bash), same idea as release CI.
 # - **microsoft-dns-smoke-windows**: install DNS Server on windows-2025, run the API natively with Python/uvicorn,
 #   then inline PowerShell (Invoke-WebRequest / Invoke-RestMethod) exercises local + optional remote Microsoft DNS.
@@ -10,29 +10,19 @@
 #
 # Optional remote lab secrets: MICROSOFT_DNS_WINRM_HOST, USER, PASSWORD, SSL, QUERY_HOST
 
-name: Microsoft DNS manual smoke (develop)
+name: Docker image + Bind + Microsoft DNS smoke test ( release)
 
 on:
+  push:
+    branches:
+      - release
   workflow_dispatch:
-    inputs:
-      allowed_zone:
-        description: "Remote lab: Microsoft primary zone FQDN (requires WinRM secrets)"
-        required: true
-        default: "smoke.ms.lab"
-      denied_zone:
-        description: "Remote lab: second zone FQDN for denied-zone API test"
-        required: true
-        default: "denied.ms.lab"
-      dns_query_server:
-        description: "Remote lab: optional Resolve-DnsName -Server target (IP or hostname)"
-        required: false
-        default: ""
 
 jobs:
   bind-smoke-linux:
     name: BIND and Docker image smoke (ubuntu + Docker)
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/develop'
+    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/release'
     steps:
       - uses: actions/checkout@v6
 
@@ -322,7 +312,7 @@ jobs:
   microsoft-dns-smoke-windows:
     name: Local Microsoft DNS WinRM smoke (windows, native API + PowerShell)
     runs-on: windows-2025
-    if: github.ref == 'refs/heads/develop'
+    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/release'
 
     steps:
       - uses: actions/checkout@v6
@@ -444,9 +434,9 @@ jobs:
           REMOTE_WINRM_PASSWORD: ${{ secrets.MICROSOFT_DNS_WINRM_PASSWORD }}
           REMOTE_WINRM_SSL: ${{ secrets.MICROSOFT_DNS_WINRM_SSL }}
           REMOTE_QUERY_HOST: ${{ secrets.MICROSOFT_DNS_QUERY_HOST }}
-          REMOTE_ALLOWED_ZONE: ${{ github.event.inputs.allowed_zone }}
-          REMOTE_DENIED_ZONE: ${{ github.event.inputs.denied_zone }}
-          INPUT_QUERY_SERVER: ${{ github.event.inputs.dns_query_server }}
+          REMOTE_ALLOWED_ZONE: smoke.ms.lab
+          REMOTE_DENIED_ZONE: denied.ms.lab
+          INPUT_QUERY_SERVER: ''
         run: |
           $ErrorActionPreference = 'Stop'
           $workspace = $env:GITHUB_WORKSPACE
