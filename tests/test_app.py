@@ -94,7 +94,7 @@ def test_authenticated_web_pages_render(client: TestClient) -> None:
         assert api_key is not None
     for path in (
         "/admin",
-        "/settings",
+        "/zones",
         "/api-keys",
         "/zones/new",
         f"/zones/{zone.id}/edit",
@@ -104,14 +104,47 @@ def test_authenticated_web_pages_render(client: TestClient) -> None:
         assert response.status_code == 200
 
 
-def test_settings_page_displays_zone_provider_metadata(client: TestClient) -> None:
+def test_zones_page_displays_zone_provider_metadata(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
-    response = client.get("/settings")
+    response = client.get("/zones")
     assert response.status_code == 200
     assert "Type" in response.text
     assert "Target DNS Server" in response.text
     assert "Azure" in response.text
     assert "&mdash;" in response.text
+
+
+def test_zones_json_request_returns_zone_ids(client: TestClient) -> None:
+    response = client.get("/zones", headers={"Accept": "application/json", "X-API-Key": "test-api-key-for-dns-endpoint"})
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    zones = response.json()
+    example = next(zone for zone in zones if zone["zone_name"] == "example.com")
+    assert isinstance(example["id"], int)
+    assert set(zones[0]) == {"id", "zone_name"}
+
+
+def test_zones_json_request_without_api_key_returns_access_denied(client: TestClient) -> None:
+    response = client.get("/zones", headers={"Content-Type": "application/json"})
+    assert response.status_code == 403
+    assert response.json()["detail"] == {
+        "error": "access_denied",
+        "message": "You do not have access or an invalid key was provided.",
+    }
+
+
+def test_zones_json_schema_is_documented(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    zones_response = schema["paths"]["/zones"]["get"]["responses"]["200"]
+    assert zones_response["content"]["application/json"]["schema"]["items"]["$ref"].endswith("/DnsZoneSummary")
+    assert "DnsZoneSummary" in schema["components"]["schemas"]
+
+
+def test_legacy_zone_page_routes_are_not_redirects(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    for path in ("/settings", "/dns-zones"):
+        response = client.get(path, follow_redirects=False)
+        assert response.status_code == 404
 
 
 def test_create_api_key_without_zone_keeps_error_in_popup(client: TestClient) -> None:
@@ -157,6 +190,49 @@ def test_edit_api_key_without_zone_keeps_error_in_popup(client: TestClient) -> N
     assert 'data-auto-open="true"' in response.text
     assert '<div class="alert error">Select at least one DNS zone.</div>' in response.text
     assert 'value="bad-edit"' in response.text
+
+
+def test_api_key_management_routes_are_not_in_openapi(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    assert "/api-keys" not in schema["paths"]
+    assert "/api-keys/revoke" not in schema["paths"]
+    assert not any(path.startswith("/api-keys/") for path in schema["paths"])
+
+
+def test_session_backed_pages_are_not_in_openapi(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    hidden_paths = {
+        "/",
+        "/login",
+        "/logout",
+        "/admin",
+        "/zones/new",
+        "/zones/{zone_id}/edit",
+        "/zones/{zone_id}",
+        "/zones/{zone_id}/delete",
+    }
+    for path in hidden_paths:
+        assert path not in schema["paths"]
+    assert set(schema["paths"]) == {"/keycheck", "/zones", "/dns-record"}
+    assert set(schema["paths"]["/zones"]) == {"get"}
+
+
+def test_keycheck_unauthorized_response_is_documented(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    response = schema["paths"]["/keycheck"]["get"]["responses"]["401"]
+    assert response["description"] == "Unauthorized"
+    content = response["content"]["application/json"]
+    assert content["example"] == {"status": "failure"}
+    assert content["schema"]["required"] == ["status"]
+
+
+def test_keycheck_success_response_is_documented(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    response = schema["paths"]["/keycheck"]["get"]["responses"]["200"]
+    assert response["description"] == "API key is valid"
+    content = response["content"]["application/json"]
+    assert content["example"] == {"status": "success"}
+    assert content["schema"]["required"] == ["status"]
 
 
 def test_dns_record_requires_api_key(client: TestClient) -> None:

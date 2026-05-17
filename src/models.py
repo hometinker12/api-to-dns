@@ -49,6 +49,11 @@ class DnsRecordResponse(BaseModel):
     values: List[str]
 
 
+class DnsZoneSummary(BaseModel):
+    id: int
+    zone_name: str
+
+
 class User(SQLModel, table=True):
     id: Optional[int] = SQLField(default=None, primary_key=True)
     username: str = SQLField(index=True, unique=True)

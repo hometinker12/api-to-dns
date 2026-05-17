@@ -70,6 +70,15 @@ button.secondary:hover,
 .button.secondary:hover {
   background: #475569;
 }
+button.neutral,
+.button.neutral {
+  background: #e5e7eb;
+  color: #374151;
+}
+button.neutral:hover,
+.button.neutral:hover {
+  background: #d1d5db;
+}
 button.danger,
 .button.danger {
   background: #fee2e2;

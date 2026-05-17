@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.1] - 2026-05-17
+
+### Added
+
+- JSON-capable `GET /zones` API that returns the zone IDs and names available to the supplied API key.
+- OpenAPI documentation for `GET /keycheck` success and failure responses.
+
+### Changed
+
+- DNS zone management now aligns with the API route naming under `/zones`; legacy `/settings` and `/dns-zones` routes were removed instead of forwarded.
+- Azure DNS subscription ID and resource group are configured only on the saved zone, not supplied in `POST /dns-record` request bodies.
+- The public OpenAPI surface is limited to API-backed routes (`/keycheck`, `GET /zones`, and `/dns-record`); session-backed web pages and API key management routes are hidden from API docs.
+- API keys are managed only through the session-protected web UI; JSON/API callers cannot create, edit, or revoke keys.
+- Admin UI styling, navigation, modal API key forms, zone forms, table layout, and button treatments were refreshed for a more consistent web experience.
+
 ## [0.3.0] - 2026-05-10
 
 ### Added
@@ -10,7 +25,7 @@
 
 ### Changed
 
-- Replaced single **DNS Settings** form with **DNS zones** list (`/settings`), **Add zone** (`/zones/new`), **Edit zone** (`/zones/{id}/edit`), and **Delete zone**.
+- Replaced single **DNS Settings** form with **DNS zones** list (`/zones`), **Add zone** (`/zones/new`), **Edit zone** (`/zones/{id}/edit`), and **Delete zone**.
 - Startup **migration**: if legacy flat `Setting` DNS keys exist and no zones exist yet, one zone row is created and **all active API keys** are granted access to it; legacy settings rows are removed.
 
 ### Removed
