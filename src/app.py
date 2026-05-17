@@ -103,6 +103,18 @@ def get_dns_client_from_settings(settings: dict):
     return create_dns_client(settings)
 
 
+def get_dns_provider_options() -> List[dict]:
+    from .dns_client import provider_options_for_template
+
+    return provider_options_for_template()
+
+
+def get_dns_provider_label(provider_key: str) -> str:
+    from .dns_client import dns_provider_display_name
+
+    return dns_provider_display_name(provider_key)
+
+
 def wants_json_response(request: Request) -> bool:
     return "application/json" in request.headers.get("accept", "").lower() or "application/json" in request.headers.get(
         "content-type", ""
@@ -231,10 +243,12 @@ def api_key_allowed_zone_names(db, api_key_id: int) -> List[str]:
 def dns_zone_public_dict(z: DnsZoneConfig) -> Dict[str, Any]:
     """Safe to use after the Session closes (plain dict)."""
     cfg = decode_zone_config(z)
+    provider_key = cfg.get("dns_provider_type", "") or "azure"
     return {
         "id": z.id,
         "zone_name": z.zone_name,
-        "dns_provider_type": cfg.get("dns_provider_type", "") or "azure",
+        "dns_provider_type": provider_key,
+        "dns_provider_label": get_dns_provider_label(provider_key),
         "dns_server": cfg.get("dns_server", "") or "",
     }
 
@@ -256,34 +270,28 @@ def _blank_preserve_secret(new_val: str, old_val: str) -> str:
     return old_val if not (new_val or "").strip() else new_val
 
 
-def build_zone_config_from_form(
-    dns_provider_type: str,
-    dns_server: str,
-    dns_username: str,
-    dns_password: str,
-    dns_tsig_algorithm: str,
-    dns_winrm_ssl: Optional[str],
-    azure_tenant_id: str,
-    azure_client_id: str,
-    azure_client_secret: str,
-    azure_subscription_id: str,
-    azure_resource_group: str,
-    existing: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+def build_zone_config_from_form(form, existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     ex = existing or {}
-    return {
-        "dns_provider_type": (dns_provider_type or "azure").strip().lower(),
-        "dns_server": (dns_server or "").strip(),
-        "dns_username": (dns_username or "").strip(),
-        "dns_password": _blank_preserve_secret(dns_password, ex.get("dns_password", "")),
-        "dns_tsig_algorithm": (dns_tsig_algorithm or "").strip(),
-        "dns_winrm_ssl": (dns_winrm_ssl or "").strip(),
-        "azure_tenant_id": (azure_tenant_id or "").strip(),
-        "azure_client_id": (azure_client_id or "").strip(),
-        "azure_client_secret": _blank_preserve_secret(azure_client_secret, ex.get("azure_client_secret", "")),
-        "azure_subscription_id": (azure_subscription_id or "").strip(),
-        "azure_resource_group": (azure_resource_group or "").strip(),
-    }
+    provider = (form.get("dns_provider_type") or ex.get("dns_provider_type") or "azure").strip().lower()
+    plugins = get_dns_provider_options()
+    plugin = next((p for p in plugins if p["key"] == provider), None)
+    if plugin is None:
+        available = ", ".join(p["key"] for p in plugins) or "none"
+        raise ValueError(f"Unknown DNS provider type: {provider}. Available providers: {available}.")
+
+    cfg: Dict[str, Any] = {"dns_provider_type": provider}
+    for field in plugin["fields"]:
+        name = field["name"]
+        if field["type"] == "checkbox":
+            value = "true" if name in form else ""
+        else:
+            value = (form.get(name) or "").strip()
+        if field["preserve_on_blank"]:
+            value = _blank_preserve_secret(value, ex.get(name, ""))
+        elif not value and field["default"] and not ex.get(name):
+            value = field["default"]
+        cfg[name] = value
+    return cfg
 
 
 @app.on_event("startup")
@@ -462,27 +470,21 @@ def zone_new_form(request: Request, user: str = Depends(get_current_user)):
     return templates.TemplateResponse(
         request=request,
         name="zone_form.html",
-        context={"request": request, "zone": None, "settings": {}, "message": None, "title": "Add DNS zone"},
+        context={
+            "request": request,
+            "zone": None,
+            "settings": {},
+            "provider_plugins": get_dns_provider_options(),
+            "message": None,
+            "title": "Add DNS zone",
+        },
     )
 
 
 @app.post("/zones", response_class=HTMLResponse, include_in_schema=False)
-def zone_create(
-    request: Request,
-    zone_name: str = Form(...),
-    dns_provider_type: str = Form("azure"),
-    dns_server: str = Form(""),
-    dns_username: str = Form(""),
-    dns_password: str = Form(""),
-    dns_tsig_algorithm: str = Form(""),
-    dns_winrm_ssl: Optional[str] = Form(None),
-    azure_tenant_id: str = Form(""),
-    azure_client_id: str = Form(""),
-    azure_client_secret: str = Form(""),
-    azure_subscription_id: str = Form(""),
-    azure_resource_group: str = Form(""),
-    user: str = Depends(get_current_user),
-):
+async def zone_create(request: Request, user: str = Depends(get_current_user)):
+    form = await request.form()
+    zone_name = str(form.get("zone_name") or "")
     canonical = normalize_zone_name(zone_name)
     if not canonical:
         with SessionLocal() as db:
@@ -502,19 +504,7 @@ def zone_create(
                 name="zones.html",
                 context={"request": request, "zones": zones_view, "message": f"A zone named {canonical!r} already exists."},
             )
-        cfg = build_zone_config_from_form(
-            dns_provider_type,
-            dns_server,
-            dns_username,
-            dns_password,
-            dns_tsig_algorithm,
-            dns_winrm_ssl,
-            azure_tenant_id,
-            azure_client_id,
-            azure_client_secret,
-            azure_subscription_id,
-            azure_resource_group,
-        )
+        cfg = build_zone_config_from_form(form)
         row = DnsZoneConfig(zone_name=canonical, encrypted_config=encode_zone_config_dict(cfg))
         db.add(row)
         db.commit()
@@ -543,6 +533,7 @@ def zone_edit_form(request: Request, zone_id: int, user: str = Depends(get_curre
             "request": request,
             "zone": zone_view,
             "settings": settings,
+            "provider_plugins": get_dns_provider_options(),
             "message": None,
             "title": f"Edit zone {title_zone}",
         },
@@ -550,41 +541,14 @@ def zone_edit_form(request: Request, zone_id: int, user: str = Depends(get_curre
 
 
 @app.post("/zones/{zone_id}", response_class=HTMLResponse, include_in_schema=False)
-def zone_update(
-    request: Request,
-    zone_id: int,
-    dns_provider_type: str = Form("azure"),
-    dns_server: str = Form(""),
-    dns_username: str = Form(""),
-    dns_password: str = Form(""),
-    dns_tsig_algorithm: str = Form(""),
-    dns_winrm_ssl: Optional[str] = Form(None),
-    azure_tenant_id: str = Form(""),
-    azure_client_id: str = Form(""),
-    azure_client_secret: str = Form(""),
-    azure_subscription_id: str = Form(""),
-    azure_resource_group: str = Form(""),
-    user: str = Depends(get_current_user),
-):
+async def zone_update(request: Request, zone_id: int, user: str = Depends(get_current_user)):
+    form = await request.form()
     with SessionLocal() as db:
         row = db.get(DnsZoneConfig, zone_id)
         if not row:
             return RedirectResponse(url="/zones", status_code=HTTP_303_SEE_OTHER)
         existing = decode_zone_config(row)
-        cfg = build_zone_config_from_form(
-            dns_provider_type,
-            dns_server,
-            dns_username,
-            dns_password,
-            dns_tsig_algorithm,
-            dns_winrm_ssl,
-            azure_tenant_id,
-            azure_client_id,
-            azure_client_secret,
-            azure_subscription_id,
-            azure_resource_group,
-            existing=existing,
-        )
+        cfg = build_zone_config_from_form(form, existing=existing)
         row.encrypted_config = encode_zone_config_dict(cfg)
         db.add(row)
         db.commit()
@@ -599,6 +563,7 @@ def zone_update(
             "request": request,
             "zone": zone_view,
             "settings": settings,
+            "provider_plugins": get_dns_provider_options(),
             "message": "Zone saved.",
             "title": f"Edit zone {title_zone}",
         },

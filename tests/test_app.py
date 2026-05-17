@@ -7,7 +7,9 @@ from sqlmodel import select
 from src.app import app, encode_zone_config_dict, normalize_zone_name
 from src.auth import create_session_cookie
 from src.db import SessionLocal, init_db
+from src.dns_client import create_dns_client, discover_plugins, dns_provider_display_name
 from src.models import ApiKey, ApiKeyAllowedZone, DnsZoneConfig
+from src.plugins.bind import BindTsigDnsClient
 
 
 @pytest.fixture
@@ -110,8 +112,40 @@ def test_zones_page_displays_zone_provider_metadata(client: TestClient) -> None:
     assert response.status_code == 200
     assert "Type" in response.text
     assert "Target DNS Server" in response.text
-    assert "Azure" in response.text
+    assert "Azure DNS (REST API)" in response.text
     assert "&mdash;" in response.text
+
+
+def test_builtin_dns_plugins_are_discovered() -> None:
+    plugins = discover_plugins()
+    assert set(plugins) >= {"azure", "bind", "microsoft"}
+    assert plugins["azure"].label == "Azure DNS (REST API)"
+    assert dns_provider_display_name("microsoft") == "Microsoft DNS (WinRM)"
+
+
+def test_dns_client_factory_uses_plugin_registry() -> None:
+    client = create_dns_client(
+        {
+            "dns_provider_type": "bind",
+            "dns_username": "api-to-dns.",
+            "dns_password": "c2VjcmV0",
+            "dns_tsig_algorithm": "hmac-sha256",
+        }
+    )
+    assert isinstance(client, BindTsigDnsClient)
+
+
+def test_zone_form_renders_plugins_from_metadata(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/zones/new")
+    assert response.status_code == 200
+    assert '<option value="azure" selected>Azure DNS (REST API)</option>' in response.text
+    assert '<option value="microsoft" >Microsoft DNS (WinRM)</option>' in response.text
+    assert '<option value="bind" >BIND / RFC 2136 (TSIG)</option>' in response.text
+    assert 'data-provider-panel="azure"' in response.text
+    assert 'name="azure_tenant_id"' in response.text
+    assert 'name="dns_winrm_ssl"' in response.text
+    assert 'name="dns_tsig_algorithm"' in response.text
 
 
 def test_zones_json_request_returns_zone_ids(client: TestClient) -> None:
