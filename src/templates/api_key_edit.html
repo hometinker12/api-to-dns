@@ -11,7 +11,9 @@
       <h1>Edit API key</h1>
       <nav class="nav-links">
         <a class="button" href="/api-keys">Back to API keys</a>
-        <a class="button" href="/settings">DNS zones</a>
+        <a class="button" href="/zones">DNS Zones</a>
+        <a class="button" href="/admin">Dashboard</a>
+        <a class="button danger" href="/logout">Logout</a>
       </nav>
     </header>
 
@@ -35,7 +37,7 @@
             </label>
           {% endfor %}
         {% else %}
-          <p>No zones configured. <a href="/zones/new">Add a DNS zone</a> first.</p>
+          <p>No zones configured. <a class="button" href="/zones/new">Add a DNS zone</a> first.</p>
         {% endif %}
       </fieldset>
       <button type="submit" {% if not all_zones %}disabled{% endif %}>Save</button>

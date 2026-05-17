@@ -194,13 +194,16 @@ jobs:
             sleep 2
           done
 
+          echo "[bind] Login as admin"
           curl --fail --silent -c /tmp/cookies -X POST http://localhost:8000/login \
             -H "Content-Type: application/x-www-form-urlencoded" \
             -d "username=admin&password=your-admin-password" \
             -o /dev/null
+          echo "[bind] Verify admin page"
           curl --fail --silent -b /tmp/cookies http://localhost:8000/admin | python3 -c "import sys; assert 'DNS Admin Dashboard' in sys.stdin.read()"
 
           for zone in smoke.test denied.test; do
+            echo "[bind] Configure zone ${zone}"
             curl --fail --silent -b /tmp/cookies -X POST http://localhost:8000/zones \
               -H "Content-Type: application/x-www-form-urlencoded" \
               --data-urlencode "zone_name=${zone}" \
@@ -212,80 +215,45 @@ jobs:
               -o /dev/null
           done
 
+          echo "[bind] Fetch API key management page"
           curl --fail --silent -b /tmp/cookies http://localhost:8000/api-keys -o /tmp/api-keys.html
-          SMOKE_ZONE_ID="$(python3 - <<'PY'
-          import re
+          SMOKE_ZONE_ID="$(python3 -c 'import re; html=open("/tmp/api-keys.html", encoding="utf-8").read(); match=re.search(r"name=\"zone_ids\" value=\"(\d+)\"\s*/>\s*<code>smoke\.test</code>", html, re.DOTALL); assert match, "Could not find smoke.test zone ID"; print(match.group(1))')"
+          : "${SMOKE_ZONE_ID:?Could not extract smoke.test zone ID}"
 
-          html = open('/tmp/api-keys.html', encoding='utf-8').read()
-          match = re.search(r'name="zone_ids" value="(\d+)"\s*/>\s*<code>smoke\.test</code>', html, re.DOTALL)
-          if not match:
-              raise SystemExit("Could not find smoke.test zone ID")
-          print(match.group(1))
-          PY
-          )"
-
+          echo "[bind] Create API key for smoke.test"
           curl --fail --silent -L -b /tmp/cookies -X POST http://localhost:8000/api-keys \
             -H "Content-Type: application/x-www-form-urlencoded" \
             --data-urlencode "label=bind-smoke-test" \
             --data-urlencode "zone_ids=${SMOKE_ZONE_ID}" \
             -o /tmp/api-key-create.html
 
-          MS_LOCAL_KEY="$(python - <<'PY'
-          import re
+          API_KEY="$(python3 -c 'import re; html=open("/tmp/api-key-create.html", encoding="utf-8").read(); match=re.search(r"API key created:\s*([^<\s]+)", html); assert match, "Could not extract API key"; print(match.group(1))')"
+          : "${API_KEY:?Could not extract API key}"
 
-          html = open('/tmp/api-key-create.html', encoding='utf-8').read()
-          match = re.search(r'API key created:\s*([^<\s]+)', html)
-          if not match:
-              raise SystemExit("Could not extract local Microsoft API key")
-          print(match.group(1))
-          PY
-          )"
-
+          echo "[bind] Validate API key with /keycheck"
           curl --fail --silent -H "X-API-Key: $API_KEY" http://localhost:8000/keycheck \
             | python3 -c "import json, sys; assert json.load(sys.stdin)['status'] == 'success'"
 
-          L_CREATE="$(LOCAL_ALLOWED_ZONE="${LOCAL_ALLOWED_ZONE}" python - <<'PY'
-          import json, os
-          z = os.environ["LOCAL_ALLOWED_ZONE"]
-          print(json.dumps({"zone_name": z, "record_type": "A", "record_name": "www", "ttl": 300, "values": ["192.0.2.10"]}))
-          PY
-          )"
-          L_UPDATE="$(LOCAL_ALLOWED_ZONE="${LOCAL_ALLOWED_ZONE}" python - <<'PY'
-          import json, os
-          z = os.environ["LOCAL_ALLOWED_ZONE"]
-          print(json.dumps({"zone_name": z, "record_type": "A", "record_name": "www", "ttl": 300, "values": ["192.0.2.20"]}))
-          PY
-          )"
-          L_DELETE="$(LOCAL_ALLOWED_ZONE="${LOCAL_ALLOWED_ZONE}" python - <<'PY'
-          import json, os
-          z = os.environ["LOCAL_ALLOWED_ZONE"]
-          print(json.dumps({"zone_name": z, "record_type": "DELETE", "record_name": "www", "values": ["A"]}))
-          PY
-          )"
-          L_DENIED="$(LOCAL_DENIED_ZONE="${LOCAL_DENIED_ZONE}" python - <<'PY'
-          import json, os
-          z = os.environ["LOCAL_DENIED_ZONE"]
-          print(json.dumps({"zone_name": z, "record_type": "A", "record_name": "blocked", "ttl": 300, "values": ["192.0.2.55"]}))
-          PY
-          )"
+          call_dns_api() {
+            local expected_status="$1"
+            local expected_action="$2"
+            local body="$3"
+            local output="/tmp/dns-response-${expected_action}.json"
+            local status
 
-          L_WWW="www.${LOCAL_ALLOWED_ZONE}"
-          echo "Local Microsoft: create / update / delete / 404 / 403"
-          call_dns_api "${MS_LOCAL_KEY}" 200 created "${L_CREATE}"
-          wait_local_a "${L_WWW}" 192.0.2.10
-          call_dns_api "${MS_LOCAL_KEY}" 200 updated "${L_UPDATE}"
-          wait_local_a "${L_WWW}" 192.0.2.20
-          call_dns_api "${MS_LOCAL_KEY}" 200 deleted "${L_DELETE}"
-          wait_local_absent "${L_WWW}"
-          call_dns_api "${MS_LOCAL_KEY}" 404 not_found "${L_DELETE}"
-          call_dns_api "${MS_LOCAL_KEY}" 403 access_denied "${L_DENIED}"
+            status="$(curl --silent --show-error -o "${output}" -w "%{http_code}" \
+              -X POST http://localhost:8000/dns-record \
+              -H "Content-Type: application/json" \
+              -H "X-API-Key: ${API_KEY}" \
+              -d "${body}")"
 
-          # --- Optional remote Microsoft lab ---
-          if [ -n "${REMOTE_WINRM_HOST:-}" ] && [ -n "${REMOTE_WINRM_USER:-}" ] && [ -n "${REMOTE_WINRM_PASSWORD:-}" ]; then
-            echo "=== Phase 2: Remote Microsoft DNS (secrets) ==="
-            REMOTE_CURL_SSL=()
-            if [ "${REMOTE_WINRM_SSL:-}" = "true" ] || [ "${REMOTE_WINRM_SSL:-}" = "True" ] || [ "${REMOTE_WINRM_SSL:-}" = "1" ]; then
-              REMOTE_CURL_SSL=(--data-urlencode "dns_winrm_ssl=true")
+            echo "[bind] ${expected_action}: HTTP ${status}"
+            cat "${output}"
+            echo
+
+            if [ "${status}" != "${expected_status}" ]; then
+              echo "Expected HTTP ${expected_status}, got ${status}"
+              exit 1
             fi
 
             python3 -c "import json,sys;b=json.load(open(sys.argv[1],encoding='utf-8'));e=sys.argv[2];assert((e=='access_denied' and b['detail']['error']=='access_denied') or (b['action']==e)),b" "${output}" "${expected_action}"
@@ -518,9 +486,11 @@ jobs:
               [hashtable] $JsonBody
             )
             $json = $JsonBody | ConvertTo-Json -Compress -Depth 6
+            Write-Host "[microsoft] POST /dns-record $($JsonBody.zone_name) $($JsonBody.record_type) $($JsonBody.record_name) expecting HTTP $ExpectedStatus"
             $resp = Invoke-WebRequest -Uri "$base/dns-record" -Method Post `
               -Headers @{ 'X-API-Key' = $ApiKey } -Body $json -ContentType 'application/json' `
               -UseBasicParsing -SkipHttpErrorCheck
+            Write-Host "[microsoft] POST /dns-record returned HTTP $($resp.StatusCode)"
             if ([int]$resp.StatusCode -ne $ExpectedStatus) {
               throw "dns-record expected HTTP $ExpectedStatus got $($resp.StatusCode): $($resp.Content)"
             }
@@ -598,7 +568,9 @@ jobs:
 
             Wait-LoginPage
 
+            Write-Host '[microsoft] GET /login and start admin session'
             $null = Invoke-WebRequest -Uri "$base/login" -UseBasicParsing -SessionVariable 'WebSession'
+            Write-Host '[microsoft] POST /login as admin'
             $login = Invoke-FormPost -Uri "$base/login" -WebSession $WebSession -Form @{
               username = 'admin'
               password = 'your-admin-password'
@@ -607,6 +579,7 @@ jobs:
               throw "Login POST unexpected status $($login.StatusCode)"
             }
 
+            Write-Host '[microsoft] GET /admin'
             $admin = Invoke-WebRequest -Uri "$base/admin" -WebSession $WebSession -UseBasicParsing
             if ($admin.Content -notmatch 'DNS Admin Dashboard') {
               throw 'Admin page did not contain expected title (session or credentials).'
@@ -635,6 +608,7 @@ jobs:
             # #endregion agent diagnostics
 
             foreach ($z in @($la, $ld)) {
+              Write-Host "[microsoft-local] Configure zone $z"
               $null = Invoke-FormPost -Uri "$base/zones" -WebSession $WebSession -Form @{
                 zone_name           = $z
                 dns_provider_type   = 'microsoft'
@@ -644,15 +618,18 @@ jobs:
               }
             }
 
+            Write-Host '[microsoft-local] GET /api-keys'
             $keysHtml = (Invoke-WebRequest -Uri "$base/api-keys" -WebSession $WebSession -UseBasicParsing).Content
             $zoneId = Get-ZoneIdFromApiKeysHtml -Html $keysHtml -ZoneFqdn $la
 
+            Write-Host '[microsoft-local] POST /api-keys'
             $createKey = Invoke-FormPost -Uri "$base/api-keys" -WebSession $WebSession -MaximumRedirection 10 -Form @{
               label    = 'ms-local-smoke'
               zone_ids = "$zoneId"
             }
             $msLocalKey = Get-ApiKeyFromCreateHtml -Html $createKey.Content
 
+            Write-Host '[microsoft-local] GET /keycheck'
             $kc = Invoke-RestMethod -Uri "$base/keycheck" -Headers @{ 'X-API-Key' = $msLocalKey }
             if ($kc.status -ne 'success') { throw 'keycheck failed' }
 
@@ -688,6 +665,7 @@ jobs:
               $ra = $env:REMOTE_ALLOWED_ZONE
               $rd = $env:REMOTE_DENIED_ZONE
               foreach ($z in @($ra, $rd)) {
+                Write-Host "[microsoft-remote] Configure zone $z"
                 $form = @{
                   zone_name           = $z
                   dns_provider_type   = 'microsoft'
@@ -701,8 +679,10 @@ jobs:
                 $null = Invoke-FormPost -Uri "$base/zones" -WebSession $WebSession -Form $form
               }
 
+              Write-Host '[microsoft-remote] GET /api-keys'
               $keysHtml2 = (Invoke-WebRequest -Uri "$base/api-keys" -WebSession $WebSession -UseBasicParsing).Content
               $rZoneId = Get-ZoneIdFromApiKeysHtml -Html $keysHtml2 -ZoneFqdn $ra
+              Write-Host '[microsoft-remote] POST /api-keys'
               $rk = Invoke-FormPost -Uri "$base/api-keys" -WebSession $WebSession -MaximumRedirection 10 -Form @{ label = 'ms-remote-smoke'; zone_ids = "$rZoneId" }
               $msRemoteKey = Get-ApiKeyFromCreateHtml -Html $rk.Content
 

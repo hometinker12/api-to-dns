@@ -9,14 +9,6 @@ _ALLOWED_DELETE_RR = frozenset({"A", "AAAA", "CNAME", "TXT"})
 
 
 class DnsRecordRequest(BaseModel):
-    subscription_id: Optional[str] = Field(
-        None,
-        description="Azure subscription ID (optional if saved on the zone; not used for BIND or Microsoft WinRM).",
-    )
-    resource_group: Optional[str] = Field(
-        None,
-        description="Azure resource group (optional if saved on the zone).",
-    )
     zone_name: Optional[str] = Field(
         None,
         description="DNS zone name (required). Must match a configured zone and be allowed for this API key.",
@@ -55,6 +47,11 @@ class DnsRecordResponse(BaseModel):
     record_name: str
     record_type: str
     values: List[str]
+
+
+class DnsZoneSummary(BaseModel):
+    id: int
+    zone_name: str
 
 
 class User(SQLModel, table=True):

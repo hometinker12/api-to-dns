@@ -20,6 +20,7 @@ from .models import (
     DnsRecordRequest,
     DnsRecordResponse,
     DnsZoneConfig,
+    DnsZoneSummary,
     Setting,
     User,
 )
@@ -27,7 +28,7 @@ from .security import decrypt_value, encrypt_value, generate_api_key, hash_passw
 
 ACCESS_DENIED_DETAIL: Dict[str, str] = {
     "error": "access_denied",
-    "message": "You do not have access to this zone, or the zone is not configured.",
+    "message": "You do not have access or an invalid key was provided.",
 }
 
 LEGACY_DNS_SETTING_NAMES = [
@@ -46,9 +47,9 @@ LEGACY_DNS_SETTING_NAMES = [
 ]
 
 app = FastAPI(
-    title="Microsoft DNS Record Service",
-    description="Create or update Microsoft DNS records via REST and manage API keys through a protected web UI.",
-    version="0.3.0",
+    title="api-to-dns Service",
+    description="Create or update DNS records via REST and manage API keys through a protected web UI.",
+    version="0.3.1",
 )
 
 app.add_middleware(
@@ -60,6 +61,25 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="src/static"), name="static")
 templates = Jinja2Templates(directory="src/templates")
+
+AUTH_REDIRECT_DETAILS = {"Authentication required", "Invalid or expired session"}
+WEB_AUTH_PATH_PREFIXES = (
+    "/admin",
+    "/zones",
+    "/api-keys",
+)
+
+
+@app.exception_handler(HTTPException)
+def http_exception_handler(request: Request, exc: HTTPException):
+    """Redirect unauthenticated browser pages while preserving JSON API errors."""
+    if (
+        exc.status_code == 401
+        and exc.detail in AUTH_REDIRECT_DETAILS
+        and request.url.path.startswith(WEB_AUTH_PATH_PREFIXES)
+    ):
+        return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
 def _render_error_response(request: Request, error: Exception, status_code: int = 500):
@@ -81,6 +101,21 @@ def get_dns_client_from_settings(settings: dict):
     from .dns_client import create_dns_client
 
     return create_dns_client(settings)
+
+
+def wants_json_response(request: Request) -> bool:
+    return "application/json" in request.headers.get("accept", "").lower() or "application/json" in request.headers.get(
+        "content-type", ""
+    ).lower()
+
+
+def api_key_from_headers(x_api_key: Optional[str], authorization: Optional[str]) -> Optional[str]:
+    api_key = x_api_key
+    if not api_key and authorization:
+        prefix = "Bearer "
+        if authorization.startswith(prefix):
+            api_key = authorization[len(prefix) :].strip()
+    return api_key
 
 
 def _http_exception_from_dns_error(exc: Exception) -> HTTPException:
@@ -195,6 +230,16 @@ def api_key_allowed_zone_names(db, api_key_id: int) -> List[str]:
 
 def dns_zone_public_dict(z: DnsZoneConfig) -> Dict[str, Any]:
     """Safe to use after the Session closes (plain dict)."""
+    cfg = decode_zone_config(z)
+    return {
+        "id": z.id,
+        "zone_name": z.zone_name,
+        "dns_provider_type": cfg.get("dns_provider_type", "") or "azure",
+        "dns_server": cfg.get("dns_server", "") or "",
+    }
+
+
+def dns_zone_summary_dict(z: DnsZoneConfig) -> Dict[str, Any]:
     return {"id": z.id, "zone_name": z.zone_name}
 
 
@@ -255,21 +300,51 @@ def startup_event():
                 db.commit()
 
 
-@app.get("/", response_class=RedirectResponse)
-def root() -> RedirectResponse:
+@app.get("/", response_class=RedirectResponse, include_in_schema=False)
+def root(request: Request) -> RedirectResponse:
+    try:
+        get_current_user(request)
+    except HTTPException:
+        return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/admin")
 
 
-@app.get("/keycheck")
+@app.get(
+    "/keycheck",
+    responses={
+        200: {
+            "description": "API key is valid",
+            "content": {
+                "application/json": {
+                    "example": {"status": "success"},
+                    "schema": {
+                        "type": "object",
+                        "properties": {"status": {"type": "string", "example": "success"}},
+                        "required": ["status"],
+                    },
+                }
+            },
+        },
+        401: {
+            "description": "Unauthorized",
+            "content": {
+                "application/json": {
+                    "example": {"status": "failure"},
+                    "schema": {
+                        "type": "object",
+                        "properties": {"status": {"type": "string", "example": "failure"}},
+                        "required": ["status"],
+                    },
+                }
+            },
+        }
+    },
+)
 def keycheck(
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     authorization: Optional[str] = Header(None, alias="Authorization"),
 ):
-    api_key = x_api_key
-    if not api_key and authorization:
-        prefix = "Bearer "
-        if authorization.startswith(prefix):
-            api_key = authorization[len(prefix) :].strip()
+    api_key = api_key_from_headers(x_api_key, authorization)
 
     if not api_key:
         return JSONResponse(status_code=401, content={"status": "failure"})
@@ -282,7 +357,7 @@ def keycheck(
     return {"status": "success"}
 
 
-@app.get("/login", response_class=HTMLResponse)
+@app.get("/login", response_class=HTMLResponse, include_in_schema=False)
 def login_form(request: Request):
     try:
         return templates.TemplateResponse(
@@ -294,7 +369,7 @@ def login_form(request: Request):
         return _render_error_response(request, exc)
 
 
-@app.post("/login", response_class=HTMLResponse)
+@app.post("/login", response_class=HTMLResponse, include_in_schema=False)
 def login(request: Request, username: str = Form(...), password: str = Form(...)):
     with SessionLocal() as db:
         user = db.exec(select(User).where(User.username == username)).first()
@@ -309,14 +384,14 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
     return response
 
 
-@app.get("/logout")
+@app.get("/logout", include_in_schema=False)
 def logout() -> RedirectResponse:
     response = RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
     response.delete_cookie("session")
     return response
 
 
-@app.get("/admin", response_class=HTMLResponse)
+@app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
 def admin(request: Request, user: str = Depends(get_current_user)):
     try:
         with SessionLocal() as db:
@@ -340,19 +415,49 @@ def admin(request: Request, user: str = Depends(get_current_user)):
         return _render_error_response(request, exc)
 
 
-@app.get("/settings", response_class=HTMLResponse)
-def settings_page(request: Request, user: str = Depends(get_current_user)):
+@app.get(
+    "/zones",
+    response_model=List[DnsZoneSummary],
+    responses={
+        200: {
+            "description": "HTML DNS zones page, or JSON zone summaries when requested with application/json.",
+            "content": {
+                "text/html": {"schema": {"type": "string"}},
+            },
+        }
+    },
+)
+def zones_page(
+    request: Request,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
     with SessionLocal() as db:
+        if wants_json_response(request):
+            api_key = api_key_from_headers(x_api_key, authorization)
+            if not api_key:
+                raise HTTPException(status_code=403, detail=ACCESS_DENIED_DETAIL)
+            key = get_api_key(db, api_key)
+            if key is None:
+                raise HTTPException(status_code=403, detail=ACCESS_DENIED_DETAIL)
+            zone_ids = [
+                link.dns_zone_config_id
+                for link in db.exec(select(ApiKeyAllowedZone).where(ApiKeyAllowedZone.api_key_id == key.id)).all()
+            ]
+            zones = [zone for zone_id in zone_ids if (zone := db.get(DnsZoneConfig, zone_id)) is not None]
+            return [DnsZoneSummary(**dns_zone_summary_dict(z)) for z in zones]
+
+        get_current_user(request)
         zones = list_dns_zones(db)
         zones_view = [dns_zone_public_dict(z) for z in zones]
     return templates.TemplateResponse(
         request=request,
-        name="settings.html",
+        name="zones.html",
         context={"request": request, "zones": zones_view, "message": None},
     )
 
 
-@app.get("/zones/new", response_class=HTMLResponse)
+@app.get("/zones/new", response_class=HTMLResponse, include_in_schema=False)
 def zone_new_form(request: Request, user: str = Depends(get_current_user)):
     return templates.TemplateResponse(
         request=request,
@@ -361,7 +466,7 @@ def zone_new_form(request: Request, user: str = Depends(get_current_user)):
     )
 
 
-@app.post("/zones", response_class=HTMLResponse)
+@app.post("/zones", response_class=HTMLResponse, include_in_schema=False)
 def zone_create(
     request: Request,
     zone_name: str = Form(...),
@@ -385,7 +490,7 @@ def zone_create(
             zones_view = [dns_zone_public_dict(z) for z in zones]
         return templates.TemplateResponse(
             request=request,
-            name="settings.html",
+            name="zones.html",
             context={"request": request, "zones": zones_view, "message": "Zone name is required."},
         )
     with SessionLocal() as db:
@@ -394,7 +499,7 @@ def zone_create(
             zones_view = [dns_zone_public_dict(z) for z in zones]
             return templates.TemplateResponse(
                 request=request,
-                name="settings.html",
+                name="zones.html",
                 context={"request": request, "zones": zones_view, "message": f"A zone named {canonical!r} already exists."},
             )
         cfg = build_zone_config_from_form(
@@ -417,17 +522,17 @@ def zone_create(
         zones_view = [dns_zone_public_dict(z) for z in zones]
     return templates.TemplateResponse(
         request=request,
-        name="settings.html",
+        name="zones.html",
         context={"request": request, "zones": zones_view, "message": f"Zone {canonical!r} added."},
     )
 
 
-@app.get("/zones/{zone_id}/edit", response_class=HTMLResponse)
+@app.get("/zones/{zone_id}/edit", response_class=HTMLResponse, include_in_schema=False)
 def zone_edit_form(request: Request, zone_id: int, user: str = Depends(get_current_user)):
     with SessionLocal() as db:
         row = db.get(DnsZoneConfig, zone_id)
         if not row:
-            return RedirectResponse(url="/settings", status_code=HTTP_303_SEE_OTHER)
+            return RedirectResponse(url="/zones", status_code=HTTP_303_SEE_OTHER)
         settings = decode_zone_config(row)
         zone_view = dns_zone_public_dict(row)
         title_zone = row.zone_name
@@ -444,7 +549,7 @@ def zone_edit_form(request: Request, zone_id: int, user: str = Depends(get_curre
     )
 
 
-@app.post("/zones/{zone_id}", response_class=HTMLResponse)
+@app.post("/zones/{zone_id}", response_class=HTMLResponse, include_in_schema=False)
 def zone_update(
     request: Request,
     zone_id: int,
@@ -464,7 +569,7 @@ def zone_update(
     with SessionLocal() as db:
         row = db.get(DnsZoneConfig, zone_id)
         if not row:
-            return RedirectResponse(url="/settings", status_code=HTTP_303_SEE_OTHER)
+            return RedirectResponse(url="/zones", status_code=HTTP_303_SEE_OTHER)
         existing = decode_zone_config(row)
         cfg = build_zone_config_from_form(
             dns_provider_type,
@@ -500,7 +605,7 @@ def zone_update(
     )
 
 
-@app.post("/zones/{zone_id}/delete", response_class=HTMLResponse)
+@app.post("/zones/{zone_id}/delete", response_class=HTMLResponse, include_in_schema=False)
 def zone_delete(request: Request, zone_id: int, user: str = Depends(get_current_user)):
     with SessionLocal() as db:
         row = db.get(DnsZoneConfig, zone_id)
@@ -513,12 +618,12 @@ def zone_delete(request: Request, zone_id: int, user: str = Depends(get_current_
         zones_view = [dns_zone_public_dict(z) for z in zones]
     return templates.TemplateResponse(
         request=request,
-        name="settings.html",
+        name="zones.html",
         context={"request": request, "zones": zones_view, "message": "Zone removed."},
     )
 
 
-@app.get("/api-keys", response_class=HTMLResponse)
+@app.get("/api-keys", response_class=HTMLResponse, include_in_schema=False)
 def api_keys_page(request: Request, user: str = Depends(get_current_user)):
     try:
         with SessionLocal() as db:
@@ -542,7 +647,7 @@ def api_keys_page(request: Request, user: str = Depends(get_current_user)):
         return _render_error_response(request, exc)
 
 
-@app.post("/api-keys/revoke", response_class=HTMLResponse)
+@app.post("/api-keys/revoke", response_class=HTMLResponse, include_in_schema=False)
 def revoke_api_key(request: Request, key_id: int = Form(...), user: str = Depends(get_current_user)):
     try:
         with SessionLocal() as db:
@@ -572,14 +677,66 @@ def revoke_api_key(request: Request, key_id: int = Form(...), user: str = Depend
         return _render_error_response(request, exc)
 
 
-@app.post("/api-keys", response_class=HTMLResponse)
+@app.post("/api-keys", response_class=HTMLResponse, include_in_schema=False)
 def create_api_key_route(
     request: Request,
     label: str = Form(...),
     zone_ids: List[int] = Form(default_factory=list),
+    key_id: Optional[int] = Form(None),
     user: str = Depends(get_current_user),
 ):
     try:
+        if key_id is not None:
+            with SessionLocal() as db:
+                row = db.get(ApiKey, key_id)
+                if not row:
+                    return RedirectResponse(url="/api-keys", status_code=HTTP_303_SEE_OTHER)
+                if not zone_ids:
+                    api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda k: k.created_at, reverse=True)
+                    key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
+                    all_zones = list_dns_zones(db)
+                    api_keys_view = [api_key_public_dict(k) for k in api_keys]
+                    all_zones_view = [dns_zone_public_dict(z) for z in all_zones]
+                    return templates.TemplateResponse(
+                        request=request,
+                        name="api_keys.html",
+                        context={
+                            "request": request,
+                            "api_keys": api_keys_view,
+                            "key_zones": key_zones,
+                            "all_zones": all_zones_view,
+                            "message": None,
+                            "edit_key_error_id": key_id,
+                            "edit_key_error": "Select at least one DNS zone.",
+                            "edit_key_label": label,
+                            "edit_key_selected_zone_ids": zone_ids,
+                        },
+                    )
+                row.label = label
+                db.add(row)
+                for link in db.exec(select(ApiKeyAllowedZone).where(ApiKeyAllowedZone.api_key_id == key_id)).all():
+                    db.delete(link)
+                db.commit()
+                for zid in zone_ids:
+                    if db.get(DnsZoneConfig, zid):
+                        db.add(ApiKeyAllowedZone(api_key_id=key_id, dns_zone_config_id=zid))
+                db.commit()
+                api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda k: k.created_at, reverse=True)
+                key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
+                all_zones = list_dns_zones(db)
+                api_keys_view = [api_key_public_dict(k) for k in api_keys]
+                all_zones_view = [dns_zone_public_dict(z) for z in all_zones]
+            return templates.TemplateResponse(
+                request=request,
+                name="api_keys.html",
+                context={
+                    "request": request,
+                    "api_keys": api_keys_view,
+                    "key_zones": key_zones,
+                    "all_zones": all_zones_view,
+                    "message": "API key updated.",
+                },
+            )
         if not zone_ids:
             with SessionLocal() as db:
                 api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda k: k.created_at, reverse=True)
@@ -595,7 +752,9 @@ def create_api_key_route(
                     "api_keys": api_keys_view,
                     "key_zones": key_zones,
                     "all_zones": all_zones_view,
-                    "message": "Select at least one DNS zone for this API key.",
+                    "message": None,
+                    "create_key_error": "Select at least one DNS zone for this API key.",
+                    "create_key_label": label,
                 },
             )
         new_key = generate_api_key()
@@ -629,7 +788,7 @@ def create_api_key_route(
         return _render_error_response(request, exc)
 
 
-@app.get("/api-keys/{key_id}/edit", response_class=HTMLResponse)
+@app.get("/api-keys/{key_id}/edit", response_class=HTMLResponse, include_in_schema=False)
 def api_key_edit_form(request: Request, key_id: int, user: str = Depends(get_current_user)):
     with SessionLocal() as db:
         row = db.get(ApiKey, key_id)
@@ -655,7 +814,7 @@ def api_key_edit_form(request: Request, key_id: int, user: str = Depends(get_cur
     )
 
 
-@app.post("/api-keys/{key_id}", response_class=HTMLResponse)
+@app.post("/api-keys/{key_id}", response_class=HTMLResponse, include_in_schema=False)
 def api_key_update(
     request: Request,
     key_id: int,
@@ -734,11 +893,7 @@ def upsert_dns_record(
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     authorization: Optional[str] = Header(None, alias="Authorization"),
 ):
-    api_key = x_api_key
-    if not api_key and authorization:
-        prefix = "Bearer "
-        if authorization.startswith(prefix):
-            api_key = authorization[len(prefix) :].strip()
+    api_key = api_key_from_headers(x_api_key, authorization)
 
     if not api_key:
         raise HTTPException(status_code=401, detail="API key is required")
@@ -769,27 +924,20 @@ def upsert_dns_record(
         settings = decode_zone_config(zone_row)
         provider = (settings.get("dns_provider_type") or "azure").strip().lower()
         if provider == "azure":
-            updates: Dict[str, Any] = {}
-            if not payload.subscription_id and settings.get("azure_subscription_id"):
-                updates["subscription_id"] = settings["azure_subscription_id"]
-            if not payload.resource_group and settings.get("azure_resource_group"):
-                updates["resource_group"] = settings["azure_resource_group"]
-            if updates:
-                payload = payload.model_copy(update=updates)
-            if not payload.subscription_id:
+            if not settings.get("azure_subscription_id"):
                 raise HTTPException(
                     status_code=400,
                     detail={
                         "error": "invalid_request",
-                        "message": "subscription_id is required for Azure DNS (save a default on the zone or include it in the request).",
+                        "message": "Azure subscription ID is required on the zone configuration.",
                     },
                 )
-            if not payload.resource_group:
+            if not settings.get("azure_resource_group"):
                 raise HTTPException(
                     status_code=400,
                     detail={
                         "error": "invalid_request",
-                        "message": "resource_group is required for Azure DNS (save a default on the zone or include it in the request).",
+                        "message": "Azure resource group is required on the zone configuration.",
                     },
                 )
 
