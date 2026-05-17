@@ -49,7 +49,7 @@ LEGACY_DNS_SETTING_NAMES = [
 app = FastAPI(
     title="api-to-dns Service",
     description="Create or update DNS records via REST and manage API keys through a protected web UI.",
-    version="0.3.0",
+    version="0.3.1",
 )
 
 app.add_middleware(
