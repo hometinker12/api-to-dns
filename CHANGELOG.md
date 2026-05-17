@@ -10,7 +10,7 @@
 
 ### Changed
 
-- Replaced single **DNS Settings** form with **DNS zones** list (`/settings`), **Add zone** (`/zones/new`), **Edit zone** (`/zones/{id}/edit`), and **Delete zone**.
+- Replaced single **DNS Settings** form with **DNS zones** list (`/dns-zones`), **Add zone** (`/zones/new`), **Edit zone** (`/zones/{id}/edit`), and **Delete zone**.
 - Startup **migration**: if legacy flat `Setting` DNS keys exist and no zones exist yet, one zone row is created and **all active API keys** are granted access to it; legacy settings rows are removed.
 
 ### Removed

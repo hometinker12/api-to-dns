@@ -64,6 +64,7 @@ templates = Jinja2Templates(directory="src/templates")
 AUTH_REDIRECT_DETAILS = {"Authentication required", "Invalid or expired session"}
 WEB_AUTH_PATH_PREFIXES = (
     "/admin",
+    "/dns-zones",
     "/settings",
     "/zones",
     "/api-keys",
@@ -370,14 +371,19 @@ def admin(request: Request, user: str = Depends(get_current_user)):
         return _render_error_response(request, exc)
 
 
-@app.get("/settings", response_class=HTMLResponse)
-def settings_page(request: Request, user: str = Depends(get_current_user)):
+@app.get("/settings")
+def legacy_settings_page_redirect(user: str = Depends(get_current_user)):
+    return RedirectResponse(url="/dns-zones", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.get("/dns-zones", response_class=HTMLResponse)
+def dns_zones_page(request: Request, user: str = Depends(get_current_user)):
     with SessionLocal() as db:
         zones = list_dns_zones(db)
         zones_view = [dns_zone_public_dict(z) for z in zones]
     return templates.TemplateResponse(
         request=request,
-        name="settings.html",
+        name="dns_zones.html",
         context={"request": request, "zones": zones_view, "message": None},
     )
 
@@ -415,7 +421,7 @@ def zone_create(
             zones_view = [dns_zone_public_dict(z) for z in zones]
         return templates.TemplateResponse(
             request=request,
-            name="settings.html",
+            name="dns_zones.html",
             context={"request": request, "zones": zones_view, "message": "Zone name is required."},
         )
     with SessionLocal() as db:
@@ -424,7 +430,7 @@ def zone_create(
             zones_view = [dns_zone_public_dict(z) for z in zones]
             return templates.TemplateResponse(
                 request=request,
-                name="settings.html",
+                name="dns_zones.html",
                 context={"request": request, "zones": zones_view, "message": f"A zone named {canonical!r} already exists."},
             )
         cfg = build_zone_config_from_form(
@@ -447,7 +453,7 @@ def zone_create(
         zones_view = [dns_zone_public_dict(z) for z in zones]
     return templates.TemplateResponse(
         request=request,
-        name="settings.html",
+        name="dns_zones.html",
         context={"request": request, "zones": zones_view, "message": f"Zone {canonical!r} added."},
     )
 
@@ -457,7 +463,7 @@ def zone_edit_form(request: Request, zone_id: int, user: str = Depends(get_curre
     with SessionLocal() as db:
         row = db.get(DnsZoneConfig, zone_id)
         if not row:
-            return RedirectResponse(url="/settings", status_code=HTTP_303_SEE_OTHER)
+            return RedirectResponse(url="/dns-zones", status_code=HTTP_303_SEE_OTHER)
         settings = decode_zone_config(row)
         zone_view = dns_zone_public_dict(row)
         title_zone = row.zone_name
@@ -494,7 +500,7 @@ def zone_update(
     with SessionLocal() as db:
         row = db.get(DnsZoneConfig, zone_id)
         if not row:
-            return RedirectResponse(url="/settings", status_code=HTTP_303_SEE_OTHER)
+            return RedirectResponse(url="/dns-zones", status_code=HTTP_303_SEE_OTHER)
         existing = decode_zone_config(row)
         cfg = build_zone_config_from_form(
             dns_provider_type,
@@ -543,7 +549,7 @@ def zone_delete(request: Request, zone_id: int, user: str = Depends(get_current_
         zones_view = [dns_zone_public_dict(z) for z in zones]
     return templates.TemplateResponse(
         request=request,
-        name="settings.html",
+        name="dns_zones.html",
         context={"request": request, "zones": zones_view, "message": "Zone removed."},
     )
 

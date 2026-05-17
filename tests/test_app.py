@@ -94,7 +94,7 @@ def test_authenticated_web_pages_render(client: TestClient) -> None:
         assert api_key is not None
     for path in (
         "/admin",
-        "/settings",
+        "/dns-zones",
         "/api-keys",
         "/zones/new",
         f"/zones/{zone.id}/edit",
@@ -104,9 +104,9 @@ def test_authenticated_web_pages_render(client: TestClient) -> None:
         assert response.status_code == 200
 
 
-def test_settings_page_displays_zone_provider_metadata(client: TestClient) -> None:
+def test_dns_zones_page_displays_zone_provider_metadata(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
-    response = client.get("/settings")
+    response = client.get("/dns-zones")
     assert response.status_code == 200
     assert "Type" in response.text
     assert "Target DNS Server" in response.text
