@@ -226,15 +226,6 @@ curl -sS -X POST "http://localhost:8000/dns-record" \
   }'
 ```
 
-**Responses (short)**
-
-- Create / update success: HTTP **200**, `"status": "success"`, `"action": "created"` or `"updated"`.
-- Delete removed a record: **200**, `"status": "success"`, `"action": "deleted"`.
-- Delete when nothing matched: **404**, `"status": "error"`, `"action": "not_found"`.
-- Zone missing or API key not allowed for that zone: **403**, `"detail": { "error": "access_denied", "message": "..." }`.
-- Validation or provider failure: **400**, **502**, **503**, or **500** with JSON `detail` (for example `{"detail": {"error": "dns_provider_failed", "message": "..."}}`).
-
-> **PowerShell:** `Invoke-RestMethod` treats HTTP **404** as a terminating error by default. For a DELETE that returns `not_found`, use `Invoke-RestMethod ... -SkipHttpErrorCheck` (PowerShell 7+) or `Invoke-WebRequest` and read the body.
 
 ## License
 
