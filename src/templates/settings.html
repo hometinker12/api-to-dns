@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Settings</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="page page-wide">
+    <header class="page-header">
+      <div>
+        <h1>Settings</h1>
+        <p class="help">Signed in as {{ user }}</p>
+      </div>
+      <nav class="nav-links">
+        <a class="button" href="/admin">Dashboard</a>
+        <a class="button danger" href="/logout">Logout</a>
+      </nav>
+    </header>
+
+    {% if message %}
+      <div class="alert {{ message_kind or 'success' }}">{{ message }}</div>
+    {% endif %}
+
+    {% if not accessible_areas %}
+      <div class="alert error">
+        Access denied.
+      </div>
+    {% else %}
+    <div class="settings-layout">
+      <aside class="settings-sidebar" aria-label="Settings areas">
+        <div class="settings-sidebar-title">Settings</div>
+        <nav class="settings-menu">
+          {% for area in accessible_areas %}
+            <a
+              class="settings-menu-item {% if area.key == selected_area %}selected{% endif %}"
+              href="/settings?area={{ area.key }}"
+            >
+              {{ area.label }}
+            </a>
+          {% endfor %}
+        </nav>
+      </aside>
+
+      <section class="settings-content">
+        {% if selected_area == "authentication" %}
+          <h2>Authentication</h2>
+          {% if can_view_accounts %}
+            <p class="help">Create user accounts, assign roles, reset passwords, and remove accounts that are no longer needed.</p>
+          {% else %}
+            <p class="help">Change your account password.</p>
+          {% endif %}
+
+          <section class="form-card">
+            <h2>Change My Password</h2>
+            <form action="/settings/account/password" method="post">
+              <label>Current password
+                <input type="password" name="current_password" required autocomplete="current-password" />
+              </label>
+              <label>New password
+                <input type="password" name="new_password" required autocomplete="new-password" />
+              </label>
+              <label>Confirm new password
+                <input type="password" name="confirm_password" required autocomplete="new-password" />
+              </label>
+              <div class="dialog-actions">
+                <button type="submit">Change password</button>
+              </div>
+            </form>
+          </section>
+
+          {% if can_view_accounts %}
+            <div class="section-title-row">
+              <h2>Users</h2>
+              {% if can_account_update %}
+                <button type="button" id="open-create-user">Create user</button>
+              {% endif %}
+            </div>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Username</th>
+                    <th class="actions-column">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for u in users %}
+                    <tr>
+                      <td>
+                        <code>{{ u.username }}</code>
+                        {% if u.username == user %}<span class="help" style="display:inline; margin-left:0.4rem;">(you)</span>{% endif %}
+                      </td>
+                      <td class="actions-column">
+                        <div class="action-cell">
+                          {% if can_account_update %}
+                            <button type="button" data-open-edit-roles="{{ u.id }}">Edit roles</button>
+                          {% endif %}
+                          {% if can_account_reset_password %}
+                            <button type="button" data-open-reset-password="{{ u.id }}">Reset password</button>
+                          {% endif %}
+                          {% if can_account_update and u.username != user %}
+                            <form action="/settings/users/{{ u.id }}/delete" method="post" onsubmit="return confirm('Delete user {{ u.username }}?');">
+                              <button type="submit" class="danger">Delete</button>
+                            </form>
+                          {% endif %}
+                        </div>
+                      </td>
+                    </tr>
+                  {% else %}
+                    <tr><td colspan="3">No users yet.</td></tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% endif %}
+
+          {% if can_account_update %}
+            <dialog id="create-user-dialog" data-auto-open="{% if auth_form_error %}true{% else %}false{% endif %}">
+              <div class="dialog-content">
+                <div class="dialog-header">
+                  <h2>Create user</h2>
+                  <button type="button" class="danger" id="close-create-user">Close</button>
+                </div>
+                {% if auth_form_error %}
+                  <div class="alert error">{{ auth_form_error }}</div>
+                {% endif %}
+                <form action="/settings/users" method="post">
+                  <label>Username
+                    <input type="text" name="username" required value="{{ auth_form_username }}" autocomplete="off" />
+                  </label>
+                  <label>Password
+                    <input type="password" name="password" required autocomplete="new-password" />
+                  </label>
+                  <fieldset>
+                    <legend>Roles</legend>
+                    <p class="help">Grant only the permissions this user needs. The default admin keeps every role.</p>
+                    {% for role in role_catalog %}
+                      <label class="inline-check">
+                        <input
+                          type="checkbox"
+                          name="roles"
+                          value="{{ role.key }}"
+                          {% if role.requires_role %}data-requires-role="{{ role.requires_role }}"{% endif %}
+                          {% if role.key in auth_form_selected_roles %}checked{% endif %}
+                        />
+                        <code>{{ role.key }}</code> &mdash; {{ role.label }}
+                      </label>
+                    {% endfor %}
+                  </fieldset>
+                  <div class="dialog-actions">
+                    <button type="button" class="secondary" id="cancel-create-user">Cancel</button>
+                    <button type="submit">Create user</button>
+                  </div>
+                </form>
+              </div>
+            </dialog>
+          {% endif %}
+
+          {% if can_account_update %}
+            {% for u in users %}
+              <dialog id="edit-roles-dialog-{{ u.id }}">
+                <div class="dialog-content">
+                  <div class="dialog-header">
+                    <h2>Edit roles for {{ u.username }}</h2>
+                    <button type="button" class="danger" data-close-edit-roles="{{ u.id }}">Close</button>
+                  </div>
+                  <form action="/settings/users/{{ u.id }}/roles" method="post">
+                    <fieldset>
+                      <legend>Roles</legend>
+                      <p class="help">Uncheck every role to leave the user with no permissions. Default admin behavior only applies when no roles have ever been assigned.</p>
+                      {% for role in role_catalog %}
+                        <label class="inline-check">
+                          <input
+                            type="checkbox"
+                            name="roles"
+                            value="{{ role.key }}"
+                            {% if role.requires_role %}data-requires-role="{{ role.requires_role }}"{% endif %}
+                            {% if role.key in u.roles %}checked{% endif %}
+                          />
+                          <code>{{ role.key }}</code> &mdash; {{ role.label }}
+                        </label>
+                      {% endfor %}
+                    </fieldset>
+                    <div class="dialog-actions">
+                      <button type="button" class="secondary" data-close-edit-roles="{{ u.id }}">Cancel</button>
+                      <button type="submit">Save roles</button>
+                    </div>
+                  </form>
+                </div>
+              </dialog>
+            {% endfor %}
+          {% endif %}
+
+          {% if can_account_reset_password %}
+            {% for u in users %}
+              <dialog id="reset-password-dialog-{{ u.id }}">
+                <div class="dialog-content">
+                  <div class="dialog-header">
+                    <h2>Reset password for {{ u.username }}</h2>
+                    <button type="button" class="danger" data-close-reset-password="{{ u.id }}">Close</button>
+                  </div>
+                  <form action="/settings/users/{{ u.id }}/password" method="post">
+                    <label>New password
+                      <input type="password" name="password" required autocomplete="new-password" />
+                    </label>
+                    <div class="dialog-actions">
+                      <button type="button" class="secondary" data-close-reset-password="{{ u.id }}">Cancel</button>
+                      <button type="submit">Reset password</button>
+                    </div>
+                  </form>
+                </div>
+              </dialog>
+            {% endfor %}
+          {% endif %}
+
+        {% elif selected_area == "plugins" %}
+          <h2>Plugin Management</h2>
+          <p class="help">DNS provider plugins are auto-discovered from <code>src/plugins/</code>. Disabled plugins cannot be selected for new DNS zones.</p>
+          {% if plugins %}
+            {% for plugin in plugins %}
+              <article class="plugin-card {% if plugin.disabled %}disabled{% endif %}" data-plugin-key="{{ plugin.key }}">
+                <header class="plugin-card-header">
+                  <div>
+                    <h3>{{ plugin.label }}</h3>
+                    <p class="help"><code>{{ plugin.key }}</code> <span class="plugin-status">{{ "Disabled" if plugin.disabled else "Enabled" }}</span></p>
+                  </div>
+                  {% if can_plugin_update %}
+                    {% if plugin.disabled %}
+                      <form action="/settings/plugins/{{ plugin.key }}/enable" method="post">
+                        <button type="submit">Enable</button>
+                      </form>
+                    {% else %}
+                      <form action="/settings/plugins/{{ plugin.key }}/disable" method="post" onsubmit="return confirm('Disable {{ plugin.label }}? It will no longer be available for new DNS zones.');">
+                        <button type="submit" class="danger">Disable</button>
+                      </form>
+                    {% endif %}
+                  {% endif %}
+                </header>
+                <p class="help">{{ plugin.help_text }}</p>
+                {% if plugin.enabled%}
+                  <details class="plugin-fields">
+                    <summary>Configuration fields</summary>
+                    {% if plugin.fields %}
+                      <div class="table-wrap">
+                        <table>
+                          <thead>
+                            <tr><th>Name</th><th>Label</th><th>Type</th></tr>
+                          </thead>
+                          <tbody>
+                            {% for field in plugin.fields %}
+                              <tr>
+                                <td><code>{{ field.name }}</code></td>
+                                <td>{{ field.label }}</td>
+                                <td>{{ field.type }}</td>
+                              </tr>
+                            {% endfor %}
+                          </tbody>
+                        </table>
+                      </div>
+                    {% else %}
+                      <p class="help">No configuration fields exposed.</p>
+                    {% endif %}
+                  </details>
+                {% endif %}
+              </article>
+            {% endfor %}
+          {% else %}
+            <div class="alert">No plugins discovered.</div>
+          {% endif %}
+
+        {% elif selected_area == "logging" %}
+          <h2>Activity Logging</h2>
+          <div class="placeholder-panel">
+            <p>Activity and audit logging is planned but not implemented yet.</p>
+            <p class="help">When delivered, this area will let you review session sign-ins, DNS record changes, API key activity, and other notable events.</p>
+          </div>
+
+        {% elif selected_area == "backup" %}
+          <h2>System Backup</h2>
+          <div class="placeholder-panel">
+            <p>Backup and restore controls are planned but not implemented yet.</p>
+            <p class="help">When delivered, this area will let you export configuration, schedule backups, and restore from a saved snapshot.</p>
+          </div>
+
+        {% else %}
+          <div class="alert error">Unknown settings area: {{ selected_area }}.</div>
+        {% endif %}
+      </section>
+    </div>
+    {% endif %}
+
+    <script>
+      function bindDialog(openSelector, closeSelector, dialog) {
+        document.querySelectorAll(openSelector).forEach((button) => {
+          button.addEventListener("click", () => dialog?.showModal());
+        });
+        document.querySelectorAll(closeSelector).forEach((button) => {
+          button.addEventListener("click", () => dialog?.close());
+        });
+      }
+
+      function enforceRoleDependencies(form) {
+        const roleInputs = Array.from(form.querySelectorAll("input[name='roles']"));
+        const inputByRole = new Map(roleInputs.map((input) => [input.value, input]));
+
+        function setForcedReadRole(input, forced) {
+          input.checked = forced;
+          input.disabled = forced;
+          input.closest("label")?.classList.toggle("role-forced", forced);
+        }
+
+        function syncDependencies(changedInput) {
+          if (changedInput?.dataset.requiresRole) {
+            const requiredInput = inputByRole.get(changedInput.dataset.requiresRole);
+            if (requiredInput) {
+              setForcedReadRole(requiredInput, changedInput.checked);
+            }
+            return;
+          }
+
+          roleInputs.forEach((input) => {
+            if (!input.dataset.requiresRole) {
+              return;
+            }
+            const requiredInput = inputByRole.get(input.dataset.requiresRole);
+            if (requiredInput && input.checked) {
+              setForcedReadRole(requiredInput, true);
+            }
+          });
+        }
+
+        roleInputs.forEach((input) => {
+          input.addEventListener("change", () => syncDependencies(input));
+        });
+        form.addEventListener("submit", () => {
+          roleInputs.forEach((input) => {
+            if (input.disabled) {
+              input.disabled = false;
+            }
+          });
+        });
+        syncDependencies();
+      }
+
+      document.querySelectorAll("form").forEach(enforceRoleDependencies);
+
+      const createUserDialog = document.getElementById("create-user-dialog");
+      document.getElementById("open-create-user")?.addEventListener("click", () => createUserDialog?.showModal());
+      document.getElementById("close-create-user")?.addEventListener("click", () => createUserDialog?.close());
+      document.getElementById("cancel-create-user")?.addEventListener("click", () => createUserDialog?.close());
+
+      document.querySelectorAll("[data-open-edit-roles]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const dialog = document.getElementById(`edit-roles-dialog-${button.dataset.openEditRoles}`);
+          dialog?.showModal();
+        });
+      });
+      document.querySelectorAll("[data-close-edit-roles]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const dialog = document.getElementById(`edit-roles-dialog-${button.dataset.closeEditRoles}`);
+          dialog?.close();
+        });
+      });
+
+      document.querySelectorAll("[data-open-reset-password]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const dialog = document.getElementById(`reset-password-dialog-${button.dataset.openResetPassword}`);
+          dialog?.showModal();
+        });
+      });
+      document.querySelectorAll("[data-close-reset-password]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const dialog = document.getElementById(`reset-password-dialog-${button.dataset.closeResetPassword}`);
+          dialog?.close();
+        });
+      });
+
+      document.querySelectorAll("dialog[data-auto-open='true']").forEach((dialog) => {
+        if (!dialog.open) {
+          dialog.showModal();
+        }
+      });
+    </script>
+  </div>
+</body>
+</html>
