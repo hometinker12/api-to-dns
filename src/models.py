@@ -58,6 +58,8 @@ class User(SQLModel, table=True):
     id: Optional[int] = SQLField(default=None, primary_key=True)
     username: str = SQLField(index=True, unique=True)
     password_hash: str
+    roles: Optional[str] = SQLField(default="")
+    disabled: bool = SQLField(default=False)
 
 
 class ApiKey(SQLModel, table=True):

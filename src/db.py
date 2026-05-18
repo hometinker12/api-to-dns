@@ -21,3 +21,34 @@ def init_db() -> None:
     from . import models  # noqa: F401 — register SQLModel subclasses before create_all
 
     SQLModel.metadata.create_all(engine)
+    _migrate_add_user_roles_column()
+    _migrate_add_user_disabled_column()
+
+
+def _migrate_add_user_roles_column() -> None:
+    """Add the `roles` column to existing `user` tables created before role support."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if "user" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("user")}
+    if "roles" in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE user ADD COLUMN roles VARCHAR DEFAULT ''"))
+
+
+def _migrate_add_user_disabled_column() -> None:
+    """Add the `disabled` column to existing `user` tables created before account disabling."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if "user" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("user")}
+    if "disabled" in columns:
+        return
+    with engine.begin() as conn:
+        default_value = "false" if engine.dialect.name != "sqlite" else "0"
+        conn.execute(text(f"ALTER TABLE user ADD COLUMN disabled BOOLEAN DEFAULT {default_value} NOT NULL"))

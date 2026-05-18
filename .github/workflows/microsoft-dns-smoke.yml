@@ -200,7 +200,7 @@ jobs:
             -d "username=admin&password=your-admin-password" \
             -o /dev/null
           echo "[bind] Verify admin page"
-          curl --fail --silent -b /tmp/cookies http://localhost:8000/admin | python3 -c "import sys; assert 'DNS Admin Dashboard' in sys.stdin.read()"
+          curl --fail --silent -b /tmp/cookies http://localhost:8000/admin | python3 -c "import sys; assert 'api-to-dns App Dashboard' in sys.stdin.read()"
 
           for zone in smoke.test denied.test; do
             echo "[bind] Configure zone ${zone}"
@@ -581,7 +581,7 @@ jobs:
 
             Write-Host '[microsoft] GET /admin'
             $admin = Invoke-WebRequest -Uri "$base/admin" -WebSession $WebSession -UseBasicParsing
-            if ($admin.Content -notmatch 'DNS Admin Dashboard') {
+            if ($admin.Content -notmatch 'api-to-dns App Dashboard') {
               throw 'Admin page did not contain expected title (session or credentials).'
             }
 

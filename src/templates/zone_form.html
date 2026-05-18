@@ -2,13 +2,13 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>{{ title }}</title>
+  <title>api-to-dns Add DNS Zone</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <div class="page">
     <header class="page-header">
-      <h1>{{ title }}</h1>
+      <h1>api-to-dns Add DNS Zone</h1>
       <nav class="nav-links">
         <a class="button" href="/zones">All zones</a>
         <a class="button" href="/admin">Dashboard</a>
@@ -38,67 +38,41 @@
         <label>DNS server type
           <p class="help">Choose the provider type first. The connection and credential fields below update to match the selected provider.</p>
           <select name="dns_provider_type" id="dns-provider-type">
-          <option value="azure" {% if provider == 'azure' %}selected{% endif %}>Azure DNS (REST API)</option>
-          <option value="microsoft" {% if settings.dns_provider_type == 'microsoft' %}selected{% endif %}>Microsoft DNS (WinRM)</option>
-          <option value="bind" {% if settings.dns_provider_type == 'bind' %}selected{% endif %}>BIND / RFC 2136 (TSIG)</option>
+          {% for plugin in provider_plugins %}
+            <option value="{{ plugin.key }}" {% if provider == plugin.key %}selected{% endif %}>{{ plugin.label }}</option>
+          {% endfor %}
           </select>
         </label>
       </section>
 
-      <section class="provider-panel" data-provider-panel="azure" {% if provider != 'azure' %}hidden{% endif %}>
-        <h2>Azure DNS</h2>
-        <p class="help">Use an Azure service principal with permission to manage records in the zone. Target DNS Server and TSIG settings are not used for Azure DNS.</p>
-        <label>Azure tenant ID
-          <input type="text" name="azure_tenant_id" value="{{ settings.azure_tenant_id or '' }}" autocomplete="off" />
-        </label>
-        <label>Azure client ID (application ID)
-          <input type="text" name="azure_client_id" value="{{ settings.azure_client_id or '' }}" autocomplete="off" />
-        </label>
-        <label>Azure client secret
-          <input type="password" name="azure_client_secret" value="" placeholder="{% if zone %}leave blank to keep current{% endif %}" autocomplete="new-password" />
-        </label>
-        <label>Default subscription ID (optional)
-          <input type="text" name="azure_subscription_id" value="{{ settings.azure_subscription_id or '' }}" autocomplete="off" />
-        </label>
-        <label>Default resource group (optional)
-          <input type="text" name="azure_resource_group" value="{{ settings.azure_resource_group or '' }}" autocomplete="off" />
-        </label>
-      </section>
-
-      <section class="provider-panel" data-provider-panel="microsoft" {% if provider != 'microsoft' %}hidden{% endif %}>
-        <h2>Microsoft DNS (WinRM)</h2>
-        <p class="help">Use a DNS server or domain controller that accepts WinRM connections. The account must have rights to manage records in the zone.</p>
-        <label>Target DNS Server
-          <input type="text" name="dns_server" value="{{ settings.dns_server or '' }}" placeholder="dc01.corp.local or 192.0.2.10" />
-        </label>
-        <label>Username
-          <input type="text" name="dns_username" value="{{ settings.dns_username or '' }}" autocomplete="off" placeholder="DOMAIN\\dns-admin" />
-        </label>
-        <label>Password
-          <input type="password" name="dns_password" value="" placeholder="{% if zone %}leave blank to keep current{% endif %}" autocomplete="new-password" />
-        </label>
-        <label class="inline-check">
-          <input type="checkbox" name="dns_winrm_ssl" value="true" {% if settings.dns_winrm_ssl %}checked{% endif %} />
-          Use HTTPS WinRM (port 5986)
-        </label>
-      </section>
-
-      <section class="provider-panel" data-provider-panel="bind" {% if provider != 'bind' %}hidden{% endif %}>
-        <h2>BIND / RFC 2136</h2>
-        <p class="help">Use a BIND server that accepts dynamic updates. Provide the TSIG key name, shared secret in base64, and the TSIG algorithm.</p>
-        <label>Target DNS Server
-          <input type="text" name="dns_server" value="{{ settings.dns_server or '' }}" placeholder="bind01.example.com or 192.0.2.10" />
-        </label>
-        <label>TSIG key name
-          <input type="text" name="dns_username" value="{{ settings.dns_username or '' }}" autocomplete="off" placeholder="api-to-dns." />
-        </label>
-        <label>TSIG secret (base64)
-          <input type="password" name="dns_password" value="" placeholder="{% if zone %}leave blank to keep current{% endif %}" autocomplete="new-password" />
-        </label>
-        <label>TSIG algorithm
-          <input type="text" name="dns_tsig_algorithm" value="{{ settings.dns_tsig_algorithm or '' }}" placeholder="hmac-sha256" />
-        </label>
-      </section>
+      {% for plugin in provider_plugins %}
+        <section class="provider-panel" data-provider-panel="{{ plugin.key }}" {% if provider != plugin.key %}hidden{% endif %}>
+          <h2>{{ plugin.heading }}</h2>
+          <p class="help">{{ plugin.help_text }}</p>
+          {% for field in plugin.fields %}
+            {% set field_value = settings.get(field.name, field.default) %}
+            {% if field.type == 'checkbox' %}
+              <label class="inline-check">
+                <input type="checkbox" name="{{ field.name }}" value="true" {% if field_value %}checked{% endif %} />
+                {{ field.label }}
+              </label>
+            {% else %}
+              <label>{{ field.label }}
+                <input
+                  type="{{ field.type }}"
+                  name="{{ field.name }}"
+                  value="{% if field.type != 'password' %}{{ field_value or field.default }}{% endif %}"
+                  placeholder="{% if field.preserve_on_blank and zone %}leave blank to keep current{% else %}{{ field.placeholder }}{% endif %}"
+                  {% if field.autocomplete %}autocomplete="{{ field.autocomplete }}"{% endif %}
+                />
+              </label>
+            {% endif %}
+            {% if field.help %}
+              <p class="help">{{ field.help }}</p>
+            {% endif %}
+          {% endfor %}
+        </section>
+      {% endfor %}
 
       <div class="action-cell">
         <button type="submit">{% if zone %}Save zone{% else %}Create zone{% endif %}</button>

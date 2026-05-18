@@ -89,7 +89,8 @@ button.danger:hover,
   background: #fecaca;
 }
 button:disabled,
-input[type="submit"]:disabled {
+input[type="submit"]:disabled,
+.button.disabled {
   background: #cbd5e1;
   color: #64748b;
   cursor: not-allowed;
@@ -197,6 +198,13 @@ label.inline-check input {
   width: auto;
   margin-top: 0;
 }
+label.inline-check.role-forced {
+  color: #64748b;
+}
+label.inline-check.role-forced code {
+  background: #e2e8f0;
+  color: #64748b;
+}
 .form-card,
 .provider-panel {
   border: 1px solid #e2e8f0;
@@ -276,6 +284,130 @@ dialog::backdrop {
   justify-content: flex-end;
   flex-wrap: wrap;
   gap: 0.75rem;
+}
+.page.page-wide {
+  width: min(1100px, calc(100% - 32px));
+}
+.settings-layout {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1fr);
+  gap: 1.5rem;
+  align-items: start;
+  margin-top: 1rem;
+}
+.settings-sidebar {
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #f8fafc;
+  overflow: hidden;
+  position: sticky;
+  top: 1rem;
+}
+.settings-sidebar-title {
+  background: #eef2f7;
+  border-bottom: 1px solid #e2e8f0;
+  padding: 0.85rem 1rem;
+  font-size: 0.85rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #475569;
+}
+.settings-menu {
+  display: flex;
+  flex-direction: column;
+  padding: 0.35rem 0;
+}
+.settings-menu-item {
+  display: block;
+  padding: 0.85rem 1rem;
+  text-decoration: none;
+  color: #1f2937;
+  font-weight: 500;
+  border-left: 3px solid transparent;
+}
+.settings-menu-item:hover {
+  background: #e2e8f0;
+}
+.settings-menu-item.selected {
+  background: #ffffff;
+  border-left-color: #2563eb;
+  color: #1d4ed8;
+}
+.settings-content {
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #ffffff;
+  padding: 1.25rem 1.5rem;
+  min-width: 0;
+}
+.settings-content > h2:first-child {
+  margin-top: 0;
+}
+.plugin-card {
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 1rem 1.25rem;
+  margin: 1rem 0;
+  background: #f8fafc;
+}
+.plugin-card.disabled {
+  background: #e5e7eb;
+  color: #374151;
+}
+.plugin-card.disabled .help,
+.plugin-card.disabled code {
+  color: #374151;
+}
+.plugin-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  margin-bottom: 0.25rem;
+}
+.plugin-card-header form {
+  margin: 0;
+}
+.plugin-card-header h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+.plugin-status {
+  display: inline-block;
+  margin-left: 0.35rem;
+  font-weight: 700;
+}
+.plugin-card h4 {
+  margin: 0.75rem 0 0.25rem;
+  font-size: 0.95rem;
+}
+.plugin-fields {
+  margin-top: 0.75rem;
+}
+.plugin-fields summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+.placeholder-panel {
+  border: 1px dashed #cbd5e1;
+  border-radius: 12px;
+  padding: 1.25rem 1.5rem;
+  background: #f8fafc;
+}
+.placeholder-panel p {
+  margin: 0 0 0.5rem;
+}
+.placeholder-panel p:last-child {
+  margin-bottom: 0;
+}
+@media (max-width: 640px) {
+  .settings-layout {
+    grid-template-columns: 1fr;
+  }
+  .settings-sidebar {
+    position: static;
+  }
 }
 @media (max-width: 640px) {
   header,

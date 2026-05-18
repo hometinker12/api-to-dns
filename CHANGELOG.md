@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.3.4] - 2026-05-17
+
+### Added
+
+- Role-based access control for user, API key, DNS zone, plugin, and system management areas, including a `global.admin` role that grants all permissions and protects global administrator accounts from lower-privileged account actions.
+- A dedicated Settings page with Authentication, Plugin Management, Activity Logging, and System Backup areas, including self-service password changes and administrator-driven user management.
+- Account disable/enable workflow that requires accounts to be disabled before deletion and blocks disabled users from signing in or continuing active sessions.
+- Five-minute sliding idle timeout for session cookies, with automatic renewal during authenticated web activity.
+- Dynamic DNS provider plugin architecture under `src/plugins/`, with metadata-driven zone forms for Azure DNS, BIND/TSIG, and Microsoft DNS over WinRM.
+- Plugin management controls that display discovered providers, allow enabled/disabled state management, and prevent disabling providers still used by configured zones.
+- Persistent Docker Compose data volume mapping for `/app/data`.
+
+### Changed
+
+- The admin dashboard now role-gates DNS zone and API key navigation, showing disabled buttons when a user lacks access.
+- DNS zone creation and editing now render provider-specific fields from plugin metadata and hide disabled providers from selection.
+- API key management and DNS zone management have refreshed modal, table, button, and navigation behavior for a more consistent web UI.
+- `/zones` supports API-key-authenticated JSON responses while retaining session-backed HTML rendering for browser requests.
+- API key creation, editing, and revocation are restricted to the session-protected web interface and hidden from the OpenAPI surface.
+- DNS record requests no longer accept Azure subscription ID or resource group in the request body; those values are stored with the zone configuration.
+- Session-backed web pages are excluded from OpenAPI documentation, while `/keycheck` documents both success and failure responses.
+
 ## [0.3.1] - 2026-05-17
 
 ### Added
