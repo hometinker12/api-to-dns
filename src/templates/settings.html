@@ -2,14 +2,14 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Settings</title>
+  <title>api-to-dns App Settings</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <div class="page page-wide">
     <header class="page-header">
       <div>
-        <h1>Settings</h1>
+        <h1>api-to-dns App Settings</h1>
         <p class="help">Signed in as {{ user }}</p>
       </div>
       <nav class="nav-links">
@@ -53,21 +53,33 @@
 
           <section class="form-card">
             <h2>Change My Password</h2>
-            <form action="/settings/account/password" method="post">
-              <label>Current password
-                <input type="password" name="current_password" required autocomplete="current-password" />
-              </label>
-              <label>New password
-                <input type="password" name="new_password" required autocomplete="new-password" />
-              </label>
-              <label>Confirm new password
-                <input type="password" name="confirm_password" required autocomplete="new-password" />
-              </label>
-              <div class="dialog-actions">
-                <button type="submit">Change password</button>
-              </div>
-            </form>
+            <p class="help">Update the password for the account you are currently signed in with.</p>
+            <button type="button" id="open-change-password">Change password</button>
           </section>
+
+          <dialog id="change-password-dialog">
+            <div class="dialog-content">
+              <div class="dialog-header">
+                <h2>Change My Password</h2>
+                <button type="button" class="danger" id="close-change-password">Close</button>
+              </div>
+              <form action="/settings/account/password" method="post">
+                <label>Current password
+                  <input type="password" name="current_password" required autocomplete="current-password" />
+                </label>
+                <label>New password
+                  <input type="password" name="new_password" required autocomplete="new-password" />
+                </label>
+                <label>Confirm new password
+                  <input type="password" name="confirm_password" required autocomplete="new-password" />
+                </label>
+                <div class="dialog-actions">
+                  <button type="button" class="secondary" id="cancel-change-password">Cancel</button>
+                  <button type="submit">Change password</button>
+                </div>
+              </form>
+            </div>
+          </dialog>
 
           {% if can_view_accounts %}
             <div class="section-title-row">
@@ -91,19 +103,32 @@
                       <td>
                         <code>{{ u.username }}</code>
                         {% if u.username == user %}<span class="help" style="display:inline; margin-left:0.4rem;">(you)</span>{% endif %}
+                        {% if u.is_global_admin %}<span class="help" style="display:inline; margin-left:0.4rem;">(Global Admin)</span>{% endif %}
+                        {% if u.disabled %}<span class="help" style="display:inline; margin-left:0.4rem;">(Disabled)</span>{% endif %}
                       </td>
                       <td class="actions-column">
                         <div class="action-cell">
-                          {% if can_account_update %}
+                          {% if u.username == user or (u.is_global_admin and not can_global_admin) %}
+                            <button type="button" class="neutral" data-open-view-roles="{{ u.id }}">View roles</button>
+                          {% elif can_account_update and not u.disabled %}
                             <button type="button" data-open-edit-roles="{{ u.id }}">Edit roles</button>
                           {% endif %}
-                          {% if can_account_reset_password %}
+                          {% if can_account_reset_password and u.username != user and not u.disabled and (not u.is_global_admin or can_global_admin) %}
                             <button type="button" data-open-reset-password="{{ u.id }}">Reset password</button>
                           {% endif %}
-                          {% if can_account_update and u.username != user %}
-                            <form action="/settings/users/{{ u.id }}/delete" method="post" onsubmit="return confirm('Delete user {{ u.username }}?');">
-                              <button type="submit" class="danger">Delete</button>
-                            </form>
+                          {% if can_account_update and u.username != user and (not u.is_global_admin or can_global_admin) %}
+                            {% if u.disabled %}
+                              <form action="/settings/users/{{ u.id }}/enable" method="post">
+                                <button type="submit">Enable account</button>
+                              </form>
+                              <form action="/settings/users/{{ u.id }}/delete" method="post" onsubmit="return confirm('Delete user {{ u.username }}?');">
+                                <button type="submit" class="danger">Delete</button>
+                              </form>
+                            {% else %}
+                              <form action="/settings/users/{{ u.id }}/disable" method="post" onsubmit="return confirm('Disable user {{ u.username }}?');">
+                                <button type="submit" class="danger">Disable account</button>
+                              </form>
+                            {% endif %}
                           {% endif %}
                         </div>
                       </td>
@@ -135,15 +160,17 @@
                   </label>
                   <fieldset>
                     <legend>Roles</legend>
-                    <p class="help">Grant only the permissions this user needs. The default admin keeps every role.</p>
+                    <p class="help">Grant only the permissions this user needs. DNS zones read access is required on every account.</p>
                     {% for role in role_catalog %}
                       <label class="inline-check">
                         <input
                           type="checkbox"
-                          name="roles"
+                          {% if role.key != "global.admin" or can_global_admin %}name="roles"{% endif %}
                           value="{{ role.key }}"
                           {% if role.requires_role %}data-requires-role="{{ role.requires_role }}"{% endif %}
-                          {% if role.key in auth_form_selected_roles %}checked{% endif %}
+                          {% if role.mandatory %}data-mandatory-role="true"{% endif %}
+                          {% if role.key in auth_form_selected_roles or role.mandatory %}checked{% endif %}
+                          {% if role.mandatory or (role.key == "global.admin" and not can_global_admin) %}disabled{% endif %}
                         />
                         <code>{{ role.key }}</code> &mdash; {{ role.label }}
                       </label>
@@ -160,58 +187,94 @@
 
           {% if can_account_update %}
             {% for u in users %}
-              <dialog id="edit-roles-dialog-{{ u.id }}">
-                <div class="dialog-content">
-                  <div class="dialog-header">
-                    <h2>Edit roles for {{ u.username }}</h2>
-                    <button type="button" class="danger" data-close-edit-roles="{{ u.id }}">Close</button>
-                  </div>
-                  <form action="/settings/users/{{ u.id }}/roles" method="post">
+              {% if u.username == user or (u.is_global_admin and not can_global_admin) %}
+                <dialog id="view-roles-dialog-{{ u.id }}">
+                  <div class="dialog-content">
+                    <div class="dialog-header">
+                      <h2>View roles for {{ u.username }}</h2>
+                      <button type="button" class="danger" data-close-view-roles="{{ u.id }}">Close</button>
+                    </div>
                     <fieldset>
                       <legend>Roles</legend>
-                      <p class="help">Uncheck every role to leave the user with no permissions. Default admin behavior only applies when no roles have ever been assigned.</p>
+                      <p class="help">Your own roles are shown read-only. Another account administrator must change them.</p>
                       {% for role in role_catalog %}
                         <label class="inline-check">
                           <input
                             type="checkbox"
-                            name="roles"
                             value="{{ role.key }}"
-                            {% if role.requires_role %}data-requires-role="{{ role.requires_role }}"{% endif %}
-                            {% if role.key in u.roles %}checked{% endif %}
+                            {% if role.key in u.stored_roles %}checked{% endif %}
+                            disabled
                           />
                           <code>{{ role.key }}</code> &mdash; {{ role.label }}
                         </label>
                       {% endfor %}
                     </fieldset>
                     <div class="dialog-actions">
-                      <button type="button" class="secondary" data-close-edit-roles="{{ u.id }}">Cancel</button>
-                      <button type="submit">Save roles</button>
+                      <button type="button" class="secondary" data-close-view-roles="{{ u.id }}">Close</button>
                     </div>
-                  </form>
-                </div>
-              </dialog>
+                  </div>
+                </dialog>
+              {% elif not u.disabled %}
+                <dialog id="edit-roles-dialog-{{ u.id }}">
+                  <div class="dialog-content">
+                    <div class="dialog-header">
+                      <h2>Edit roles for {{ u.username }}</h2>
+                      <button type="button" class="danger" data-close-edit-roles="{{ u.id }}">Close</button>
+                    </div>
+                    <form action="/settings/users/{{ u.id }}/roles" method="post">
+                      <fieldset>
+                        <legend>Roles</legend>
+                        <p class="help">Uncheck every role to leave the user with no permissions. Default admin behavior only applies when no roles have ever been assigned.</p>
+                        {% for role in role_catalog %}
+                          <label class="inline-check">
+                            <input
+                              type="checkbox"
+                              {% if role.key != "global.admin" or can_global_admin %}name="roles"{% endif %}
+                              value="{{ role.key }}"
+                              {% if role.requires_role %}data-requires-role="{{ role.requires_role }}"{% endif %}
+                            {% if role.mandatory %}data-mandatory-role="true"{% endif %}
+                            {% if role.key in u.stored_roles or role.mandatory %}checked{% endif %}
+                            {% if role.mandatory or (role.key == "global.admin" and not can_global_admin) %}disabled{% endif %}
+                            />
+                            <code>{{ role.key }}</code> &mdash; {{ role.label }}
+                          </label>
+                        {% endfor %}
+                      </fieldset>
+                      <div class="dialog-actions">
+                        <button type="button" class="secondary" data-close-edit-roles="{{ u.id }}">Cancel</button>
+                        <button type="submit">Save roles</button>
+                      </div>
+                    </form>
+                  </div>
+                </dialog>
+              {% endif %}
             {% endfor %}
           {% endif %}
 
           {% if can_account_reset_password %}
             {% for u in users %}
-              <dialog id="reset-password-dialog-{{ u.id }}">
-                <div class="dialog-content">
-                  <div class="dialog-header">
-                    <h2>Reset password for {{ u.username }}</h2>
-                    <button type="button" class="danger" data-close-reset-password="{{ u.id }}">Close</button>
-                  </div>
-                  <form action="/settings/users/{{ u.id }}/password" method="post">
-                    <label>New password
-                      <input type="password" name="password" required autocomplete="new-password" />
-                    </label>
-                    <div class="dialog-actions">
-                      <button type="button" class="secondary" data-close-reset-password="{{ u.id }}">Cancel</button>
-                      <button type="submit">Reset password</button>
+              {% if u.username != user and not u.disabled %}
+                <dialog id="reset-password-dialog-{{ u.id }}">
+                  <div class="dialog-content">
+                    <div class="dialog-header">
+                      <h2>Reset password for {{ u.username }}</h2>
+                      <button type="button" class="danger" data-close-reset-password="{{ u.id }}">Close</button>
                     </div>
-                  </form>
-                </div>
-              </dialog>
+                    <form action="/settings/users/{{ u.id }}/password" method="post">
+                      <label>New password
+                        <input type="password" name="password" required autocomplete="new-password" />
+                      </label>
+                      <label>Confirm new password
+                        <input type="password" name="confirm_password" required autocomplete="new-password" />
+                      </label>
+                      <div class="dialog-actions">
+                        <button type="button" class="secondary" data-close-reset-password="{{ u.id }}">Cancel</button>
+                        <button type="submit">Reset password</button>
+                      </div>
+                    </form>
+                  </div>
+                </dialog>
+              {% endif %}
             {% endfor %}
           {% endif %}
 
@@ -304,14 +367,51 @@
       function enforceRoleDependencies(form) {
         const roleInputs = Array.from(form.querySelectorAll("input[name='roles']"));
         const inputByRole = new Map(roleInputs.map((input) => [input.value, input]));
+        const globalAdminInput = inputByRole.get("global.admin");
+
+        function setMandatoryRole(input) {
+          input.checked = true;
+          input.disabled = true;
+          input.closest("label")?.classList.add("role-forced");
+        }
 
         function setForcedReadRole(input, forced) {
+          if (input.dataset.mandatoryRole === "true" && !forced) {
+            setMandatoryRole(input);
+            return;
+          }
           input.checked = forced;
           input.disabled = forced;
           input.closest("label")?.classList.toggle("role-forced", forced);
         }
 
+        function setGlobalAdminRoles(forced) {
+          roleInputs.forEach((input) => {
+            if (input === globalAdminInput) {
+              return;
+            }
+            if (forced) {
+              input.checked = true;
+              input.disabled = true;
+              input.closest("label")?.classList.add("role-forced");
+              return;
+            }
+            if (input.dataset.mandatoryRole === "true") {
+              setMandatoryRole(input);
+              return;
+            }
+            input.disabled = false;
+            input.closest("label")?.classList.remove("role-forced");
+          });
+        }
+
         function syncDependencies(changedInput) {
+          if (globalAdminInput?.checked) {
+            setGlobalAdminRoles(true);
+            return;
+          }
+          setGlobalAdminRoles(false);
+
           if (changedInput?.dataset.requiresRole) {
             const requiredInput = inputByRole.get(changedInput.dataset.requiresRole);
             if (requiredInput) {
@@ -334,6 +434,11 @@
         roleInputs.forEach((input) => {
           input.addEventListener("change", () => syncDependencies(input));
         });
+        roleInputs.forEach((input) => {
+          if (input.dataset.mandatoryRole === "true") {
+            setMandatoryRole(input);
+          }
+        });
         form.addEventListener("submit", () => {
           roleInputs.forEach((input) => {
             if (input.disabled) {
@@ -351,6 +456,11 @@
       document.getElementById("close-create-user")?.addEventListener("click", () => createUserDialog?.close());
       document.getElementById("cancel-create-user")?.addEventListener("click", () => createUserDialog?.close());
 
+      const changePasswordDialog = document.getElementById("change-password-dialog");
+      document.getElementById("open-change-password")?.addEventListener("click", () => changePasswordDialog?.showModal());
+      document.getElementById("close-change-password")?.addEventListener("click", () => changePasswordDialog?.close());
+      document.getElementById("cancel-change-password")?.addEventListener("click", () => changePasswordDialog?.close());
+
       document.querySelectorAll("[data-open-edit-roles]").forEach((button) => {
         button.addEventListener("click", () => {
           const dialog = document.getElementById(`edit-roles-dialog-${button.dataset.openEditRoles}`);
@@ -360,6 +470,19 @@
       document.querySelectorAll("[data-close-edit-roles]").forEach((button) => {
         button.addEventListener("click", () => {
           const dialog = document.getElementById(`edit-roles-dialog-${button.dataset.closeEditRoles}`);
+          dialog?.close();
+        });
+      });
+
+      document.querySelectorAll("[data-open-view-roles]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const dialog = document.getElementById(`view-roles-dialog-${button.dataset.openViewRoles}`);
+          dialog?.showModal();
+        });
+      });
+      document.querySelectorAll("[data-close-view-roles]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const dialog = document.getElementById(`view-roles-dialog-${button.dataset.closeViewRoles}`);
           dialog?.close();
         });
       });

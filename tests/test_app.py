@@ -2,10 +2,13 @@ from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
+from itsdangerous import SignatureExpired
 from sqlmodel import select
 
+import src.auth as auth_module
 from src.app import (
     ALL_ROLES,
+    ROLE_GLOBAL_ADMIN,
     ROLE_ACCOUNT_RESET_PASSWORD,
     ROLE_ACCOUNT_UPDATE,
     ROLE_API_KEYS_READ,
@@ -18,10 +21,12 @@ from src.app import (
     _serialize_roles,
     app,
     encode_zone_config_dict,
+    get_user_roles,
+    user_has_role,
     normalize_zone_name,
     set_disabled_dns_plugins,
 )
-from src.auth import create_session_cookie
+from src.auth import SESSION_IDLE_TIMEOUT_SECONDS, create_session_cookie
 from src.db import SessionLocal, init_db
 from src.dns_client import create_dns_client, discover_plugins, dns_provider_display_name
 from src.models import ApiKey, ApiKeyAllowedZone, DnsZoneConfig, User
@@ -75,6 +80,9 @@ def client(api_key_value: str) -> TestClient:
     with SessionLocal() as db:
         set_disabled_dns_plugins(db, set())
         _seed_example_zone_and_permission(db, api_key_value)
+        if not db.exec(select(User).where(User.username == "admin")).first():
+            db.add(User(username="admin", password_hash=hash_password("x"), roles=_serialize_roles(ALL_ROLES)))
+            db.commit()
     return TestClient(app)
 
 
@@ -85,6 +93,105 @@ def test_root_redirects_to_login_without_session(client: TestClient) -> None:
 
 
 def test_admin_redirects_to_login_without_session(client: TestClient) -> None:
+    response = client.get("/admin", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
+
+
+def test_login_sets_five_minute_session_cookie(client: TestClient) -> None:
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "admin", "x", ALL_ROLES)
+
+    response = client.post(
+        "/login",
+        data={"username": "admin", "password": "x"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin"
+    set_cookie = response.headers["set-cookie"]
+    assert "session=" in set_cookie
+    assert f"Max-Age={SESSION_IDLE_TIMEOUT_SECONDS}" in set_cookie
+    assert "HttpOnly" in set_cookie
+    assert "SameSite=lax" in set_cookie
+
+
+def test_authenticated_page_refreshes_session_cookie(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+
+    response = client.get("/admin")
+    assert response.status_code == 200
+    set_cookie = response.headers["set-cookie"]
+    assert "session=" in set_cookie
+    assert f"Max-Age={SESSION_IDLE_TIMEOUT_SECONDS}" in set_cookie
+    assert "HttpOnly" in set_cookie
+    assert "SameSite=lax" in set_cookie
+
+
+def test_invalid_session_redirects_to_login_without_refresh(client: TestClient) -> None:
+    client.cookies.set("session", "not-a-valid-session-cookie")
+
+    response = client.get("/admin", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
+    assert "set-cookie" not in response.headers
+
+
+def test_expired_session_redirects_to_login_without_refresh(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def expired_session(_: str) -> str:
+        raise SignatureExpired("expired")
+
+    client.cookies.set("session", create_session_cookie("admin"))
+    monkeypatch.setattr(auth_module, "verify_session_cookie", expired_session)
+
+    response = client.get("/admin", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
+    assert "set-cookie" not in response.headers
+
+
+def test_deleted_session_user_redirects_to_login(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("deleted-user"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        user = _create_user(db, "deleted-user", "x", ALL_ROLES)
+        _create_user(db, "admin", "x", ALL_ROLES)
+        db.delete(user)
+        db.commit()
+
+    for path in ("/admin", "/settings", "/zones"):
+        response = client.get(path, follow_redirects=False)
+        assert response.status_code == 303
+        assert response.headers["location"] == "/login"
+
+
+def test_disabled_user_cannot_login(client: TestClient) -> None:
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "disabled-user", "x", ALL_ROLES, disabled=True)
+        _create_user(db, "admin", "x", ALL_ROLES)
+
+    response = client.post(
+        "/login",
+        data={"username": "disabled-user", "password": "x"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 200
+    assert "Invalid credentials." in response.text
+    assert "set-cookie" not in response.headers
+
+
+def test_disabled_session_user_redirects_to_login(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("disabled-user"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "disabled-user", "x", ALL_ROLES, disabled=True)
+        _create_user(db, "admin", "x", ALL_ROLES)
+
     response = client.get("/admin", follow_redirects=False)
     assert response.status_code == 303
     assert response.headers["location"] == "/login"
@@ -263,6 +370,8 @@ def test_session_backed_pages_are_not_in_openapi(client: TestClient) -> None:
         "/zones/{zone_id}/delete",
         "/settings",
         "/settings/users",
+        "/settings/users/{user_id}/disable",
+        "/settings/users/{user_id}/enable",
         "/settings/users/{user_id}/delete",
         "/settings/users/{user_id}/password",
         "/settings/users/{user_id}/roles",
@@ -478,11 +587,12 @@ def _delete_users(db) -> None:
     db.commit()
 
 
-def _create_user(db, username: str, password: str, roles=None) -> User:
+def _create_user(db, username: str, password: str, roles=None, disabled: bool = False) -> User:
     row = User(
         username=username,
         password_hash=hash_password(password),
         roles=_serialize_roles(roles or []),
+        disabled=disabled,
     )
     db.add(row)
     db.commit()
@@ -529,6 +639,24 @@ def test_no_role_user_can_change_own_password_only(client: TestClient) -> None:
         changed = db.get(User, user_id)
         assert changed is not None
         assert changed.password_hash != original_hash
+
+
+def test_change_my_password_form_is_modal_opened_by_button(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("self-service"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "self-service", "old-password", [])
+        _create_user(db, "admin", "x", ALL_ROLES)
+
+    response = client.get("/settings")
+    assert response.status_code == 200
+    assert 'id="open-change-password"' in response.text
+    assert '<dialog id="change-password-dialog">' in response.text
+    dialog = response.text.split('<dialog id="change-password-dialog">', 1)[1].split("</dialog>", 1)[0]
+    assert 'action="/settings/account/password"' in dialog
+    assert 'name="current_password"' in dialog
+    assert 'name="new_password"' in dialog
+    assert 'name="confirm_password"' in dialog
 
 
 def test_self_password_change_rejects_wrong_current_password(client: TestClient) -> None:
@@ -618,9 +746,8 @@ def test_dashboard_disables_zone_and_api_key_buttons_without_roles(client: TestC
 
     response = client.get("/admin")
     assert response.status_code == 200
-    assert '<span class="button disabled" aria-disabled="true">DNS Zones</span>' in response.text
+    assert '<a class="button" href="/zones">DNS Zones</a>' in response.text
     assert '<span class="button disabled" aria-disabled="true">API Keys</span>' in response.text
-    assert 'href="/zones"' not in response.text
     assert 'href="/api-keys"' not in response.text
 
 
@@ -637,15 +764,21 @@ def test_dashboard_enables_role_allowed_buttons(client: TestClient) -> None:
     assert '<a class="button" href="/api-keys">API Keys</a>' in response.text
 
 
-def test_create_user_form_defaults_to_no_roles_selected(client: TestClient) -> None:
+def test_create_user_form_defaults_to_required_dns_zones_read_only(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
     response = client.get("/settings")
     assert response.status_code == 200
     create_dialog = response.text.split('<dialog id="create-user-dialog"', 1)[1].split("</dialog>", 1)[0]
-    assert "checked" not in create_dialog
+    dns_role_input = create_dialog.split('value="dns_zones.read"', 1)[1].split("/>", 1)[0]
+    assert "checked" in dns_role_input
+    assert "disabled" in dns_role_input
+    assert 'data-mandatory-role="true"' in dns_role_input
+    assert 'value="global.read"' in create_dialog
+    assert 'value="api_keys.read"' in create_dialog
     assert "global.read" in create_dialog
     assert "api_keys.read" in create_dialog
     assert "dns_zones.read" in create_dialog
+    assert create_dialog.count("checked") == 1
     assert "account.read" not in create_dialog
     assert "system.read" not in create_dialog
 
@@ -673,6 +806,173 @@ def test_settings_create_user_persists_account(client: TestClient) -> None:
         assert set((alice.roles or "").split(",")) == {ROLE_DNS_ZONES_READ, ROLE_API_KEYS_READ}
 
 
+def test_settings_create_user_always_persists_dns_zones_read(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "admin", "x", ALL_ROLES)
+
+    response = client.post(
+        "/settings/users",
+        data={
+            "username": "zone-reader-by-default",
+            "password": "passw0rd!",
+            "roles": [],
+        },
+    )
+    assert response.status_code == 200
+
+    with SessionLocal() as db:
+        created = db.exec(select(User).where(User.username == "zone-reader-by-default")).first()
+        assert created is not None
+        assert (created.roles or "") == ROLE_DNS_ZONES_READ
+
+
+def test_current_user_row_shows_read_only_roles_view(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        admin = _create_user(db, "admin", "x", ALL_ROLES)
+        other = _create_user(db, "other", "x", [ROLE_DNS_ZONES_READ])
+        admin_id = admin.id
+        other_id = other.id
+
+    response = client.get("/settings")
+    assert response.status_code == 200
+    table_row = response.text.split("<code>admin</code>", 1)[1].split("</tr>", 1)[0]
+    assert "View roles" in table_row
+    assert "Edit roles" not in table_row
+    assert "Reset password" not in table_row
+
+    dialog = response.text.split(f'<dialog id="view-roles-dialog-{admin_id}">', 1)[1].split("</dialog>", 1)[0]
+    assert "Save roles" not in dialog
+    assert 'name="roles"' not in dialog
+    assert "disabled" in dialog
+    assert "global.read" in dialog
+    assert f'id="reset-password-dialog-{admin_id}"' not in response.text
+
+    reset_dialog = response.text.split(f'<dialog id="reset-password-dialog-{other_id}">', 1)[1].split("</dialog>", 1)[0]
+    assert 'name="password"' in reset_dialog
+    assert 'name="confirm_password"' in reset_dialog
+
+
+def test_enabled_user_row_shows_disable_instead_of_delete(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "admin", "x", ALL_ROLES)
+        _create_user(db, "enabled-user", "x", [ROLE_DNS_ZONES_READ])
+
+    response = client.get("/settings")
+    assert response.status_code == 200
+    table_row = response.text.split("<code>enabled-user</code>", 1)[1].split("</tr>", 1)[0]
+    assert "Disable account" in table_row
+    assert "Delete" not in table_row
+    assert "Edit roles" in table_row
+    assert "Reset password" in table_row
+
+
+def test_disabled_user_row_shows_enable_delete_and_hides_edit_actions(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "admin", "x", ALL_ROLES)
+        disabled_user = _create_user(db, "disabled-user", "x", [ROLE_DNS_ZONES_READ], disabled=True)
+        disabled_user_id = disabled_user.id
+
+    response = client.get("/settings")
+    assert response.status_code == 200
+    table_row = response.text.split("<code>disabled-user</code>", 1)[1].split("</tr>", 1)[0]
+    assert "(Disabled)" in table_row
+    assert "Enable account" in table_row
+    assert "Delete" in table_row
+    assert "Edit roles" not in table_row
+    assert "Reset password" not in table_row
+    assert f'id="edit-roles-dialog-{disabled_user_id}"' not in response.text
+    assert f'id="reset-password-dialog-{disabled_user_id}"' not in response.text
+
+
+def test_non_global_admin_sees_only_view_roles_for_global_admin_row(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("account-admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "account-admin", "x", [ROLE_ACCOUNT_UPDATE, ROLE_ACCOUNT_RESET_PASSWORD])
+        protected = _create_user(db, "protected-global", "x", [ROLE_GLOBAL_ADMIN])
+        protected_id = protected.id
+
+    response = client.get("/settings")
+    assert response.status_code == 200
+    table_row = response.text.split("<code>protected-global</code>", 1)[1].split("</tr>", 1)[0]
+    assert "(Global Admin)" in table_row
+    assert "View roles" in table_row
+    assert "Edit roles" not in table_row
+    assert "Reset password" not in table_row
+    assert "Disable account" not in table_row
+    assert "Enable account" not in table_row
+    assert "Delete" not in table_row
+    assert f'id="edit-roles-dialog-{protected_id}"' not in response.text
+    view_dialog = response.text.split(f'<dialog id="view-roles-dialog-{protected_id}">', 1)[1].split("</dialog>", 1)[0]
+    assert "global.admin" in view_dialog
+    assert "Save roles" not in view_dialog
+
+
+def test_global_admin_checkbox_visible_disabled_for_non_global_admin_create(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("account-admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "account-admin", "x", [ROLE_ACCOUNT_UPDATE])
+        _create_user(db, "global-admin", "x", [ROLE_GLOBAL_ADMIN])
+
+    response = client.get("/settings")
+    assert response.status_code == 200
+    create_dialog = response.text.split('<dialog id="create-user-dialog"', 1)[1].split("</dialog>", 1)[0]
+    global_admin_input = create_dialog.split('value="global.admin"', 1)[1].split("/>", 1)[0]
+    assert "disabled" in global_admin_input
+    assert 'name="roles"' not in global_admin_input
+
+
+def test_global_admin_edit_dialog_checks_all_roles_and_js_locks_them(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("global-admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "global-admin", "x", [ROLE_GLOBAL_ADMIN])
+        target = _create_user(db, "target-global", "x", [ROLE_GLOBAL_ADMIN])
+        target_id = target.id
+
+    response = client.get("/settings")
+    assert response.status_code == 200
+    dialog = response.text.split(f'<dialog id="edit-roles-dialog-{target_id}">', 1)[1].split("</dialog>", 1)[0]
+    global_admin_input = dialog.split('value="global.admin"', 1)[1].split("/>", 1)[0]
+    account_update_input = dialog.split('value="account.update"', 1)[1].split("/>", 1)[0]
+    assert "checked" in global_admin_input
+    assert "disabled" not in global_admin_input
+    assert "checked" in account_update_input
+    assert "setGlobalAdminRoles(true)" in response.text
+    assert 'input.disabled = true;' in response.text
+
+
+def test_global_admin_selection_persists_all_roles(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("global-admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "global-admin", "x", [ROLE_GLOBAL_ADMIN])
+
+    response = client.post(
+        "/settings/users",
+        data={
+            "username": "new-global-admin",
+            "password": "passw0rd!",
+            "roles": [ROLE_GLOBAL_ADMIN],
+        },
+    )
+    assert response.status_code == 200
+
+    with SessionLocal() as db:
+        created = db.exec(select(User).where(User.username == "new-global-admin")).first()
+        assert created is not None
+        assert set((created.roles or "").split(",")) == set(ALL_ROLES)
+
+
 def test_settings_create_user_update_role_adds_read_role(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
     with SessionLocal() as db:
@@ -692,7 +992,11 @@ def test_settings_create_user_update_role_adds_read_role(client: TestClient) -> 
     with SessionLocal() as db:
         api_editor = db.exec(select(User).where(User.username == "api-editor")).first()
         assert api_editor is not None
-        assert set((api_editor.roles or "").split(",")) == {ROLE_API_KEYS_READ, ROLE_API_KEYS_UPDATE}
+        assert set((api_editor.roles or "").split(",")) == {
+            ROLE_API_KEYS_READ,
+            ROLE_API_KEYS_UPDATE,
+            ROLE_DNS_ZONES_READ,
+        }
 
 
 def test_settings_update_roles_update_role_adds_read_role(client: TestClient) -> None:
@@ -715,6 +1019,269 @@ def test_settings_update_roles_update_role_adds_read_role(client: TestClient) ->
         assert set((zone_editor.roles or "").split(",")) == {ROLE_DNS_ZONES_READ, ROLE_DNS_ZONES_UPDATE}
 
 
+def test_settings_update_roles_cannot_remove_dns_zones_read(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "admin", "x", ALL_ROLES)
+        user = _create_user(db, "required-zone-reader", "secret", [ROLE_API_KEYS_READ])
+        user_id = user.id
+
+    response = client.post(
+        f"/settings/users/{user_id}/roles",
+        data={"roles": [ROLE_API_KEYS_READ]},
+    )
+    assert response.status_code == 200
+
+    with SessionLocal() as db:
+        user = db.get(User, user_id)
+        assert user is not None
+        assert set((user.roles or "").split(",")) == {ROLE_API_KEYS_READ, ROLE_DNS_ZONES_READ}
+
+
+def test_global_admin_grants_all_effective_roles(client: TestClient) -> None:
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "super-admin", "x", [ROLE_GLOBAL_ADMIN])
+
+        assert set(get_user_roles(db, "super-admin")) == set(ALL_ROLES)
+        for role in ALL_ROLES:
+            assert user_has_role(db, "super-admin", role)
+
+
+def test_non_global_admin_cannot_create_global_admin_user(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("account-admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "account-admin", "x", [ROLE_ACCOUNT_UPDATE])
+        _create_user(db, "global-admin", "x", [ROLE_GLOBAL_ADMIN])
+
+    response = client.post(
+        "/settings/users",
+        data={
+            "username": "new-global-admin",
+            "password": "passw0rd!",
+            "roles": [ROLE_GLOBAL_ADMIN],
+        },
+    )
+    assert response.status_code == 200
+    assert "Only a global admin can grant global admin." in response.text
+    with SessionLocal() as db:
+        assert db.exec(select(User).where(User.username == "new-global-admin")).first() is None
+
+
+def test_global_admin_can_create_global_admin_user(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("global-admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "global-admin", "x", [ROLE_GLOBAL_ADMIN])
+
+    response = client.post(
+        "/settings/users",
+        data={
+            "username": "new-global-admin",
+            "password": "passw0rd!",
+            "roles": [ROLE_GLOBAL_ADMIN],
+        },
+    )
+    assert response.status_code == 200
+    assert "new-global-admin" in response.text and "created" in response.text
+    with SessionLocal() as db:
+        created = db.exec(select(User).where(User.username == "new-global-admin")).first()
+        assert created is not None
+        assert set((created.roles or "").split(",")) == set(ALL_ROLES)
+
+
+def test_non_global_admin_cannot_assign_or_remove_global_admin_role(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("account-admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "account-admin", "x", [ROLE_ACCOUNT_UPDATE])
+        target = _create_user(db, "target", "x", [ROLE_API_KEYS_READ])
+        protected = _create_user(db, "protected", "x", [ROLE_GLOBAL_ADMIN])
+        target_id = target.id
+        protected_id = protected.id
+
+    response = client.post(
+        f"/settings/users/{target_id}/roles",
+        data={"roles": [ROLE_GLOBAL_ADMIN]},
+    )
+    assert response.status_code == 200
+    assert "Only a global admin can change global admin role assignments." in response.text
+    with SessionLocal() as db:
+        target = db.get(User, target_id)
+        assert target is not None
+        assert ROLE_GLOBAL_ADMIN not in (target.roles or "").split(",")
+
+    response = client.post(
+        f"/settings/users/{protected_id}/roles",
+        data={"roles": [ROLE_DNS_ZONES_READ]},
+    )
+    assert response.status_code == 200
+    assert "Only a global admin can manage another global admin account." in response.text
+    with SessionLocal() as db:
+        protected = db.get(User, protected_id)
+        assert protected is not None
+        assert ROLE_GLOBAL_ADMIN in (protected.roles or "").split(",")
+
+
+def test_global_admin_can_update_other_global_admin_roles(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("global-admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "global-admin", "x", [ROLE_GLOBAL_ADMIN])
+        target = _create_user(db, "target-global", "x", [ROLE_GLOBAL_ADMIN])
+        target_id = target.id
+
+    response = client.post(
+        f"/settings/users/{target_id}/roles",
+        data={"roles": [ROLE_DNS_ZONES_UPDATE]},
+    )
+    assert response.status_code == 200
+    assert "Roles updated" in response.text
+    with SessionLocal() as db:
+        target = db.get(User, target_id)
+        assert target is not None
+        assert set((target.roles or "").split(",")) == {ROLE_DNS_ZONES_READ, ROLE_DNS_ZONES_UPDATE}
+
+
+def test_settings_disable_user_marks_account_disabled(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "admin", "x", ALL_ROLES)
+        user = _create_user(db, "disable-me", "secret", [ROLE_API_KEYS_READ])
+        user_id = user.id
+
+    response = client.post(f"/settings/users/{user_id}/disable")
+    assert response.status_code == 200
+    assert "disable-me" in response.text and "disabled" in response.text
+    assert "(Disabled)" in response.text
+
+    with SessionLocal() as db:
+        user = db.get(User, user_id)
+        assert user is not None
+        assert user.disabled is True
+
+
+def test_settings_enable_user_restores_normal_actions(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "admin", "x", ALL_ROLES)
+        user = _create_user(db, "enable-me", "secret", [ROLE_API_KEYS_READ], disabled=True)
+        user_id = user.id
+
+    response = client.post(f"/settings/users/{user_id}/enable")
+    assert response.status_code == 200
+    assert "enable-me" in response.text and "enabled" in response.text
+
+    with SessionLocal() as db:
+        user = db.get(User, user_id)
+        assert user is not None
+        assert user.disabled is False
+
+    table_row = response.text.split("<code>enable-me</code>", 1)[1].split("</tr>", 1)[0]
+    assert "Disable account" in table_row
+    assert "Enable account" not in table_row
+    assert "Edit roles" in table_row
+    assert "Reset password" in table_row
+
+
+def test_non_global_admin_cannot_manage_global_admin_account(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("account-admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "account-admin", "x", [ROLE_ACCOUNT_UPDATE, ROLE_ACCOUNT_RESET_PASSWORD])
+        protected = _create_user(db, "protected-global", "x", [ROLE_GLOBAL_ADMIN])
+        protected_id = protected.id
+
+    for method, data in (
+        ("disable", None),
+        ("password", {"password": "new-pass", "confirm_password": "new-pass"}),
+        ("roles", {"roles": [ROLE_API_KEYS_READ]}),
+    ):
+        response = client.post(f"/settings/users/{protected_id}/{method}", data=data)
+        assert response.status_code == 200
+        assert "Only a global admin can manage another global admin account." in response.text
+
+    with SessionLocal() as db:
+        protected = db.get(User, protected_id)
+        assert protected is not None
+        assert protected.disabled is False
+        assert set((protected.roles or "").split(",")) == set(ALL_ROLES)
+
+
+def test_non_global_admin_cannot_delete_or_enable_disabled_global_admin(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("account-admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "account-admin", "x", [ROLE_ACCOUNT_UPDATE])
+        protected = _create_user(db, "protected-global", "x", [ROLE_GLOBAL_ADMIN], disabled=True)
+        protected_id = protected.id
+
+    for method in ("enable", "delete"):
+        response = client.post(f"/settings/users/{protected_id}/{method}")
+        assert response.status_code == 200
+        assert "Only a global admin can manage another global admin account." in response.text
+
+    with SessionLocal() as db:
+        protected = db.get(User, protected_id)
+        assert protected is not None
+        assert protected.disabled is True
+
+
+def test_global_admin_can_manage_other_global_admin_account(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("global-admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "global-admin", "x", [ROLE_GLOBAL_ADMIN])
+        protected = _create_user(db, "protected-global", "x", [ROLE_GLOBAL_ADMIN])
+        protected_id = protected.id
+
+    response = client.post(f"/settings/users/{protected_id}/disable")
+    assert response.status_code == 200
+    assert "protected-global" in response.text and "disabled" in response.text
+
+    response = client.post(f"/settings/users/{protected_id}/enable")
+    assert response.status_code == 200
+    assert "protected-global" in response.text and "enabled" in response.text
+
+
+def test_settings_cannot_disable_current_user(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        admin = _create_user(db, "admin", "x", ALL_ROLES)
+        _create_user(db, "other", "x", ALL_ROLES)
+        admin_id = admin.id
+
+    response = client.post(f"/settings/users/{admin_id}/disable")
+    assert response.status_code == 200
+    assert "You cannot disable the user you are signed in as." in response.text
+    with SessionLocal() as db:
+        admin = db.get(User, admin_id)
+        assert admin is not None
+        assert admin.disabled is False
+
+
+def test_settings_cannot_disable_last_enabled_user(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("only-enabled"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        only_enabled = _create_user(db, "only-enabled", "x", ALL_ROLES)
+        _create_user(db, "disabled-user", "x", ALL_ROLES, disabled=True)
+        only_enabled_id = only_enabled.id
+
+    response = client.post(f"/settings/users/{only_enabled_id}/disable")
+    assert response.status_code == 200
+    assert "At least one enabled user account must remain." in response.text
+    with SessionLocal() as db:
+        only_enabled = db.get(User, only_enabled_id)
+        assert only_enabled is not None
+        assert only_enabled.disabled is False
+
+
 def test_settings_reset_password_updates_hash(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
     with SessionLocal() as db:
@@ -726,7 +1293,7 @@ def test_settings_reset_password_updates_hash(client: TestClient) -> None:
 
     response = client.post(
         f"/settings/users/{bob_id}/password",
-        data={"password": "brand-new"},
+        data={"password": "brand-new", "confirm_password": "brand-new"},
     )
     assert response.status_code == 200
     assert "Password reset" in response.text and "bob" in response.text
@@ -736,7 +1303,43 @@ def test_settings_reset_password_updates_hash(client: TestClient) -> None:
         assert bob.password_hash != original_hash
 
 
+def test_privileged_reset_password_rejects_mismatched_confirmation(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "admin", "x", ALL_ROLES)
+        bob = _create_user(db, "bob", "original", [ROLE_DNS_ZONES_READ])
+        original_hash = bob.password_hash
+        bob_id = bob.id
+
+    response = client.post(
+        f"/settings/users/{bob_id}/password",
+        data={"password": "brand-new", "confirm_password": "different"},
+    )
+    assert response.status_code == 200
+    assert "New password and confirmation do not match." in response.text
+    with SessionLocal() as db:
+        bob = db.get(User, bob_id)
+        assert bob is not None
+        assert bob.password_hash == original_hash
+
+
 def test_settings_delete_user_removes_account(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "admin", "x", ALL_ROLES)
+        carol = _create_user(db, "carol", "secret", [ROLE_API_KEYS_READ], disabled=True)
+        carol_id = carol.id
+
+    response = client.post(f"/settings/users/{carol_id}/delete")
+    assert response.status_code == 200
+    assert "carol" in response.text and "deleted" in response.text
+    with SessionLocal() as db:
+        assert db.get(User, carol_id) is None
+
+
+def test_settings_cannot_delete_enabled_user(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
     with SessionLocal() as db:
         _delete_users(db)
@@ -746,9 +1349,11 @@ def test_settings_delete_user_removes_account(client: TestClient) -> None:
 
     response = client.post(f"/settings/users/{carol_id}/delete")
     assert response.status_code == 200
-    assert "carol" in response.text and "deleted" in response.text
+    assert "Disable the user account before deleting it." in response.text
     with SessionLocal() as db:
-        assert db.get(User, carol_id) is None
+        carol = db.get(User, carol_id)
+        assert carol is not None
+        assert carol.disabled is False
 
 
 def test_settings_cannot_delete_current_user(client: TestClient) -> None:
@@ -767,7 +1372,7 @@ def test_settings_cannot_delete_current_user(client: TestClient) -> None:
 
 
 def test_settings_cannot_delete_last_user(client: TestClient) -> None:
-    client.cookies.set("session", create_session_cookie("admin"))
+    client.cookies.set("session", create_session_cookie("only"))
     with SessionLocal() as db:
         _delete_users(db)
         only = _create_user(db, "only", "secret", ALL_ROLES)
@@ -854,7 +1459,7 @@ def test_settings_reset_password_requires_reset_role(client: TestClient) -> None
 
     response = client.post(
         f"/settings/users/{target_id}/password",
-        data={"password": "new-pass"},
+        data={"password": "new-pass", "confirm_password": "new-pass"},
     )
     assert response.status_code == 403
 
@@ -1062,7 +1667,7 @@ def test_settings_backup_area_requires_global_read_or_system_update(client: Test
     assert "Authentication" in response.text
 
 
-def test_zones_html_requires_dns_zones_read(client: TestClient) -> None:
+def test_dns_zones_read_is_required_on_all_user_accounts(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("noreader"))
     with SessionLocal() as db:
         _delete_users(db)
@@ -1070,8 +1675,8 @@ def test_zones_html_requires_dns_zones_read(client: TestClient) -> None:
         _create_user(db, "admin", "x", ALL_ROLES)
 
     response = client.get("/zones", follow_redirects=False)
-    assert response.status_code == 403
-    assert '<div class="alert error">You do not have permission to access this resource.</div>' in response.text
+    assert response.status_code == 200
+    assert "Configured zones" in response.text
 
 
 def test_dns_zones_read_can_view_zones_without_global_read(client: TestClient) -> None:

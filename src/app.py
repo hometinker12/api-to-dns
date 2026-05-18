@@ -12,7 +12,7 @@ from fastapi.templating import Jinja2Templates
 from sqlmodel import select
 from starlette.status import HTTP_303_SEE_OTHER, HTTP_404_NOT_FOUND
 
-from .auth import create_session_cookie, get_current_user
+from .auth import create_session_cookie, get_current_user, session_cookie_settings
 from .db import SessionLocal, init_db
 from .models import (
     ApiKey,
@@ -31,6 +31,7 @@ ACCESS_DENIED_DETAIL: Dict[str, str] = {
     "message": "You do not have access or an invalid key was provided.",
 }
 
+ROLE_GLOBAL_ADMIN = "global.admin"
 ROLE_GLOBAL_READ = "global.read"
 ROLE_ACCOUNT_UPDATE = "account.update"
 ROLE_ACCOUNT_RESET_PASSWORD = "account.reset_password"
@@ -45,8 +46,10 @@ ROLE_DEPENDENCIES: Dict[str, str] = {
     ROLE_API_KEYS_UPDATE: ROLE_API_KEYS_READ,
     ROLE_DNS_ZONES_UPDATE: ROLE_DNS_ZONES_READ,
 }
+MANDATORY_ROLES: Set[str] = {ROLE_DNS_ZONES_READ}
 
 ALL_ROLES: List[str] = [
+    ROLE_GLOBAL_ADMIN,
     ROLE_GLOBAL_READ,
     ROLE_ACCOUNT_UPDATE,
     ROLE_ACCOUNT_RESET_PASSWORD,
@@ -57,14 +60,16 @@ ALL_ROLES: List[str] = [
     ROLE_PLUGIN_UPDATE,
     ROLE_SYSTEM_UPDATE,
 ]
+LEGACY_DEFAULT_ROLES: Set[str] = set(ALL_ROLES) - {ROLE_GLOBAL_ADMIN}
 
 ROLE_LABELS: List[Dict[str, str]] = [
+    {"key": ROLE_GLOBAL_ADMIN, "label": "Global: admin"},
     {"key": ROLE_GLOBAL_READ, "label": "Global: read-only"},
     {"key": ROLE_ACCOUNT_UPDATE, "label": "Account: update"},
     {"key": ROLE_ACCOUNT_RESET_PASSWORD, "label": "Account: reset password"},
     {"key": ROLE_API_KEYS_READ, "label": "API keys: read"},
     {"key": ROLE_API_KEYS_UPDATE, "label": "API keys: update", "requires_role": ROLE_API_KEYS_READ},
-    {"key": ROLE_DNS_ZONES_READ, "label": "DNS zones: read"},
+    {"key": ROLE_DNS_ZONES_READ, "label": "DNS zones: read", "mandatory": True},
     {"key": ROLE_DNS_ZONES_UPDATE, "label": "DNS zones: update", "requires_role": ROLE_DNS_ZONES_READ},
     {"key": ROLE_PLUGIN_UPDATE, "label": "Plugin management"},
     {"key": ROLE_SYSTEM_UPDATE, "label": "System: update"},
@@ -134,6 +139,15 @@ WEB_AUTH_PATH_PREFIXES = (
     "/api-keys",
     "/settings",
 )
+
+
+@app.middleware("http")
+async def refresh_session_cookie(request: Request, call_next):
+    response = await call_next(request)
+    session_user = getattr(request.state, "session_user", None)
+    if session_user and request.url.path != "/logout" and response.status_code < 400:
+        response.set_cookie("session", create_session_cookie(session_user), **session_cookie_settings())
+    return response
 
 
 @app.exception_handler(HTTPException)
@@ -260,34 +274,60 @@ def _parse_roles(raw: Optional[str]) -> Set[str]:
 
 def _serialize_roles(roles) -> str:
     cleaned = {r for r in roles if r in ALL_ROLES}
+    if ROLE_GLOBAL_ADMIN in cleaned:
+        cleaned = set(ALL_ROLES)
+    cleaned.update(MANDATORY_ROLES)
     return ",".join(sorted(cleaned))
 
 
 def normalize_selected_roles(roles) -> List[str]:
     selected = {r for r in roles if r in ALL_ROLES}
+    if ROLE_GLOBAL_ADMIN in selected:
+        return sorted(ALL_ROLES)
+    selected.update(MANDATORY_ROLES)
     for role, required_role in ROLE_DEPENDENCIES.items():
         if role in selected:
             selected.add(required_role)
     return sorted(selected)
 
 
+def effective_roles(stored_roles: Set[str]) -> Set[str]:
+    if ROLE_GLOBAL_ADMIN in stored_roles:
+        return set(ALL_ROLES)
+    return stored_roles | MANDATORY_ROLES
+
+
 def get_user_roles(db, username: str) -> Set[str]:
     """Return the role set for `username`."""
     user_row = db.exec(select(User).where(User.username == username)).first()
     if user_row is None:
-        return set(ALL_ROLES)
-    return _parse_roles(user_row.roles)
+        return set()
+    return effective_roles(_parse_roles(user_row.roles))
 
 
 def user_has_role(db, username: str, role: str) -> bool:
     roles = get_user_roles(db, username)
-    return role in roles or (
+    return ROLE_GLOBAL_ADMIN in roles or role in roles or (
         ROLE_GLOBAL_READ in roles and role in {ROLE_API_KEYS_READ, ROLE_DNS_ZONES_READ}
     )
 
 
 def user_has_any_role(db, username: str, roles) -> bool:
     return any(user_has_role(db, username, role) for role in roles)
+
+
+def user_is_global_admin(db, username: str) -> bool:
+    return ROLE_GLOBAL_ADMIN in get_user_roles(db, username)
+
+
+def target_is_global_admin(target: User) -> bool:
+    return ROLE_GLOBAL_ADMIN in effective_roles(_parse_roles(target.roles))
+
+
+def global_admin_guard_message(db, actor: str, target: User) -> Optional[str]:
+    if target_is_global_admin(target) and not user_is_global_admin(db, actor):
+        return "Only a global admin can manage another global admin account."
+    return None
 
 
 def require_role(role: str):
@@ -303,11 +343,17 @@ def require_role(role: str):
 
 
 def user_public_dict(u: User) -> Dict[str, Any]:
+    stored_roles = _parse_roles(u.roles)
+    display_roles = stored_roles or LEGACY_DEFAULT_ROLES
+    effective_display_roles = effective_roles(display_roles)
     return {
         "id": u.id,
         "username": u.username,
-        "roles": sorted(_parse_roles(u.roles) or set(ALL_ROLES)),
-        "has_default_roles": not _parse_roles(u.roles),
+        "disabled": u.disabled,
+        "roles": sorted(effective_display_roles),
+        "stored_roles": sorted(display_roles | MANDATORY_ROLES),
+        "is_global_admin": ROLE_GLOBAL_ADMIN in effective_display_roles,
+        "has_default_roles": not stored_roles,
     }
 
 
@@ -523,7 +569,7 @@ def startup_event():
                     User(
                         username=admin_user,
                         password_hash=hash_password(admin_password),
-                        roles=_serialize_roles(ALL_ROLES),
+                        roles=_serialize_roles([*ALL_ROLES, ROLE_GLOBAL_ADMIN]),
                     )
                 )
                 db.commit()
@@ -602,14 +648,14 @@ def login_form(request: Request):
 def login(request: Request, username: str = Form(...), password: str = Form(...)):
     with SessionLocal() as db:
         user = db.exec(select(User).where(User.username == username)).first()
-        if not user or not verify_password(password, user.password_hash):
+        if not user or user.disabled or not verify_password(password, user.password_hash):
             return templates.TemplateResponse(
                 request=request,
                 name="login.html",
                 context={"error": "Invalid credentials."},
             )
     response = RedirectResponse(url="/admin", status_code=HTTP_303_SEE_OTHER)
-    response.set_cookie("session", create_session_cookie(username), httponly=True)
+    response.set_cookie("session", create_session_cookie(username), **session_cookie_settings())
     return response
 
 
@@ -1149,6 +1195,7 @@ def _settings_context(
         "can_view_accounts": can_view_accounts,
         "can_account_update": ROLE_ACCOUNT_UPDATE in user_roles,
         "can_account_reset_password": ROLE_ACCOUNT_RESET_PASSWORD in user_roles,
+        "can_global_admin": ROLE_GLOBAL_ADMIN in user_roles,
         "can_plugin_update": ROLE_PLUGIN_UPDATE in user_roles,
     }
 
@@ -1244,6 +1291,15 @@ def settings_user_create(
             auth_form_selected_roles=selected_roles,
         )
     with SessionLocal() as db:
+        if ROLE_GLOBAL_ADMIN in selected_roles and not user_is_global_admin(db, user):
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                auth_form_error="Only a global admin can grant global admin.",
+                auth_form_username=normalized,
+                auth_form_selected_roles=[r for r in selected_roles if r != ROLE_GLOBAL_ADMIN],
+            )
         if db.exec(select(User).where(User.username == normalized)).first():
             return _render_settings(
                 request,
@@ -1269,6 +1325,111 @@ def settings_user_create(
     )
 
 
+@app.post("/settings/users/{user_id}/disable", response_class=HTMLResponse, include_in_schema=False)
+def settings_user_disable(
+    request: Request,
+    user_id: int,
+    user: str = Depends(require_role(ROLE_ACCOUNT_UPDATE)),
+):
+    with SessionLocal() as db:
+        target = db.get(User, user_id)
+        if not target:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="User not found.",
+                message_kind="error",
+            )
+        if guard_message := global_admin_guard_message(db, user, target):
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message=guard_message,
+                message_kind="error",
+            )
+        if target.disabled:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message=f"User {target.username!r} is already disabled.",
+                message_kind="error",
+            )
+        enabled_users = db.exec(select(User).where(User.disabled == False)).all()  # noqa: E712
+        if len(enabled_users) <= 1:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="At least one enabled user account must remain.",
+                message_kind="error",
+            )
+        if target.username == user:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="You cannot disable the user you are signed in as.",
+                message_kind="error",
+            )
+        target.disabled = True
+        db.add(target)
+        db.commit()
+        username = target.username
+    return _render_settings(
+        request,
+        user,
+        "authentication",
+        message=f"User {username!r} disabled.",
+    )
+
+
+@app.post("/settings/users/{user_id}/enable", response_class=HTMLResponse, include_in_schema=False)
+def settings_user_enable(
+    request: Request,
+    user_id: int,
+    user: str = Depends(require_role(ROLE_ACCOUNT_UPDATE)),
+):
+    with SessionLocal() as db:
+        target = db.get(User, user_id)
+        if not target:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="User not found.",
+                message_kind="error",
+            )
+        if guard_message := global_admin_guard_message(db, user, target):
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message=guard_message,
+                message_kind="error",
+            )
+        if not target.disabled:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message=f"User {target.username!r} is already enabled.",
+                message_kind="error",
+            )
+        target.disabled = False
+        db.add(target)
+        db.commit()
+        username = target.username
+    return _render_settings(
+        request,
+        user,
+        "authentication",
+        message=f"User {username!r} enabled.",
+    )
+
+
 @app.post("/settings/users/{user_id}/delete", response_class=HTMLResponse, include_in_schema=False)
 def settings_user_delete(
     request: Request,
@@ -1285,12 +1446,12 @@ def settings_user_delete(
                 message="User not found.",
                 message_kind="error",
             )
-        if target.username == user:
+        if guard_message := global_admin_guard_message(db, user, target):
             return _render_settings(
                 request,
                 user,
                 "authentication",
-                message="You cannot delete the user you are signed in as.",
+                message=guard_message,
                 message_kind="error",
             )
         remaining = db.exec(select(User)).all()
@@ -1300,6 +1461,22 @@ def settings_user_delete(
                 user,
                 "authentication",
                 message="At least one user account must remain.",
+                message_kind="error",
+            )
+        if target.username == user:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="You cannot delete the user you are signed in as.",
+                message_kind="error",
+            )
+        if not target.disabled:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="Disable the user account before deleting it.",
                 message_kind="error",
             )
         username = target.username
@@ -1318,14 +1495,23 @@ def settings_user_reset_password(
     request: Request,
     user_id: int,
     password: str = Form(...),
+    confirm_password: str = Form(...),
     user: str = Depends(require_role(ROLE_ACCOUNT_RESET_PASSWORD)),
 ):
-    if not password:
+    if not password or not confirm_password:
         return _render_settings(
             request,
             user,
             "authentication",
             message="A new password is required.",
+            message_kind="error",
+        )
+    if password != confirm_password:
+        return _render_settings(
+            request,
+            user,
+            "authentication",
+            message="New password and confirmation do not match.",
             message_kind="error",
         )
     with SessionLocal() as db:
@@ -1336,6 +1522,22 @@ def settings_user_reset_password(
                 user,
                 "authentication",
                 message="User not found.",
+                message_kind="error",
+            )
+        if guard_message := global_admin_guard_message(db, user, target):
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message=guard_message,
+                message_kind="error",
+            )
+        if target.disabled:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="Enable the user account before resetting its password.",
                 message_kind="error",
             )
         target.password_hash = hash_password(password)
@@ -1366,6 +1568,42 @@ def settings_user_update_roles(
                 user,
                 "authentication",
                 message="User not found.",
+                message_kind="error",
+            )
+        if guard_message := global_admin_guard_message(db, user, target):
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message=guard_message,
+                message_kind="error",
+            )
+        if target.username == user:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="You cannot edit roles for the user you are signed in as.",
+                message_kind="error",
+            )
+        target_stored_roles = _parse_roles(target.roles)
+        if (
+            (ROLE_GLOBAL_ADMIN in selected or ROLE_GLOBAL_ADMIN in target_stored_roles)
+            and not user_is_global_admin(db, user)
+        ):
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="Only a global admin can change global admin role assignments.",
+                message_kind="error",
+            )
+        if target.disabled:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="Enable the user account before editing its roles.",
                 message_kind="error",
             )
         target.roles = _serialize_roles(selected)

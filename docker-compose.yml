@@ -9,5 +9,8 @@ services:
     env_file:
       - .env
     volumes:
-      - ./data:/app/data
+      - api-to-dns-data:/app/data
     restart: unless-stopped
+
+volumes:
+  api-to-dns-data:
