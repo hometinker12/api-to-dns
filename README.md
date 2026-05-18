@@ -13,6 +13,8 @@ A Dockerized FastAPI service to manage DNS records through a protected admin web
 - Choose DNS provider (**Azure**, **Microsoft / WinRM**, **BIND / TSIG**) **per zone** and store connection details and credentials **encrypted at rest**
 - Create, update, or **delete** DNS records via `POST /dns-record`
 - Structured JSON errors (for example **404** when a DELETE finds no record, **502** when the DNS provider fails)
+- Searchable database-backed activity logs for sign-ins, API key changes, DNS record activity, provider failures, and alert events
+- Email alert rules for matching stored activity events, with SMTP failover across an ordered server list
 - Docker Compose-ready deployment
 
 ## Getting Started
@@ -53,6 +55,7 @@ Create a `.env` file using `.env.example` and configure the following values:
 | `ADMIN_USER` | Initial admin username |
 | `ADMIN_PASSWORD` | Initial admin password |
 | `DATABASE_URL` | Optional database URL (default: `sqlite:///./data/app.db`) |
+| `LOG_FILE` | Optional file path for rotating operational logs (Docker Compose sets `/app/logs/api-to-dns.log`) |
 
 **Azure DNS** (per zone): tenant ID, client ID, client secret, and optional default subscription and resource group are stored on that zone’s row in **DNS zones** (encrypted). They are **not** read from `AZURE_*` environment variables.
 
@@ -81,6 +84,43 @@ The web interface allows you to:
 - Sign in with admin credentials
 - Add and edit **DNS zones** (each zone name is unique; each has its own provider type, server, and credentials)
 - Create and revoke **API keys**, and **edit** keys to change their label or **allowed zones**
+- Review and search activity logs under **Settings → Log Viewing / Searching**
+- Configure logging level, retention, SMTP delivery, and operational log rotation under **Settings → System Settings**
+- Create email alert rules under **Settings → Email Alerting**
+
+## Activity Logs, Operational Logs, And Alerts
+
+The app uses two separate logging paths:
+
+- **Activity logs** are database rows intended for admin review, filtering, retention cleanup, and email alerting. They capture audit events such as login success/failure, logout, API key create/update/revoke, DNS zone changes, plugin enable/disable, user management changes, DNS record create/update/delete/not-found events, invalid requests, access denied events, DNS provider failures, and alert delivery success/failure.
+- **Operational logs** are Python/Docker runtime diagnostics intended for container and process troubleshooting. Docker Compose rotates stdout/stderr with the `json-file` driver (`max-size: 10m`, `max-file: 5`). When `LOG_FILE` is configured, the Python logger also writes to a rotating file handler; the provided Compose file stores that file under a separate `api-to-dns-logs` volume mounted at `/app/logs`.
+
+### Logging Level And Retention
+
+The activity logging level is configured under **System Settings**:
+
+- `verbose` stores page requests/API calls as `http.request`, informational events, warning events, and error events.
+- `informational` stores informational, warning, and error events, but excludes verbose request noise.
+- `warning` stores warning and error events only.
+- `error` stores error events only.
+
+Security-category activity is always stored regardless of the selected level. This includes `auth.*`, `api_key.*`, `dns.record_*`, and `user.*` events. In **Log Viewing / Searching**, the text search field is shown by default; level, category, event type, status, zone, actor, and date range live under **Advanced Search**.
+
+Activity log retention is configured under **System Settings** with presets such as 24 hours, 1 week, 30 days, 60 days, 90 days, 180 days, and 365 days. Cleanup runs at startup and opportunistically during activity logging, at most once per day. This is retention cleanup for database rows, not file rotation.
+
+### Email Alerting
+
+Alert rules match stored activity events by event type, category, minimum level, optional text search, recipients, and cooldown. Alert subjects and bodies can use placeholders such as `{event_type}`, `{level}`, `{category}`, `{timestamp}`, `{message}`, `{status}`, `{actor_type}`, `{actor_label}`, `{zone_name}`, `{record_name}`, `{details}`, `{system_dns_name}`, and `{system_ip_address}`.
+
+SMTP delivery settings live under **System Settings**. The SMTP server field accepts an ordered CSV list such as `smtp1.example.com,192.0.2.25,smtp-backup.example.com`; delivery tries each server in order until one succeeds. Anonymous SMTP skips authentication. Successful delivery writes an informational `alert.email_sent` event. If delivery fails for every server, the app writes an `alert.email_failed` activity event without blocking the original action.
+
+### Planned Infrastructure Settings
+
+**System Settings** includes placeholders for syslog forwarding and SSL certificate management. Syslog host, port, protocol, facility, and minimum level are planned but not implemented yet. Certificate upload, private key upload, chain management, expiration display, and reload/renewal actions are also planned for a later release.
+
+### Logging Security
+
+The app redacts secret-looking detail fields before storing activity logs or sending alert emails. It logs API key IDs, labels, and short SHA-256 fingerprints rather than full API key values. Request bodies are not stored by default, and DNS provider credentials remain encrypted at rest in configuration rows.
 
 ## API Usage
 

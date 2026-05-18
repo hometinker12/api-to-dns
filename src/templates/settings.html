@@ -333,12 +333,423 @@
             <div class="alert">No plugins discovered.</div>
           {% endif %}
 
-        {% elif selected_area == "logging" %}
-          <h2>Activity Logging</h2>
-          <div class="placeholder-panel">
-            <p>Activity and audit logging is planned but not implemented yet.</p>
-            <p class="help">When delivered, this area will let you review session sign-ins, DNS record changes, API key activity, and other notable events.</p>
-          </div>
+        {% elif selected_area == "system_settings" %}
+          {% set sys = system_settings_view %}
+          <h2>System Settings</h2>
+          <p class="help">Service-wide infrastructure configuration. SMTP credentials and other secrets are encrypted at rest.</p>
+
+          <section class="form-card">
+            <h2>System Identity</h2>
+            <p class="help">Auto-detected from the runtime. These values populate <code>{system_dns_name}</code> and <code>{system_ip_address}</code> in alert templates.</p>
+            <label>System DNS name
+              <input type="text" value="{{ sys.identity.system_dns_name }}" disabled readonly />
+            </label>
+            <label>System IP address
+              <input type="text" value="{{ sys.identity.system_ip_address }}" disabled readonly />
+            </label>
+            {% if sys.is_docker %}
+              <p class="help">Detected Docker container runtime.</p>
+            {% endif %}
+          </section>
+
+          <section class="form-card">
+            <h2>Logging Configuration</h2>
+            <p class="help">Storage threshold for non-security activity events. <code>verbose</code> records every page request and API call; security-category events are always logged.</p>
+            <form action="/settings/system/log-level" method="post">
+              <input type="hidden" name="redirect_area" value="system_settings" />
+              <label>Activity log level
+                <select name="log_level" {% if not can_system_update %}disabled{% endif %}>
+                  {% for option in sys.log_levels %}
+                    <option value="{{ option }}" {% if sys.log_level == option %}selected{% endif %}>{{ option|lower }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              {% if can_system_update %}
+                <button type="submit">Save log level</button>
+              {% endif %}
+            </form>
+          </section>
+
+          <section class="form-card">
+            <h2>Audit Log Retention</h2>
+            <p class="help">Activity log rows older than this window are deleted by a daily cleanup job.</p>
+            <form action="/settings/system/retention" method="post">
+              <label>Retention days
+                <select name="retention_days" {% if not can_system_update %}disabled{% endif %}>
+                  {% for option in sys.retention_options %}
+                    <option value="{{ option.value }}" {% if sys.retention_days == option.value %}selected{% endif %}>{{ option.label }}</option>
+                  {% endfor %}
+                  {% if sys.retention_days not in (sys.retention_options | map(attribute='value') | list) %}
+                    <option value="{{ sys.retention_days }}" selected>{{ sys.retention_days }} days (custom)</option>
+                  {% endif %}
+                </select>
+              </label>
+              {% if can_system_update %}
+                <button type="submit">Save retention</button>
+              {% endif %}
+            </form>
+          </section>
+
+          <section class="form-card">
+            <h2>SMTP Delivery</h2>
+            <p class="help">SMTP servers are tried in order. Anonymous mode skips authentication entirely.</p>
+            <form action="/settings/system/smtp" method="post">
+              <label>SMTP servers (CSV)
+                <input type="text" name="smtp_servers" value="{{ sys.smtp.servers | join(',') }}" placeholder="smtp1.example.com,192.0.2.25,smtp-backup.example.com" {% if not can_system_update %}disabled{% endif %} />
+              </label>
+              <label>Port
+                <input type="text" name="smtp_port" value="{{ sys.smtp.port }}" {% if not can_system_update %}disabled{% endif %} />
+              </label>
+              <label>Security
+                <select name="smtp_security" {% if not can_system_update %}disabled{% endif %}>
+                  {% for option in ["none", "starttls", "ssl"] %}
+                    <option value="{{ option }}" {% if sys.smtp.security == option %}selected{% endif %}>{{ option }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label class="inline-check">
+                <input type="checkbox" name="smtp_anonymous" id="smtp-anonymous" {% if sys.smtp.anonymous %}checked{% endif %} {% if not can_system_update %}disabled{% endif %} />
+                Anonymous SMTP (no authentication)
+              </label>
+              <label>Username
+                <input type="text" name="smtp_username" id="smtp-username" value="{{ sys.smtp.username }}" {% if not can_system_update %}disabled{% endif %} />
+              </label>
+              <label>Password
+                <input type="password" name="smtp_password" id="smtp-password" placeholder="{% if sys.smtp.password_set %}(unchanged){% else %}(not set){% endif %}" {% if not can_system_update %}disabled{% endif %} />
+              </label>
+              <label>From address
+                <input type="email" name="smtp_from" value="{{ sys.smtp.from_address }}" {% if not can_system_update %}disabled{% endif %} />
+              </label>
+              <label>Timeout (seconds)
+                <input type="text" name="smtp_timeout" value="{{ sys.smtp.timeout }}" {% if not can_system_update %}disabled{% endif %} />
+              </label>
+              {% if can_system_update %}
+                <button type="submit">Save SMTP settings</button>
+              {% endif %}
+            </form>
+          </section>
+
+          <section class="form-card">
+            <h2>Operational Log Rotation</h2>
+            <p class="help">Docker stdout/stderr logs are rotated by Docker (see <code>docker-compose.yml</code>). Optionally enable a rotating file handler for non-Docker installs.</p>
+            <form action="/settings/system/log-rotation" method="post">
+              <label>Log file path (optional)
+                <input type="text" name="log_file" value="{{ sys.operational_log.log_file }}" placeholder="/var/log/api-to-dns.log" {% if not can_system_update %}disabled{% endif %} />
+              </label>
+              <label>Max file size (bytes)
+                <input type="text" name="max_bytes" value="{{ sys.operational_log.max_bytes }}" {% if not can_system_update %}disabled{% endif %} />
+              </label>
+              <label>Backup file count
+                <input type="text" name="backup_count" value="{{ sys.operational_log.backup_count }}" {% if not can_system_update %}disabled{% endif %} />
+              </label>
+              {% if can_system_update %}
+                <button type="submit">Save log rotation</button>
+              {% endif %}
+            </form>
+          </section>
+
+          <section class="form-card">
+            <h2>Syslog Server (planned)</h2>
+            <div class="placeholder-panel">
+              <p>Syslog forwarding is not implemented yet.</p>
+              <p class="help">A future release will add host, port, protocol, facility, and minimum-level fields here.</p>
+            </div>
+          </section>
+
+          <section class="form-card">
+            <h2>SSL Certificate Management (planned)</h2>
+            <div class="placeholder-panel">
+              <p>Certificate upload, chain management, expiration display, and reload actions are not implemented yet.</p>
+              <p class="help">A future release will provide certificate upload, private key upload, certificate chain, expiration details, and reload actions.</p>
+            </div>
+          </section>
+
+        {% elif selected_area == "log_viewing" %}
+          {% set lv = log_view %}
+          <h2>Log Viewing / Searching</h2>
+          <p class="help">Searchable activity events. Retention is currently <strong>{{ lv.shared.retention_days }} days</strong> (configured under System Settings).</p>
+
+          <section class="form-card">
+            <h2>Search</h2>
+            <form action="/settings" method="get">
+              <input type="hidden" name="area" value="log_viewing" />
+              <label>Text query
+                <input type="text" name="text_query" value="{{ lv.params.text_query or '' }}" placeholder="Search message, details, event type, zone, actor, or category" />
+              </label>
+              <details class="advanced-search" {% if lv.params.level or lv.params.category or lv.params.event_type or lv.params.status or lv.params.zone_name or lv.params.actor or lv.params.start or lv.params.end %}open{% endif %}>
+                <summary>Advanced Search</summary>
+                <label>Level
+                  <select name="level">
+                    <option value="">(any)</option>
+                    {% for option in lv.shared.log_levels %}
+                      <option value="{{ option }}" {% if lv.params.level == option %}selected{% endif %}>{{ option|lower }}</option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <label>Category
+                  <select name="category">
+                    <option value="">(any)</option>
+                    {% for option in lv.shared.log_categories %}
+                      <option value="{{ option }}" {% if lv.params.category == option %}selected{% endif %}>{{ option }}</option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <label>Event type
+                  <input type="text" name="event_type" value="{{ lv.params.event_type or '' }}" placeholder="dns.record_created" />
+                </label>
+                <label>Status
+                  <input type="text" name="log_status" value="{{ lv.params.status or '' }}" placeholder="success or error" />
+                </label>
+                <label>Zone
+                  <input type="text" name="zone_name" value="{{ lv.params.zone_name or '' }}" />
+                </label>
+                <label>Actor
+                  <input type="text" name="actor" value="{{ lv.params.actor or '' }}" placeholder="username or API key label" />
+                </label>
+                <label>From (ISO 8601)
+                  <input type="text" name="start" value="{{ lv.params.start.isoformat() if lv.params.start else '' }}" placeholder="2026-01-01T00:00:00" />
+                </label>
+                <label>To (ISO 8601)
+                  <input type="text" name="end" value="{{ lv.params.end.isoformat() if lv.params.end else '' }}" placeholder="2026-01-31T23:59:59" />
+                </label>
+              </details>
+              <button type="submit">Search</button>
+            </form>
+          </section>
+
+          <section class="form-card">
+            <h2>Recent Activity</h2>
+            <p class="help">Showing {{ lv.offset }} to {{ lv.offset + lv.rows | length }} of {{ lv.total }}.</p>
+            <div class="pagination-nav" aria-label="Activity log pagination">
+              <form action="/settings" method="get">
+                <input type="hidden" name="area" value="log_viewing" />
+                <input type="hidden" name="text_query" value="{{ lv.params.text_query or '' }}" />
+                <input type="hidden" name="level" value="{{ lv.params.level or '' }}" />
+                <input type="hidden" name="category" value="{{ lv.params.category or '' }}" />
+                <input type="hidden" name="event_type" value="{{ lv.params.event_type or '' }}" />
+                <input type="hidden" name="log_status" value="{{ lv.params.status or '' }}" />
+                <input type="hidden" name="zone_name" value="{{ lv.params.zone_name or '' }}" />
+                <input type="hidden" name="actor" value="{{ lv.params.actor or '' }}" />
+                <input type="hidden" name="start" value="{{ lv.params.start.isoformat() if lv.params.start else '' }}" />
+                <input type="hidden" name="end" value="{{ lv.params.end.isoformat() if lv.params.end else '' }}" />
+                <button type="submit" name="offset" value="{{ lv.previous_offset }}" class="secondary" {% if not lv.has_previous %}disabled{% endif %}>Previous</button>
+                <button type="submit" name="offset" value="{{ lv.next_offset }}" class="secondary" {% if not lv.has_next %}disabled{% endif %}>Next</button>
+              </form>
+            </div>
+            <div class="table-wrap">
+              <table class="activity-log-table">
+                <thead>
+                  <tr>
+                    <th>Timestamp</th>
+                    <th>Level</th>
+                    <th>Category</th>
+                    <th>Event</th>
+                    <th>Actor</th>
+                    <th>Zone</th>
+                    <th>Status</th>
+                    <th>Message</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in lv.rows %}
+                    <tr>
+                      <td><code>{{ row.timestamp }}</code></td>
+                      <td><code>{{ row.level }}</code></td>
+                      <td><code></code>{{ row.category }}</code></td>
+                      <td><code>{{ row.event_type }}</code></td>
+                      <td><code>{{ row.actor_label }} ({{ row.actor_type }})</code></td>
+                      <td><code>{{ row.zone_name }}</code></td>
+                      <td><code>{{ row.status }}</code></td>
+                      <td><code>{{ row.message }}</code></td>
+                    </tr>
+                  {% else %}
+                    <tr><td colspan="8"><code>No events match.</code></td></tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+        {% elif selected_area == "email_alerting" %}
+          {% set av = alert_view %}
+          <h2>Email Alerting</h2>
+          <p class="help">SMTP delivery settings live under <a href="/settings?area=system_settings">System Settings</a>. Alert rules consume those settings.</p>
+
+          <section class="form-card">
+            <h2>Alert Rules</h2>
+            <div class="section-title-row">
+              <h3>Existing rules</h3>
+              {% if can_system_update %}
+                <button type="button" id="open-create-alert">Create alert rule</button>
+              {% endif %}
+            </div>
+            <div class="table-wrap">
+              <table class="compact-table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Event Type</th>
+                    <th>Category</th>
+                    <th>Minimum Level</th>
+                    <th>Recipients</th>
+                    <th>Cooldown</th>
+                    <th>Enabled</th>
+                    <th class="actions-column">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for rule in av.rules %}
+                    <tr>
+                      <td><code>{{ rule.name }}</code></td>
+                      <td>{{ rule.event_type or '(any)' }}</td>
+                      <td>{{ rule.category or '(any)' }}</td>
+                      <td>{{ rule.minimum_level }}</td>
+                      <td>{{ rule.email_recipients }}</td>
+                      <td>{{ rule.cooldown_minutes }} min</td>
+                      <td>{{ 'yes' if rule.enabled else 'no' }}</td>
+                      <td class="actions-column">
+                        <div class="action-cell">
+                          {% if can_system_update %}
+                            <button type="button" data-open-edit-alert="{{ rule.id }}">Edit</button>
+                            <form action="/settings/alerts/{{ rule.id }}/delete" method="post" onsubmit="return confirm('Delete alert rule {{ rule.name }}?');">
+                              <button type="submit" class="danger">Delete</button>
+                            </form>
+                          {% endif %}
+                        </div>
+                      </td>
+                    </tr>
+                  {% else %}
+                    <tr><td colspan="8">No alert rules configured.</td></tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="form-card">
+            <h2>Template Variables</h2>
+            <p class="help">Use these placeholders in alert subject and body templates. Missing values render as the empty string. Templates are rendered as plain text.</p>
+            <ul>
+              {% for variable in av.template_variables %}
+                <li><code>{{ variable.name }}</code> &mdash; {{ variable.description }}</li>
+              {% endfor %}
+            </ul>
+            <p class="help">Default subject: <code>{{ av.default_subject }}</code></p>
+          </section>
+
+          {% if can_system_update %}
+            <dialog id="create-alert-dialog">
+              <div class="dialog-content">
+                <div class="dialog-header">
+                  <h2>Create alert rule</h2>
+                  <button type="button" class="danger" id="close-create-alert">Close</button>
+                </div>
+                <form action="/settings/alerts" method="post">
+                  <label>Name
+                    <input type="text" name="name" required />
+                  </label>
+                  <label>Event type (leave blank for any)
+                    <input type="text" name="event_type" placeholder="dns.provider_failed" />
+                  </label>
+                  <label>Category (leave blank for any)
+                    <select name="category">
+                      <option value="">(any)</option>
+                      {% for option in av.shared.log_categories %}
+                        <option value="{{ option }}">{{ option }}</option>
+                      {% endfor %}
+                    </select>
+                  </label>
+                  <label>Minimum level
+                    <select name="minimum_level">
+                      {% for option in av.shared.log_levels %}
+                        <option value="{{ option }}" {% if option == "WARNING" %}selected{% endif %}>{{ option|lower }}</option>
+                      {% endfor %}
+                    </select>
+                  </label>
+                  <label>Contains text (optional)
+                    <input type="text" name="message_contains" />
+                  </label>
+                  <label>Email recipients (CSV)
+                    <input type="text" name="email_recipients" required placeholder="oncall@example.com,team@example.com" />
+                  </label>
+                  <label>Cooldown minutes
+                    <input type="text" name="cooldown_minutes" value="0" />
+                  </label>
+                  <label class="inline-check">
+                    <input type="checkbox" name="enabled" checked />
+                    Enabled
+                  </label>
+                  <label>Subject template
+                    <input type="text" name="email_subject_template" placeholder="{{ av.default_subject }}" value="{{ av.default_subject }}" />
+                  </label>
+                  <label>Body template
+                    <textarea name="email_body_template" rows="6" placeholder="{{ av.default_body }}">{{ av.default_body }}</textarea>
+                  </label>
+                  <div class="dialog-actions">
+                    <button type="button" class="secondary" id="cancel-create-alert">Cancel</button>
+                    <button type="submit">Create alert rule</button>
+                  </div>
+                </form>
+              </div>
+            </dialog>
+
+            {% for rule in av.rules %}
+              <dialog id="edit-alert-dialog-{{ rule.id }}">
+                <div class="dialog-content">
+                  <div class="dialog-header">
+                    <h2>Edit alert rule</h2>
+                    <button type="button" class="danger" data-close-edit-alert="{{ rule.id }}">Close</button>
+                  </div>
+                  <form action="/settings/alerts/{{ rule.id }}" method="post">
+                    <label>Name
+                      <input type="text" name="name" required value="{{ rule.name }}" />
+                    </label>
+                    <label>Event type (leave blank for any)
+                      <input type="text" name="event_type" value="{{ rule.event_type }}" />
+                    </label>
+                    <label>Category (leave blank for any)
+                      <select name="category">
+                        <option value="">(any)</option>
+                        {% for option in av.shared.log_categories %}
+                          <option value="{{ option }}" {% if option == rule.category %}selected{% endif %}>{{ option }}</option>
+                        {% endfor %}
+                      </select>
+                    </label>
+                    <label>Minimum level
+                      <select name="minimum_level">
+                        {% for option in av.shared.log_levels %}
+                          <option value="{{ option }}" {% if option == rule.minimum_level %}selected{% endif %}>{{ option|lower }}</option>
+                        {% endfor %}
+                      </select>
+                    </label>
+                    <label>Contains text (optional)
+                      <input type="text" name="message_contains" value="{{ rule.message_contains }}" />
+                    </label>
+                    <label>Email recipients (CSV)
+                      <input type="text" name="email_recipients" required value="{{ rule.email_recipients }}" />
+                    </label>
+                    <label>Cooldown minutes
+                      <input type="text" name="cooldown_minutes" value="{{ rule.cooldown_minutes }}" />
+                    </label>
+                    <label class="inline-check">
+                      <input type="checkbox" name="enabled" {% if rule.enabled %}checked{% endif %} />
+                      Enabled
+                    </label>
+                    <label>Subject template
+                      <input type="text" name="email_subject_template" value="{{ rule.email_subject_template }}" />
+                    </label>
+                    <label>Body template
+                      <textarea name="email_body_template" rows="6">{{ rule.email_body_template }}</textarea>
+                    </label>
+                    <div class="dialog-actions">
+                      <button type="button" class="secondary" data-close-edit-alert="{{ rule.id }}">Cancel</button>
+                      <button type="submit">Save alert rule</button>
+                    </div>
+                  </form>
+                </div>
+              </dialog>
+            {% endfor %}
+          {% endif %}
 
         {% elif selected_area == "backup" %}
           <h2>System Backup</h2>
@@ -505,6 +916,42 @@
           dialog.showModal();
         }
       });
+
+      const createAlertDialog = document.getElementById("create-alert-dialog");
+      document.getElementById("open-create-alert")?.addEventListener("click", () => createAlertDialog?.showModal());
+      document.getElementById("close-create-alert")?.addEventListener("click", () => createAlertDialog?.close());
+      document.getElementById("cancel-create-alert")?.addEventListener("click", () => createAlertDialog?.close());
+
+      document.querySelectorAll("[data-open-edit-alert]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const dialog = document.getElementById(`edit-alert-dialog-${button.dataset.openEditAlert}`);
+          dialog?.showModal();
+        });
+      });
+      document.querySelectorAll("[data-close-edit-alert]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const dialog = document.getElementById(`edit-alert-dialog-${button.dataset.closeEditAlert}`);
+          dialog?.close();
+        });
+      });
+
+      const smtpAnonymous = document.getElementById("smtp-anonymous");
+      const smtpUsername = document.getElementById("smtp-username");
+      const smtpPassword = document.getElementById("smtp-password");
+      function syncSmtpAnonymous() {
+        if (!smtpAnonymous) {
+          return;
+        }
+        const anonymous = smtpAnonymous.checked;
+        if (smtpUsername) {
+          smtpUsername.disabled = anonymous;
+        }
+        if (smtpPassword) {
+          smtpPassword.disabled = anonymous;
+        }
+      }
+      smtpAnonymous?.addEventListener("change", syncSmtpAnonymous);
+      syncSmtpAnonymous();
     </script>
   </div>
 </body>

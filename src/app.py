@@ -2,6 +2,7 @@ import html
 import json
 import os
 import traceback
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Set
 
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Request
@@ -12,9 +13,36 @@ from fastapi.templating import Jinja2Templates
 from sqlmodel import select
 from starlette.status import HTTP_303_SEE_OTHER, HTTP_404_NOT_FOUND
 
+from . import activity_logging
+from .activity_logging import (
+    DEFAULT_BODY_TEMPLATE,
+    DEFAULT_SUBJECT_TEMPLATE,
+    LOGGER,
+    configure_operational_logging,
+    emit_activity_event,
+    evaluate_alert_rules,
+    get_log_level,
+    get_retention_days,
+    get_smtp_config,
+    is_running_in_docker,
+    query_activity_logs,
+    run_retention_cleanup,
+    set_log_level,
+    set_retention_days,
+    set_smtp_config,
+    system_identity,
+)
 from .auth import create_session_cookie, get_current_user, session_cookie_settings
 from .db import SessionLocal, init_db
 from .models import (
+    LOG_CATEGORY_VALUES,
+    LOG_LEVEL_ERROR,
+    LOG_LEVEL_INFORMATIONAL,
+    LOG_LEVEL_VALUES,
+    LOG_LEVEL_VERBOSE,
+    LOG_LEVEL_WARNING,
+    ActivityLog,
+    AlertRule,
     ApiKey,
     ApiKeyAllowedZone,
     DnsRecordRequest,
@@ -75,7 +103,7 @@ ROLE_LABELS: List[Dict[str, str]] = [
     {"key": ROLE_SYSTEM_UPDATE, "label": "System: update"},
 ]
 
-SETTINGS_AREAS: List[Dict[str, str]] = [
+SETTINGS_AREAS: List[Dict[str, Any]] = [
     {
         "key": "authentication",
         "label": "Authentication",
@@ -87,8 +115,18 @@ SETTINGS_AREAS: List[Dict[str, str]] = [
         "required_roles": [ROLE_GLOBAL_READ, ROLE_PLUGIN_UPDATE],
     },
     {
-        "key": "logging",
-        "label": "Activity Logging",
+        "key": "system_settings",
+        "label": "System Settings",
+        "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
+    },
+    {
+        "key": "log_viewing",
+        "label": "Log Viewing / Searching",
+        "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
+    },
+    {
+        "key": "email_alerting",
+        "label": "Email Alerting",
         "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
     },
     {
@@ -97,6 +135,10 @@ SETTINGS_AREAS: List[Dict[str, str]] = [
         "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
     },
 ]
+
+LEGACY_SETTINGS_AREA_ALIASES: Dict[str, str] = {
+    "logging": "log_viewing",
+}
 
 ROLE_FORBIDDEN_DETAIL = "You do not have permission to access this resource."
 DISABLED_DNS_PLUGINS_SETTING = "disabled_dns_plugins"
@@ -150,6 +192,38 @@ async def refresh_session_cookie(request: Request, call_next):
     return response
 
 
+# Paths that are never useful in the activity log at VERBOSE.
+_REQUEST_LOG_IGNORE_PREFIXES = ("/static",)
+
+
+@app.middleware("http")
+async def record_request_activity(request: Request, call_next):
+    response = await call_next(request)
+    try:
+        path = request.url.path
+        if path.startswith(_REQUEST_LOG_IGNORE_PREFIXES):
+            return response
+        with SessionLocal() as db:
+            session_user = getattr(request.state, "session_user", None)
+            emit_activity_event(
+                db,
+                event_type="http.request",
+                level=LOG_LEVEL_VERBOSE,
+                category="http",
+                status="success" if response.status_code < 400 else "error",
+                actor_type="user" if session_user else "anonymous",
+                actor_label=session_user,
+                request_method=request.method,
+                request_path=path,
+                request_status_code=response.status_code,
+                request_ip=_client_ip(request),
+                evaluate_alerts=False,
+            )
+    except Exception:  # pragma: no cover - logging must never break a request
+        LOGGER.exception("request activity logging failed")
+    return response
+
+
 @app.exception_handler(HTTPException)
 def http_exception_handler(request: Request, exc: HTTPException):
     """Redirect unauthenticated browser pages while preserving JSON API errors."""
@@ -186,8 +260,7 @@ def _render_access_denied_response() -> HTMLResponse:
 
 def _render_error_response(request: Request, error: Exception, status_code: int = 500):
     traceback_text = traceback.format_exc()
-    print("Application error:", error)
-    print(traceback_text)
+    LOGGER.exception("Application error: %s", error)
     content = (
         "<html><body><h1>Application error</h1>"
         f"<p>{html.escape(str(error))}</p>"
@@ -196,6 +269,20 @@ def _render_error_response(request: Request, error: Exception, status_code: int 
         "</pre></body></html>"
     )
     return HTMLResponse(content=content, status_code=status_code)
+
+
+def _client_ip(request: Request) -> Optional[str]:
+    client = getattr(request, "client", None)
+    return client.host if client else None
+
+
+def _record_activity(**kwargs: Any) -> None:
+    """Best-effort activity event with an isolated session."""
+    try:
+        with SessionLocal() as db:
+            emit_activity_event(db, **kwargs)
+    except Exception:  # pragma: no cover - logging must never break a request
+        LOGGER.exception("emit_activity_event failed for event %s", kwargs.get("event_type"))
 
 
 def get_dns_client_from_settings(settings: dict):
@@ -560,6 +647,11 @@ def startup_event():
     init_db()
     with SessionLocal() as db:
         migrate_legacy_dns_settings_if_needed(db)
+        configure_operational_logging(level=get_log_level(db))
+        try:
+            run_retention_cleanup(db, force=True)
+        except Exception:  # pragma: no cover - never block startup
+            LOGGER.exception("startup activity retention cleanup failed")
     admin_user = os.getenv("ADMIN_USER")
     admin_password = os.getenv("ADMIN_PASSWORD")
     if admin_user and admin_password:
@@ -646,21 +738,68 @@ def login_form(request: Request):
 
 @app.post("/login", response_class=HTMLResponse, include_in_schema=False)
 def login(request: Request, username: str = Form(...), password: str = Form(...)):
+    ip = _client_ip(request)
     with SessionLocal() as db:
         user = db.exec(select(User).where(User.username == username)).first()
         if not user or user.disabled or not verify_password(password, user.password_hash):
+            try:
+                emit_activity_event(
+                    db,
+                    event_type="auth.login_failed",
+                    level=LOG_LEVEL_WARNING,
+                    status="error",
+                    actor_type="user",
+                    actor_label=username,
+                    message=f"Failed login for {username!r}",
+                    details={"reason": "disabled" if user and user.disabled else "invalid_credentials"},
+                    request_ip=ip,
+                )
+            except Exception:  # pragma: no cover
+                LOGGER.exception("could not record auth.login_failed")
             return templates.TemplateResponse(
                 request=request,
                 name="login.html",
                 context={"error": "Invalid credentials."},
             )
+        try:
+            emit_activity_event(
+                db,
+                event_type="auth.login_succeeded",
+                level=LOG_LEVEL_INFORMATIONAL,
+                status="success",
+                actor_type="user",
+                actor_label=username,
+                message=f"Successful login for {username!r}",
+                request_ip=ip,
+            )
+        except Exception:  # pragma: no cover
+            LOGGER.exception("could not record auth.login_succeeded")
     response = RedirectResponse(url="/admin", status_code=HTTP_303_SEE_OTHER)
     response.set_cookie("session", create_session_cookie(username), **session_cookie_settings())
     return response
 
 
 @app.get("/logout", include_in_schema=False)
-def logout() -> RedirectResponse:
+def logout(request: Request) -> RedirectResponse:
+    session_token = request.cookies.get("session")
+    actor: Optional[str] = None
+    if session_token:
+        try:
+            from .auth import verify_session_cookie
+
+            actor = verify_session_cookie(session_token)
+        except Exception:  # pragma: no cover - invalid sessions still log out
+            actor = None
+    if actor:
+        _record_activity(
+            event_type="auth.logout",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=actor,
+            message=f"Logout for {actor!r}",
+            request_ip=_client_ip(request),
+        )
     response = RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
     response.delete_cookie("session")
     return response
@@ -798,6 +937,17 @@ async def zone_create(request: Request, user: str = Depends(require_role(ROLE_DN
         row = DnsZoneConfig(zone_name=canonical, encrypted_config=encode_zone_config_dict(cfg))
         db.add(row)
         db.commit()
+        emit_activity_event(
+            db,
+            event_type="dns_zone.created",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            zone_name=canonical,
+            message=f"Zone {canonical!r} added",
+            details={"dns_provider_type": cfg.get("dns_provider_type")},
+        )
         zones = list_dns_zones(db)
         zones_view = [dns_zone_public_dict(z) for z in zones]
     return templates.TemplateResponse(
@@ -862,6 +1012,17 @@ async def zone_update(request: Request, zone_id: int, user: str = Depends(requir
         settings = decode_zone_config(row)
         zone_view = dns_zone_public_dict(row)
         title_zone = row.zone_name
+        emit_activity_event(
+            db,
+            event_type="dns_zone.updated",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            zone_name=row.zone_name,
+            message=f"Zone {row.zone_name!r} updated",
+            details={"dns_provider_type": cfg.get("dns_provider_type")},
+        )
     return templates.TemplateResponse(
         request=request,
         name="zone_form.html",
@@ -880,11 +1041,24 @@ async def zone_update(request: Request, zone_id: int, user: str = Depends(requir
 def zone_delete(request: Request, zone_id: int, user: str = Depends(require_role(ROLE_DNS_ZONES_UPDATE))):
     with SessionLocal() as db:
         row = db.get(DnsZoneConfig, zone_id)
+        removed_zone_name = None
         if row:
+            removed_zone_name = row.zone_name
             for link in db.exec(select(ApiKeyAllowedZone).where(ApiKeyAllowedZone.dns_zone_config_id == zone_id)).all():
                 db.delete(link)
             db.delete(row)
             db.commit()
+        if removed_zone_name:
+            emit_activity_event(
+                db,
+                event_type="dns_zone.deleted",
+                level=LOG_LEVEL_WARNING,
+                status="success",
+                actor_type="user",
+                actor_label=user,
+                zone_name=removed_zone_name,
+                message=f"Zone {removed_zone_name!r} deleted",
+            )
         zones = list_dns_zones(db)
         zones_view = [dns_zone_public_dict(z) for z in zones]
     return templates.TemplateResponse(
@@ -927,6 +1101,16 @@ def revoke_api_key(request: Request, key_id: int = Form(...), user: str = Depend
                 api_key.active = False
                 db.add(api_key)
                 db.commit()
+                emit_activity_event(
+                    db,
+                    event_type="api_key.revoked",
+                    level=LOG_LEVEL_WARNING,
+                    status="success",
+                    actor_type="user",
+                    actor_label=user,
+                    message=f"API key {api_key.label!r} revoked",
+                    details={"api_key_id": api_key.id, "api_key_label": api_key.label},
+                )
             api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda k: k.created_at, reverse=True)
             key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
             all_zones = list_dns_zones(db)
@@ -992,6 +1176,16 @@ def create_api_key_route(
                     if db.get(DnsZoneConfig, zid):
                         db.add(ApiKeyAllowedZone(api_key_id=key_id, dns_zone_config_id=zid))
                 db.commit()
+                emit_activity_event(
+                    db,
+                    event_type="api_key.updated",
+                    level=LOG_LEVEL_INFORMATIONAL,
+                    status="success",
+                    actor_type="user",
+                    actor_label=user,
+                    message=f"API key {label!r} updated",
+                    details={"api_key_id": key_id, "api_key_label": label, "allowed_zone_ids": list(zone_ids)},
+                )
                 api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda k: k.created_at, reverse=True)
                 key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
                 all_zones = list_dns_zones(db)
@@ -1038,6 +1232,20 @@ def create_api_key_route(
                 if db.get(DnsZoneConfig, zid):
                     db.add(ApiKeyAllowedZone(api_key_id=api_key.id, dns_zone_config_id=zid))
             db.commit()
+            emit_activity_event(
+                db,
+                event_type="api_key.created",
+                level=LOG_LEVEL_INFORMATIONAL,
+                status="success",
+                actor_type="user",
+                actor_label=user,
+                message=f"API key {label!r} created",
+                details={
+                    "api_key_id": api_key.id,
+                    "api_key_label": api_key.label,
+                    "allowed_zone_ids": list(zone_ids),
+                },
+            )
             api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda k: k.created_at, reverse=True)
             key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
             all_zones = list_dns_zones(db)
@@ -1123,6 +1331,16 @@ def api_key_update(
             if db.get(DnsZoneConfig, zid):
                 db.add(ApiKeyAllowedZone(api_key_id=key_id, dns_zone_config_id=zid))
         db.commit()
+        emit_activity_event(
+            db,
+            event_type="api_key.updated",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"API key {label!r} updated",
+            details={"api_key_id": key_id, "api_key_label": label, "allowed_zone_ids": list(zone_ids)},
+        )
         all_zones = list_dns_zones(db)
         allowed_ids = {
             link.dns_zone_config_id
@@ -1146,6 +1364,24 @@ def api_key_update(
     )
 
 
+LOG_SEARCH_PAGE_SIZE = 25
+ALERT_TEMPLATE_VARIABLES: List[Dict[str, str]] = [
+    {"name": "{event_type}", "description": "Activity event identifier (e.g. dns.record_created)"},
+    {"name": "{level}", "description": "Event severity: VERBOSE, INFORMATIONAL, WARNING, or ERROR"},
+    {"name": "{category}", "description": "Event category, such as security, http, dns, alert, system, or user"},
+    {"name": "{timestamp}", "description": "Event timestamp in UTC ISO 8601"},
+    {"name": "{message}", "description": "Short human-readable summary"},
+    {"name": "{status}", "description": "success or error"},
+    {"name": "{actor_type}", "description": "user, api_key, system, or anonymous"},
+    {"name": "{actor_label}", "description": "Username or API key label"},
+    {"name": "{zone_name}", "description": "DNS zone associated with the event (if any)"},
+    {"name": "{record_name}", "description": "DNS record name (if any)"},
+    {"name": "{details}", "description": "JSON-encoded sanitized event detail payload"},
+    {"name": "{system_dns_name}", "description": "Detected system DNS name (or Docker Container)"},
+    {"name": "{system_ip_address}", "description": "Detected system IP address (or Docker Container)"},
+]
+
+
 def _settings_context(
     request: Request,
     user: str,
@@ -1155,6 +1391,7 @@ def _settings_context(
     auth_form_error: Optional[str] = None,
     auth_form_username: Optional[str] = None,
     auth_form_selected_roles: Optional[List[str]] = None,
+    log_search_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     with SessionLocal() as db:
         user_roles = get_user_roles(db, user)
@@ -1171,12 +1408,131 @@ def _settings_context(
             if ROLE_GLOBAL_READ in user_roles or ROLE_PLUGIN_UPDATE in user_roles
             else []
         )
+        accessible = accessible_settings_areas(user_roles)
+        accessible_keys = {a["key"] for a in accessible}
+        requested_area = (area or "").strip().lower() or (accessible[0]["key"] if accessible else "")
+        if requested_area not in accessible_keys:
+            requested_area = accessible[0]["key"] if accessible else ""
 
-    accessible = accessible_settings_areas(user_roles)
-    accessible_keys = {a["key"] for a in accessible}
-    requested_area = (area or "").strip().lower() or (accessible[0]["key"] if accessible else "")
-    if requested_area not in accessible_keys:
-        requested_area = accessible[0]["key"] if accessible else ""
+        system_settings_view: Optional[Dict[str, Any]] = None
+        log_view: Optional[Dict[str, Any]] = None
+        alert_view: Optional[Dict[str, Any]] = None
+
+        if requested_area in {"system_settings", "log_viewing", "email_alerting"} and (
+            ROLE_GLOBAL_READ in user_roles or ROLE_SYSTEM_UPDATE in user_roles
+        ):
+            identity = system_identity()
+            smtp = get_smtp_config(db)
+            current_level = get_log_level(db)
+            retention_days = get_retention_days(db)
+            shared_system = {
+                "identity": identity,
+                "is_docker": is_running_in_docker(),
+                "log_level": current_level,
+                "log_levels": list(LOG_LEVEL_VALUES),
+                "log_categories": list(LOG_CATEGORY_VALUES),
+                "retention_days": retention_days,
+                "retention_options": [
+                    {"value": 1, "label": "24 hours"},
+                    {"value": 7, "label": "1 week"},
+                    {"value": 30, "label": "30 days"},
+                    {"value": 60, "label": "60 days"},
+                    {"value": 90, "label": "90 days"},
+                    {"value": 180, "label": "180 days"},
+                    {"value": 365, "label": "365 days"},
+                ],
+                "smtp": {**smtp, "password_set": bool(smtp.get("password"))},
+                "operational_log": {
+                    "log_file": activity_logging._get_setting(db, activity_logging.SETTING_LOG_FILE) or "",
+                    "max_bytes": int(
+                        activity_logging._get_setting(db, activity_logging.SETTING_LOG_MAX_BYTES) or 1_048_576
+                    ),
+                    "backup_count": int(
+                        activity_logging._get_setting(db, activity_logging.SETTING_LOG_BACKUP_COUNT) or 5
+                    ),
+                },
+            }
+
+            if requested_area == "system_settings":
+                system_settings_view = shared_system
+
+            if requested_area == "log_viewing":
+                params = log_search_params or {}
+                rows, total = query_activity_logs(
+                    db,
+                    event_type=params.get("event_type") or None,
+                    level=params.get("level") or None,
+                    category=params.get("category") or None,
+                    status=params.get("status") or None,
+                    zone_name=params.get("zone_name") or None,
+                    actor=params.get("actor") or None,
+                    text_query=params.get("text_query") or None,
+                    start=params.get("start"),
+                    end=params.get("end"),
+                    limit=LOG_SEARCH_PAGE_SIZE,
+                    offset=max(0, int(params.get("offset") or 0)),
+                )
+                current_offset = max(0, int(params.get("offset") or 0))
+                previous_offset = max(0, current_offset - LOG_SEARCH_PAGE_SIZE)
+                next_offset = current_offset + LOG_SEARCH_PAGE_SIZE
+                log_view = {
+                    "shared": shared_system,
+                    "params": params,
+                    "rows": [
+                        {
+                            "id": row.id,
+                            "timestamp": row.timestamp.isoformat() if row.timestamp else "",
+                            "level": row.level,
+                            "category": row.category or "",
+                            "event_type": row.event_type,
+                            "status": row.status or "",
+                            "actor_type": row.actor_type or "",
+                            "actor_label": row.actor_label or "",
+                            "zone_name": row.zone_name or "",
+                            "record_name": row.record_name or "",
+                            "message": row.message or "",
+                            "details_json": row.details_json or "",
+                            "request_method": row.request_method or "",
+                            "request_path": row.request_path or "",
+                            "request_status_code": row.request_status_code,
+                            "request_ip": row.request_ip or "",
+                        }
+                        for row in rows
+                    ],
+                    "total": total,
+                    "page_size": LOG_SEARCH_PAGE_SIZE,
+                    "offset": current_offset,
+                    "previous_offset": previous_offset,
+                    "next_offset": next_offset,
+                    "has_previous": current_offset > 0,
+                    "has_next": next_offset < total,
+                }
+
+            if requested_area == "email_alerting":
+                rules = list(db.exec(select(AlertRule)).all())
+                alert_view = {
+                    "shared": shared_system,
+                    "rules": [
+                        {
+                            "id": rule.id,
+                            "enabled": rule.enabled,
+                            "name": rule.name or "",
+                            "event_type": rule.event_type or "",
+                            "category": rule.category or "",
+                            "minimum_level": rule.minimum_level,
+                            "message_contains": rule.message_contains or "",
+                            "email_recipients": rule.email_recipients or "",
+                            "email_subject_template": rule.email_subject_template or "",
+                            "email_body_template": rule.email_body_template or "",
+                            "cooldown_minutes": rule.cooldown_minutes,
+                            "last_triggered_at": rule.last_triggered_at.isoformat() if rule.last_triggered_at else "",
+                        }
+                        for rule in sorted(rules, key=lambda r: (r.name or "", r.id or 0))
+                    ],
+                    "template_variables": ALERT_TEMPLATE_VARIABLES,
+                    "default_subject": DEFAULT_SUBJECT_TEMPLATE,
+                    "default_body": DEFAULT_BODY_TEMPLATE,
+                }
 
     return {
         "request": request,
@@ -1197,6 +1553,10 @@ def _settings_context(
         "can_account_reset_password": ROLE_ACCOUNT_RESET_PASSWORD in user_roles,
         "can_global_admin": ROLE_GLOBAL_ADMIN in user_roles,
         "can_plugin_update": ROLE_PLUGIN_UPDATE in user_roles,
+        "can_system_update": ROLE_SYSTEM_UPDATE in user_roles,
+        "system_settings_view": system_settings_view,
+        "log_view": log_view,
+        "alert_view": alert_view,
     }
 
 
@@ -1217,9 +1577,45 @@ def _render_settings(
 def settings_page(
     request: Request,
     area: Optional[str] = None,
+    event_type: Optional[str] = None,
+    level: Optional[str] = None,
+    category: Optional[str] = None,
+    log_status: Optional[str] = None,
+    zone_name: Optional[str] = None,
+    actor: Optional[str] = None,
+    text_query: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    offset: int = 0,
     user: str = Depends(get_current_user),
 ):
-    return _render_settings(request, user, area)
+    normalized_area = (area or "").strip().lower()
+    if normalized_area in LEGACY_SETTINGS_AREA_ALIASES:
+        normalized_area = LEGACY_SETTINGS_AREA_ALIASES[normalized_area]
+    log_search_params: Optional[Dict[str, Any]] = None
+    if normalized_area == "log_viewing":
+        log_search_params = {
+            "event_type": (event_type or "").strip() or None,
+            "level": (level or "").strip() or None,
+            "category": (category or "").strip() or None,
+            "status": (log_status or "").strip() or None,
+            "zone_name": (zone_name or "").strip() or None,
+            "actor": (actor or "").strip() or None,
+            "text_query": (text_query or "").strip() or None,
+            "start": _parse_iso_datetime(start),
+            "end": _parse_iso_datetime(end),
+            "offset": offset,
+        }
+    return _render_settings(request, user, normalized_area, log_search_params=log_search_params)
+
+
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 @app.post("/settings/account/password", response_class=HTMLResponse, include_in_schema=False)
@@ -1259,6 +1655,16 @@ def settings_self_password_change(
         target.password_hash = hash_password(new_password)
         db.add(target)
         db.commit()
+        emit_activity_event(
+            db,
+            event_type="user.password_changed",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"User {user!r} changed their own password",
+            details={"target_username": user},
+        )
     return _render_settings(request, user, "authentication", message="Password changed.")
 
 
@@ -1317,6 +1723,16 @@ def settings_user_create(
             )
         )
         db.commit()
+        emit_activity_event(
+            db,
+            event_type="user.created",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"User {normalized!r} created",
+            details={"target_username": normalized, "roles": selected_roles},
+        )
     return _render_settings(
         request,
         user,
@@ -1378,6 +1794,16 @@ def settings_user_disable(
         db.add(target)
         db.commit()
         username = target.username
+        emit_activity_event(
+            db,
+            event_type="user.disabled",
+            level=LOG_LEVEL_WARNING,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"User {username!r} disabled",
+            details={"target_username": username, "target_user_id": user_id},
+        )
     return _render_settings(
         request,
         user,
@@ -1422,6 +1848,16 @@ def settings_user_enable(
         db.add(target)
         db.commit()
         username = target.username
+        emit_activity_event(
+            db,
+            event_type="user.enabled",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"User {username!r} enabled",
+            details={"target_username": username, "target_user_id": user_id},
+        )
     return _render_settings(
         request,
         user,
@@ -1482,6 +1918,16 @@ def settings_user_delete(
         username = target.username
         db.delete(target)
         db.commit()
+        emit_activity_event(
+            db,
+            event_type="user.deleted",
+            level=LOG_LEVEL_WARNING,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"User {username!r} deleted",
+            details={"target_username": username, "target_user_id": user_id},
+        )
     return _render_settings(
         request,
         user,
@@ -1544,6 +1990,16 @@ def settings_user_reset_password(
         db.add(target)
         db.commit()
         username = target.username
+        emit_activity_event(
+            db,
+            event_type="user.password_reset",
+            level=LOG_LEVEL_WARNING,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"Password reset for {username!r}",
+            details={"target_username": username, "target_user_id": user_id},
+        )
     return _render_settings(
         request,
         user,
@@ -1610,6 +2066,16 @@ def settings_user_update_roles(
         db.add(target)
         db.commit()
         username = target.username
+        emit_activity_event(
+            db,
+            event_type="user.roles_updated",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"Roles updated for {username!r}",
+            details={"target_username": username, "roles": selected},
+        )
     return _render_settings(
         request,
         user,
@@ -1666,6 +2132,16 @@ def settings_plugin_disable(
             )
         disabled.add(normalized_key)
         set_disabled_dns_plugins(db, disabled)
+        emit_activity_event(
+            db,
+            event_type="plugin.disabled",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"Plugin {normalized_key!r} disabled",
+            details={"plugin_key": normalized_key},
+        )
 
     return _render_settings(request, user, "plugins", message=f"{get_dns_provider_label(normalized_key)} disabled.")
 
@@ -1689,10 +2165,301 @@ def settings_plugin_enable(
 
     with SessionLocal() as db:
         disabled = get_disabled_dns_plugins(db)
+        was_disabled = normalized_key in disabled
         disabled.discard(normalized_key)
         set_disabled_dns_plugins(db, disabled)
+        if was_disabled:
+            emit_activity_event(
+                db,
+                event_type="plugin.enabled",
+                level=LOG_LEVEL_INFORMATIONAL,
+                status="success",
+                actor_type="user",
+                actor_label=user,
+                message=f"Plugin {normalized_key!r} enabled",
+                details={"plugin_key": normalized_key},
+            )
 
     return _render_settings(request, user, "plugins", message=f"{get_dns_provider_label(normalized_key)} enabled.")
+
+
+@app.post("/settings/system/log-level", response_class=HTMLResponse, include_in_schema=False)
+def settings_update_log_level(
+    request: Request,
+    log_level: str = Form(...),
+    redirect_area: str = Form("system_settings"),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    target_area = (redirect_area or "system_settings").strip().lower()
+    if target_area not in {"system_settings", "log_viewing"}:
+        target_area = "system_settings"
+    try:
+        previous = None
+        with SessionLocal() as db:
+            previous = get_log_level(db)
+            applied = set_log_level(db, log_level)
+            configure_operational_logging(level=applied)
+            emit_activity_event(
+                db,
+                event_type="system.log_level_changed",
+                level=LOG_LEVEL_INFORMATIONAL,
+                status="success",
+                actor_type="user",
+                actor_label=user,
+                message=f"Activity log level set to {applied}",
+                details={"previous_level": previous, "new_level": applied},
+            )
+    except ValueError as exc:
+        return _render_settings(request, user, target_area, message=str(exc), message_kind="error")
+    return _render_settings(request, user, target_area, message=f"Activity log level set to {applied}.")
+
+
+@app.post("/settings/system/retention", response_class=HTMLResponse, include_in_schema=False)
+def settings_update_retention(
+    request: Request,
+    retention_days: int = Form(...),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    if retention_days < 1:
+        return _render_settings(
+            request, user, "system_settings", message="Retention must be at least 1 day.", message_kind="error"
+        )
+    with SessionLocal() as db:
+        applied = set_retention_days(db, retention_days)
+        emit_activity_event(
+            db,
+            event_type="system.retention_changed",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"Activity log retention set to {applied} days",
+            details={"retention_days": applied},
+        )
+    return _render_settings(
+        request, user, "system_settings", message=f"Activity log retention set to {applied} days."
+    )
+
+
+@app.post("/settings/system/smtp", response_class=HTMLResponse, include_in_schema=False)
+def settings_update_smtp(
+    request: Request,
+    smtp_servers: str = Form(""),
+    smtp_port: int = Form(activity_logging.DEFAULT_SMTP_PORT),
+    smtp_security: str = Form("none"),
+    smtp_anonymous: Optional[str] = Form(None),
+    smtp_username: str = Form(""),
+    smtp_password: str = Form(""),
+    smtp_from: str = Form(""),
+    smtp_timeout: int = Form(activity_logging.DEFAULT_SMTP_TIMEOUT),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    anonymous = smtp_anonymous is not None
+    with SessionLocal() as db:
+        set_smtp_config(
+            db,
+            servers=smtp_servers,
+            port=smtp_port,
+            anonymous=anonymous,
+            username=smtp_username,
+            password=smtp_password,
+            from_address=smtp_from,
+            security=smtp_security,
+            timeout=smtp_timeout,
+        )
+        emit_activity_event(
+            db,
+            event_type="system.smtp_updated",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message="SMTP delivery settings updated",
+            details={
+                "servers_count": len([s for s in (smtp_servers or "").split(",") if s.strip()]),
+                "anonymous": anonymous,
+                "security": smtp_security,
+            },
+        )
+    return _render_settings(request, user, "system_settings", message="SMTP delivery settings saved.")
+
+
+@app.post("/settings/system/log-rotation", response_class=HTMLResponse, include_in_schema=False)
+def settings_update_log_rotation(
+    request: Request,
+    log_file: str = Form(""),
+    max_bytes: int = Form(1_048_576),
+    backup_count: int = Form(5),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    with SessionLocal() as db:
+        activity_logging._set_setting(db, activity_logging.SETTING_LOG_FILE, log_file or "")
+        activity_logging._set_setting(db, activity_logging.SETTING_LOG_MAX_BYTES, str(max(1024, int(max_bytes))))
+        activity_logging._set_setting(db, activity_logging.SETTING_LOG_BACKUP_COUNT, str(max(0, int(backup_count))))
+        configure_operational_logging(
+            level=get_log_level(db),
+            log_file=log_file or None,
+            max_bytes=max(1024, int(max_bytes)),
+            backup_count=max(0, int(backup_count)),
+        )
+        emit_activity_event(
+            db,
+            event_type="system.log_rotation_updated",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message="Operational log rotation updated",
+            details={
+                "log_file_configured": bool(log_file),
+                "max_bytes": max(1024, int(max_bytes)),
+                "backup_count": max(0, int(backup_count)),
+            },
+        )
+    return _render_settings(request, user, "system_settings", message="Operational log rotation saved.")
+
+
+@app.post("/settings/alerts", response_class=HTMLResponse, include_in_schema=False)
+def settings_alerts_create(
+    request: Request,
+    name: str = Form(...),
+    event_type: str = Form(""),
+    category: str = Form(""),
+    minimum_level: str = Form(LOG_LEVEL_WARNING),
+    message_contains: str = Form(""),
+    email_recipients: str = Form(...),
+    email_subject_template: str = Form(""),
+    email_body_template: str = Form(""),
+    cooldown_minutes: int = Form(0),
+    enabled: Optional[str] = Form("on"),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    cleaned_level = (minimum_level or LOG_LEVEL_WARNING).strip().upper()
+    if cleaned_level not in LOG_LEVEL_VALUES:
+        return _render_settings(
+            request, user, "email_alerting", message=f"Unsupported level: {minimum_level}", message_kind="error"
+        )
+    cleaned_category = (category or "").strip().lower()
+    if cleaned_category and cleaned_category not in LOG_CATEGORY_VALUES:
+        return _render_settings(
+            request, user, "email_alerting", message=f"Unsupported category: {category}", message_kind="error"
+        )
+    if not email_recipients.strip():
+        return _render_settings(
+            request, user, "email_alerting", message="At least one email recipient is required.", message_kind="error"
+        )
+    with SessionLocal() as db:
+        rule = AlertRule(
+            enabled=bool(enabled),
+            name=name.strip(),
+            event_type=event_type.strip() or None,
+            category=cleaned_category or None,
+            minimum_level=cleaned_level,
+            message_contains=message_contains.strip() or None,
+            email_recipients=email_recipients.strip(),
+            email_subject_template=email_subject_template,
+            email_body_template=email_body_template,
+            cooldown_minutes=max(0, int(cooldown_minutes)),
+        )
+        db.add(rule)
+        db.commit()
+        db.refresh(rule)
+        emit_activity_event(
+            db,
+            event_type="alert_rule.created",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"Alert rule {name!r} created",
+            details={"rule_id": rule.id, "rule_name": rule.name, "category": cleaned_category, "minimum_level": cleaned_level},
+        )
+    return _render_settings(request, user, "email_alerting", message=f"Alert rule {name!r} created.")
+
+
+@app.post("/settings/alerts/{rule_id}", response_class=HTMLResponse, include_in_schema=False)
+def settings_alerts_update(
+    request: Request,
+    rule_id: int,
+    name: str = Form(...),
+    event_type: str = Form(""),
+    category: str = Form(""),
+    minimum_level: str = Form(LOG_LEVEL_WARNING),
+    message_contains: str = Form(""),
+    email_recipients: str = Form(...),
+    email_subject_template: str = Form(""),
+    email_body_template: str = Form(""),
+    cooldown_minutes: int = Form(0),
+    enabled: Optional[str] = Form(None),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    cleaned_level = (minimum_level or LOG_LEVEL_WARNING).strip().upper()
+    if cleaned_level not in LOG_LEVEL_VALUES:
+        return _render_settings(
+            request, user, "email_alerting", message=f"Unsupported level: {minimum_level}", message_kind="error"
+        )
+    cleaned_category = (category or "").strip().lower()
+    if cleaned_category and cleaned_category not in LOG_CATEGORY_VALUES:
+        return _render_settings(
+            request, user, "email_alerting", message=f"Unsupported category: {category}", message_kind="error"
+        )
+    with SessionLocal() as db:
+        rule = db.get(AlertRule, rule_id)
+        if rule is None:
+            return _render_settings(
+                request, user, "email_alerting", message="Alert rule not found.", message_kind="error"
+            )
+        rule.enabled = enabled is not None
+        rule.name = name.strip()
+        rule.event_type = event_type.strip() or None
+        rule.category = cleaned_category or None
+        rule.minimum_level = cleaned_level
+        rule.message_contains = message_contains.strip() or None
+        rule.email_recipients = email_recipients.strip()
+        rule.email_subject_template = email_subject_template
+        rule.email_body_template = email_body_template
+        rule.cooldown_minutes = max(0, int(cooldown_minutes))
+        db.add(rule)
+        db.commit()
+        emit_activity_event(
+            db,
+            event_type="alert_rule.updated",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"Alert rule {name!r} updated",
+            details={"rule_id": rule_id, "rule_name": rule.name, "category": cleaned_category, "minimum_level": cleaned_level},
+        )
+    return _render_settings(request, user, "email_alerting", message=f"Alert rule {name!r} updated.")
+
+
+@app.post("/settings/alerts/{rule_id}/delete", response_class=HTMLResponse, include_in_schema=False)
+def settings_alerts_delete(
+    request: Request,
+    rule_id: int,
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    with SessionLocal() as db:
+        rule = db.get(AlertRule, rule_id)
+        if rule is None:
+            return _render_settings(
+                request, user, "email_alerting", message="Alert rule not found.", message_kind="error"
+            )
+        rule_name = rule.name
+        db.delete(rule)
+        db.commit()
+        emit_activity_event(
+            db,
+            event_type="alert_rule.deleted",
+            level=LOG_LEVEL_WARNING,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"Alert rule {rule_name!r} deleted",
+            details={"rule_id": rule_id, "rule_name": rule_name},
+        )
+    return _render_settings(request, user, "email_alerting", message=f"Alert rule {rule_name!r} deleted.")
 
 
 @app.post(
@@ -1717,14 +2484,45 @@ def upsert_dns_record(
     api_key = api_key_from_headers(x_api_key, authorization)
 
     if not api_key:
+        _record_activity(
+            event_type="dns.access_denied",
+            level=LOG_LEVEL_WARNING,
+            status="error",
+            actor_type="api_key",
+            message="API key missing on /dns-record",
+        )
         raise HTTPException(status_code=401, detail="API key is required")
 
     with SessionLocal() as db:
         key = db.exec(select(ApiKey).where(ApiKey.key == api_key, ApiKey.active == True)).first()
         if key is None:
+            emit_activity_event(
+                db,
+                event_type="dns.access_denied",
+                level=LOG_LEVEL_WARNING,
+                status="error",
+                actor_type="api_key",
+                actor_label="invalid",
+                message="Invalid or revoked API key used on /dns-record",
+                details={"key_fingerprint": _api_key_fingerprint(api_key)},
+            )
             raise HTTPException(status_code=401, detail="Invalid API key")
 
+        actor_id = str(key.id) if key.id is not None else None
+        actor_label = key.label
+
         if not payload.zone_name or not str(payload.zone_name).strip():
+            emit_activity_event(
+                db,
+                event_type="dns.invalid_request",
+                level=LOG_LEVEL_WARNING,
+                status="error",
+                actor_type="api_key",
+                actor_id=actor_id,
+                actor_label=actor_label,
+                record_name=payload.record_name,
+                message="zone_name is required on /dns-record",
+            )
             raise HTTPException(
                 status_code=400,
                 detail={"error": "invalid_request", "message": "zone_name is required on every request."},
@@ -1732,6 +2530,18 @@ def upsert_dns_record(
         canonical = normalize_zone_name(payload.zone_name)
         zone_row = db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == canonical)).first()
         if zone_row is None:
+            emit_activity_event(
+                db,
+                event_type="dns.access_denied",
+                level=LOG_LEVEL_WARNING,
+                status="error",
+                actor_type="api_key",
+                actor_id=actor_id,
+                actor_label=actor_label,
+                zone_name=canonical,
+                record_name=payload.record_name,
+                message=f"Unknown DNS zone {canonical!r}",
+            )
             raise HTTPException(status_code=403, detail=ACCESS_DENIED_DETAIL)
         perm = db.exec(
             select(ApiKeyAllowedZone).where(
@@ -1740,12 +2550,36 @@ def upsert_dns_record(
             )
         ).first()
         if perm is None:
+            emit_activity_event(
+                db,
+                event_type="dns.access_denied",
+                level=LOG_LEVEL_WARNING,
+                status="error",
+                actor_type="api_key",
+                actor_id=actor_id,
+                actor_label=actor_label,
+                zone_name=canonical,
+                record_name=payload.record_name,
+                message=f"API key {actor_label!r} not allowed for zone {canonical!r}",
+            )
             raise HTTPException(status_code=403, detail=ACCESS_DENIED_DETAIL)
 
         settings = decode_zone_config(zone_row)
         provider = (settings.get("dns_provider_type") or "azure").strip().lower()
         if provider == "azure":
             if not settings.get("azure_subscription_id"):
+                emit_activity_event(
+                    db,
+                    event_type="dns.invalid_request",
+                    level=LOG_LEVEL_WARNING,
+                    status="error",
+                    actor_type="api_key",
+                    actor_id=actor_id,
+                    actor_label=actor_label,
+                    zone_name=canonical,
+                    record_name=payload.record_name,
+                    message="Azure subscription ID is required on the zone configuration.",
+                )
                 raise HTTPException(
                     status_code=400,
                     detail={
@@ -1754,6 +2588,18 @@ def upsert_dns_record(
                     },
                 )
             if not settings.get("azure_resource_group"):
+                emit_activity_event(
+                    db,
+                    event_type="dns.invalid_request",
+                    level=LOG_LEVEL_WARNING,
+                    status="error",
+                    actor_type="api_key",
+                    actor_id=actor_id,
+                    actor_label=actor_label,
+                    zone_name=canonical,
+                    record_name=payload.record_name,
+                    message="Azure resource group is required on the zone configuration.",
+                )
                 raise HTTPException(
                     status_code=400,
                     detail={
@@ -1786,10 +2632,62 @@ def upsert_dns_record(
                 record_type=payload.record_type,
                 values=payload.values,
             )
+            event_type = "dns.record_" + action
+            event_level = LOG_LEVEL_INFORMATIONAL if status == "success" else LOG_LEVEL_WARNING
+            emit_activity_event(
+                db,
+                event_type=event_type,
+                level=event_level,
+                status=status,
+                actor_type="api_key",
+                actor_id=actor_id,
+                actor_label=actor_label,
+                zone_name=payload.zone_name,
+                record_name=payload.record_name,
+                message=f"DNS record {payload.record_name}.{payload.zone_name} {action}",
+                details={
+                    "record_type": payload.record_type,
+                    "values_count": len(payload.values),
+                    "provider": provider,
+                },
+            )
             if op == "DELETE" and not existed:
                 return JSONResponse(status_code=HTTP_404_NOT_FOUND, content=body.model_dump())
             return body
         except HTTPException:
             raise
         except Exception as exc:
-            raise _http_exception_from_dns_error(exc) from exc
+            mapped = _http_exception_from_dns_error(exc)
+            sanitized_error = (str(exc) or "DNS provider error").splitlines()[0][:512]
+            emit_activity_event(
+                db,
+                event_type="dns.provider_failed",
+                level=LOG_LEVEL_ERROR,
+                status="error",
+                actor_type="api_key",
+                actor_id=actor_id,
+                actor_label=actor_label,
+                zone_name=payload.zone_name,
+                record_name=payload.record_name,
+                message=sanitized_error,
+                details={
+                    "provider": provider,
+                    "record_type": payload.record_type,
+                    "exception_type": type(exc).__name__,
+                },
+            )
+            raise mapped from exc
+
+
+def _api_key_fingerprint(api_key: str) -> str:
+    """Return a short, log-safe fingerprint for an API key string.
+
+    Never logs the key itself: the prefix is short and combined with a SHA-256
+    digest so the full key cannot be recovered from logs.
+    """
+    import hashlib
+
+    if not api_key:
+        return ""
+    digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+    return f"sha256:{digest}"

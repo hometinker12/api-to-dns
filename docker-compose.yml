@@ -8,9 +8,18 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      LOG_FILE: /app/logs/api-to-dns.log
     volumes:
       - api-to-dns-data:/app/data
+      - api-to-dns-logs:/app/logs
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
 volumes:
   api-to-dns-data:
+  api-to-dns-logs:

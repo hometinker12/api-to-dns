@@ -1,3 +1,5 @@
+import json
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
@@ -5,7 +7,17 @@ from fastapi.testclient import TestClient
 from itsdangerous import SignatureExpired
 from sqlmodel import select
 
+import src.activity_logging as activity_logging
 import src.auth as auth_module
+from src.activity_logging import (
+    emit_activity_event,
+    query_activity_logs,
+    render_alert_template,
+    run_retention_cleanup,
+    set_log_level,
+    set_retention_days,
+    set_smtp_config,
+)
 from src.app import (
     ALL_ROLES,
     ROLE_GLOBAL_ADMIN,
@@ -29,7 +41,18 @@ from src.app import (
 from src.auth import SESSION_IDLE_TIMEOUT_SECONDS, create_session_cookie
 from src.db import SessionLocal, init_db
 from src.dns_client import create_dns_client, discover_plugins, dns_provider_display_name
-from src.models import ApiKey, ApiKeyAllowedZone, DnsZoneConfig, User
+from src.models import (
+    LOG_LEVEL_ERROR,
+    LOG_LEVEL_INFORMATIONAL,
+    LOG_LEVEL_VERBOSE,
+    LOG_LEVEL_WARNING,
+    ActivityLog,
+    AlertRule,
+    ApiKey,
+    ApiKeyAllowedZone,
+    DnsZoneConfig,
+    User,
+)
 from src.plugins.bind import BindTsigDnsClient
 from src.security import hash_password
 
@@ -378,6 +401,13 @@ def test_session_backed_pages_are_not_in_openapi(client: TestClient) -> None:
         "/settings/account/password",
         "/settings/plugins/{plugin_key}/disable",
         "/settings/plugins/{plugin_key}/enable",
+        "/settings/system/log-level",
+        "/settings/system/retention",
+        "/settings/system/smtp",
+        "/settings/system/log-rotation",
+        "/settings/alerts",
+        "/settings/alerts/{rule_id}",
+        "/settings/alerts/{rule_id}/delete",
     }
     for path in hidden_paths:
         assert path not in schema["paths"]
@@ -622,7 +652,9 @@ def test_no_role_user_can_change_own_password_only(client: TestClient) -> None:
     assert "Create user" not in response.text
     assert "Edit roles" not in response.text
     assert "Plugin Management" not in response.text
-    assert "Activity Logging" not in response.text
+    assert "System Settings" not in response.text
+    assert "Log Viewing / Searching" not in response.text
+    assert "Email Alerting" not in response.text
     assert "System Backup" not in response.text
 
     response = client.post(
@@ -720,7 +752,9 @@ def test_settings_renders_for_authenticated_session(client: TestClient) -> None:
     assert 'classList.toggle("role-forced", forced)' in response.text
     assert "Authentication" in response.text
     assert "Plugin Management" in response.text
-    assert "Activity Logging" in response.text
+    assert "System Settings" in response.text
+    assert "Log Viewing / Searching" in response.text
+    assert "Email Alerting" in response.text
     assert "System Backup" in response.text
 
 
@@ -1520,7 +1554,9 @@ def test_global_read_can_view_read_only_pages(client: TestClient) -> None:
     for path, expected_text in (
         ("/settings?area=authentication", "Authentication"),
         ("/settings?area=plugins", "Plugin Management"),
-        ("/settings?area=logging", "Activity Logging"),
+        ("/settings?area=logging", "Log Viewing / Searching"),
+        ("/settings?area=system_settings", "System Settings"),
+        ("/settings?area=email_alerting", "Email Alerting"),
         ("/settings?area=backup", "System Backup"),
         ("/zones", "Configured zones"),
         ("/api-keys", "Existing API keys"),
@@ -1552,7 +1588,7 @@ def test_system_update_can_view_system_placeholders_without_global_read(client: 
 
     response = client.get("/settings?area=logging")
     assert response.status_code == 200
-    assert "Activity Logging" in response.text
+    assert "Log Viewing / Searching" in response.text
     assert "System Backup" in response.text
     assert "Authentication" in response.text
     assert "Plugin Management" not in response.text
@@ -1638,12 +1674,24 @@ def test_manual_zone_create_with_disabled_provider_is_rejected(client: TestClien
         )
 
 
-def test_settings_logging_area_renders_placeholder(client: TestClient) -> None:
+def test_settings_activity_logging_sections_render(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
-    response = client.get("/settings?area=logging")
+    response = client.get("/settings?area=system_settings")
     assert response.status_code == 200
-    assert "Activity Logging" in response.text
-    assert "not implemented yet" in response.text
+    assert "System Settings" in response.text
+    assert "Logging Configuration" in response.text
+    assert "SMTP Delivery" in response.text
+
+    response = client.get("/settings?area=log_viewing")
+    assert response.status_code == 200
+    assert "Log Viewing / Searching" in response.text
+    assert "Advanced Search" in response.text
+    assert "Category" in response.text
+
+    response = client.get("/settings?area=email_alerting")
+    assert response.status_code == 200
+    assert "Email Alerting" in response.text
+    assert "Template Variables" in response.text
 
 
 def test_settings_backup_area_renders_placeholder(client: TestClient) -> None:
@@ -1764,3 +1812,367 @@ def test_api_key_post_to_dns_record_unaffected_by_session_roles(
         },
     )
     assert response.status_code == 200
+
+
+def _delete_activity_logs(db) -> None:
+    for row in db.exec(select(ActivityLog)).all():
+        db.delete(row)
+    for rule in db.exec(select(AlertRule)).all():
+        db.delete(rule)
+    db.commit()
+    activity_logging._retention_state.clear()
+
+
+def test_activity_events_written_for_api_key_creation_and_revocation(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_log_level(db, LOG_LEVEL_INFORMATIONAL)
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+
+    response = client.post("/api-keys", data={"label": "audit-key", "zone_ids": str(zone.id)})
+    assert response.status_code == 200
+    with SessionLocal() as db:
+        created = db.exec(select(ApiKey).where(ApiKey.label == "audit-key")).first()
+        assert created is not None
+        create_event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "api_key.created")).first()
+        assert create_event is not None
+        assert create_event.actor_label == "admin"
+        assert "audit-key" in (create_event.message or "")
+
+    response = client.post("/api-keys/revoke", data={"key_id": str(created.id)})
+    assert response.status_code == 200
+    with SessionLocal() as db:
+        revoke_event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "api_key.revoked")).first()
+        assert revoke_event is not None
+        assert revoke_event.level == LOG_LEVEL_WARNING
+        assert "audit-key" in (revoke_event.message or "")
+
+
+def test_dns_provider_failure_writes_error_activity_log(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_log_level(db, LOG_LEVEL_INFORMATIONAL)
+
+    fake = MagicMock()
+    fake.create_or_update_record.side_effect = RuntimeError("WinRM failed with password=supersecret")
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+
+    response = client.post(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "broken",
+            "ttl": 300,
+            "values": ["192.0.2.1"],
+        },
+    )
+    assert response.status_code == 502
+    with SessionLocal() as db:
+        event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "dns.provider_failed")).first()
+        assert event is not None
+        assert event.level == LOG_LEVEL_ERROR
+        assert event.zone_name == "example.com"
+        assert event.record_name == "broken"
+        assert event.details_json is not None
+        assert "supersecret" not in event.details_json
+
+
+def test_request_activity_respects_configured_log_level(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_log_level(db, LOG_LEVEL_VERBOSE)
+
+    response = client.get("/admin")
+    assert response.status_code == 200
+    with SessionLocal() as db:
+        verbose_event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "http.request")).first()
+        assert verbose_event is not None
+        assert verbose_event.level == LOG_LEVEL_VERBOSE
+        assert verbose_event.category == "http"
+        assert verbose_event.request_path == "/admin"
+        _delete_activity_logs(db)
+        set_log_level(db, LOG_LEVEL_INFORMATIONAL)
+
+    response = client.get("/admin")
+    assert response.status_code == 200
+    with SessionLocal() as db:
+        suppressed = db.exec(select(ActivityLog).where(ActivityLog.event_type == "http.request")).first()
+        assert suppressed is None
+        set_log_level(db, LOG_LEVEL_INFORMATIONAL)
+
+
+def test_invalid_api_key_activity_log_uses_fingerprint_not_secret(client: TestClient) -> None:
+    bad_key = "invalid-api-key-secret-value"
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_log_level(db, LOG_LEVEL_INFORMATIONAL)
+
+    response = client.post(
+        "/dns-record",
+        headers={"X-API-Key": bad_key},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "www",
+            "ttl": 300,
+            "values": ["192.0.2.1"],
+        },
+    )
+    assert response.status_code == 401
+    with SessionLocal() as db:
+        event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "dns.access_denied")).first()
+        assert event is not None
+        assert event.details_json is not None
+        assert bad_key not in event.details_json
+        assert "sha256:" in event.details_json
+
+
+def test_activity_log_filtering_by_event_type_and_level(client: TestClient) -> None:
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_log_level(db, LOG_LEVEL_INFORMATIONAL)
+        emit_activity_event(
+            db,
+            event_type="pytest.filter.info",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            message="filter me",
+        )
+        emit_activity_event(
+            db,
+            event_type="pytest.filter.error",
+            level=LOG_LEVEL_ERROR,
+            category="alert",
+            status="error",
+            message="other row",
+        )
+
+        rows, total = query_activity_logs(db, event_type="pytest.filter.error", level=LOG_LEVEL_ERROR, category="alert")
+
+    assert total == 1
+    assert len(rows) == 1
+    assert rows[0].event_type == "pytest.filter.error"
+    assert rows[0].category == "alert"
+
+
+def test_security_category_events_are_always_logged(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_log_level(db, LOG_LEVEL_ERROR)
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+
+    response = client.post("/api-keys", data={"label": "security-key", "zone_ids": str(zone.id)})
+    assert response.status_code == 200
+
+    fake = MagicMock()
+    fake.create_or_update_record.return_value = False
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+    response = client.post(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "security-record",
+            "ttl": 300,
+            "values": ["192.0.2.1"],
+        },
+    )
+    assert response.status_code == 200
+
+    with SessionLocal() as db:
+        api_key_event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "api_key.created")).first()
+        dns_event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "dns.record_created")).first()
+        emit_activity_event(
+            db,
+            event_type="user.roles_updated",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label="admin",
+            message="User roles changed",
+        )
+        user_event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "user.roles_updated")).first()
+        assert api_key_event is not None
+        assert api_key_event.category == "security"
+        assert dns_event is not None
+        assert dns_event.category == "security"
+        assert dns_event.level == LOG_LEVEL_INFORMATIONAL
+        assert user_event is not None
+        assert user_event.category == "security"
+        assert user_event.level == LOG_LEVEL_INFORMATIONAL
+        set_log_level(db, LOG_LEVEL_INFORMATIONAL)
+
+
+def test_alert_rules_trigger_render_templates_and_respect_cooldown(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent_messages = []
+
+    def fake_send_alert_email(db, *, recipients, subject, body):
+        sent_messages.append({"recipients": recipients, "subject": subject, "body": body})
+        return True, []
+
+    monkeypatch.setattr(activity_logging, "send_alert_email", fake_send_alert_email)
+    monkeypatch.setattr(
+        activity_logging,
+        "system_identity",
+        lambda: {"system_dns_name": "dns-host.example", "system_ip_address": "192.0.2.44"},
+    )
+
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_log_level(db, LOG_LEVEL_INFORMATIONAL)
+        rule = AlertRule(
+            enabled=True,
+            name="provider failures",
+            event_type="pytest.alert",
+            minimum_level=LOG_LEVEL_WARNING,
+            message_contains="Provider",
+            email_recipients="first@example.com, second@example.com",
+            email_subject_template="Alert {level} {event_type} {missing}",
+            email_body_template="System {system_dns_name} {system_ip_address} {zone_name} {record_name}",
+            cooldown_minutes=60,
+        )
+        db.add(rule)
+        db.commit()
+        emit_activity_event(
+            db,
+            event_type="pytest.alert",
+            level=LOG_LEVEL_ERROR,
+            status="error",
+            zone_name="example.com",
+            record_name="www",
+            message="Provider failed",
+        )
+        emit_activity_event(
+            db,
+            event_type="pytest.alert",
+            level=LOG_LEVEL_ERROR,
+            status="error",
+            zone_name="example.com",
+            record_name="www",
+            message="Provider failed again",
+        )
+
+    assert len(sent_messages) == 1
+    assert sent_messages[0]["recipients"] == ["first@example.com", "second@example.com"]
+    assert sent_messages[0]["subject"] == "Alert ERROR pytest.alert "
+    assert "dns-host.example 192.0.2.44 example.com www" in sent_messages[0]["body"]
+    assert render_alert_template("Missing {not_present}", {}) == "Missing "
+    with SessionLocal() as db:
+        sent_event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "alert.email_sent")).first()
+        assert sent_event is not None
+        assert sent_event.level == LOG_LEVEL_INFORMATIONAL
+        assert sent_event.category == "alert"
+
+
+def test_smtp_alert_delivery_tries_csv_servers_in_order(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts = []
+    sent_subjects = []
+
+    class FakeSmtp:
+        def ehlo(self):
+            return None
+
+        def send_message(self, message):
+            sent_subjects.append(message["Subject"])
+
+        def quit(self):
+            return None
+
+    def fake_build_smtp_client(server: str, port: int, security: str, timeout: int):
+        attempts.append((server, port, security, timeout))
+        if server == "smtp-fail.example":
+            raise OSError("connection refused")
+        return FakeSmtp()
+
+    monkeypatch.setattr(activity_logging, "_build_smtp_client", fake_build_smtp_client)
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_smtp_config(
+            db,
+            servers="smtp-fail.example, smtp-ok.example",
+            port=2525,
+            anonymous=True,
+            username="",
+            password="",
+            from_address="api-to-dns@example.com",
+            security="none",
+            timeout=7,
+        )
+        sent, failures = activity_logging.send_alert_email(
+            db,
+            recipients=["ops@example.com"],
+            subject="test subject",
+            body="test body",
+        )
+
+    assert sent is True
+    assert [attempt[0] for attempt in attempts] == ["smtp-fail.example", "smtp-ok.example"]
+    assert failures == [{"server": "smtp-fail.example", "error": "connection refused"}]
+    assert sent_subjects == ["test subject"]
+
+
+def test_smtp_failures_are_reported_without_exception(client: TestClient) -> None:
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_smtp_config(
+            db,
+            servers="",
+            port=25,
+            anonymous=True,
+            username="",
+            password="",
+            from_address="api-to-dns@example.com",
+            security="none",
+            timeout=5,
+        )
+        sent, failures = activity_logging.send_alert_email(
+            db,
+            recipients=["ops@example.com"],
+            subject="test",
+            body="body",
+        )
+
+    assert sent is False
+    assert failures[0]["error"] == "No SMTP servers configured"
+
+
+def test_retention_cleanup_deletes_only_rows_older_than_retention(client: TestClient) -> None:
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_log_level(db, LOG_LEVEL_INFORMATIONAL)
+        set_retention_days(db, 30)
+        old_row = ActivityLog(
+            timestamp=datetime.utcnow() - timedelta(days=31),
+            level=LOG_LEVEL_INFORMATIONAL,
+            event_type="pytest.retention.old",
+        )
+        boundary_row = ActivityLog(
+            timestamp=datetime.utcnow() - timedelta(days=30) + timedelta(seconds=5),
+            level=LOG_LEVEL_INFORMATIONAL,
+            event_type="pytest.retention.boundary",
+        )
+        db.add(old_row)
+        db.add(boundary_row)
+        db.commit()
+        db.refresh(old_row)
+        db.refresh(boundary_row)
+        old_id = old_row.id
+        boundary_id = boundary_row.id
+
+        removed = run_retention_cleanup(db, force=True)
+
+        assert removed == 1
+        assert db.get(ActivityLog, old_id) is None
+        assert db.get(ActivityLog, boundary_id) is not None
