@@ -2,14 +2,14 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>DNS zones</title>
+  <title>api-to-dns DNS Zones</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <div class="page">
     <header class="page-header">
       <div>
-        <h1>DNS zones</h1>
+        <h1>api-to-dns DNS Zones</h1>
         <p class="help">Each zone has its own provider type, connection, and credentials. API keys are granted access by zone.</p>
       </div>
       <nav class="nav-links">
@@ -37,7 +37,7 @@
               {% for z in zones %}
                 <tr>
                   <td><code>{{ z.zone_name }}</code></td>
-                  <td>{{ z.dns_provider_type|capitalize }}</td>
+                  <td>{{ z.dns_provider_label }}</td>
                   <td>{% if z.dns_server %}<code>{{ z.dns_server }}</code>{% else %}&mdash;{% endif %}</td>
                   <td class="actions-column">
                     <div class="action-cell">

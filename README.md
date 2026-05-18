@@ -1,8 +1,8 @@
 # DNS REST Service
 
-[![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/) [![Python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/) [![Release](https://img.shields.io/badge/release-0.3.1-blue)](VERSION) [![AI Assisted](https://img.shields.io/badge/AI%20Assisted-yes-blue)](https://cursor.com)
+[![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/) [![Python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/) [![Release](https://img.shields.io/badge/release-0.3.4-blue)](VERSION) [![AI Assisted](https://img.shields.io/badge/AI%20Assisted-yes-blue)](https://cursor.com)
 
-Current release: `0.3.1`
+Current release: `0.3.4`
 
 A Dockerized FastAPI service to manage DNS records through a protected admin web UI and secure API key authentication. Supported backends are **Azure DNS**, **on-premises Microsoft DNS (WinRM)**, and **BIND** (or other servers) using **RFC 2136 dynamic updates with TSIG**.
 
@@ -226,15 +226,6 @@ curl -sS -X POST "http://localhost:8000/dns-record" \
   }'
 ```
 
-**Responses (short)**
-
-- Create / update success: HTTP **200**, `"status": "success"`, `"action": "created"` or `"updated"`.
-- Delete removed a record: **200**, `"status": "success"`, `"action": "deleted"`.
-- Delete when nothing matched: **404**, `"status": "error"`, `"action": "not_found"`.
-- Zone missing or API key not allowed for that zone: **403**, `"detail": { "error": "access_denied", "message": "..." }`.
-- Validation or provider failure: **400**, **502**, **503**, or **500** with JSON `detail` (for example `{"detail": {"error": "dns_provider_failed", "message": "..."}}`).
-
-> **PowerShell:** `Invoke-RestMethod` treats HTTP **404** as a terminating error by default. For a DELETE that returns `not_found`, use `Invoke-RestMethod ... -SkipHttpErrorCheck` (PowerShell 7+) or `Invoke-WebRequest` and read the body.
 
 ## License
 

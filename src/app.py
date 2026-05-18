@@ -2,7 +2,7 @@ import html
 import json
 import os
 import traceback
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,7 +12,7 @@ from fastapi.templating import Jinja2Templates
 from sqlmodel import select
 from starlette.status import HTTP_303_SEE_OTHER, HTTP_404_NOT_FOUND
 
-from .auth import create_session_cookie, get_current_user
+from .auth import create_session_cookie, get_current_user, session_cookie_settings
 from .db import SessionLocal, init_db
 from .models import (
     ApiKey,
@@ -30,6 +30,76 @@ ACCESS_DENIED_DETAIL: Dict[str, str] = {
     "error": "access_denied",
     "message": "You do not have access or an invalid key was provided.",
 }
+
+ROLE_GLOBAL_ADMIN = "global.admin"
+ROLE_GLOBAL_READ = "global.read"
+ROLE_ACCOUNT_UPDATE = "account.update"
+ROLE_ACCOUNT_RESET_PASSWORD = "account.reset_password"
+ROLE_API_KEYS_READ = "api_keys.read"
+ROLE_API_KEYS_UPDATE = "api_keys.update"
+ROLE_DNS_ZONES_READ = "dns_zones.read"
+ROLE_DNS_ZONES_UPDATE = "dns_zones.update"
+ROLE_PLUGIN_UPDATE = "plugin.update"
+ROLE_SYSTEM_UPDATE = "system.update"
+
+ROLE_DEPENDENCIES: Dict[str, str] = {
+    ROLE_API_KEYS_UPDATE: ROLE_API_KEYS_READ,
+    ROLE_DNS_ZONES_UPDATE: ROLE_DNS_ZONES_READ,
+}
+MANDATORY_ROLES: Set[str] = {ROLE_DNS_ZONES_READ}
+
+ALL_ROLES: List[str] = [
+    ROLE_GLOBAL_ADMIN,
+    ROLE_GLOBAL_READ,
+    ROLE_ACCOUNT_UPDATE,
+    ROLE_ACCOUNT_RESET_PASSWORD,
+    ROLE_API_KEYS_READ,
+    ROLE_API_KEYS_UPDATE,
+    ROLE_DNS_ZONES_READ,
+    ROLE_DNS_ZONES_UPDATE,
+    ROLE_PLUGIN_UPDATE,
+    ROLE_SYSTEM_UPDATE,
+]
+LEGACY_DEFAULT_ROLES: Set[str] = set(ALL_ROLES) - {ROLE_GLOBAL_ADMIN}
+
+ROLE_LABELS: List[Dict[str, str]] = [
+    {"key": ROLE_GLOBAL_ADMIN, "label": "Global: admin"},
+    {"key": ROLE_GLOBAL_READ, "label": "Global: read-only"},
+    {"key": ROLE_ACCOUNT_UPDATE, "label": "Account: update"},
+    {"key": ROLE_ACCOUNT_RESET_PASSWORD, "label": "Account: reset password"},
+    {"key": ROLE_API_KEYS_READ, "label": "API keys: read"},
+    {"key": ROLE_API_KEYS_UPDATE, "label": "API keys: update", "requires_role": ROLE_API_KEYS_READ},
+    {"key": ROLE_DNS_ZONES_READ, "label": "DNS zones: read", "mandatory": True},
+    {"key": ROLE_DNS_ZONES_UPDATE, "label": "DNS zones: update", "requires_role": ROLE_DNS_ZONES_READ},
+    {"key": ROLE_PLUGIN_UPDATE, "label": "Plugin management"},
+    {"key": ROLE_SYSTEM_UPDATE, "label": "System: update"},
+]
+
+SETTINGS_AREAS: List[Dict[str, str]] = [
+    {
+        "key": "authentication",
+        "label": "Authentication",
+        "required_roles": [ROLE_GLOBAL_READ, ROLE_ACCOUNT_UPDATE, ROLE_ACCOUNT_RESET_PASSWORD],
+    },
+    {
+        "key": "plugins",
+        "label": "Plugin Management",
+        "required_roles": [ROLE_GLOBAL_READ, ROLE_PLUGIN_UPDATE],
+    },
+    {
+        "key": "logging",
+        "label": "Activity Logging",
+        "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
+    },
+    {
+        "key": "backup",
+        "label": "System Backup",
+        "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
+    },
+]
+
+ROLE_FORBIDDEN_DETAIL = "You do not have permission to access this resource."
+DISABLED_DNS_PLUGINS_SETTING = "disabled_dns_plugins"
 
 LEGACY_DNS_SETTING_NAMES = [
     "dns_provider_type",
@@ -49,7 +119,7 @@ LEGACY_DNS_SETTING_NAMES = [
 app = FastAPI(
     title="api-to-dns Service",
     description="Create or update DNS records via REST and manage API keys through a protected web UI.",
-    version="0.3.1",
+    version="0.3.4",
 )
 
 app.add_middleware(
@@ -67,7 +137,17 @@ WEB_AUTH_PATH_PREFIXES = (
     "/admin",
     "/zones",
     "/api-keys",
+    "/settings",
 )
+
+
+@app.middleware("http")
+async def refresh_session_cookie(request: Request, call_next):
+    response = await call_next(request)
+    session_user = getattr(request.state, "session_user", None)
+    if session_user and request.url.path != "/logout" and response.status_code < 400:
+        response.set_cookie("session", create_session_cookie(session_user), **session_cookie_settings())
+    return response
 
 
 @app.exception_handler(HTTPException)
@@ -79,7 +159,29 @@ def http_exception_handler(request: Request, exc: HTTPException):
         and request.url.path.startswith(WEB_AUTH_PATH_PREFIXES)
     ):
         return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
+    if (
+        exc.status_code == 403
+        and exc.detail == ROLE_FORBIDDEN_DETAIL
+        and request.url.path.startswith(WEB_AUTH_PATH_PREFIXES)
+        and "application/json" not in request.headers.get("accept", "").lower()
+    ):
+        return _render_access_denied_response()
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+def _render_access_denied_response() -> HTMLResponse:
+    return HTMLResponse(
+        content=(
+            "<!DOCTYPE html><html><head><title>Access denied</title>"
+            "<link rel=\"stylesheet\" href=\"/static/style.css\" /></head>"
+            "<body><div class=\"page\">"
+            "<h1>Access denied</h1>"
+            f"<div class=\"alert error\">{html.escape(ROLE_FORBIDDEN_DETAIL)}</div>"
+            "<p><a class=\"button\" href=\"/admin\">Back to dashboard</a></p>"
+            "</div></body></html>"
+        ),
+        status_code=403,
+    )
 
 
 def _render_error_response(request: Request, error: Exception, status_code: int = 500):
@@ -101,6 +203,22 @@ def get_dns_client_from_settings(settings: dict):
     from .dns_client import create_dns_client
 
     return create_dns_client(settings)
+
+
+def get_dns_provider_options() -> List[dict]:
+    from .dns_client import provider_options_for_template
+
+    return provider_options_for_template()
+
+
+def get_known_dns_provider_keys() -> Set[str]:
+    return {plugin["key"] for plugin in get_dns_provider_options()}
+
+
+def get_dns_provider_label(provider_key: str) -> str:
+    from .dns_client import dns_provider_display_name
+
+    return dns_provider_display_name(provider_key)
 
 
 def wants_json_response(request: Request) -> bool:
@@ -148,6 +266,105 @@ def get_db():
         yield db
 
 
+def _parse_roles(raw: Optional[str]) -> Set[str]:
+    if not raw:
+        return set()
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def _serialize_roles(roles) -> str:
+    cleaned = {r for r in roles if r in ALL_ROLES}
+    if ROLE_GLOBAL_ADMIN in cleaned:
+        cleaned = set(ALL_ROLES)
+    cleaned.update(MANDATORY_ROLES)
+    return ",".join(sorted(cleaned))
+
+
+def normalize_selected_roles(roles) -> List[str]:
+    selected = {r for r in roles if r in ALL_ROLES}
+    if ROLE_GLOBAL_ADMIN in selected:
+        return sorted(ALL_ROLES)
+    selected.update(MANDATORY_ROLES)
+    for role, required_role in ROLE_DEPENDENCIES.items():
+        if role in selected:
+            selected.add(required_role)
+    return sorted(selected)
+
+
+def effective_roles(stored_roles: Set[str]) -> Set[str]:
+    if ROLE_GLOBAL_ADMIN in stored_roles:
+        return set(ALL_ROLES)
+    return stored_roles | MANDATORY_ROLES
+
+
+def get_user_roles(db, username: str) -> Set[str]:
+    """Return the role set for `username`."""
+    user_row = db.exec(select(User).where(User.username == username)).first()
+    if user_row is None:
+        return set()
+    return effective_roles(_parse_roles(user_row.roles))
+
+
+def user_has_role(db, username: str, role: str) -> bool:
+    roles = get_user_roles(db, username)
+    return ROLE_GLOBAL_ADMIN in roles or role in roles or (
+        ROLE_GLOBAL_READ in roles and role in {ROLE_API_KEYS_READ, ROLE_DNS_ZONES_READ}
+    )
+
+
+def user_has_any_role(db, username: str, roles) -> bool:
+    return any(user_has_role(db, username, role) for role in roles)
+
+
+def user_is_global_admin(db, username: str) -> bool:
+    return ROLE_GLOBAL_ADMIN in get_user_roles(db, username)
+
+
+def target_is_global_admin(target: User) -> bool:
+    return ROLE_GLOBAL_ADMIN in effective_roles(_parse_roles(target.roles))
+
+
+def global_admin_guard_message(db, actor: str, target: User) -> Optional[str]:
+    if target_is_global_admin(target) and not user_is_global_admin(db, actor):
+        return "Only a global admin can manage another global admin account."
+    return None
+
+
+def require_role(role: str):
+    """FastAPI dependency factory that returns the username when the user has `role`."""
+
+    def _dependency(user: str = Depends(get_current_user)) -> str:
+        with SessionLocal() as db:
+            if not user_has_role(db, user, role):
+                raise HTTPException(status_code=403, detail=ROLE_FORBIDDEN_DETAIL)
+        return user
+
+    return _dependency
+
+
+def user_public_dict(u: User) -> Dict[str, Any]:
+    stored_roles = _parse_roles(u.roles)
+    display_roles = stored_roles or LEGACY_DEFAULT_ROLES
+    effective_display_roles = effective_roles(display_roles)
+    return {
+        "id": u.id,
+        "username": u.username,
+        "disabled": u.disabled,
+        "roles": sorted(effective_display_roles),
+        "stored_roles": sorted(display_roles | MANDATORY_ROLES),
+        "is_global_admin": ROLE_GLOBAL_ADMIN in effective_display_roles,
+        "has_default_roles": not stored_roles,
+    }
+
+
+def accessible_settings_areas(user_roles: Set[str]) -> List[Dict[str, str]]:
+    return [
+        area
+        for area in SETTINGS_AREAS
+        if area["key"] == "authentication" or any(role in user_roles for role in area["required_roles"])
+    ]
+
+
 def normalize_zone_name(zone: str) -> str:
     return zone.strip().rstrip(".").lower()
 
@@ -172,6 +389,54 @@ def delete_setting(db, name: str) -> None:
     if record:
         db.delete(record)
     db.commit()
+
+
+def get_disabled_dns_plugins(db) -> Set[str]:
+    raw = get_setting(db, DISABLED_DNS_PLUGINS_SETTING)
+    if not raw:
+        return set()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return set()
+    if not isinstance(parsed, list):
+        return set()
+    known_keys = get_known_dns_provider_keys()
+    return {str(key).strip().lower() for key in parsed if str(key).strip().lower() in known_keys}
+
+
+def set_disabled_dns_plugins(db, plugin_keys) -> None:
+    known_keys = get_known_dns_provider_keys()
+    cleaned = sorted({str(key).strip().lower() for key in plugin_keys if str(key).strip().lower() in known_keys})
+    if cleaned:
+        set_setting(db, DISABLED_DNS_PLUGINS_SETTING, json.dumps(cleaned))
+    else:
+        delete_setting(db, DISABLED_DNS_PLUGINS_SETTING)
+
+
+def dns_provider_options_with_state(db) -> List[dict]:
+    disabled = get_disabled_dns_plugins(db)
+    options: List[dict] = []
+    for plugin in get_dns_provider_options():
+        row = dict(plugin)
+        row["enabled"] = row["key"] not in disabled
+        row["disabled"] = not row["enabled"]
+        options.append(row)
+    return options
+
+
+def enabled_dns_provider_options(db) -> List[dict]:
+    return [plugin for plugin in dns_provider_options_with_state(db) if plugin["enabled"]]
+
+
+def zones_using_dns_provider(db, provider_key: str) -> List[str]:
+    matches: List[str] = []
+    for zone in list_dns_zones(db):
+        settings = decode_zone_config(zone)
+        provider = (settings.get("dns_provider_type") or "azure").strip().lower()
+        if provider == provider_key:
+            matches.append(zone.zone_name)
+    return matches
 
 
 def decode_zone_config(row: DnsZoneConfig) -> Dict[str, Any]:
@@ -231,10 +496,12 @@ def api_key_allowed_zone_names(db, api_key_id: int) -> List[str]:
 def dns_zone_public_dict(z: DnsZoneConfig) -> Dict[str, Any]:
     """Safe to use after the Session closes (plain dict)."""
     cfg = decode_zone_config(z)
+    provider_key = cfg.get("dns_provider_type", "") or "azure"
     return {
         "id": z.id,
         "zone_name": z.zone_name,
-        "dns_provider_type": cfg.get("dns_provider_type", "") or "azure",
+        "dns_provider_type": provider_key,
+        "dns_provider_label": get_dns_provider_label(provider_key),
         "dns_server": cfg.get("dns_server", "") or "",
     }
 
@@ -257,33 +524,35 @@ def _blank_preserve_secret(new_val: str, old_val: str) -> str:
 
 
 def build_zone_config_from_form(
-    dns_provider_type: str,
-    dns_server: str,
-    dns_username: str,
-    dns_password: str,
-    dns_tsig_algorithm: str,
-    dns_winrm_ssl: Optional[str],
-    azure_tenant_id: str,
-    azure_client_id: str,
-    azure_client_secret: str,
-    azure_subscription_id: str,
-    azure_resource_group: str,
+    form,
     existing: Optional[Dict[str, Any]] = None,
+    provider_plugins: Optional[List[dict]] = None,
 ) -> Dict[str, Any]:
     ex = existing or {}
-    return {
-        "dns_provider_type": (dns_provider_type or "azure").strip().lower(),
-        "dns_server": (dns_server or "").strip(),
-        "dns_username": (dns_username or "").strip(),
-        "dns_password": _blank_preserve_secret(dns_password, ex.get("dns_password", "")),
-        "dns_tsig_algorithm": (dns_tsig_algorithm or "").strip(),
-        "dns_winrm_ssl": (dns_winrm_ssl or "").strip(),
-        "azure_tenant_id": (azure_tenant_id or "").strip(),
-        "azure_client_id": (azure_client_id or "").strip(),
-        "azure_client_secret": _blank_preserve_secret(azure_client_secret, ex.get("azure_client_secret", "")),
-        "azure_subscription_id": (azure_subscription_id or "").strip(),
-        "azure_resource_group": (azure_resource_group or "").strip(),
-    }
+    provider = (form.get("dns_provider_type") or ex.get("dns_provider_type") or "azure").strip().lower()
+    plugins = provider_plugins if provider_plugins is not None else get_dns_provider_options()
+    plugin = next((p for p in plugins if p["key"] == provider), None)
+    if plugin is None:
+        if provider in get_known_dns_provider_keys():
+            raise ValueError(
+                f"{get_dns_provider_label(provider)} is disabled. Enable it in Settings before using it for a DNS zone."
+            )
+        available = ", ".join(p["key"] for p in plugins) or "none"
+        raise ValueError(f"Unknown DNS provider type: {provider}. Available providers: {available}.")
+
+    cfg: Dict[str, Any] = {"dns_provider_type": provider}
+    for field in plugin["fields"]:
+        name = field["name"]
+        if field["type"] == "checkbox":
+            value = "true" if name in form else ""
+        else:
+            value = (form.get(name) or "").strip()
+        if field["preserve_on_blank"]:
+            value = _blank_preserve_secret(value, ex.get(name, ""))
+        elif not value and field["default"] and not ex.get(name):
+            value = field["default"]
+        cfg[name] = value
+    return cfg
 
 
 @app.on_event("startup")
@@ -296,7 +565,13 @@ def startup_event():
     if admin_user and admin_password:
         with SessionLocal() as db:
             if not db.exec(select(User).where(User.username == admin_user)).first():
-                db.add(User(username=admin_user, password_hash=hash_password(admin_password)))
+                db.add(
+                    User(
+                        username=admin_user,
+                        password_hash=hash_password(admin_password),
+                        roles=_serialize_roles([*ALL_ROLES, ROLE_GLOBAL_ADMIN]),
+                    )
+                )
                 db.commit()
 
 
@@ -373,14 +648,14 @@ def login_form(request: Request):
 def login(request: Request, username: str = Form(...), password: str = Form(...)):
     with SessionLocal() as db:
         user = db.exec(select(User).where(User.username == username)).first()
-        if not user or not verify_password(password, user.password_hash):
+        if not user or user.disabled or not verify_password(password, user.password_hash):
             return templates.TemplateResponse(
                 request=request,
                 name="login.html",
                 context={"error": "Invalid credentials."},
             )
     response = RedirectResponse(url="/admin", status_code=HTTP_303_SEE_OTHER)
-    response.set_cookie("session", create_session_cookie(username), httponly=True)
+    response.set_cookie("session", create_session_cookie(username), **session_cookie_settings())
     return response
 
 
@@ -395,6 +670,8 @@ def logout() -> RedirectResponse:
 def admin(request: Request, user: str = Depends(get_current_user)):
     try:
         with SessionLocal() as db:
+            can_view_zones = user_has_role(db, user, ROLE_DNS_ZONES_READ) or user_has_role(db, user, ROLE_DNS_ZONES_UPDATE)
+            can_view_api_keys = user_has_role(db, user, ROLE_API_KEYS_READ) or user_has_role(db, user, ROLE_API_KEYS_UPDATE)
             zones = list_dns_zones(db)
             api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda key: key.created_at, reverse=True)
             key_zones: Dict[int, List[str]] = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
@@ -409,6 +686,8 @@ def admin(request: Request, user: str = Depends(get_current_user)):
                 "zones": zones_view,
                 "api_keys": api_keys_view,
                 "key_zones": key_zones,
+                "can_view_zones": can_view_zones,
+                "can_view_api_keys": can_view_api_keys,
             },
         )
     except Exception as exc:
@@ -447,7 +726,9 @@ def zones_page(
             zones = [zone for zone_id in zone_ids if (zone := db.get(DnsZoneConfig, zone_id)) is not None]
             return [DnsZoneSummary(**dns_zone_summary_dict(z)) for z in zones]
 
-        get_current_user(request)
+        user = get_current_user(request)
+        if not user_has_role(db, user, ROLE_DNS_ZONES_READ):
+            raise HTTPException(status_code=403, detail=ROLE_FORBIDDEN_DETAIL)
         zones = list_dns_zones(db)
         zones_view = [dns_zone_public_dict(z) for z in zones]
     return templates.TemplateResponse(
@@ -458,31 +739,27 @@ def zones_page(
 
 
 @app.get("/zones/new", response_class=HTMLResponse, include_in_schema=False)
-def zone_new_form(request: Request, user: str = Depends(get_current_user)):
+def zone_new_form(request: Request, user: str = Depends(require_role(ROLE_DNS_ZONES_UPDATE))):
+    with SessionLocal() as db:
+        provider_plugins = enabled_dns_provider_options(db)
     return templates.TemplateResponse(
         request=request,
         name="zone_form.html",
-        context={"request": request, "zone": None, "settings": {}, "message": None, "title": "Add DNS zone"},
+        context={
+            "request": request,
+            "zone": None,
+            "settings": {},
+            "provider_plugins": provider_plugins,
+            "message": None if provider_plugins else "No DNS provider plugins are enabled. Enable a plugin in Settings first.",
+            "title": "Add DNS zone",
+        },
     )
 
 
 @app.post("/zones", response_class=HTMLResponse, include_in_schema=False)
-def zone_create(
-    request: Request,
-    zone_name: str = Form(...),
-    dns_provider_type: str = Form("azure"),
-    dns_server: str = Form(""),
-    dns_username: str = Form(""),
-    dns_password: str = Form(""),
-    dns_tsig_algorithm: str = Form(""),
-    dns_winrm_ssl: Optional[str] = Form(None),
-    azure_tenant_id: str = Form(""),
-    azure_client_id: str = Form(""),
-    azure_client_secret: str = Form(""),
-    azure_subscription_id: str = Form(""),
-    azure_resource_group: str = Form(""),
-    user: str = Depends(get_current_user),
-):
+async def zone_create(request: Request, user: str = Depends(require_role(ROLE_DNS_ZONES_UPDATE))):
+    form = await request.form()
+    zone_name = str(form.get("zone_name") or "")
     canonical = normalize_zone_name(zone_name)
     if not canonical:
         with SessionLocal() as db:
@@ -494,6 +771,7 @@ def zone_create(
             context={"request": request, "zones": zones_view, "message": "Zone name is required."},
         )
     with SessionLocal() as db:
+        provider_plugins = enabled_dns_provider_options(db)
         if db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == canonical)).first():
             zones = list_dns_zones(db)
             zones_view = [dns_zone_public_dict(z) for z in zones]
@@ -502,19 +780,21 @@ def zone_create(
                 name="zones.html",
                 context={"request": request, "zones": zones_view, "message": f"A zone named {canonical!r} already exists."},
             )
-        cfg = build_zone_config_from_form(
-            dns_provider_type,
-            dns_server,
-            dns_username,
-            dns_password,
-            dns_tsig_algorithm,
-            dns_winrm_ssl,
-            azure_tenant_id,
-            azure_client_id,
-            azure_client_secret,
-            azure_subscription_id,
-            azure_resource_group,
-        )
+        try:
+            cfg = build_zone_config_from_form(form, provider_plugins=provider_plugins)
+        except ValueError as exc:
+            return templates.TemplateResponse(
+                request=request,
+                name="zone_form.html",
+                context={
+                    "request": request,
+                    "zone": None,
+                    "settings": {"dns_provider_type": (form.get("dns_provider_type") or "").strip().lower()},
+                    "provider_plugins": provider_plugins,
+                    "message": str(exc),
+                    "title": "Add DNS zone",
+                },
+            )
         row = DnsZoneConfig(zone_name=canonical, encrypted_config=encode_zone_config_dict(cfg))
         db.add(row)
         db.commit()
@@ -528,13 +808,14 @@ def zone_create(
 
 
 @app.get("/zones/{zone_id}/edit", response_class=HTMLResponse, include_in_schema=False)
-def zone_edit_form(request: Request, zone_id: int, user: str = Depends(get_current_user)):
+def zone_edit_form(request: Request, zone_id: int, user: str = Depends(require_role(ROLE_DNS_ZONES_UPDATE))):
     with SessionLocal() as db:
         row = db.get(DnsZoneConfig, zone_id)
         if not row:
             return RedirectResponse(url="/zones", status_code=HTTP_303_SEE_OTHER)
         settings = decode_zone_config(row)
         zone_view = dns_zone_public_dict(row)
+        provider_plugins = enabled_dns_provider_options(db)
         title_zone = row.zone_name
     return templates.TemplateResponse(
         request=request,
@@ -543,6 +824,7 @@ def zone_edit_form(request: Request, zone_id: int, user: str = Depends(get_curre
             "request": request,
             "zone": zone_view,
             "settings": settings,
+            "provider_plugins": provider_plugins,
             "message": None,
             "title": f"Edit zone {title_zone}",
         },
@@ -550,41 +832,29 @@ def zone_edit_form(request: Request, zone_id: int, user: str = Depends(get_curre
 
 
 @app.post("/zones/{zone_id}", response_class=HTMLResponse, include_in_schema=False)
-def zone_update(
-    request: Request,
-    zone_id: int,
-    dns_provider_type: str = Form("azure"),
-    dns_server: str = Form(""),
-    dns_username: str = Form(""),
-    dns_password: str = Form(""),
-    dns_tsig_algorithm: str = Form(""),
-    dns_winrm_ssl: Optional[str] = Form(None),
-    azure_tenant_id: str = Form(""),
-    azure_client_id: str = Form(""),
-    azure_client_secret: str = Form(""),
-    azure_subscription_id: str = Form(""),
-    azure_resource_group: str = Form(""),
-    user: str = Depends(get_current_user),
-):
+async def zone_update(request: Request, zone_id: int, user: str = Depends(require_role(ROLE_DNS_ZONES_UPDATE))):
+    form = await request.form()
     with SessionLocal() as db:
         row = db.get(DnsZoneConfig, zone_id)
         if not row:
             return RedirectResponse(url="/zones", status_code=HTTP_303_SEE_OTHER)
         existing = decode_zone_config(row)
-        cfg = build_zone_config_from_form(
-            dns_provider_type,
-            dns_server,
-            dns_username,
-            dns_password,
-            dns_tsig_algorithm,
-            dns_winrm_ssl,
-            azure_tenant_id,
-            azure_client_id,
-            azure_client_secret,
-            azure_subscription_id,
-            azure_resource_group,
-            existing=existing,
-        )
+        provider_plugins = enabled_dns_provider_options(db)
+        try:
+            cfg = build_zone_config_from_form(form, existing=existing, provider_plugins=provider_plugins)
+        except ValueError as exc:
+            return templates.TemplateResponse(
+                request=request,
+                name="zone_form.html",
+                context={
+                    "request": request,
+                    "zone": dns_zone_public_dict(row),
+                    "settings": existing,
+                    "provider_plugins": provider_plugins,
+                    "message": str(exc),
+                    "title": f"Edit zone {row.zone_name}",
+                },
+            )
         row.encrypted_config = encode_zone_config_dict(cfg)
         db.add(row)
         db.commit()
@@ -599,6 +869,7 @@ def zone_update(
             "request": request,
             "zone": zone_view,
             "settings": settings,
+            "provider_plugins": provider_plugins,
             "message": "Zone saved.",
             "title": f"Edit zone {title_zone}",
         },
@@ -606,7 +877,7 @@ def zone_update(
 
 
 @app.post("/zones/{zone_id}/delete", response_class=HTMLResponse, include_in_schema=False)
-def zone_delete(request: Request, zone_id: int, user: str = Depends(get_current_user)):
+def zone_delete(request: Request, zone_id: int, user: str = Depends(require_role(ROLE_DNS_ZONES_UPDATE))):
     with SessionLocal() as db:
         row = db.get(DnsZoneConfig, zone_id)
         if row:
@@ -624,7 +895,7 @@ def zone_delete(request: Request, zone_id: int, user: str = Depends(get_current_
 
 
 @app.get("/api-keys", response_class=HTMLResponse, include_in_schema=False)
-def api_keys_page(request: Request, user: str = Depends(get_current_user)):
+def api_keys_page(request: Request, user: str = Depends(require_role(ROLE_API_KEYS_READ))):
     try:
         with SessionLocal() as db:
             api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda key: key.created_at, reverse=True)
@@ -648,7 +919,7 @@ def api_keys_page(request: Request, user: str = Depends(get_current_user)):
 
 
 @app.post("/api-keys/revoke", response_class=HTMLResponse, include_in_schema=False)
-def revoke_api_key(request: Request, key_id: int = Form(...), user: str = Depends(get_current_user)):
+def revoke_api_key(request: Request, key_id: int = Form(...), user: str = Depends(require_role(ROLE_API_KEYS_UPDATE))):
     try:
         with SessionLocal() as db:
             api_key = db.get(ApiKey, key_id)
@@ -683,7 +954,7 @@ def create_api_key_route(
     label: str = Form(...),
     zone_ids: List[int] = Form(default_factory=list),
     key_id: Optional[int] = Form(None),
-    user: str = Depends(get_current_user),
+    user: str = Depends(require_role(ROLE_API_KEYS_UPDATE)),
 ):
     try:
         if key_id is not None:
@@ -789,7 +1060,7 @@ def create_api_key_route(
 
 
 @app.get("/api-keys/{key_id}/edit", response_class=HTMLResponse, include_in_schema=False)
-def api_key_edit_form(request: Request, key_id: int, user: str = Depends(get_current_user)):
+def api_key_edit_form(request: Request, key_id: int, user: str = Depends(require_role(ROLE_API_KEYS_UPDATE))):
     with SessionLocal() as db:
         row = db.get(ApiKey, key_id)
         if not row:
@@ -820,7 +1091,7 @@ def api_key_update(
     key_id: int,
     label: str = Form(...),
     zone_ids: List[int] = Form(default_factory=list),
-    user: str = Depends(get_current_user),
+    user: str = Depends(require_role(ROLE_API_KEYS_UPDATE)),
 ):
     with SessionLocal() as db:
         row = db.get(ApiKey, key_id)
@@ -873,6 +1144,556 @@ def api_key_update(
             "message": "API key updated.",
         },
     )
+
+
+def _settings_context(
+    request: Request,
+    user: str,
+    area: Optional[str],
+    message: Optional[str] = None,
+    message_kind: str = "success",
+    auth_form_error: Optional[str] = None,
+    auth_form_username: Optional[str] = None,
+    auth_form_selected_roles: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    with SessionLocal() as db:
+        user_roles = get_user_roles(db, user)
+        can_view_accounts = bool(
+            {ROLE_GLOBAL_READ, ROLE_ACCOUNT_UPDATE, ROLE_ACCOUNT_RESET_PASSWORD}.intersection(user_roles)
+        )
+        users_view = (
+            [user_public_dict(u) for u in sorted(db.exec(select(User)).all(), key=lambda u: u.username.lower())]
+            if can_view_accounts
+            else []
+        )
+        plugin_options = (
+            dns_provider_options_with_state(db)
+            if ROLE_GLOBAL_READ in user_roles or ROLE_PLUGIN_UPDATE in user_roles
+            else []
+        )
+
+    accessible = accessible_settings_areas(user_roles)
+    accessible_keys = {a["key"] for a in accessible}
+    requested_area = (area or "").strip().lower() or (accessible[0]["key"] if accessible else "")
+    if requested_area not in accessible_keys:
+        requested_area = accessible[0]["key"] if accessible else ""
+
+    return {
+        "request": request,
+        "user": user,
+        "user_roles": sorted(user_roles),
+        "accessible_areas": accessible,
+        "selected_area": requested_area,
+        "users": users_view,
+        "role_catalog": ROLE_LABELS,
+        "plugins": plugin_options,
+        "message": message,
+        "message_kind": message_kind,
+        "auth_form_error": auth_form_error,
+        "auth_form_username": auth_form_username or "",
+        "auth_form_selected_roles": [] if auth_form_selected_roles is None else auth_form_selected_roles,
+        "can_view_accounts": can_view_accounts,
+        "can_account_update": ROLE_ACCOUNT_UPDATE in user_roles,
+        "can_account_reset_password": ROLE_ACCOUNT_RESET_PASSWORD in user_roles,
+        "can_global_admin": ROLE_GLOBAL_ADMIN in user_roles,
+        "can_plugin_update": ROLE_PLUGIN_UPDATE in user_roles,
+    }
+
+
+def _render_settings(
+    request: Request,
+    user: str,
+    area: Optional[str],
+    **kwargs: Any,
+):
+    return templates.TemplateResponse(
+        request=request,
+        name="settings.html",
+        context=_settings_context(request, user, area, **kwargs),
+    )
+
+
+@app.get("/settings", response_class=HTMLResponse, include_in_schema=False)
+def settings_page(
+    request: Request,
+    area: Optional[str] = None,
+    user: str = Depends(get_current_user),
+):
+    return _render_settings(request, user, area)
+
+
+@app.post("/settings/account/password", response_class=HTMLResponse, include_in_schema=False)
+def settings_self_password_change(
+    request: Request,
+    current_password: str = Form(...),
+    new_password: str = Form(...),
+    confirm_password: str = Form(...),
+    user: str = Depends(get_current_user),
+):
+    if not new_password:
+        return _render_settings(
+            request,
+            user,
+            "authentication",
+            message="A new password is required.",
+            message_kind="error",
+        )
+    if new_password != confirm_password:
+        return _render_settings(
+            request,
+            user,
+            "authentication",
+            message="New password and confirmation do not match.",
+            message_kind="error",
+        )
+    with SessionLocal() as db:
+        target = db.exec(select(User).where(User.username == user)).first()
+        if target is None or not verify_password(current_password, target.password_hash):
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="Current password is incorrect.",
+                message_kind="error",
+            )
+        target.password_hash = hash_password(new_password)
+        db.add(target)
+        db.commit()
+    return _render_settings(request, user, "authentication", message="Password changed.")
+
+
+@app.post("/settings/users", response_class=HTMLResponse, include_in_schema=False)
+def settings_user_create(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    roles: List[str] = Form(default_factory=list),
+    user: str = Depends(require_role(ROLE_ACCOUNT_UPDATE)),
+):
+    normalized = username.strip()
+    selected_roles = normalize_selected_roles(roles)
+    if not normalized:
+        return _render_settings(
+            request,
+            user,
+            "authentication",
+            auth_form_error="Username is required.",
+            auth_form_username=username,
+            auth_form_selected_roles=selected_roles,
+        )
+    if not password:
+        return _render_settings(
+            request,
+            user,
+            "authentication",
+            auth_form_error="Password is required.",
+            auth_form_username=normalized,
+            auth_form_selected_roles=selected_roles,
+        )
+    with SessionLocal() as db:
+        if ROLE_GLOBAL_ADMIN in selected_roles and not user_is_global_admin(db, user):
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                auth_form_error="Only a global admin can grant global admin.",
+                auth_form_username=normalized,
+                auth_form_selected_roles=[r for r in selected_roles if r != ROLE_GLOBAL_ADMIN],
+            )
+        if db.exec(select(User).where(User.username == normalized)).first():
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                auth_form_error=f"A user named {normalized!r} already exists.",
+                auth_form_username=normalized,
+                auth_form_selected_roles=selected_roles,
+            )
+        db.add(
+            User(
+                username=normalized,
+                password_hash=hash_password(password),
+                roles=_serialize_roles(selected_roles),
+            )
+        )
+        db.commit()
+    return _render_settings(
+        request,
+        user,
+        "authentication",
+        message=f"User {normalized!r} created.",
+    )
+
+
+@app.post("/settings/users/{user_id}/disable", response_class=HTMLResponse, include_in_schema=False)
+def settings_user_disable(
+    request: Request,
+    user_id: int,
+    user: str = Depends(require_role(ROLE_ACCOUNT_UPDATE)),
+):
+    with SessionLocal() as db:
+        target = db.get(User, user_id)
+        if not target:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="User not found.",
+                message_kind="error",
+            )
+        if guard_message := global_admin_guard_message(db, user, target):
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message=guard_message,
+                message_kind="error",
+            )
+        if target.disabled:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message=f"User {target.username!r} is already disabled.",
+                message_kind="error",
+            )
+        enabled_users = db.exec(select(User).where(User.disabled == False)).all()  # noqa: E712
+        if len(enabled_users) <= 1:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="At least one enabled user account must remain.",
+                message_kind="error",
+            )
+        if target.username == user:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="You cannot disable the user you are signed in as.",
+                message_kind="error",
+            )
+        target.disabled = True
+        db.add(target)
+        db.commit()
+        username = target.username
+    return _render_settings(
+        request,
+        user,
+        "authentication",
+        message=f"User {username!r} disabled.",
+    )
+
+
+@app.post("/settings/users/{user_id}/enable", response_class=HTMLResponse, include_in_schema=False)
+def settings_user_enable(
+    request: Request,
+    user_id: int,
+    user: str = Depends(require_role(ROLE_ACCOUNT_UPDATE)),
+):
+    with SessionLocal() as db:
+        target = db.get(User, user_id)
+        if not target:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="User not found.",
+                message_kind="error",
+            )
+        if guard_message := global_admin_guard_message(db, user, target):
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message=guard_message,
+                message_kind="error",
+            )
+        if not target.disabled:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message=f"User {target.username!r} is already enabled.",
+                message_kind="error",
+            )
+        target.disabled = False
+        db.add(target)
+        db.commit()
+        username = target.username
+    return _render_settings(
+        request,
+        user,
+        "authentication",
+        message=f"User {username!r} enabled.",
+    )
+
+
+@app.post("/settings/users/{user_id}/delete", response_class=HTMLResponse, include_in_schema=False)
+def settings_user_delete(
+    request: Request,
+    user_id: int,
+    user: str = Depends(require_role(ROLE_ACCOUNT_UPDATE)),
+):
+    with SessionLocal() as db:
+        target = db.get(User, user_id)
+        if not target:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="User not found.",
+                message_kind="error",
+            )
+        if guard_message := global_admin_guard_message(db, user, target):
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message=guard_message,
+                message_kind="error",
+            )
+        remaining = db.exec(select(User)).all()
+        if len(remaining) <= 1:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="At least one user account must remain.",
+                message_kind="error",
+            )
+        if target.username == user:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="You cannot delete the user you are signed in as.",
+                message_kind="error",
+            )
+        if not target.disabled:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="Disable the user account before deleting it.",
+                message_kind="error",
+            )
+        username = target.username
+        db.delete(target)
+        db.commit()
+    return _render_settings(
+        request,
+        user,
+        "authentication",
+        message=f"User {username!r} deleted.",
+    )
+
+
+@app.post("/settings/users/{user_id}/password", response_class=HTMLResponse, include_in_schema=False)
+def settings_user_reset_password(
+    request: Request,
+    user_id: int,
+    password: str = Form(...),
+    confirm_password: str = Form(...),
+    user: str = Depends(require_role(ROLE_ACCOUNT_RESET_PASSWORD)),
+):
+    if not password or not confirm_password:
+        return _render_settings(
+            request,
+            user,
+            "authentication",
+            message="A new password is required.",
+            message_kind="error",
+        )
+    if password != confirm_password:
+        return _render_settings(
+            request,
+            user,
+            "authentication",
+            message="New password and confirmation do not match.",
+            message_kind="error",
+        )
+    with SessionLocal() as db:
+        target = db.get(User, user_id)
+        if not target:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="User not found.",
+                message_kind="error",
+            )
+        if guard_message := global_admin_guard_message(db, user, target):
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message=guard_message,
+                message_kind="error",
+            )
+        if target.disabled:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="Enable the user account before resetting its password.",
+                message_kind="error",
+            )
+        target.password_hash = hash_password(password)
+        db.add(target)
+        db.commit()
+        username = target.username
+    return _render_settings(
+        request,
+        user,
+        "authentication",
+        message=f"Password reset for {username!r}.",
+    )
+
+
+@app.post("/settings/users/{user_id}/roles", response_class=HTMLResponse, include_in_schema=False)
+def settings_user_update_roles(
+    request: Request,
+    user_id: int,
+    roles: List[str] = Form(default_factory=list),
+    user: str = Depends(require_role(ROLE_ACCOUNT_UPDATE)),
+):
+    selected = normalize_selected_roles(roles)
+    with SessionLocal() as db:
+        target = db.get(User, user_id)
+        if not target:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="User not found.",
+                message_kind="error",
+            )
+        if guard_message := global_admin_guard_message(db, user, target):
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message=guard_message,
+                message_kind="error",
+            )
+        if target.username == user:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="You cannot edit roles for the user you are signed in as.",
+                message_kind="error",
+            )
+        target_stored_roles = _parse_roles(target.roles)
+        if (
+            (ROLE_GLOBAL_ADMIN in selected or ROLE_GLOBAL_ADMIN in target_stored_roles)
+            and not user_is_global_admin(db, user)
+        ):
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="Only a global admin can change global admin role assignments.",
+                message_kind="error",
+            )
+        if target.disabled:
+            return _render_settings(
+                request,
+                user,
+                "authentication",
+                message="Enable the user account before editing its roles.",
+                message_kind="error",
+            )
+        target.roles = _serialize_roles(selected)
+        db.add(target)
+        db.commit()
+        username = target.username
+    return _render_settings(
+        request,
+        user,
+        "authentication",
+        message=f"Roles updated for {username!r}.",
+    )
+
+
+@app.post("/settings/plugins/{plugin_key}/disable", response_class=HTMLResponse, include_in_schema=False)
+def settings_plugin_disable(
+    request: Request,
+    plugin_key: str,
+    user: str = Depends(require_role(ROLE_PLUGIN_UPDATE)),
+):
+    normalized_key = plugin_key.strip().lower()
+    known_keys = get_known_dns_provider_keys()
+    if normalized_key not in known_keys:
+        return _render_settings(
+            request,
+            user,
+            "plugins",
+            message=f"Unknown DNS provider plugin: {plugin_key}.",
+            message_kind="error",
+        )
+
+    with SessionLocal() as db:
+        disabled = get_disabled_dns_plugins(db)
+        if normalized_key in disabled:
+            return _render_settings(request, user, "plugins", message=f"{get_dns_provider_label(normalized_key)} is already disabled.")
+        enabled_count = len([plugin for plugin in get_dns_provider_options() if plugin["key"] not in disabled])
+        if enabled_count <= 1:
+            return _render_settings(
+                request,
+                user,
+                "plugins",
+                message="At least one DNS provider plugin must remain enabled.",
+                message_kind="error",
+            )
+        zone_names = zones_using_dns_provider(db, normalized_key)
+        if zone_names:
+            zones_text = ", ".join(zone_names)
+            first_zone = zone_names[0]
+            return _render_settings(
+                request,
+                user,
+                "plugins",
+                message=(
+                    f"Cannot disable {get_dns_provider_label(normalized_key)}. "
+                    f"Delete DNS zone {first_zone} first."
+                    if len(zone_names) == 1
+                    else f"Cannot disable {get_dns_provider_label(normalized_key)}. Delete DNS zones {zones_text} first."
+                ),
+                message_kind="error",
+            )
+        disabled.add(normalized_key)
+        set_disabled_dns_plugins(db, disabled)
+
+    return _render_settings(request, user, "plugins", message=f"{get_dns_provider_label(normalized_key)} disabled.")
+
+
+@app.post("/settings/plugins/{plugin_key}/enable", response_class=HTMLResponse, include_in_schema=False)
+def settings_plugin_enable(
+    request: Request,
+    plugin_key: str,
+    user: str = Depends(require_role(ROLE_PLUGIN_UPDATE)),
+):
+    normalized_key = plugin_key.strip().lower()
+    known_keys = get_known_dns_provider_keys()
+    if normalized_key not in known_keys:
+        return _render_settings(
+            request,
+            user,
+            "plugins",
+            message=f"Unknown DNS provider plugin: {plugin_key}.",
+            message_kind="error",
+        )
+
+    with SessionLocal() as db:
+        disabled = get_disabled_dns_plugins(db)
+        disabled.discard(normalized_key)
+        set_disabled_dns_plugins(db, disabled)
+
+    return _render_settings(request, user, "plugins", message=f"{get_dns_provider_label(normalized_key)} enabled.")
+
 
 @app.post(
     "/dns-record",

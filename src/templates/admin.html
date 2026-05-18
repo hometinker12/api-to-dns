@@ -2,23 +2,32 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>DNS Admin Dashboard</title>
+  <title>api-to-dns App Dashboard</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <div class="page">
     <header class="page-header">
       <div>
-        <h1>DNS Admin Dashboard</h1>
+        <h1>api-to-dns App Dashboard</h1>
         <p class="help">Signed in as {{ user }}</p>
       </div>
-      <nav class="nav-links">        
+      <nav class="nav-links">
+        <a class="button" href="/settings">Settings</a>
         <a class="button danger" href="/logout">Logout</a>
       </nav>
     </header>
     <nav class="nav-links">
+      {% if can_view_zones %}
         <a class="button" href="/zones">DNS Zones</a>
-      <a class="button" href="/api-keys">API Keys</a>
+      {% else %}
+        <span class="button disabled" aria-disabled="true">DNS Zones</span>
+      {% endif %}
+      {% if can_view_api_keys %}
+        <a class="button" href="/api-keys">API Keys</a>
+      {% else %}
+        <span class="button disabled" aria-disabled="true">API Keys</span>
+      {% endif %}
       <a class="button neutral" href="/docs#/">API Docs</a>
     </nav>
     <section>
