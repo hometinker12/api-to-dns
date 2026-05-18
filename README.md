@@ -104,7 +104,7 @@ The activity logging level is configured under **System Settings**:
 - `warning` stores warning and error events only.
 - `error` stores error events only.
 
-Security-category activity is always stored regardless of the selected level. This includes `auth.*`, `api_key.*`, `dns.record_*`, and `user.*` events. In **Log Viewing / Searching**, the text search field is shown by default; level, category, event type, status, zone, actor, and date range live under **Advanced Search**.
+Security-category activity is always stored regardless of the selected level. This includes `auth.*`, `api_key.*`, and `user.*` events. DNS API outcomes such as `dns.record_created` use the `dns` category. All other events derive their category from the event type prefix (for example `plugin.disabled` → `plugin`, `http.request` → `http`, `dns_zone.created` → `dns_zone`). In **Log Viewing / Searching**, the text search field is shown by default; level, category, event type, status, zone, actor, and date range live under **Advanced Search**.
 
 Activity log retention is configured under **System Settings** with presets such as 24 hours, 1 week, 30 days, 60 days, 90 days, 180 days, and 365 days. Cleanup runs at startup and opportunistically during activity logging, at most once per day. This is retention cleanup for database rows, not file rotation.
 

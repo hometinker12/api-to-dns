@@ -1,47 +1,36 @@
-import html
-import json
 import os
-import traceback
+from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, Form, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from sqlmodel import select
 from starlette.status import HTTP_303_SEE_OTHER, HTTP_404_NOT_FOUND
 
 from . import activity_logging
 from .activity_logging import (
-    DEFAULT_BODY_TEMPLATE,
-    DEFAULT_SUBJECT_TEMPLATE,
     LOGGER,
     configure_operational_logging,
     emit_activity_event,
-    evaluate_alert_rules,
     get_log_level,
     get_retention_days,
     get_smtp_config,
-    is_running_in_docker,
-    query_activity_logs,
     run_retention_cleanup,
     set_log_level,
     set_retention_days,
     set_smtp_config,
-    system_identity,
 )
 from .auth import create_session_cookie, get_current_user, session_cookie_settings
 from .db import SessionLocal, init_db
+from .http_utils import api_key_fingerprint, api_key_from_headers, http_exception_from_dns_error, wants_json_response
 from .models import (
-    LOG_CATEGORY_VALUES,
     LOG_LEVEL_ERROR,
     LOG_LEVEL_INFORMATIONAL,
-    LOG_LEVEL_VALUES,
     LOG_LEVEL_VERBOSE,
     LOG_LEVEL_WARNING,
-    ActivityLog,
     AlertRule,
     ApiKey,
     ApiKeyAllowedZone,
@@ -49,119 +38,130 @@ from .models import (
     DnsRecordResponse,
     DnsZoneConfig,
     DnsZoneSummary,
-    Setting,
     User,
 )
-from .security import decrypt_value, encrypt_value, generate_api_key, hash_password, verify_password
+from .paths import STATIC_DIR
+from .rbac import (
+    ALL_ROLES,
+    LEGACY_SETTINGS_AREA_ALIASES,
+    ROLE_ACCOUNT_RESET_PASSWORD,
+    ROLE_ACCOUNT_UPDATE,
+    ROLE_API_KEYS_READ,
+    ROLE_API_KEYS_UPDATE,
+    ROLE_DNS_ZONES_READ,
+    ROLE_DNS_ZONES_UPDATE,
+    ROLE_FORBIDDEN_DETAIL,
+    ROLE_GLOBAL_ADMIN,
+    ROLE_GLOBAL_READ,
+    ROLE_PLUGIN_UPDATE,
+    ROLE_SYSTEM_UPDATE,
+    get_user_roles,
+    global_admin_guard_message,
+    normalize_selected_roles,
+    require_role,
+    serialize_roles,
+    user_has_role,
+    user_is_global_admin,
+    user_public_dict,
+)
+from .security import generate_api_key, hash_password, verify_password
+from .settings_context import render_settings
+from .settings_store import get_setting, set_setting
+from .web import client_ip, record_activity, render_access_denied_response, render_error_response, templates
+from .zone_service import (
+    api_key_allowed_zone_names,
+    api_key_public_dict,
+    build_zone_config_from_form,
+    create_dns_client_from_settings,
+    decode_zone_config,
+    dns_provider_display_name,
+    dns_provider_options_with_state,
+    dns_zone_public_dict,
+    dns_zone_summary_dict,
+    enabled_dns_provider_options,
+    encode_zone_config_dict,
+    get_api_key,
+    get_disabled_dns_plugins,
+    get_dns_provider_options,
+    get_known_dns_provider_keys,
+    list_dns_zones,
+    migrate_legacy_dns_settings_if_needed,
+    normalize_zone_name,
+    set_disabled_dns_plugins,
+    zones_using_dns_provider,
+)
 
 ACCESS_DENIED_DETAIL: Dict[str, str] = {
     "error": "access_denied",
     "message": "You do not have access or an invalid key was provided.",
 }
 
-ROLE_GLOBAL_ADMIN = "global.admin"
-ROLE_GLOBAL_READ = "global.read"
-ROLE_ACCOUNT_UPDATE = "account.update"
-ROLE_ACCOUNT_RESET_PASSWORD = "account.reset_password"
-ROLE_API_KEYS_READ = "api_keys.read"
-ROLE_API_KEYS_UPDATE = "api_keys.update"
-ROLE_DNS_ZONES_READ = "dns_zones.read"
-ROLE_DNS_ZONES_UPDATE = "dns_zones.update"
-ROLE_PLUGIN_UPDATE = "plugin.update"
-ROLE_SYSTEM_UPDATE = "system.update"
+AUTH_REDIRECT_DETAILS = {"Authentication required", "Invalid or expired session"}
+WEB_AUTH_PATH_PREFIXES = (
+    "/admin",
+    "/zones",
+    "/api-keys",
+    "/settings",
+)
+_REQUEST_LOG_IGNORE_PREFIXES = ("/static",)
 
-ROLE_DEPENDENCIES: Dict[str, str] = {
-    ROLE_API_KEYS_UPDATE: ROLE_API_KEYS_READ,
-    ROLE_DNS_ZONES_UPDATE: ROLE_DNS_ZONES_READ,
-}
-MANDATORY_ROLES: Set[str] = {ROLE_DNS_ZONES_READ}
 
-ALL_ROLES: List[str] = [
-    ROLE_GLOBAL_ADMIN,
-    ROLE_GLOBAL_READ,
-    ROLE_ACCOUNT_UPDATE,
-    ROLE_ACCOUNT_RESET_PASSWORD,
-    ROLE_API_KEYS_READ,
-    ROLE_API_KEYS_UPDATE,
-    ROLE_DNS_ZONES_READ,
-    ROLE_DNS_ZONES_UPDATE,
-    ROLE_PLUGIN_UPDATE,
-    ROLE_SYSTEM_UPDATE,
-]
-LEGACY_DEFAULT_ROLES: Set[str] = set(ALL_ROLES) - {ROLE_GLOBAL_ADMIN}
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    with SessionLocal() as db:
+        migrate_legacy_dns_settings_if_needed(db)
+        configure_operational_logging(level=get_log_level(db))
+        try:
+            run_retention_cleanup(db, force=True)
+        except Exception:
+            LOGGER.exception("startup activity retention cleanup failed")
+    admin_user = os.getenv("ADMIN_USER")
+    admin_password = os.getenv("ADMIN_PASSWORD")
+    if admin_user and admin_password:
+        with SessionLocal() as db:
+            if not db.exec(select(User).where(User.username == admin_user)).first():
+                db.add(
+                    User(
+                        username=admin_user,
+                        password_hash=hash_password(admin_password),
+                        roles=serialize_roles([*ALL_ROLES, ROLE_GLOBAL_ADMIN]),
+                    )
+                )
+                db.commit()
+    yield
 
-ROLE_LABELS: List[Dict[str, str]] = [
-    {"key": ROLE_GLOBAL_ADMIN, "label": "Global: admin"},
-    {"key": ROLE_GLOBAL_READ, "label": "Global: read-only"},
-    {"key": ROLE_ACCOUNT_UPDATE, "label": "Account: update"},
-    {"key": ROLE_ACCOUNT_RESET_PASSWORD, "label": "Account: reset password"},
-    {"key": ROLE_API_KEYS_READ, "label": "API keys: read"},
-    {"key": ROLE_API_KEYS_UPDATE, "label": "API keys: update", "requires_role": ROLE_API_KEYS_READ},
-    {"key": ROLE_DNS_ZONES_READ, "label": "DNS zones: read", "mandatory": True},
-    {"key": ROLE_DNS_ZONES_UPDATE, "label": "DNS zones: update", "requires_role": ROLE_DNS_ZONES_READ},
-    {"key": ROLE_PLUGIN_UPDATE, "label": "Plugin management"},
-    {"key": ROLE_SYSTEM_UPDATE, "label": "System: update"},
-]
 
-SETTINGS_AREAS: List[Dict[str, Any]] = [
-    {
-        "key": "authentication",
-        "label": "Authentication",
-        "required_roles": [ROLE_GLOBAL_READ, ROLE_ACCOUNT_UPDATE, ROLE_ACCOUNT_RESET_PASSWORD],
-    },
-    {
-        "key": "plugins",
-        "label": "Plugin Management",
-        "required_roles": [ROLE_GLOBAL_READ, ROLE_PLUGIN_UPDATE],
-    },
-    {
-        "key": "system_settings",
-        "label": "System Settings",
-        "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
-    },
-    {
-        "key": "log_viewing",
-        "label": "Log Viewing / Searching",
-        "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
-    },
-    {
-        "key": "email_alerting",
-        "label": "Email Alerting",
-        "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
-    },
-    {
-        "key": "backup",
-        "label": "System Backup",
-        "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
-    },
-]
+def startup_event() -> None:
+    """Run startup initialization (used by tests; production uses ``lifespan``)."""
+    init_db()
+    with SessionLocal() as db:
+        migrate_legacy_dns_settings_if_needed(db)
+        configure_operational_logging(level=get_log_level(db))
+        try:
+            run_retention_cleanup(db, force=True)
+        except Exception:
+            LOGGER.exception("startup activity retention cleanup failed")
+    admin_user = os.getenv("ADMIN_USER")
+    admin_password = os.getenv("ADMIN_PASSWORD")
+    if admin_user and admin_password:
+        with SessionLocal() as db:
+            if not db.exec(select(User).where(User.username == admin_user)).first():
+                db.add(
+                    User(
+                        username=admin_user,
+                        password_hash=hash_password(admin_password),
+                        roles=serialize_roles([*ALL_ROLES, ROLE_GLOBAL_ADMIN]),
+                    )
+                )
+                db.commit()
 
-LEGACY_SETTINGS_AREA_ALIASES: Dict[str, str] = {
-    "logging": "log_viewing",
-}
-
-ROLE_FORBIDDEN_DETAIL = "You do not have permission to access this resource."
-DISABLED_DNS_PLUGINS_SETTING = "disabled_dns_plugins"
-
-LEGACY_DNS_SETTING_NAMES = [
-    "dns_provider_type",
-    "dns_server",
-    "dns_zone",
-    "dns_username",
-    "dns_password",
-    "dns_tsig_algorithm",
-    "dns_winrm_ssl",
-    "azure_tenant_id",
-    "azure_client_id",
-    "azure_client_secret",
-    "azure_subscription_id",
-    "azure_resource_group",
-]
 
 app = FastAPI(
     title="api-to-dns Service",
     description="Create or update DNS records via REST and manage API keys through a protected web UI.",
     version="0.3.4",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -171,17 +171,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/static", StaticFiles(directory="src/static"), name="static")
-templates = Jinja2Templates(directory="src/templates")
-
-AUTH_REDIRECT_DETAILS = {"Authentication required", "Invalid or expired session"}
-WEB_AUTH_PATH_PREFIXES = (
-    "/admin",
-    "/zones",
-    "/api-keys",
-    "/settings",
-)
-
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 @app.middleware("http")
 async def refresh_session_cookie(request: Request, call_next):
@@ -209,14 +199,13 @@ async def record_request_activity(request: Request, call_next):
                 db,
                 event_type="http.request",
                 level=LOG_LEVEL_VERBOSE,
-                category="http",
                 status="success" if response.status_code < 400 else "error",
                 actor_type="user" if session_user else "anonymous",
                 actor_label=session_user,
                 request_method=request.method,
                 request_path=path,
                 request_status_code=response.status_code,
-                request_ip=_client_ip(request),
+                request_ip=client_ip(request),
                 evaluate_alerts=False,
             )
     except Exception:  # pragma: no cover - logging must never break a request
@@ -239,433 +228,16 @@ def http_exception_handler(request: Request, exc: HTTPException):
         and request.url.path.startswith(WEB_AUTH_PATH_PREFIXES)
         and "application/json" not in request.headers.get("accept", "").lower()
     ):
-        return _render_access_denied_response()
+        return render_access_denied_response()
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
-def _render_access_denied_response() -> HTMLResponse:
-    return HTMLResponse(
-        content=(
-            "<!DOCTYPE html><html><head><title>Access denied</title>"
-            "<link rel=\"stylesheet\" href=\"/static/style.css\" /></head>"
-            "<body><div class=\"page\">"
-            "<h1>Access denied</h1>"
-            f"<div class=\"alert error\">{html.escape(ROLE_FORBIDDEN_DETAIL)}</div>"
-            "<p><a class=\"button\" href=\"/admin\">Back to dashboard</a></p>"
-            "</div></body></html>"
-        ),
-        status_code=403,
-    )
 
+# Backwards-compatible re-exports for tests and external callers.
+from .rbac import parse_roles as _parse_roles, serialize_roles as _serialize_roles
 
-def _render_error_response(request: Request, error: Exception, status_code: int = 500):
-    traceback_text = traceback.format_exc()
-    LOGGER.exception("Application error: %s", error)
-    content = (
-        "<html><body><h1>Application error</h1>"
-        f"<p>{html.escape(str(error))}</p>"
-        "<pre>"
-        f"{html.escape(traceback_text)}"
-        "</pre></body></html>"
-    )
-    return HTMLResponse(content=content, status_code=status_code)
-
-
-def _client_ip(request: Request) -> Optional[str]:
-    client = getattr(request, "client", None)
-    return client.host if client else None
-
-
-def _record_activity(**kwargs: Any) -> None:
-    """Best-effort activity event with an isolated session."""
-    try:
-        with SessionLocal() as db:
-            emit_activity_event(db, **kwargs)
-    except Exception:  # pragma: no cover - logging must never break a request
-        LOGGER.exception("emit_activity_event failed for event %s", kwargs.get("event_type"))
-
-
-def get_dns_client_from_settings(settings: dict):
-    """Build a DNS provider client from decrypted zone configuration."""
-    from .dns_client import create_dns_client
-
-    return create_dns_client(settings)
-
-
-def get_dns_provider_options() -> List[dict]:
-    from .dns_client import provider_options_for_template
-
-    return provider_options_for_template()
-
-
-def get_known_dns_provider_keys() -> Set[str]:
-    return {plugin["key"] for plugin in get_dns_provider_options()}
-
-
-def get_dns_provider_label(provider_key: str) -> str:
-    from .dns_client import dns_provider_display_name
-
-    return dns_provider_display_name(provider_key)
-
-
-def wants_json_response(request: Request) -> bool:
-    return "application/json" in request.headers.get("accept", "").lower() or "application/json" in request.headers.get(
-        "content-type", ""
-    ).lower()
-
-
-def api_key_from_headers(x_api_key: Optional[str], authorization: Optional[str]) -> Optional[str]:
-    api_key = x_api_key
-    if not api_key and authorization:
-        prefix = "Bearer "
-        if authorization.startswith(prefix):
-            api_key = authorization[len(prefix) :].strip()
-    return api_key
-
-
-def _http_exception_from_dns_error(exc: Exception) -> HTTPException:
-    """Map provider/configuration errors to HTTP errors with structured detail."""
-    if isinstance(exc, HTTPException):
-        return exc
-    if isinstance(exc, ValueError):
-        return HTTPException(
-            status_code=400,
-            detail={"error": "invalid_request", "message": str(exc) or "invalid request"},
-        )
-    if isinstance(exc, RuntimeError):
-        return HTTPException(
-            status_code=502,
-            detail={"error": "dns_provider_failed", "message": str(exc)},
-        )
-    if isinstance(exc, ImportError):
-        return HTTPException(
-            status_code=503,
-            detail={"error": "dependency_unavailable", "message": str(exc)},
-        )
-    return HTTPException(
-        status_code=500,
-        detail={"error": "unexpected", "message": str(exc)},
-    )
-
-
-def get_db():
-    with SessionLocal() as db:
-        yield db
-
-
-def _parse_roles(raw: Optional[str]) -> Set[str]:
-    if not raw:
-        return set()
-    return {part.strip() for part in raw.split(",") if part.strip()}
-
-
-def _serialize_roles(roles) -> str:
-    cleaned = {r for r in roles if r in ALL_ROLES}
-    if ROLE_GLOBAL_ADMIN in cleaned:
-        cleaned = set(ALL_ROLES)
-    cleaned.update(MANDATORY_ROLES)
-    return ",".join(sorted(cleaned))
-
-
-def normalize_selected_roles(roles) -> List[str]:
-    selected = {r for r in roles if r in ALL_ROLES}
-    if ROLE_GLOBAL_ADMIN in selected:
-        return sorted(ALL_ROLES)
-    selected.update(MANDATORY_ROLES)
-    for role, required_role in ROLE_DEPENDENCIES.items():
-        if role in selected:
-            selected.add(required_role)
-    return sorted(selected)
-
-
-def effective_roles(stored_roles: Set[str]) -> Set[str]:
-    if ROLE_GLOBAL_ADMIN in stored_roles:
-        return set(ALL_ROLES)
-    return stored_roles | MANDATORY_ROLES
-
-
-def get_user_roles(db, username: str) -> Set[str]:
-    """Return the role set for `username`."""
-    user_row = db.exec(select(User).where(User.username == username)).first()
-    if user_row is None:
-        return set()
-    return effective_roles(_parse_roles(user_row.roles))
-
-
-def user_has_role(db, username: str, role: str) -> bool:
-    roles = get_user_roles(db, username)
-    return ROLE_GLOBAL_ADMIN in roles or role in roles or (
-        ROLE_GLOBAL_READ in roles and role in {ROLE_API_KEYS_READ, ROLE_DNS_ZONES_READ}
-    )
-
-
-def user_has_any_role(db, username: str, roles) -> bool:
-    return any(user_has_role(db, username, role) for role in roles)
-
-
-def user_is_global_admin(db, username: str) -> bool:
-    return ROLE_GLOBAL_ADMIN in get_user_roles(db, username)
-
-
-def target_is_global_admin(target: User) -> bool:
-    return ROLE_GLOBAL_ADMIN in effective_roles(_parse_roles(target.roles))
-
-
-def global_admin_guard_message(db, actor: str, target: User) -> Optional[str]:
-    if target_is_global_admin(target) and not user_is_global_admin(db, actor):
-        return "Only a global admin can manage another global admin account."
-    return None
-
-
-def require_role(role: str):
-    """FastAPI dependency factory that returns the username when the user has `role`."""
-
-    def _dependency(user: str = Depends(get_current_user)) -> str:
-        with SessionLocal() as db:
-            if not user_has_role(db, user, role):
-                raise HTTPException(status_code=403, detail=ROLE_FORBIDDEN_DETAIL)
-        return user
-
-    return _dependency
-
-
-def user_public_dict(u: User) -> Dict[str, Any]:
-    stored_roles = _parse_roles(u.roles)
-    display_roles = stored_roles or LEGACY_DEFAULT_ROLES
-    effective_display_roles = effective_roles(display_roles)
-    return {
-        "id": u.id,
-        "username": u.username,
-        "disabled": u.disabled,
-        "roles": sorted(effective_display_roles),
-        "stored_roles": sorted(display_roles | MANDATORY_ROLES),
-        "is_global_admin": ROLE_GLOBAL_ADMIN in effective_display_roles,
-        "has_default_roles": not stored_roles,
-    }
-
-
-def accessible_settings_areas(user_roles: Set[str]) -> List[Dict[str, str]]:
-    return [
-        area
-        for area in SETTINGS_AREAS
-        if area["key"] == "authentication" or any(role in user_roles for role in area["required_roles"])
-    ]
-
-
-def normalize_zone_name(zone: str) -> str:
-    return zone.strip().rstrip(".").lower()
-
-
-def get_setting(db, name: str) -> Optional[str]:
-    record = db.exec(select(Setting).where(Setting.name == name)).first()
-    return decrypt_value(record.value) if record else None
-
-
-def set_setting(db, name: str, value: str) -> None:
-    encrypted = encrypt_value(value)
-    record = db.exec(select(Setting).where(Setting.name == name)).first()
-    if record:
-        record.value = encrypted
-    else:
-        db.add(Setting(name=name, value=encrypted))
-    db.commit()
-
-
-def delete_setting(db, name: str) -> None:
-    record = db.exec(select(Setting).where(Setting.name == name)).first()
-    if record:
-        db.delete(record)
-    db.commit()
-
-
-def get_disabled_dns_plugins(db) -> Set[str]:
-    raw = get_setting(db, DISABLED_DNS_PLUGINS_SETTING)
-    if not raw:
-        return set()
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return set()
-    if not isinstance(parsed, list):
-        return set()
-    known_keys = get_known_dns_provider_keys()
-    return {str(key).strip().lower() for key in parsed if str(key).strip().lower() in known_keys}
-
-
-def set_disabled_dns_plugins(db, plugin_keys) -> None:
-    known_keys = get_known_dns_provider_keys()
-    cleaned = sorted({str(key).strip().lower() for key in plugin_keys if str(key).strip().lower() in known_keys})
-    if cleaned:
-        set_setting(db, DISABLED_DNS_PLUGINS_SETTING, json.dumps(cleaned))
-    else:
-        delete_setting(db, DISABLED_DNS_PLUGINS_SETTING)
-
-
-def dns_provider_options_with_state(db) -> List[dict]:
-    disabled = get_disabled_dns_plugins(db)
-    options: List[dict] = []
-    for plugin in get_dns_provider_options():
-        row = dict(plugin)
-        row["enabled"] = row["key"] not in disabled
-        row["disabled"] = not row["enabled"]
-        options.append(row)
-    return options
-
-
-def enabled_dns_provider_options(db) -> List[dict]:
-    return [plugin for plugin in dns_provider_options_with_state(db) if plugin["enabled"]]
-
-
-def zones_using_dns_provider(db, provider_key: str) -> List[str]:
-    matches: List[str] = []
-    for zone in list_dns_zones(db):
-        settings = decode_zone_config(zone)
-        provider = (settings.get("dns_provider_type") or "azure").strip().lower()
-        if provider == provider_key:
-            matches.append(zone.zone_name)
-    return matches
-
-
-def decode_zone_config(row: DnsZoneConfig) -> Dict[str, Any]:
-    raw = decrypt_value(row.encrypted_config)
-    return json.loads(raw)
-
-
-def encode_zone_config_dict(cfg: Dict[str, Any]) -> str:
-    return encrypt_value(json.dumps(cfg))
-
-
-def migrate_legacy_dns_settings_if_needed(db) -> None:
-    if db.exec(select(DnsZoneConfig)).first():
-        return
-    zone_raw = get_setting(db, "dns_zone")
-    if not zone_raw or not str(zone_raw).strip():
-        return
-    canonical = normalize_zone_name(zone_raw)
-    cfg = {
-        "dns_provider_type": get_setting(db, "dns_provider_type") or "azure",
-        "dns_server": get_setting(db, "dns_server") or "",
-        "dns_username": get_setting(db, "dns_username") or "",
-        "dns_password": get_setting(db, "dns_password") or "",
-        "dns_tsig_algorithm": get_setting(db, "dns_tsig_algorithm") or "",
-        "dns_winrm_ssl": get_setting(db, "dns_winrm_ssl") or "",
-        "azure_tenant_id": get_setting(db, "azure_tenant_id") or "",
-        "azure_client_id": get_setting(db, "azure_client_id") or "",
-        "azure_client_secret": get_setting(db, "azure_client_secret") or "",
-        "azure_subscription_id": get_setting(db, "azure_subscription_id") or "",
-        "azure_resource_group": get_setting(db, "azure_resource_group") or "",
-    }
-    row = DnsZoneConfig(zone_name=canonical, encrypted_config=encode_zone_config_dict(cfg))
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    for key in db.exec(select(ApiKey).where(ApiKey.active == True)).all():
-        db.add(ApiKeyAllowedZone(api_key_id=key.id, dns_zone_config_id=row.id))
-    db.commit()
-    for name in LEGACY_DNS_SETTING_NAMES:
-        delete_setting(db, name)
-
-
-def list_dns_zones(db) -> List[DnsZoneConfig]:
-    return sorted(db.exec(select(DnsZoneConfig)).all(), key=lambda z: z.zone_name)
-
-
-def api_key_allowed_zone_names(db, api_key_id: int) -> List[str]:
-    links = db.exec(select(ApiKeyAllowedZone).where(ApiKeyAllowedZone.api_key_id == api_key_id)).all()
-    names: List[str] = []
-    for link in links:
-        z = db.get(DnsZoneConfig, link.dns_zone_config_id)
-        if z:
-            names.append(z.zone_name)
-    return sorted(names)
-
-
-def dns_zone_public_dict(z: DnsZoneConfig) -> Dict[str, Any]:
-    """Safe to use after the Session closes (plain dict)."""
-    cfg = decode_zone_config(z)
-    provider_key = cfg.get("dns_provider_type", "") or "azure"
-    return {
-        "id": z.id,
-        "zone_name": z.zone_name,
-        "dns_provider_type": provider_key,
-        "dns_provider_label": get_dns_provider_label(provider_key),
-        "dns_server": cfg.get("dns_server", "") or "",
-    }
-
-
-def dns_zone_summary_dict(z: DnsZoneConfig) -> Dict[str, Any]:
-    return {"id": z.id, "zone_name": z.zone_name}
-
-
-def api_key_public_dict(k: ApiKey) -> Dict[str, Any]:
-    """Safe to use after the Session closes (plain dict)."""
-    return {"id": k.id, "label": k.label, "key": k.key, "active": k.active}
-
-
-def get_api_key(db, api_key: str):
-    return db.exec(select(ApiKey).where(ApiKey.key == api_key, ApiKey.active == True)).first()
-
-
-def _blank_preserve_secret(new_val: str, old_val: str) -> str:
-    return old_val if not (new_val or "").strip() else new_val
-
-
-def build_zone_config_from_form(
-    form,
-    existing: Optional[Dict[str, Any]] = None,
-    provider_plugins: Optional[List[dict]] = None,
-) -> Dict[str, Any]:
-    ex = existing or {}
-    provider = (form.get("dns_provider_type") or ex.get("dns_provider_type") or "azure").strip().lower()
-    plugins = provider_plugins if provider_plugins is not None else get_dns_provider_options()
-    plugin = next((p for p in plugins if p["key"] == provider), None)
-    if plugin is None:
-        if provider in get_known_dns_provider_keys():
-            raise ValueError(
-                f"{get_dns_provider_label(provider)} is disabled. Enable it in Settings before using it for a DNS zone."
-            )
-        available = ", ".join(p["key"] for p in plugins) or "none"
-        raise ValueError(f"Unknown DNS provider type: {provider}. Available providers: {available}.")
-
-    cfg: Dict[str, Any] = {"dns_provider_type": provider}
-    for field in plugin["fields"]:
-        name = field["name"]
-        if field["type"] == "checkbox":
-            value = "true" if name in form else ""
-        else:
-            value = (form.get(name) or "").strip()
-        if field["preserve_on_blank"]:
-            value = _blank_preserve_secret(value, ex.get(name, ""))
-        elif not value and field["default"] and not ex.get(name):
-            value = field["default"]
-        cfg[name] = value
-    return cfg
-
-
-@app.on_event("startup")
-def startup_event():
-    init_db()
-    with SessionLocal() as db:
-        migrate_legacy_dns_settings_if_needed(db)
-        configure_operational_logging(level=get_log_level(db))
-        try:
-            run_retention_cleanup(db, force=True)
-        except Exception:  # pragma: no cover - never block startup
-            LOGGER.exception("startup activity retention cleanup failed")
-    admin_user = os.getenv("ADMIN_USER")
-    admin_password = os.getenv("ADMIN_PASSWORD")
-    if admin_user and admin_password:
-        with SessionLocal() as db:
-            if not db.exec(select(User).where(User.username == admin_user)).first():
-                db.add(
-                    User(
-                        username=admin_user,
-                        password_hash=hash_password(admin_password),
-                        roles=_serialize_roles([*ALL_ROLES, ROLE_GLOBAL_ADMIN]),
-                    )
-                )
-                db.commit()
-
+get_dns_client_from_settings = create_dns_client_from_settings
+get_dns_provider_label = dns_provider_display_name
 
 @app.get("/", response_class=RedirectResponse, include_in_schema=False)
 def root(request: Request) -> RedirectResponse:
@@ -733,12 +305,12 @@ def login_form(request: Request):
             context={"error": None},
         )
     except Exception as exc:
-        return _render_error_response(request, exc)
+        return render_error_response(request, exc)
 
 
 @app.post("/login", response_class=HTMLResponse, include_in_schema=False)
 def login(request: Request, username: str = Form(...), password: str = Form(...)):
-    ip = _client_ip(request)
+    ip = client_ip(request)
     with SessionLocal() as db:
         user = db.exec(select(User).where(User.username == username)).first()
         if not user or user.disabled or not verify_password(password, user.password_hash):
@@ -791,14 +363,14 @@ def logout(request: Request) -> RedirectResponse:
         except Exception:  # pragma: no cover - invalid sessions still log out
             actor = None
     if actor:
-        _record_activity(
+        record_activity(
             event_type="auth.logout",
             level=LOG_LEVEL_INFORMATIONAL,
             status="success",
             actor_type="user",
             actor_label=actor,
             message=f"Logout for {actor!r}",
-            request_ip=_client_ip(request),
+            request_ip=client_ip(request),
         )
     response = RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
     response.delete_cookie("session")
@@ -830,7 +402,7 @@ def admin(request: Request, user: str = Depends(get_current_user)):
             },
         )
     except Exception as exc:
-        return _render_error_response(request, exc)
+        return render_error_response(request, exc)
 
 
 @app.get(
@@ -1089,7 +661,7 @@ def api_keys_page(request: Request, user: str = Depends(require_role(ROLE_API_KE
             },
         )
     except Exception as exc:
-        return _render_error_response(request, exc)
+        return render_error_response(request, exc)
 
 
 @app.post("/api-keys/revoke", response_class=HTMLResponse, include_in_schema=False)
@@ -1129,7 +701,7 @@ def revoke_api_key(request: Request, key_id: int = Form(...), user: str = Depend
             },
         )
     except Exception as exc:
-        return _render_error_response(request, exc)
+        return render_error_response(request, exc)
 
 
 @app.post("/api-keys", response_class=HTMLResponse, include_in_schema=False)
@@ -1264,7 +836,7 @@ def create_api_key_route(
             },
         )
     except Exception as exc:
-        return _render_error_response(request, exc)
+        return render_error_response(request, exc)
 
 
 @app.get("/api-keys/{key_id}/edit", response_class=HTMLResponse, include_in_schema=False)
@@ -1364,215 +936,6 @@ def api_key_update(
     )
 
 
-LOG_SEARCH_PAGE_SIZE = 25
-ALERT_TEMPLATE_VARIABLES: List[Dict[str, str]] = [
-    {"name": "{event_type}", "description": "Activity event identifier (e.g. dns.record_created)"},
-    {"name": "{level}", "description": "Event severity: VERBOSE, INFORMATIONAL, WARNING, or ERROR"},
-    {"name": "{category}", "description": "Event category, such as security, http, dns, alert, system, or user"},
-    {"name": "{timestamp}", "description": "Event timestamp in UTC ISO 8601"},
-    {"name": "{message}", "description": "Short human-readable summary"},
-    {"name": "{status}", "description": "success or error"},
-    {"name": "{actor_type}", "description": "user, api_key, system, or anonymous"},
-    {"name": "{actor_label}", "description": "Username or API key label"},
-    {"name": "{zone_name}", "description": "DNS zone associated with the event (if any)"},
-    {"name": "{record_name}", "description": "DNS record name (if any)"},
-    {"name": "{details}", "description": "JSON-encoded sanitized event detail payload"},
-    {"name": "{system_dns_name}", "description": "Detected system DNS name (or Docker Container)"},
-    {"name": "{system_ip_address}", "description": "Detected system IP address (or Docker Container)"},
-]
-
-
-def _settings_context(
-    request: Request,
-    user: str,
-    area: Optional[str],
-    message: Optional[str] = None,
-    message_kind: str = "success",
-    auth_form_error: Optional[str] = None,
-    auth_form_username: Optional[str] = None,
-    auth_form_selected_roles: Optional[List[str]] = None,
-    log_search_params: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    with SessionLocal() as db:
-        user_roles = get_user_roles(db, user)
-        can_view_accounts = bool(
-            {ROLE_GLOBAL_READ, ROLE_ACCOUNT_UPDATE, ROLE_ACCOUNT_RESET_PASSWORD}.intersection(user_roles)
-        )
-        users_view = (
-            [user_public_dict(u) for u in sorted(db.exec(select(User)).all(), key=lambda u: u.username.lower())]
-            if can_view_accounts
-            else []
-        )
-        plugin_options = (
-            dns_provider_options_with_state(db)
-            if ROLE_GLOBAL_READ in user_roles or ROLE_PLUGIN_UPDATE in user_roles
-            else []
-        )
-        accessible = accessible_settings_areas(user_roles)
-        accessible_keys = {a["key"] for a in accessible}
-        requested_area = (area or "").strip().lower() or (accessible[0]["key"] if accessible else "")
-        if requested_area not in accessible_keys:
-            requested_area = accessible[0]["key"] if accessible else ""
-
-        system_settings_view: Optional[Dict[str, Any]] = None
-        log_view: Optional[Dict[str, Any]] = None
-        alert_view: Optional[Dict[str, Any]] = None
-
-        if requested_area in {"system_settings", "log_viewing", "email_alerting"} and (
-            ROLE_GLOBAL_READ in user_roles or ROLE_SYSTEM_UPDATE in user_roles
-        ):
-            identity = system_identity()
-            smtp = get_smtp_config(db)
-            current_level = get_log_level(db)
-            retention_days = get_retention_days(db)
-            shared_system = {
-                "identity": identity,
-                "is_docker": is_running_in_docker(),
-                "log_level": current_level,
-                "log_levels": list(LOG_LEVEL_VALUES),
-                "log_categories": list(LOG_CATEGORY_VALUES),
-                "retention_days": retention_days,
-                "retention_options": [
-                    {"value": 1, "label": "24 hours"},
-                    {"value": 7, "label": "1 week"},
-                    {"value": 30, "label": "30 days"},
-                    {"value": 60, "label": "60 days"},
-                    {"value": 90, "label": "90 days"},
-                    {"value": 180, "label": "180 days"},
-                    {"value": 365, "label": "365 days"},
-                ],
-                "smtp": {**smtp, "password_set": bool(smtp.get("password"))},
-                "operational_log": {
-                    "log_file": activity_logging._get_setting(db, activity_logging.SETTING_LOG_FILE) or "",
-                    "max_bytes": int(
-                        activity_logging._get_setting(db, activity_logging.SETTING_LOG_MAX_BYTES) or 1_048_576
-                    ),
-                    "backup_count": int(
-                        activity_logging._get_setting(db, activity_logging.SETTING_LOG_BACKUP_COUNT) or 5
-                    ),
-                },
-            }
-
-            if requested_area == "system_settings":
-                system_settings_view = shared_system
-
-            if requested_area == "log_viewing":
-                params = log_search_params or {}
-                rows, total = query_activity_logs(
-                    db,
-                    event_type=params.get("event_type") or None,
-                    level=params.get("level") or None,
-                    category=params.get("category") or None,
-                    status=params.get("status") or None,
-                    zone_name=params.get("zone_name") or None,
-                    actor=params.get("actor") or None,
-                    text_query=params.get("text_query") or None,
-                    start=params.get("start"),
-                    end=params.get("end"),
-                    limit=LOG_SEARCH_PAGE_SIZE,
-                    offset=max(0, int(params.get("offset") or 0)),
-                )
-                current_offset = max(0, int(params.get("offset") or 0))
-                previous_offset = max(0, current_offset - LOG_SEARCH_PAGE_SIZE)
-                next_offset = current_offset + LOG_SEARCH_PAGE_SIZE
-                log_view = {
-                    "shared": shared_system,
-                    "params": params,
-                    "rows": [
-                        {
-                            "id": row.id,
-                            "timestamp": row.timestamp.isoformat() if row.timestamp else "",
-                            "level": row.level,
-                            "category": row.category or "",
-                            "event_type": row.event_type,
-                            "status": row.status or "",
-                            "actor_type": row.actor_type or "",
-                            "actor_label": row.actor_label or "",
-                            "zone_name": row.zone_name or "",
-                            "record_name": row.record_name or "",
-                            "message": row.message or "",
-                            "details_json": row.details_json or "",
-                            "request_method": row.request_method or "",
-                            "request_path": row.request_path or "",
-                            "request_status_code": row.request_status_code,
-                            "request_ip": row.request_ip or "",
-                        }
-                        for row in rows
-                    ],
-                    "total": total,
-                    "page_size": LOG_SEARCH_PAGE_SIZE,
-                    "offset": current_offset,
-                    "previous_offset": previous_offset,
-                    "next_offset": next_offset,
-                    "has_previous": current_offset > 0,
-                    "has_next": next_offset < total,
-                }
-
-            if requested_area == "email_alerting":
-                rules = list(db.exec(select(AlertRule)).all())
-                alert_view = {
-                    "shared": shared_system,
-                    "rules": [
-                        {
-                            "id": rule.id,
-                            "enabled": rule.enabled,
-                            "name": rule.name or "",
-                            "event_type": rule.event_type or "",
-                            "category": rule.category or "",
-                            "minimum_level": rule.minimum_level,
-                            "message_contains": rule.message_contains or "",
-                            "email_recipients": rule.email_recipients or "",
-                            "email_subject_template": rule.email_subject_template or "",
-                            "email_body_template": rule.email_body_template or "",
-                            "cooldown_minutes": rule.cooldown_minutes,
-                            "last_triggered_at": rule.last_triggered_at.isoformat() if rule.last_triggered_at else "",
-                        }
-                        for rule in sorted(rules, key=lambda r: (r.name or "", r.id or 0))
-                    ],
-                    "template_variables": ALERT_TEMPLATE_VARIABLES,
-                    "default_subject": DEFAULT_SUBJECT_TEMPLATE,
-                    "default_body": DEFAULT_BODY_TEMPLATE,
-                }
-
-    return {
-        "request": request,
-        "user": user,
-        "user_roles": sorted(user_roles),
-        "accessible_areas": accessible,
-        "selected_area": requested_area,
-        "users": users_view,
-        "role_catalog": ROLE_LABELS,
-        "plugins": plugin_options,
-        "message": message,
-        "message_kind": message_kind,
-        "auth_form_error": auth_form_error,
-        "auth_form_username": auth_form_username or "",
-        "auth_form_selected_roles": [] if auth_form_selected_roles is None else auth_form_selected_roles,
-        "can_view_accounts": can_view_accounts,
-        "can_account_update": ROLE_ACCOUNT_UPDATE in user_roles,
-        "can_account_reset_password": ROLE_ACCOUNT_RESET_PASSWORD in user_roles,
-        "can_global_admin": ROLE_GLOBAL_ADMIN in user_roles,
-        "can_plugin_update": ROLE_PLUGIN_UPDATE in user_roles,
-        "can_system_update": ROLE_SYSTEM_UPDATE in user_roles,
-        "system_settings_view": system_settings_view,
-        "log_view": log_view,
-        "alert_view": alert_view,
-    }
-
-
-def _render_settings(
-    request: Request,
-    user: str,
-    area: Optional[str],
-    **kwargs: Any,
-):
-    return templates.TemplateResponse(
-        request=request,
-        name="settings.html",
-        context=_settings_context(request, user, area, **kwargs),
-    )
-
-
 @app.get("/settings", response_class=HTMLResponse, include_in_schema=False)
 def settings_page(
     request: Request,
@@ -1606,7 +969,7 @@ def settings_page(
             "end": _parse_iso_datetime(end),
             "offset": offset,
         }
-    return _render_settings(request, user, normalized_area, log_search_params=log_search_params)
+    return render_settings(request, user, normalized_area, log_search_params=log_search_params)
 
 
 def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -1627,7 +990,7 @@ def settings_self_password_change(
     user: str = Depends(get_current_user),
 ):
     if not new_password:
-        return _render_settings(
+        return render_settings(
             request,
             user,
             "authentication",
@@ -1635,7 +998,7 @@ def settings_self_password_change(
             message_kind="error",
         )
     if new_password != confirm_password:
-        return _render_settings(
+        return render_settings(
             request,
             user,
             "authentication",
@@ -1645,7 +1008,7 @@ def settings_self_password_change(
     with SessionLocal() as db:
         target = db.exec(select(User).where(User.username == user)).first()
         if target is None or not verify_password(current_password, target.password_hash):
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1665,7 +1028,7 @@ def settings_self_password_change(
             message=f"User {user!r} changed their own password",
             details={"target_username": user},
         )
-    return _render_settings(request, user, "authentication", message="Password changed.")
+    return render_settings(request, user, "authentication", message="Password changed.")
 
 
 @app.post("/settings/users", response_class=HTMLResponse, include_in_schema=False)
@@ -1679,7 +1042,7 @@ def settings_user_create(
     normalized = username.strip()
     selected_roles = normalize_selected_roles(roles)
     if not normalized:
-        return _render_settings(
+        return render_settings(
             request,
             user,
             "authentication",
@@ -1688,7 +1051,7 @@ def settings_user_create(
             auth_form_selected_roles=selected_roles,
         )
     if not password:
-        return _render_settings(
+        return render_settings(
             request,
             user,
             "authentication",
@@ -1698,7 +1061,7 @@ def settings_user_create(
         )
     with SessionLocal() as db:
         if ROLE_GLOBAL_ADMIN in selected_roles and not user_is_global_admin(db, user):
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1707,7 +1070,7 @@ def settings_user_create(
                 auth_form_selected_roles=[r for r in selected_roles if r != ROLE_GLOBAL_ADMIN],
             )
         if db.exec(select(User).where(User.username == normalized)).first():
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1719,7 +1082,7 @@ def settings_user_create(
             User(
                 username=normalized,
                 password_hash=hash_password(password),
-                roles=_serialize_roles(selected_roles),
+                roles=serialize_roles(selected_roles),
             )
         )
         db.commit()
@@ -1733,7 +1096,7 @@ def settings_user_create(
             message=f"User {normalized!r} created",
             details={"target_username": normalized, "roles": selected_roles},
         )
-    return _render_settings(
+    return render_settings(
         request,
         user,
         "authentication",
@@ -1750,7 +1113,7 @@ def settings_user_disable(
     with SessionLocal() as db:
         target = db.get(User, user_id)
         if not target:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1758,7 +1121,7 @@ def settings_user_disable(
                 message_kind="error",
             )
         if guard_message := global_admin_guard_message(db, user, target):
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1766,7 +1129,7 @@ def settings_user_disable(
                 message_kind="error",
             )
         if target.disabled:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1775,7 +1138,7 @@ def settings_user_disable(
             )
         enabled_users = db.exec(select(User).where(User.disabled == False)).all()  # noqa: E712
         if len(enabled_users) <= 1:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1783,7 +1146,7 @@ def settings_user_disable(
                 message_kind="error",
             )
         if target.username == user:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1804,7 +1167,7 @@ def settings_user_disable(
             message=f"User {username!r} disabled",
             details={"target_username": username, "target_user_id": user_id},
         )
-    return _render_settings(
+    return render_settings(
         request,
         user,
         "authentication",
@@ -1821,7 +1184,7 @@ def settings_user_enable(
     with SessionLocal() as db:
         target = db.get(User, user_id)
         if not target:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1829,7 +1192,7 @@ def settings_user_enable(
                 message_kind="error",
             )
         if guard_message := global_admin_guard_message(db, user, target):
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1837,7 +1200,7 @@ def settings_user_enable(
                 message_kind="error",
             )
         if not target.disabled:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1858,7 +1221,7 @@ def settings_user_enable(
             message=f"User {username!r} enabled",
             details={"target_username": username, "target_user_id": user_id},
         )
-    return _render_settings(
+    return render_settings(
         request,
         user,
         "authentication",
@@ -1875,7 +1238,7 @@ def settings_user_delete(
     with SessionLocal() as db:
         target = db.get(User, user_id)
         if not target:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1883,7 +1246,7 @@ def settings_user_delete(
                 message_kind="error",
             )
         if guard_message := global_admin_guard_message(db, user, target):
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1892,7 +1255,7 @@ def settings_user_delete(
             )
         remaining = db.exec(select(User)).all()
         if len(remaining) <= 1:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1900,7 +1263,7 @@ def settings_user_delete(
                 message_kind="error",
             )
         if target.username == user:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1908,7 +1271,7 @@ def settings_user_delete(
                 message_kind="error",
             )
         if not target.disabled:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1928,7 +1291,7 @@ def settings_user_delete(
             message=f"User {username!r} deleted",
             details={"target_username": username, "target_user_id": user_id},
         )
-    return _render_settings(
+    return render_settings(
         request,
         user,
         "authentication",
@@ -1945,7 +1308,7 @@ def settings_user_reset_password(
     user: str = Depends(require_role(ROLE_ACCOUNT_RESET_PASSWORD)),
 ):
     if not password or not confirm_password:
-        return _render_settings(
+        return render_settings(
             request,
             user,
             "authentication",
@@ -1953,7 +1316,7 @@ def settings_user_reset_password(
             message_kind="error",
         )
     if password != confirm_password:
-        return _render_settings(
+        return render_settings(
             request,
             user,
             "authentication",
@@ -1963,7 +1326,7 @@ def settings_user_reset_password(
     with SessionLocal() as db:
         target = db.get(User, user_id)
         if not target:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1971,7 +1334,7 @@ def settings_user_reset_password(
                 message_kind="error",
             )
         if guard_message := global_admin_guard_message(db, user, target):
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1979,7 +1342,7 @@ def settings_user_reset_password(
                 message_kind="error",
             )
         if target.disabled:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -2000,7 +1363,7 @@ def settings_user_reset_password(
             message=f"Password reset for {username!r}",
             details={"target_username": username, "target_user_id": user_id},
         )
-    return _render_settings(
+    return render_settings(
         request,
         user,
         "authentication",
@@ -2019,7 +1382,7 @@ def settings_user_update_roles(
     with SessionLocal() as db:
         target = db.get(User, user_id)
         if not target:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -2027,7 +1390,7 @@ def settings_user_update_roles(
                 message_kind="error",
             )
         if guard_message := global_admin_guard_message(db, user, target):
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -2035,7 +1398,7 @@ def settings_user_update_roles(
                 message_kind="error",
             )
         if target.username == user:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -2047,7 +1410,7 @@ def settings_user_update_roles(
             (ROLE_GLOBAL_ADMIN in selected or ROLE_GLOBAL_ADMIN in target_stored_roles)
             and not user_is_global_admin(db, user)
         ):
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -2055,14 +1418,14 @@ def settings_user_update_roles(
                 message_kind="error",
             )
         if target.disabled:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
                 message="Enable the user account before editing its roles.",
                 message_kind="error",
             )
-        target.roles = _serialize_roles(selected)
+        target.roles = serialize_roles(selected)
         db.add(target)
         db.commit()
         username = target.username
@@ -2076,7 +1439,7 @@ def settings_user_update_roles(
             message=f"Roles updated for {username!r}",
             details={"target_username": username, "roles": selected},
         )
-    return _render_settings(
+    return render_settings(
         request,
         user,
         "authentication",
@@ -2093,7 +1456,7 @@ def settings_plugin_disable(
     normalized_key = plugin_key.strip().lower()
     known_keys = get_known_dns_provider_keys()
     if normalized_key not in known_keys:
-        return _render_settings(
+        return render_settings(
             request,
             user,
             "plugins",
@@ -2104,10 +1467,10 @@ def settings_plugin_disable(
     with SessionLocal() as db:
         disabled = get_disabled_dns_plugins(db)
         if normalized_key in disabled:
-            return _render_settings(request, user, "plugins", message=f"{get_dns_provider_label(normalized_key)} is already disabled.")
+            return render_settings(request, user, "plugins", message=f"{dns_provider_display_name(normalized_key)} is already disabled.")
         enabled_count = len([plugin for plugin in get_dns_provider_options() if plugin["key"] not in disabled])
         if enabled_count <= 1:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "plugins",
@@ -2118,15 +1481,15 @@ def settings_plugin_disable(
         if zone_names:
             zones_text = ", ".join(zone_names)
             first_zone = zone_names[0]
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "plugins",
                 message=(
-                    f"Cannot disable {get_dns_provider_label(normalized_key)}. "
+                    f"Cannot disable {dns_provider_display_name(normalized_key)}. "
                     f"Delete DNS zone {first_zone} first."
                     if len(zone_names) == 1
-                    else f"Cannot disable {get_dns_provider_label(normalized_key)}. Delete DNS zones {zones_text} first."
+                    else f"Cannot disable {dns_provider_display_name(normalized_key)}. Delete DNS zones {zones_text} first."
                 ),
                 message_kind="error",
             )
@@ -2143,7 +1506,7 @@ def settings_plugin_disable(
             details={"plugin_key": normalized_key},
         )
 
-    return _render_settings(request, user, "plugins", message=f"{get_dns_provider_label(normalized_key)} disabled.")
+    return render_settings(request, user, "plugins", message=f"{dns_provider_display_name(normalized_key)} disabled.")
 
 
 @app.post("/settings/plugins/{plugin_key}/enable", response_class=HTMLResponse, include_in_schema=False)
@@ -2155,7 +1518,7 @@ def settings_plugin_enable(
     normalized_key = plugin_key.strip().lower()
     known_keys = get_known_dns_provider_keys()
     if normalized_key not in known_keys:
-        return _render_settings(
+        return render_settings(
             request,
             user,
             "plugins",
@@ -2180,7 +1543,7 @@ def settings_plugin_enable(
                 details={"plugin_key": normalized_key},
             )
 
-    return _render_settings(request, user, "plugins", message=f"{get_dns_provider_label(normalized_key)} enabled.")
+    return render_settings(request, user, "plugins", message=f"{dns_provider_display_name(normalized_key)} enabled.")
 
 
 @app.post("/settings/system/log-level", response_class=HTMLResponse, include_in_schema=False)
@@ -2210,8 +1573,8 @@ def settings_update_log_level(
                 details={"previous_level": previous, "new_level": applied},
             )
     except ValueError as exc:
-        return _render_settings(request, user, target_area, message=str(exc), message_kind="error")
-    return _render_settings(request, user, target_area, message=f"Activity log level set to {applied}.")
+        return render_settings(request, user, target_area, message=str(exc), message_kind="error")
+    return render_settings(request, user, target_area, message=f"Activity log level set to {applied}.")
 
 
 @app.post("/settings/system/retention", response_class=HTMLResponse, include_in_schema=False)
@@ -2221,7 +1584,7 @@ def settings_update_retention(
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
     if retention_days < 1:
-        return _render_settings(
+        return render_settings(
             request, user, "system_settings", message="Retention must be at least 1 day.", message_kind="error"
         )
     with SessionLocal() as db:
@@ -2236,7 +1599,7 @@ def settings_update_retention(
             message=f"Activity log retention set to {applied} days",
             details={"retention_days": applied},
         )
-    return _render_settings(
+    return render_settings(
         request, user, "system_settings", message=f"Activity log retention set to {applied} days."
     )
 
@@ -2281,7 +1644,7 @@ def settings_update_smtp(
                 "security": smtp_security,
             },
         )
-    return _render_settings(request, user, "system_settings", message="SMTP delivery settings saved.")
+    return render_settings(request, user, "system_settings", message="SMTP delivery settings saved.")
 
 
 @app.post("/settings/system/log-rotation", response_class=HTMLResponse, include_in_schema=False)
@@ -2293,9 +1656,9 @@ def settings_update_log_rotation(
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
     with SessionLocal() as db:
-        activity_logging._set_setting(db, activity_logging.SETTING_LOG_FILE, log_file or "")
-        activity_logging._set_setting(db, activity_logging.SETTING_LOG_MAX_BYTES, str(max(1024, int(max_bytes))))
-        activity_logging._set_setting(db, activity_logging.SETTING_LOG_BACKUP_COUNT, str(max(0, int(backup_count))))
+        set_setting(db, activity_logging.SETTING_LOG_FILE, log_file or "")
+        set_setting(db, activity_logging.SETTING_LOG_MAX_BYTES, str(max(1024, int(max_bytes))))
+        set_setting(db, activity_logging.SETTING_LOG_BACKUP_COUNT, str(max(0, int(backup_count))))
         configure_operational_logging(
             level=get_log_level(db),
             log_file=log_file or None,
@@ -2316,7 +1679,7 @@ def settings_update_log_rotation(
                 "backup_count": max(0, int(backup_count)),
             },
         )
-    return _render_settings(request, user, "system_settings", message="Operational log rotation saved.")
+    return render_settings(request, user, "system_settings", message="Operational log rotation saved.")
 
 
 @app.post("/settings/alerts", response_class=HTMLResponse, include_in_schema=False)
@@ -2336,16 +1699,16 @@ def settings_alerts_create(
 ):
     cleaned_level = (minimum_level or LOG_LEVEL_WARNING).strip().upper()
     if cleaned_level not in LOG_LEVEL_VALUES:
-        return _render_settings(
+        return render_settings(
             request, user, "email_alerting", message=f"Unsupported level: {minimum_level}", message_kind="error"
         )
     cleaned_category = (category or "").strip().lower()
     if cleaned_category and cleaned_category not in LOG_CATEGORY_VALUES:
-        return _render_settings(
+        return render_settings(
             request, user, "email_alerting", message=f"Unsupported category: {category}", message_kind="error"
         )
     if not email_recipients.strip():
-        return _render_settings(
+        return render_settings(
             request, user, "email_alerting", message="At least one email recipient is required.", message_kind="error"
         )
     with SessionLocal() as db:
@@ -2374,7 +1737,7 @@ def settings_alerts_create(
             message=f"Alert rule {name!r} created",
             details={"rule_id": rule.id, "rule_name": rule.name, "category": cleaned_category, "minimum_level": cleaned_level},
         )
-    return _render_settings(request, user, "email_alerting", message=f"Alert rule {name!r} created.")
+    return render_settings(request, user, "email_alerting", message=f"Alert rule {name!r} created.")
 
 
 @app.post("/settings/alerts/{rule_id}", response_class=HTMLResponse, include_in_schema=False)
@@ -2395,18 +1758,18 @@ def settings_alerts_update(
 ):
     cleaned_level = (minimum_level or LOG_LEVEL_WARNING).strip().upper()
     if cleaned_level not in LOG_LEVEL_VALUES:
-        return _render_settings(
+        return render_settings(
             request, user, "email_alerting", message=f"Unsupported level: {minimum_level}", message_kind="error"
         )
     cleaned_category = (category or "").strip().lower()
     if cleaned_category and cleaned_category not in LOG_CATEGORY_VALUES:
-        return _render_settings(
+        return render_settings(
             request, user, "email_alerting", message=f"Unsupported category: {category}", message_kind="error"
         )
     with SessionLocal() as db:
         rule = db.get(AlertRule, rule_id)
         if rule is None:
-            return _render_settings(
+            return render_settings(
                 request, user, "email_alerting", message="Alert rule not found.", message_kind="error"
             )
         rule.enabled = enabled is not None
@@ -2431,7 +1794,7 @@ def settings_alerts_update(
             message=f"Alert rule {name!r} updated",
             details={"rule_id": rule_id, "rule_name": rule.name, "category": cleaned_category, "minimum_level": cleaned_level},
         )
-    return _render_settings(request, user, "email_alerting", message=f"Alert rule {name!r} updated.")
+    return render_settings(request, user, "email_alerting", message=f"Alert rule {name!r} updated.")
 
 
 @app.post("/settings/alerts/{rule_id}/delete", response_class=HTMLResponse, include_in_schema=False)
@@ -2443,7 +1806,7 @@ def settings_alerts_delete(
     with SessionLocal() as db:
         rule = db.get(AlertRule, rule_id)
         if rule is None:
-            return _render_settings(
+            return render_settings(
                 request, user, "email_alerting", message="Alert rule not found.", message_kind="error"
             )
         rule_name = rule.name
@@ -2459,7 +1822,7 @@ def settings_alerts_delete(
             message=f"Alert rule {rule_name!r} deleted",
             details={"rule_id": rule_id, "rule_name": rule_name},
         )
-    return _render_settings(request, user, "email_alerting", message=f"Alert rule {rule_name!r} deleted.")
+    return render_settings(request, user, "email_alerting", message=f"Alert rule {rule_name!r} deleted.")
 
 
 @app.post(
@@ -2484,7 +1847,7 @@ def upsert_dns_record(
     api_key = api_key_from_headers(x_api_key, authorization)
 
     if not api_key:
-        _record_activity(
+        record_activity(
             event_type="dns.access_denied",
             level=LOG_LEVEL_WARNING,
             status="error",
@@ -2504,7 +1867,7 @@ def upsert_dns_record(
                 actor_type="api_key",
                 actor_label="invalid",
                 message="Invalid or revoked API key used on /dns-record",
-                details={"key_fingerprint": _api_key_fingerprint(api_key)},
+                details={"key_fingerprint": api_key_fingerprint(api_key)},
             )
             raise HTTPException(status_code=401, detail="Invalid API key")
 
@@ -2657,7 +2020,7 @@ def upsert_dns_record(
         except HTTPException:
             raise
         except Exception as exc:
-            mapped = _http_exception_from_dns_error(exc)
+            mapped = http_exception_from_dns_error(exc)
             sanitized_error = (str(exc) or "DNS provider error").splitlines()[0][:512]
             emit_activity_event(
                 db,
@@ -2679,7 +2042,7 @@ def upsert_dns_record(
             raise mapped from exc
 
 
-def _api_key_fingerprint(api_key: str) -> str:
+def api_key_fingerprint(api_key: str) -> str:
     """Return a short, log-safe fingerprint for an API key string.
 
     Never logs the key itself: the prefix is short and combined with a SHA-256

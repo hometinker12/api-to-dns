@@ -11,6 +11,7 @@ import src.activity_logging as activity_logging
 import src.auth as auth_module
 from src.activity_logging import (
     emit_activity_event,
+    infer_event_category,
     query_activity_logs,
     render_alert_template,
     run_retention_cleanup,
@@ -55,58 +56,7 @@ from src.models import (
 )
 from src.plugins.bind import BindTsigDnsClient
 from src.security import hash_password
-
-
-@pytest.fixture
-def api_key_value() -> str:
-    return "test-api-key-for-dns-endpoint"
-
-
-def _seed_example_zone_and_permission(db, api_key_value: str) -> None:
-    if not db.exec(select(ApiKey).where(ApiKey.key == api_key_value)).first():
-        db.add(ApiKey(label="pytest", key=api_key_value, active=True))
-        db.commit()
-    key = db.exec(select(ApiKey).where(ApiKey.key == api_key_value)).first()
-    zname = normalize_zone_name("example.com")
-    zone = db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == zname)).first()
-    if not zone:
-        cfg = {
-            "dns_provider_type": "azure",
-            "dns_server": "",
-            "dns_username": "",
-            "dns_password": "",
-            "dns_tsig_algorithm": "",
-            "dns_winrm_ssl": "",
-            "azure_tenant_id": "",
-            "azure_client_id": "",
-            "azure_client_secret": "",
-            "azure_subscription_id": "00000000-0000-0000-0000-000000000001",
-            "azure_resource_group": "rg-test",
-        }
-        zone = DnsZoneConfig(zone_name=zname, encrypted_config=encode_zone_config_dict(cfg))
-        db.add(zone)
-        db.commit()
-        db.refresh(zone)
-    if not db.exec(
-        select(ApiKeyAllowedZone).where(
-            ApiKeyAllowedZone.api_key_id == key.id,
-            ApiKeyAllowedZone.dns_zone_config_id == zone.id,
-        )
-    ).first():
-        db.add(ApiKeyAllowedZone(api_key_id=key.id, dns_zone_config_id=zone.id))
-        db.commit()
-
-
-@pytest.fixture
-def client(api_key_value: str) -> TestClient:
-    init_db()
-    with SessionLocal() as db:
-        set_disabled_dns_plugins(db, set())
-        _seed_example_zone_and_permission(db, api_key_value)
-        if not db.exec(select(User).where(User.username == "admin")).first():
-            db.add(User(username="admin", password_hash=hash_password("x"), roles=_serialize_roles(ALL_ROLES)))
-            db.commit()
-    return TestClient(app)
+from src.time_utils import utc_now
 
 
 def test_root_redirects_to_login_without_session(client: TestClient) -> None:
@@ -468,6 +418,10 @@ def test_dns_record_with_mock_client(client: TestClient, api_key_value: str, mon
     assert body["status"] == "success"
     assert body["action"] == "created"
     fake.create_or_update_record.assert_called_once()
+    with SessionLocal() as db:
+        event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "dns.record_created")).first()
+        assert event is not None
+        assert event.category == "dns"
 
 
 def test_dns_record_delete_with_mock_client(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1883,6 +1837,22 @@ def test_dns_provider_failure_writes_error_activity_log(
         assert "supersecret" not in event.details_json
 
 
+def test_infer_event_category_uses_prefix_except_security() -> None:
+    assert infer_event_category("http.request") == "http"
+    assert infer_event_category("plugin.disabled") == "plugin"
+    assert infer_event_category("plugin.enabled") == "plugin"
+    assert infer_event_category("dns_zone.created") == "dns_zone"
+    assert infer_event_category("system.smtp_updated") == "system"
+    assert infer_event_category("alert.email_sent") == "alert"
+    assert infer_event_category("alert_rule.created") == "alert_rule"
+    assert infer_event_category("dns.provider_failed") == "dns"
+    assert infer_event_category("auth.login_failed") == "security"
+    assert infer_event_category("api_key.created") == "security"
+    assert infer_event_category("user.roles_updated") == "security"
+    assert infer_event_category("dns.record_created") == "dns"
+    assert infer_event_category("dns.record_updated") == "dns"
+
+
 def test_request_activity_respects_configured_log_level(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
     with SessionLocal() as db:
@@ -1962,7 +1932,7 @@ def test_activity_log_filtering_by_event_type_and_level(client: TestClient) -> N
     assert rows[0].category == "alert"
 
 
-def test_security_category_events_are_always_logged(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_security_category_events_are_always_logged(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
     with SessionLocal() as db:
         _delete_activity_logs(db)
@@ -1973,25 +1943,8 @@ def test_security_category_events_are_always_logged(client: TestClient, api_key_
     response = client.post("/api-keys", data={"label": "security-key", "zone_ids": str(zone.id)})
     assert response.status_code == 200
 
-    fake = MagicMock()
-    fake.create_or_update_record.return_value = False
-    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
-    response = client.post(
-        "/dns-record",
-        headers={"X-API-Key": api_key_value},
-        json={
-            "zone_name": "example.com",
-            "record_type": "A",
-            "record_name": "security-record",
-            "ttl": 300,
-            "values": ["192.0.2.1"],
-        },
-    )
-    assert response.status_code == 200
-
     with SessionLocal() as db:
         api_key_event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "api_key.created")).first()
-        dns_event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "dns.record_created")).first()
         emit_activity_event(
             db,
             event_type="user.roles_updated",
@@ -2004,9 +1957,6 @@ def test_security_category_events_are_always_logged(client: TestClient, api_key_
         user_event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "user.roles_updated")).first()
         assert api_key_event is not None
         assert api_key_event.category == "security"
-        assert dns_event is not None
-        assert dns_event.category == "security"
-        assert dns_event.level == LOG_LEVEL_INFORMATIONAL
         assert user_event is not None
         assert user_event.category == "security"
         assert user_event.level == LOG_LEVEL_INFORMATIONAL
@@ -2154,12 +2104,12 @@ def test_retention_cleanup_deletes_only_rows_older_than_retention(client: TestCl
         set_log_level(db, LOG_LEVEL_INFORMATIONAL)
         set_retention_days(db, 30)
         old_row = ActivityLog(
-            timestamp=datetime.utcnow() - timedelta(days=31),
+            timestamp=utc_now() - timedelta(days=31),
             level=LOG_LEVEL_INFORMATIONAL,
             event_type="pytest.retention.old",
         )
         boundary_row = ActivityLog(
-            timestamp=datetime.utcnow() - timedelta(days=30) + timedelta(seconds=5),
+            timestamp=utc_now() - timedelta(days=30) + timedelta(seconds=5),
             level=LOG_LEVEL_INFORMATIONAL,
             event_type="pytest.retention.boundary",
         )

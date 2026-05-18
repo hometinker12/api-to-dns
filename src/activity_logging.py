@@ -32,14 +32,13 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from sqlmodel import select
 
+from .settings_store import get_setting, set_setting
+from .time_utils import utc_now
 from .models import (
     LOG_CATEGORY_ALERT,
-    LOG_CATEGORY_DNS,
-    LOG_CATEGORY_HTTP,
-    LOG_CATEGORY_SECURITY,
-    LOG_CATEGORY_SYSTEM,
-    LOG_CATEGORY_USER,
     LOG_CATEGORY_VALUES,
+    LOG_CATEGORY_SECURITY,
+    SECURITY_EVENT_PREFIXES,
     LOG_LEVEL_ERROR,
     LOG_LEVEL_INFORMATIONAL,
     LOG_LEVEL_ORDER,
@@ -109,25 +108,8 @@ _REDACTED = "***redacted***"
 _retention_state: Dict[str, datetime] = {}
 
 
-# ---------------------------------------------------------------------------
-# Settings helpers (thin wrappers around the encrypted Setting table API)
-# ---------------------------------------------------------------------------
-
-
-def _get_setting(db, name: str) -> Optional[str]:
-    from .app import get_setting
-
-    return get_setting(db, name)
-
-
-def _set_setting(db, name: str, value: str) -> None:
-    from .app import set_setting
-
-    set_setting(db, name, value)
-
-
 def get_log_level(db) -> str:
-    raw = (_get_setting(db, SETTING_LOG_LEVEL) or "").strip().upper()
+    raw = (get_setting(db, SETTING_LOG_LEVEL) or "").strip().upper()
     if raw not in LOG_LEVEL_VALUES:
         return DEFAULT_LOG_LEVEL
     return raw
@@ -137,12 +119,12 @@ def set_log_level(db, value: str) -> str:
     cleaned = (value or "").strip().upper()
     if cleaned not in LOG_LEVEL_VALUES:
         raise ValueError(f"Unsupported log level: {value!r}")
-    _set_setting(db, SETTING_LOG_LEVEL, cleaned)
+    set_setting(db, SETTING_LOG_LEVEL, cleaned)
     return cleaned
 
 
 def get_retention_days(db) -> int:
-    raw = _get_setting(db, SETTING_RETENTION_DAYS)
+    raw = get_setting(db, SETTING_RETENTION_DAYS)
     if raw is None:
         return DEFAULT_RETENTION_DAYS
     try:
@@ -154,7 +136,7 @@ def get_retention_days(db) -> int:
 
 def set_retention_days(db, value: int) -> int:
     days = max(1, int(value))
-    _set_setting(db, SETTING_RETENTION_DAYS, str(days))
+    set_setting(db, SETTING_RETENTION_DAYS, str(days))
     return days
 
 
@@ -218,19 +200,21 @@ def normalize_category(category: Optional[str]) -> Optional[str]:
 
 
 def infer_event_category(event_type: str) -> Optional[str]:
-    """Infer a broad category from a normalized event type."""
+    """Infer category from the event type namespace.
+
+    By default the segment before the first dot is the category (``plugin.disabled`` →
+    ``plugin``, ``http.request`` → ``http``). Types listed in ``SECURITY_EVENT_PREFIXES``
+    always map to the security category instead.
+    """
     normalized = (event_type or "").strip().lower()
-    if normalized.startswith(("auth.", "api_key.", "dns.record_", "user.")):
-        return LOG_CATEGORY_SECURITY
-    if normalized == "http.request":
-        return LOG_CATEGORY_HTTP
-    if normalized.startswith("dns."):
-        return LOG_CATEGORY_DNS
-    if normalized.startswith(("alert.", "alert_rule.")):
-        return LOG_CATEGORY_ALERT
-    if normalized.startswith("system."):
-        return LOG_CATEGORY_SYSTEM
-    return None
+    if not normalized:
+        return None
+    for prefix in SECURITY_EVENT_PREFIXES:
+        if normalized.startswith(prefix):
+            return LOG_CATEGORY_SECURITY
+    if "." in normalized:
+        return normalized.split(".", 1)[0]
+    return normalized
 
 
 def should_store_event(event_level: str, configured_level: str, category: Optional[str] = None) -> bool:
@@ -324,7 +308,7 @@ def emit_activity_event(
         return None
 
     row = ActivityLog(
-        timestamp=datetime.utcnow(),
+        timestamp=utc_now(),
         level=normalized_level,
         category=normalized_category,
         event_type=event_type,
@@ -434,20 +418,20 @@ def run_retention_cleanup(db, *, force: bool = False) -> int:
     """
     if not force:
         last_local = _retention_state.get("last")
-        if last_local is not None and (datetime.utcnow() - last_local) < timedelta(hours=24):
+        if last_local is not None and (utc_now() - last_local) < timedelta(hours=24):
             return 0
-        stored = _get_setting(db, SETTING_LAST_RETENTION)
+        stored = get_setting(db, SETTING_LAST_RETENTION)
         if stored:
             try:
                 last_db = datetime.fromisoformat(stored)
             except ValueError:
                 last_db = None
-            if last_db is not None and (datetime.utcnow() - last_db) < timedelta(hours=24):
+            if last_db is not None and (utc_now() - last_db) < timedelta(hours=24):
                 _retention_state["last"] = last_db
                 return 0
 
     days = get_retention_days(db)
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = utc_now() - timedelta(days=days)
     rows = db.exec(select(ActivityLog).where(ActivityLog.timestamp < cutoff)).all()
     removed = 0
     for row in rows:
@@ -455,8 +439,8 @@ def run_retention_cleanup(db, *, force: bool = False) -> int:
         removed += 1
     if removed:
         db.commit()
-    now = datetime.utcnow()
-    _set_setting(db, SETTING_LAST_RETENTION, now.isoformat())
+    now = utc_now()
+    set_setting(db, SETTING_LAST_RETENTION, now.isoformat())
     _retention_state["last"] = now
     return removed
 
@@ -473,26 +457,26 @@ def _parse_csv(value: Optional[str]) -> List[str]:
 
 
 def get_smtp_config(db) -> Dict[str, Any]:
-    servers = _parse_csv(_get_setting(db, SETTING_SMTP_SERVERS))
+    servers = _parse_csv(get_setting(db, SETTING_SMTP_SERVERS))
     try:
-        port = int(_get_setting(db, SETTING_SMTP_PORT) or DEFAULT_SMTP_PORT)
+        port = int(get_setting(db, SETTING_SMTP_PORT) or DEFAULT_SMTP_PORT)
     except ValueError:
         port = DEFAULT_SMTP_PORT
-    anonymous = (_get_setting(db, SETTING_SMTP_ANONYMOUS) or "").strip().lower() in {"1", "true", "yes", "on"}
-    security = (_get_setting(db, SETTING_SMTP_SECURITY) or DEFAULT_SMTP_SECURITY).strip().lower()
+    anonymous = (get_setting(db, SETTING_SMTP_ANONYMOUS) or "").strip().lower() in {"1", "true", "yes", "on"}
+    security = (get_setting(db, SETTING_SMTP_SECURITY) or DEFAULT_SMTP_SECURITY).strip().lower()
     if security not in {"none", "starttls", "ssl"}:
         security = DEFAULT_SMTP_SECURITY
     try:
-        timeout = int(_get_setting(db, SETTING_SMTP_TIMEOUT) or DEFAULT_SMTP_TIMEOUT)
+        timeout = int(get_setting(db, SETTING_SMTP_TIMEOUT) or DEFAULT_SMTP_TIMEOUT)
     except ValueError:
         timeout = DEFAULT_SMTP_TIMEOUT
     return {
         "servers": servers,
         "port": port,
         "anonymous": anonymous,
-        "username": _get_setting(db, SETTING_SMTP_USERNAME) or "",
-        "password": _get_setting(db, SETTING_SMTP_PASSWORD) or "",
-        "from_address": _get_setting(db, SETTING_SMTP_FROM) or "",
+        "username": get_setting(db, SETTING_SMTP_USERNAME) or "",
+        "password": get_setting(db, SETTING_SMTP_PASSWORD) or "",
+        "from_address": get_setting(db, SETTING_SMTP_FROM) or "",
         "security": security,
         "timeout": timeout,
     }
@@ -511,18 +495,18 @@ def set_smtp_config(
     timeout: int,
     preserve_password_if_blank: bool = True,
 ) -> None:
-    _set_setting(db, SETTING_SMTP_SERVERS, servers or "")
-    _set_setting(db, SETTING_SMTP_PORT, str(int(port)))
-    _set_setting(db, SETTING_SMTP_ANONYMOUS, "true" if anonymous else "false")
-    _set_setting(db, SETTING_SMTP_USERNAME, username or "")
+    set_setting(db, SETTING_SMTP_SERVERS, servers or "")
+    set_setting(db, SETTING_SMTP_PORT, str(int(port)))
+    set_setting(db, SETTING_SMTP_ANONYMOUS, "true" if anonymous else "false")
+    set_setting(db, SETTING_SMTP_USERNAME, username or "")
     if password or not preserve_password_if_blank:
-        _set_setting(db, SETTING_SMTP_PASSWORD, password or "")
-    _set_setting(db, SETTING_SMTP_FROM, from_address or "")
+        set_setting(db, SETTING_SMTP_PASSWORD, password or "")
+    set_setting(db, SETTING_SMTP_FROM, from_address or "")
     cleaned_security = (security or DEFAULT_SMTP_SECURITY).strip().lower()
     if cleaned_security not in {"none", "starttls", "ssl"}:
         cleaned_security = DEFAULT_SMTP_SECURITY
-    _set_setting(db, SETTING_SMTP_SECURITY, cleaned_security)
-    _set_setting(db, SETTING_SMTP_TIMEOUT, str(int(timeout)))
+    set_setting(db, SETTING_SMTP_SECURITY, cleaned_security)
+    set_setting(db, SETTING_SMTP_TIMEOUT, str(int(timeout)))
 
 
 def _build_smtp_client(server: str, port: int, security: str, timeout: int) -> smtplib.SMTP:
@@ -657,7 +641,7 @@ def evaluate_alert_rules(db, row: ActivityLog) -> List[AlertRule]:
                 continue
         if rule.cooldown_minutes and rule.last_triggered_at:
             cooldown_delta = timedelta(minutes=max(0, int(rule.cooldown_minutes)))
-            if (datetime.utcnow() - rule.last_triggered_at) < cooldown_delta:
+            if (utc_now() - rule.last_triggered_at) < cooldown_delta:
                 continue
 
         recipients = _parse_csv(rule.email_recipients)
@@ -667,7 +651,7 @@ def evaluate_alert_rules(db, row: ActivityLog) -> List[AlertRule]:
         body = render_alert_template(body_template, base_values)
 
         sent, failures = send_alert_email(db, recipients=recipients, subject=subject, body=body)
-        rule.last_triggered_at = datetime.utcnow()
+        rule.last_triggered_at = utc_now()
         db.add(rule)
         db.commit()
 

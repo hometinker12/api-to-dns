@@ -1,4 +1,6 @@
 from datetime import datetime
+
+from .time_utils import utc_now
 from typing import List, Optional
 
 from pydantic import BaseModel, Field, model_validator
@@ -17,16 +19,29 @@ LOG_LEVEL_ORDER = {LOG_LEVEL_VERBOSE: 0, LOG_LEVEL_INFORMATIONAL: 10, LOG_LEVEL_
 LOG_CATEGORY_SECURITY = "security"
 LOG_CATEGORY_HTTP = "http"
 LOG_CATEGORY_DNS = "dns"
+LOG_CATEGORY_PLUGIN = "plugin"
+LOG_CATEGORY_DNS_ZONE = "dns_zone"
 LOG_CATEGORY_ALERT = "alert"
+LOG_CATEGORY_ALERT_RULE = "alert_rule"
 LOG_CATEGORY_SYSTEM = "system"
 LOG_CATEGORY_USER = "user"
 LOG_CATEGORY_VALUES = (
     LOG_CATEGORY_SECURITY,
     LOG_CATEGORY_HTTP,
     LOG_CATEGORY_DNS,
+    LOG_CATEGORY_PLUGIN,
+    LOG_CATEGORY_DNS_ZONE,
     LOG_CATEGORY_ALERT,
+    LOG_CATEGORY_ALERT_RULE,
     LOG_CATEGORY_SYSTEM,
     LOG_CATEGORY_USER,
+)
+
+# Event types with these prefixes always use the security category (see infer_event_category).
+SECURITY_EVENT_PREFIXES = (
+    "auth.",
+    "api_key.",
+    "user.",
 )
 
 
@@ -89,7 +104,7 @@ class ApiKey(SQLModel, table=True):
     label: str
     key: str = SQLField(index=True, unique=True)
     active: bool = SQLField(default=True)
-    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+    created_at: datetime = SQLField(default_factory=utc_now)
 
 
 class DnsZoneConfig(SQLModel, table=True):
@@ -137,7 +152,7 @@ class ActivityLog(SQLModel, table=True):
     )
 
     id: Optional[int] = SQLField(default=None, primary_key=True)
-    timestamp: datetime = SQLField(default_factory=datetime.utcnow)
+    timestamp: datetime = SQLField(default_factory=utc_now)
     level: str = SQLField(default=LOG_LEVEL_INFORMATIONAL)
     category: Optional[str] = SQLField(default=None)
     event_type: str = SQLField(default="")

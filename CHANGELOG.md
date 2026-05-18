@@ -5,7 +5,7 @@
 ### Added
 
 - Role-based access control for user, API key, DNS zone, plugin, and system management areas, including a `global.admin` role that grants all permissions and protects global administrator accounts from lower-privileged account actions.
-- A dedicated Settings page with Authentication, Plugin Management, Activity Logging, and System Backup areas, including self-service password changes and administrator-driven user management.
+- A dedicated Settings page with Authentication, Plugin Management, Log Viewing / Searching, and System Backup areas, including self-service password changes and administrator-driven user management.
 - Account disable/enable workflow that requires accounts to be disabled before deletion and blocks disabled users from signing in or continuing active sessions.
 - Five-minute sliding idle timeout for session cookies, with automatic renewal during authenticated web activity.
 - Dynamic DNS provider plugin architecture under `src/plugins/`, with metadata-driven zone forms for Azure DNS, BIND/TSIG, and Microsoft DNS over WinRM.
