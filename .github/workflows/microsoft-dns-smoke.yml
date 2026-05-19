@@ -300,6 +300,8 @@ jobs:
 
           call_dns_api POST 200 created "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.10"]}'
           wait_for_record_value www.smoke.test 192.0.2.10
+          call_dns_api PATCH 200 updated "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":450}'
+          wait_for_record_value www.smoke.test 192.0.2.10
           call_dns_api POST 409 record_already_exists "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.10"]}'
           call_dns_api PUT 200 updated "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.20"]}'
           wait_for_record_value www.smoke.test 192.0.2.20
@@ -674,12 +676,17 @@ jobs:
             $www = "www.$la"
             $jCreate  = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.10') }
             $jReplace = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.20') }
+            $jPatchTtl = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; ttl = 450 }
             $jPatch   = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; values = @('192.0.2.30') }
             $qDelete  = @{ zone_name = $la; record_name = 'www'; record_type = 'A' }
             $jDenied  = @{ zone_name = $ld; record_type = 'A'; record_name = 'blocked'; ttl = 300; values = @('192.0.2.55') }
 
             $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -Method POST -JsonBody $jCreate
             Assert-DnsRecordAction -Json $x -ExpectedAction 'created'
+            Wait-LocalA -Fqdn $www -ExpectedIp '192.0.2.10'
+
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -Method PATCH -JsonBody $jPatchTtl
+            Assert-DnsRecordAction -Json $x -ExpectedAction 'updated'
             Wait-LocalA -Fqdn $www -ExpectedIp '192.0.2.10'
 
             $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 409 -Method POST -JsonBody $jCreate

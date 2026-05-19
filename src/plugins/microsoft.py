@@ -1,3 +1,4 @@
+import json
 import time
 from typing import Any, Dict, List, Optional
 
@@ -217,18 +218,57 @@ class MicrosoftWinRmDnsClient:
         name_at = "@" if name == "@" else name
 
         types_to_query = lookup_record_types_to_query(record_type)
-        if len(types_to_query) == 1:
-            ps_rr = winrm_rr_type(types_to_query[0])
-            if self._record_exists(dns_server, zone, name_at, ps_rr):
-                return [DnsRecordInfo(record_name=name_at, record_type=types_to_query[0])]
-            return []
-
         results: List[DnsRecordInfo] = []
         for rt in types_to_query:
-            ps_rr = winrm_rr_type(rt)
-            if self._record_exists(dns_server, zone, name_at, ps_rr):
-                results.append(DnsRecordInfo(record_name=name_at, record_type=rt))
+            info = self._get_record_details(dns_server, zone, name_at, rt)
+            if info is not None:
+                results.append(info)
         return results
+
+    def _get_record_details(
+        self,
+        computer: str,
+        zone: str,
+        name: str,
+        api_rr_type: str,
+    ) -> Optional[DnsRecordInfo]:
+        ps_rr = winrm_rr_type(api_rr_type)
+        ps = (
+            "Import-Module DnsServer -ErrorAction SilentlyContinue\n"
+            f"$records = @(Get-DnsServerResourceRecord -ComputerName {ps_single_quoted(computer)} "
+            f"-ZoneName {ps_single_quoted(zone)} -Name {ps_single_quoted(name)} "
+            f"-RRType {ps_single_quoted(ps_rr)} -ErrorAction SilentlyContinue)\n"
+            "if ($records.Count -eq 0) { exit 0 }\n"
+            "$ttl = [int]$records[0].TimeToLive.TotalSeconds\n"
+            "$values = @()\n"
+            f"switch ('{api_rr_type}') {{\n"
+            "  'A' { $values = @($records | ForEach-Object { $_.RecordData.IPv4Address.IPAddressToString }) }\n"
+            "  'AAAA' { $values = @($records | ForEach-Object { $_.RecordData.IPv6Address.IPAddressToString }) }\n"
+            "  'CNAME' { $values = @([string]$records[0].RecordData.HostNameAlias) }\n"
+            "  'TXT' {\n"
+            "    foreach ($rec in $records) {\n"
+            "      $text = $rec.RecordData.DescriptiveText\n"
+            "      if ($text -is [System.Array]) { $values += [string]::Join('', $text) }\n"
+            "      else { $values += [string]$text }\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+            "@{ ttl = $ttl; values = @($values) } | ConvertTo-Json -Compress\n"
+        )
+        result = self._run_ps_with_retry(computer, ps)
+        out = (result.std_out or b"").decode(errors="replace").strip()
+        if not out:
+            return None
+        data = json.loads(out)
+        values = data.get("values") or []
+        if isinstance(values, str):
+            values = [values]
+        return DnsRecordInfo(
+            record_name=name,
+            record_type=api_rr_type,
+            ttl=int(data["ttl"]),
+            values=[str(v) for v in values],
+        )
 
     def _record_exists(self, computer: str, zone: str, name: str, rr_type: str) -> bool:
         ps = (

@@ -268,7 +268,9 @@ def test_zone_test_success(client: TestClient, monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr(
         "src.app.test_zone_record_lookup",
-        lambda _cfg, **kwargs: [DnsRecordInfo(record_name="www", record_type="A")],
+        lambda _cfg, **kwargs: [
+            DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])
+        ],
     )
     response = client.post(
         "/zones/test",
@@ -287,8 +289,10 @@ def test_zone_test_success(client: TestClient, monkeypatch: pytest.MonkeyPatch) 
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "success"
-    assert body["records"] == [{"record_name": "www", "record_type": "A"}]
-    assert set(body["records"][0]) == {"record_name", "record_type"}
+    assert body["records"] == [
+        {"record_name": "www", "record_type": "A", "ttl": 300, "values": ["192.0.2.1"]}
+    ]
+    assert set(body["records"][0]) == {"record_name", "record_type", "ttl", "values"}
 
 
 def test_zone_test_not_found(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -500,7 +504,9 @@ def test_dns_record_get_with_mock_client(client: TestClient, api_key_value: str,
 
     monkeypatch.setattr(
         "src.app.test_zone_record_lookup",
-        lambda _settings, **kwargs: [DnsRecordInfo(record_name="www", record_type="A")],
+        lambda _settings, **kwargs: [
+            DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])
+        ],
     )
     response = client.get(
         "/dns-record",
@@ -516,7 +522,32 @@ def test_dns_record_get_with_mock_client(client: TestClient, api_key_value: str,
     assert body["status"] == "success"
     assert body["zone_name"] == "example.com"
     assert body["record_name"] == "www"
-    assert body["records"] == [{"record_name": "www", "record_type": "A"}]
+    assert body["records"] == [
+        {"record_name": "www", "record_type": "A", "ttl": 300, "values": ["192.0.2.1"]}
+    ]
+
+
+def test_dns_record_get_untyped_multi_type(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.models import DnsRecordInfo
+
+    monkeypatch.setattr(
+        "src.app.test_zone_record_lookup",
+        lambda _settings, **kwargs: [
+            DnsRecordInfo(record_name="@", record_type="A", ttl=500, values=["10.0.0.1"]),
+            DnsRecordInfo(record_name="@", record_type="CNAME", ttl=1000, values=["target.example.com"]),
+        ],
+    )
+    response = client.get(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        params={"zone_name": "example.com", "record_name": "@"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert len(body["records"]) == 2
+    assert body["records"][0]["ttl"] == 500
+    assert body["records"][1]["ttl"] == 1000
 
 
 def test_dns_record_get_not_found(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -699,7 +730,9 @@ def test_dns_record_patch_updates_values(
     from src.models import DnsRecordInfo
 
     fake = MagicMock()
-    fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A")]
+    fake.get_record.return_value = [
+        DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])
+    ]
     fake.create_or_update_record.return_value = True
     monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
 
@@ -720,6 +753,92 @@ def test_dns_record_patch_updates_values(
     assert body["values"] == ["192.0.2.99"]
     fake.get_record.assert_called_once()
     fake.create_or_update_record.assert_called_once()
+    internal = fake.create_or_update_record.call_args.args[0]
+    assert internal.ttl == 300
+
+
+def test_dns_record_patch_ttl_only(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.models import DnsRecordInfo
+
+    fake = MagicMock()
+    fake.get_record.return_value = [
+        DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])
+    ]
+    fake.create_or_update_record.return_value = True
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+
+    response = client.patch(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "www",
+            "ttl": 600,
+        },
+    )
+    assert response.status_code == 200
+    internal = fake.create_or_update_record.call_args.args[0]
+    assert internal.ttl == 600
+    assert internal.values == ["192.0.2.1"]
+
+
+def test_dns_record_patch_both_fields(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.models import DnsRecordInfo
+
+    fake = MagicMock()
+    fake.get_record.return_value = [
+        DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])
+    ]
+    fake.create_or_update_record.return_value = True
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+
+    response = client.patch(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "www",
+            "ttl": 900,
+            "values": ["192.0.2.99"],
+        },
+    )
+    assert response.status_code == 200
+    internal = fake.create_or_update_record.call_args.args[0]
+    assert internal.ttl == 900
+    assert internal.values == ["192.0.2.99"]
+
+
+def test_dns_record_patch_neither_field_returns_422(client: TestClient, api_key_value: str) -> None:
+    response = client.patch(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "www",
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_dns_record_patch_empty_values_returns_422(client: TestClient, api_key_value: str) -> None:
+    response = client.patch(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "www",
+            "values": [],
+        },
+    )
+    assert response.status_code == 422
 
 
 def test_dns_record_patch_missing_returns_404(

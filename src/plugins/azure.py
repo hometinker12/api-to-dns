@@ -125,8 +125,32 @@ class AzureDnsClient:
                 rt,
             )
             if existing is not None:
-                results.append(DnsRecordInfo(record_name=display_name, record_type=rt))
+                results.append(self._record_set_to_info(existing, display_name, rt))
         return results
+
+    def _record_set_to_info(self, record_set, display_name: str, record_type: str) -> DnsRecordInfo:
+        ttl = int(record_set.ttl or 300)
+        rt = record_type.upper()
+        values: List[str] = []
+        if rt == "A":
+            values = [r.ipv4_address for r in (record_set.a_records or [])]
+        elif rt == "AAAA":
+            values = [r.ipv6_address for r in (record_set.aaaa_records or [])]
+        elif rt == "CNAME":
+            cname = record_set.cname_record
+            if cname and cname.cname:
+                values = [cname.cname.rstrip(".")]
+        elif rt == "TXT":
+            for txt in record_set.txt_records or []:
+                if txt.value:
+                    for part in txt.value:
+                        values.append(part)
+        return DnsRecordInfo(
+            record_name=display_name,
+            record_type=rt,
+            ttl=ttl,
+            values=values,
+        )
 
     def _get_existing_record_set(
         self,

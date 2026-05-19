@@ -136,7 +136,7 @@ All examples target `http://localhost:8000/dns-record` with `Content-Type: appli
 | `GET`    | Lookup | yes | Return which supported record types exist at a name. |
 | `POST`   | Create | no | Create a new record. Returns **409** `record_already_exists` if a record of that type already exists. |
 | `PUT`    | Full replacement | yes | Replace the record's type/TTL/values. Returns **404** `not_found` if the type does not exist. |
-| `PATCH`  | Partial update | no | Replace only the record's values. Returns **404** `not_found` if the type does not exist. |
+| `PATCH`  | Partial update | no | Update `ttl` and/or `values`; omitted fields are preserved from the live record. Returns **404** `not_found` if the type does not exist. |
 | `DELETE` | Remove | yes | Delete the record of the given type. Returns **404** `not_found` if the type does not exist. |
 
 `record_type` accepts **`A`**, **`AAAA`**, **`CNAME`**, or **`TXT`**. The legacy `POST` upsert and `record_type: "DELETE"` pseudo-payload have been removed.
@@ -189,9 +189,11 @@ If no record of that type exists at the name, the response is **404**:
 {"status":"error","action":"not_found","zone_name":"example.com","record_name":"www","record_type":"A","values":["192.0.2.20"]}
 ```
 
-### Update record values only (`PATCH`)
+### Partial update (`PATCH`)
 
-Use `PATCH` to update only the `values` of an existing record (the request body does not include `ttl`).
+Use `PATCH` to update **`ttl`**, **`values`**, or **both** on an existing record. At least one field is required. Omitted fields are merged from the live record (the API fetches the current record before applying the change).
+
+Update values only (TTL preserved):
 
 ```bash
 curl -sS -X PATCH "http://localhost:8000/dns-record" \
@@ -202,6 +204,20 @@ curl -sS -X PATCH "http://localhost:8000/dns-record" \
     "record_type": "A",
     "record_name": "www",
     "values": ["192.0.2.30"]
+  }'
+```
+
+Update TTL only (values preserved):
+
+```bash
+curl -sS -X PATCH "http://localhost:8000/dns-record" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: YOUR_API_KEY" \
+  -d '{
+    "zone_name": "example.com",
+    "record_type": "A",
+    "record_name": "www",
+    "ttl": 600
   }'
 ```
 
@@ -229,7 +245,23 @@ If nothing matches, the response is **404** `not_found`.
 
 ### Look up records (`GET`)
 
-`GET /dns-record` reports which supported record types exist at a name (results contain `record_name` and `record_type` only — no TTL or rdata).
+`GET /dns-record` always returns a **`records` array**. Each element describes one supported record type present at the name. When records exist, every element includes `record_name`, `record_type`, and `ttl`; `values` is included when the provider returns rdata.
+
+Optional `record_type` query parameter filters which types appear in the array; it does not change the per-item shape. When nothing matches, `status` is `not_found` and `records` is `[]`.
+
+Example response when `@` has both `A` and `CNAME` records:
+
+```json
+{
+  "status": "success",
+  "zone_name": "example.com",
+  "record_name": "@",
+  "records": [
+    {"record_name": "@", "record_type": "A", "ttl": 500, "values": ["10.0.0.1"]},
+    {"record_name": "@", "record_type": "CNAME", "ttl": 1000, "values": ["target.example.com"]}
+  ]
+}
+```
 
 ```bash
 curl -sS \

@@ -2095,9 +2095,9 @@ def settings_alerts_delete(
     response_model=DnsRecordGetResponse,
     summary="Look up DNS records",
     description=(
-        "Return which record types exist at a name in a configured zone. "
-        "Results include record name and type only (no TTL or rdata values). "
-        "Optional record_type filters to A, AAAA, CNAME, or TXT; omit to return all supported types present at the name. "
+        "Return records at a name in a configured zone as a ``records`` array. "
+        "Each found record includes ``record_name``, ``record_type``, ``ttl``, and ``values`` when "
+        "returned by the provider. Optional ``record_type`` filters which types appear in the array. "
         "Requires a valid API key with access to the zone."
     ),
     responses={
@@ -2261,6 +2261,8 @@ def _apply_dns_mutation(
     values: List[str],
     mode: Literal["create", "replace", "patch", "delete"],
     endpoint: str,
+    patch_ttl: Optional[int] = None,
+    patch_values: Optional[List[str]] = None,
 ):
     """Shared pre-check + mutation flow for POST/PUT/PATCH/DELETE on ``/dns-record``."""
 
@@ -2287,6 +2289,88 @@ def _apply_dns_mutation(
 
         try:
             client = get_dns_client_from_settings(settings)
+
+            if mode == "patch":
+                records = client.get_record(
+                    record_name=record_name,
+                    record_type=rt_upper,
+                    dns_server=settings.get("dns_server"),
+                    dns_zone=zone_row.zone_name,
+                )
+                if not records:
+                    body = DnsRecordResponse(
+                        status="error",
+                        action="not_found",
+                        zone_name=zone_row.zone_name,
+                        record_name=record_name,
+                        record_type=rt_upper,
+                        values=list(patch_values or []),
+                    )
+                    emit_activity_event(
+                        db,
+                        event_type="dns.record_not_found",
+                        level=LOG_LEVEL_WARNING,
+                        status="error",
+                        actor_type="api_key",
+                        actor_id=actor_id,
+                        actor_label=actor_label,
+                        zone_name=zone_row.zone_name,
+                        record_name=record_name,
+                        message=f"DNS record {record_name}.{zone_row.zone_name} {rt_upper} not found",
+                        details={"record_type": rt_upper, "provider": provider},
+                    )
+                    return JSONResponse(status_code=HTTP_404_NOT_FOUND, content=body.model_dump())
+
+                existing = records[0]
+                if existing.ttl is None or not existing.values:
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "error": "dns_provider_failed",
+                            "message": "Could not read existing TTL and values for PATCH merge.",
+                        },
+                    )
+                final_ttl = patch_ttl if patch_ttl is not None else existing.ttl
+                final_values = list(patch_values) if patch_values is not None else list(existing.values)
+                internal = DnsRecordRequest(
+                    zone_name=zone_row.zone_name,
+                    record_type=rt_upper,
+                    record_name=record_name,
+                    ttl=final_ttl,
+                    values=final_values,
+                )
+                client.create_or_update_record(
+                    internal,
+                    dns_server=settings.get("dns_server"),
+                    dns_zone=zone_row.zone_name,
+                )
+                body = DnsRecordResponse(
+                    status="success",
+                    action="updated",
+                    zone_name=zone_row.zone_name,
+                    record_name=record_name,
+                    record_type=rt_upper,
+                    values=final_values,
+                )
+                emit_activity_event(
+                    db,
+                    event_type="dns.record_updated",
+                    level=LOG_LEVEL_INFORMATIONAL,
+                    status="success",
+                    actor_type="api_key",
+                    actor_id=actor_id,
+                    actor_label=actor_label,
+                    zone_name=zone_row.zone_name,
+                    record_name=record_name,
+                    message=f"DNS record {record_name}.{zone_row.zone_name} updated",
+                    details={
+                        "record_type": rt_upper,
+                        "values_count": len(final_values),
+                        "provider": provider,
+                    },
+                )
+                return body
+
             exists = _record_exists_at_type(
                 client,
                 settings=settings,
@@ -2319,7 +2403,7 @@ def _apply_dns_mutation(
                 )
                 return JSONResponse(status_code=HTTP_409_CONFLICT, content=body.model_dump())
 
-            if mode in ("replace", "patch", "delete") and not exists:
+            if mode in ("replace", "delete") and not exists:
                 body = DnsRecordResponse(
                     status="error",
                     action="not_found",
@@ -2497,10 +2581,10 @@ def replace_dns_record(
 @app.patch(
     "/dns-record",
     response_model=DnsRecordResponse,
-    summary="Update DNS record values (partial update)",
+    summary="Update a DNS record (partial update)",
     description=(
-        "Replace only the record's values (TTL is preserved by the provider where supported). "
-        "Pre-checks with ``get_record`` and returns **404** ``not_found`` if no record "
+        "Update ``ttl`` and/or ``values`` on an existing record. Omitted fields are preserved "
+        "from the live record (via ``get_record``). Returns **404** ``not_found`` if no record "
         "of the given type exists at the name."
     ),
     responses={
@@ -2523,9 +2607,11 @@ def patch_dns_record(
         record_name=payload.record_name,
         record_type=payload.record_type,
         ttl=None,
-        values=payload.values,
+        values=[],
         mode="patch",
         endpoint="PATCH /dns-record",
+        patch_ttl=payload.ttl,
+        patch_values=payload.values,
     )
 
 

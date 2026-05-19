@@ -140,9 +140,9 @@ class DnsRecordReplaceRequest(BaseModel):
 
 
 class DnsRecordPatchRequest(BaseModel):
-    """Body for ``PATCH /dns-record`` (values-only update). Returns 404 if the record type does not exist.
+    """Body for ``PATCH /dns-record`` (partial update). Returns 404 if the record type does not exist.
 
-    PATCH only updates the record's values list; TTL is not changed by this request.
+    Send ``ttl`` and/or ``values``; omitted fields are preserved from the live record.
     """
 
     zone_name: Optional[str] = Field(
@@ -151,22 +151,30 @@ class DnsRecordPatchRequest(BaseModel):
     )
     record_type: str = Field(..., description="DNS record type: A, AAAA, CNAME, or TXT.")
     record_name: str = Field(..., description="Record name relative to the zone, e.g. www")
-    values: List[str] = Field(
-        default_factory=list,
-        description="New record values; must contain at least one entry. Replaces the existing values list.",
+    ttl: Optional[int] = Field(None, description="New TTL in seconds; omit to preserve the existing TTL.")
+    values: Optional[List[str]] = Field(
+        None,
+        description="New record values; omit to preserve existing values.",
     )
 
     @model_validator(mode="after")
     def _validate(self):
         _validate_public_record_type(self.record_type)
-        if not self.values:
-            raise ValueError("values is required and must contain at least one entry.")
+        if self.ttl is None and self.values is None:
+            raise ValueError("At least one of ttl or values must be provided.")
+        if self.values is not None and not self.values:
+            raise ValueError("values must contain at least one entry when provided.")
         return self
 
 
 class DnsRecordInfo(BaseModel):
     record_name: str = Field(..., description="Record name relative to the zone, e.g. www or @")
     record_type: str = Field(..., description="DNS record type: A, AAAA, CNAME, or TXT")
+    ttl: Optional[int] = Field(None, description="Time to live in seconds when the record exists.")
+    values: Optional[List[str]] = Field(
+        None,
+        description="Record rdata values in the same format as POST/PUT when available from the provider.",
+    )
 
 
 class DnsRecordGetResponse(BaseModel):
@@ -178,7 +186,10 @@ class DnsRecordGetResponse(BaseModel):
     record_name: str
     records: List[DnsRecordInfo] = Field(
         default_factory=list,
-        description="Matching records (name and type only). Empty when status is not_found.",
+        description=(
+            "Matching records at the name. Each element includes record_name, record_type, and ttl "
+            "(and values when returned by the provider). Empty when status is not_found."
+        ),
     )
 
 
