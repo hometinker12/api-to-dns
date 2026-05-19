@@ -1,16 +1,16 @@
 # DNS REST Service
 
-[![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/) [![Python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/) [![Release](https://img.shields.io/badge/release-0.3.4-blue)](VERSION) [![AI Assisted](https://img.shields.io/badge/AI%20Assisted-yes-blue)](https://cursor.com)
+[Docker](https://www.docker.com/) [Python](https://www.python.org/) [Release](VERSION) [AI Assisted](https://cursor.com)
 
 Current release: `0.3.4`
 
-A Dockerized FastAPI service to manage DNS records through a protected admin web UI and secure API key authentication. Supported backends are **Azure DNS**, **on-premises Microsoft DNS (WinRM)**, and **BIND** (or other servers) using **RFC 2136 dynamic updates with TSIG**.
+A Dockerized FastAPI service to manage DNS records through a protected admin web UI and secure API key authentication. Supported backends are **Azure DNS**, **Cloudflare DNS** (API v4), **on-premises Microsoft DNS (WinRM)**, and **BIND** (or other servers) using **RFC 2136 dynamic updates with TSIG**.
 
 ## Features
 
 - Protected admin interface with username/password login
 - Generate and revoke API keys for REST access
-- Choose DNS provider (**Azure**, **Microsoft / WinRM**, **BIND / TSIG**) **per zone** and store connection details and credentials **encrypted at rest**
+- Choose DNS provider (**Azure**, **Cloudflare**, **Microsoft / WinRM**, **BIND / TSIG**) **per zone** and store connection details and credentials **encrypted at rest**
 - RESTful `/dns-record` resource with `GET`, `POST`, `PUT`, `PATCH`, and `DELETE` methods
 - Pre-flight existence checks return **409** on create-conflict and **404** on missing-record updates/deletes
 - Structured JSON errors (for example **502** when the DNS provider fails)
@@ -49,16 +49,20 @@ After login, open **DNS zones** to add one row per zone (each row is a unique zo
 
 Create a `.env` file using `.env.example` and configure the following values:
 
-| Variable | Description |
-|----------|-------------|
-| `SECRET_KEY` | Session signing secret (use a random string) |
-| `ENCRYPTION_KEY` | Key for encrypting settings in the database (must be a valid Fernet key) |
-| `ADMIN_USER` | Initial admin username |
-| `ADMIN_PASSWORD` | Initial admin password |
-| `DATABASE_URL` | Optional database URL (default: `sqlite:///./data/app.db`) |
-| `LOG_FILE` | Optional file path for rotating operational logs (Docker Compose sets `/app/logs/api-to-dns.log`) |
 
-**Azure DNS** (per zone): tenant ID, client ID, client secret, and optional default subscription and resource group are stored on that zone’s row in **DNS zones** (encrypted). They are **not** read from `AZURE_*` environment variables.
+| Variable         | Description                                                                                       |
+| ---------------- | ------------------------------------------------------------------------------------------------- |
+| `SECRET_KEY`     | Session signing secret (use a random string)                                                      |
+| `ENCRYPTION_KEY` | Key for encrypting settings in the database (must be a valid Fernet key)                          |
+| `ADMIN_USER`     | Initial admin username                                                                            |
+| `ADMIN_PASSWORD` | Initial admin password                                                                            |
+| `DATABASE_URL`   | Optional database URL (default: `sqlite:///./data/app.db`)                                        |
+| `LOG_FILE`       | Optional file path for rotating operational logs (Docker Compose sets `/app/logs/api-to-dns.log`) |
+
+
+**Azure DNS** (per zone): tenant ID, client ID, client secret, and optional default subscription and resource group are stored on that zone’s row in **DNS zones** (encrypted). They are **not** read from `AZURE_`* environment variables.
+
+**Cloudflare DNS** (per zone): scoped **API token** (Zone → DNS → Read **and** Edit on the target zone), an optional zone ID (skips the zone name lookup when set), and an optional **Proxied** checkbox (orange-cloud on created or updated A, AAAA, and CNAME records) are stored on that zone’s row in **DNS zones** (encrypted). Cloudflare ignores the **Target DNS Server** and TSIG settings.
 
 ### Generating the ENCRYPTION_KEY
 
@@ -83,7 +87,7 @@ print(f'ENCRYPTION_KEY={key}')
 The web interface allows you to:
 
 - Sign in with admin credentials
-- Add and edit **DNS zones** (each zone name is unique; each has its own provider type, server, and credentials)
+- Add and edit **DNS zones** (each zone name is unique; each has its own provider type, server, and credentials). Use the **Test Configuration** button on a zone form to verify credentials and zone access by looking up a known record before saving.
 - Create and revoke **API keys**, and **edit** keys to change their label or **allowed zones**
 - Review and search activity logs under **Settings → Log Viewing / Searching**
 - Configure logging level, retention, SMTP delivery, and operational log rotation under **Settings → System Settings**
@@ -125,23 +129,25 @@ The app redacts secret-looking detail fields before storing activity logs or sen
 
 ## API Usage
 
-Authenticate with **`X-API-Key: <key>`** or **`Authorization: Bearer <key>`**.
+Authenticate with `**X-API-Key: <key>`** or `**Authorization: Bearer <key>**`.
 
 All examples target `http://localhost:8000/dns-record` with `Content-Type: application/json`.
 
 `/dns-record` is a single REST resource. Each method has well-defined semantics:
 
-| Method | Scope | Idempotent | Behavior |
-|--------|-------|------------|----------|
-| `GET`    | Lookup | yes | Return which supported record types exist at a name. |
-| `POST`   | Create | no | Create a new record. Returns **409** `record_already_exists` if a record of that type already exists. |
-| `PUT`    | Full replacement | yes | Replace the record's type/TTL/values. Returns **404** `not_found` if the type does not exist. |
-| `PATCH`  | Partial update | no | Update `ttl` and/or `values`; omitted fields are preserved from the live record. Returns **404** `not_found` if the type does not exist. |
-| `DELETE` | Remove | yes | Delete the record of the given type. Returns **404** `not_found` if the type does not exist. |
 
-`record_type` accepts **`A`**, **`AAAA`**, **`CNAME`**, or **`TXT`**. The legacy `POST` upsert and `record_type: "DELETE"` pseudo-payload have been removed.
+| Method   | Scope            | Idempotent | Behavior                                                                                                                                 |
+| -------- | ---------------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET`    | Lookup           | yes        | Return which supported record types exist at a name.                                                                                     |
+| `POST`   | Create           | no         | Create a new record. Returns **409** `record_already_exists` if a record of that type already exists.                                    |
+| `PUT`    | Full replacement | yes        | Replace the record's type/TTL/values. Returns **404** `not_found` if the type does not exist.                                            |
+| `PATCH`  | Partial update   | no         | Update `ttl` and/or `values`; omitted fields are preserved from the live record. Returns **404** `not_found` if the type does not exist. |
+| `DELETE` | Remove           | yes        | Delete the record of the given type. Returns **404** `not_found` if the type does not exist.                                             |
 
-**`zone_name` is required** on every request and must match a zone you configured under **DNS zones**. The API key must include that zone in its **allowed zones** list (see **API Keys** in the admin UI). If the zone is missing or the key is not allowed, the response is **403** with `{"detail":{"error":"access_denied","message":"..."}}`.
+
+`record_type` accepts `**A`**, `**AAAA**`, `**CNAME**`, or `**TXT**`. The legacy `POST` upsert and `record_type: "DELETE"` pseudo-payload have been removed.
+
+`**zone_name` is required** on every request and must match a zone you configured under **DNS zones**. The API key must include that zone in its **allowed zones** list (see **API Keys** in the admin UI). If the zone is missing or the key is not allowed, the response is **403** with `{"detail":{"error":"access_denied","message":"..."}}`.
 
 ### Create a new A record (`POST`)
 
@@ -158,6 +164,24 @@ curl -sS -X POST "http://localhost:8000/dns-record" \
     "ttl": 300,
     "values": ["192.0.2.10"]
   }'
+```
+
+PowerShell:
+
+```powershell
+$body = @{
+  zone_name   = "example.com"
+  record_type = "A"
+  record_name = "www"
+  ttl         = 300
+  values      = @("192.0.2.10")
+} | ConvertTo-Json -Compress
+
+Invoke-RestMethod -Method POST `
+  "http://localhost:8000/dns-record" `
+  -Headers @{ "X-API-Key" = $apiKey } `
+  -ContentType "application/json" `
+  -Body $body
 ```
 
 If a record of that type already exists at the name, the response is **409**:
@@ -183,6 +207,24 @@ curl -sS -X PUT "http://localhost:8000/dns-record" \
   }'
 ```
 
+PowerShell:
+
+```powershell
+$body = @{
+  zone_name   = "example.com"
+  record_type = "A"
+  record_name = "www"
+  ttl         = 600
+  values      = @("192.0.2.20")
+} | ConvertTo-Json -Compress
+
+Invoke-RestMethod -Method PUT `
+  "http://localhost:8000/dns-record" `
+  -Headers @{ "X-API-Key" = $apiKey } `
+  -ContentType "application/json" `
+  -Body $body
+```
+
 If no record of that type exists at the name, the response is **404**:
 
 ```json
@@ -191,7 +233,7 @@ If no record of that type exists at the name, the response is **404**:
 
 ### Partial update (`PATCH`)
 
-Use `PATCH` to update **`ttl`**, **`values`**, or **both** on an existing record. At least one field is required. Omitted fields are merged from the live record (the API fetches the current record before applying the change).
+Use `PATCH` to update `**ttl**`, `**values**`, or **both** on an existing record. At least one field is required. Omitted fields are merged from the live record (the API fetches the current record before applying the change).
 
 Update values only (TTL preserved):
 
@@ -207,6 +249,23 @@ curl -sS -X PATCH "http://localhost:8000/dns-record" \
   }'
 ```
 
+PowerShell:
+
+```powershell
+$body = @{
+  zone_name   = "example.com"
+  record_type = "A"
+  record_name = "www"
+  values      = @("192.0.2.30")
+} | ConvertTo-Json -Compress
+
+Invoke-RestMethod -Method PATCH `
+  "http://localhost:8000/dns-record" `
+  -Headers @{ "X-API-Key" = $apiKey } `
+  -ContentType "application/json" `
+  -Body $body
+```
+
 Update TTL only (values preserved):
 
 ```bash
@@ -219,6 +278,23 @@ curl -sS -X PATCH "http://localhost:8000/dns-record" \
     "record_name": "www",
     "ttl": 600
   }'
+```
+
+PowerShell:
+
+```powershell
+$body = @{
+  zone_name   = "example.com"
+  record_type = "A"
+  record_name = "www"
+  ttl         = 600
+} | ConvertTo-Json -Compress
+
+Invoke-RestMethod -Method PATCH `
+  "http://localhost:8000/dns-record" `
+  -Headers @{ "X-API-Key" = $apiKey } `
+  -ContentType "application/json" `
+  -Body $body
 ```
 
 `PATCH` returns **404** with the same body shape as `PUT` when the record does not exist.
@@ -245,7 +321,7 @@ If nothing matches, the response is **404** `not_found`.
 
 ### Look up records (`GET`)
 
-`GET /dns-record` always returns a **`records` array**. Each element describes one supported record type present at the name. When records exist, every element includes `record_name`, `record_type`, and `ttl`; `values` is included when the provider returns rdata.
+`GET /dns-record` always returns a `**records` array**. Each element describes one supported record type present at the name. When records exist, every element includes `record_name`, `record_type`, and `ttl`; `values` is included when the provider returns rdata.
 
 Optional `record_type` query parameter filters which types appear in the array; it does not change the per-item shape. When nothing matches, `status` is `not_found` and `records` is `[]`.
 
@@ -269,7 +345,14 @@ curl -sS \
   -H "X-API-Key: YOUR_API_KEY"
 ```
 
+PowerShell:
+
+```powershell
+Invoke-RestMethod -Method GET `
+  "http://localhost:8000/dns-record?zone_name=example.com&record_name=www&record_type=A" `
+  -Headers @{ "X-API-Key" = $apiKey }
+```
 
 ## License
 
-MIT
+This project is licensed under the **MIT License with the Commons Clause**. The full license text is in [LICENSE.md](LICENSE.md).

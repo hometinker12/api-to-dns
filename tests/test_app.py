@@ -216,8 +216,9 @@ def test_zones_page_displays_zone_provider_metadata(client: TestClient) -> None:
 
 def test_builtin_dns_plugins_are_discovered() -> None:
     plugins = discover_plugins()
-    assert set(plugins) >= {"azure", "bind", "microsoft"}
+    assert set(plugins) >= {"azure", "bind", "cloudflare", "microsoft"}
     assert plugins["azure"].label == "Azure DNS (REST API)"
+    assert plugins["cloudflare"].label == "Cloudflare DNS (REST API)"
     assert dns_provider_display_name("microsoft") == "Microsoft DNS (WinRM)"
 
 
@@ -240,8 +241,12 @@ def test_zone_form_renders_plugins_from_metadata(client: TestClient) -> None:
     assert '<option value="azure" selected>Azure DNS (REST API)</option>' in response.text
     assert '<option value="microsoft" >Microsoft DNS (WinRM)</option>' in response.text
     assert '<option value="bind" >BIND / RFC 2136 (TSIG)</option>' in response.text
+    assert '<option value="cloudflare" >Cloudflare DNS (REST API)</option>' in response.text
     assert 'data-provider-panel="azure"' in response.text
+    assert 'data-provider-panel="cloudflare"' in response.text
     assert 'name="azure_tenant_id"' in response.text
+    assert 'name="cloudflare_api_token"' in response.text
+    assert 'name="cloudflare_proxied"' in response.text
     assert 'name="dns_winrm_ssl"' in response.text
     assert 'name="dns_tsig_algorithm"' in response.text
     assert 'id="zone-test-btn"' in response.text
@@ -2055,6 +2060,7 @@ def test_disabling_last_enabled_plugin_is_blocked(client: TestClient) -> None:
 
     assert client.post("/settings/plugins/bind/disable").status_code == 200
     assert client.post("/settings/plugins/microsoft/disable").status_code == 200
+    assert client.post("/settings/plugins/cloudflare/disable").status_code == 200
     response = client.post("/settings/plugins/azure/disable")
     assert response.status_code == 200
     assert "At least one DNS provider plugin must remain enabled." in response.text
