@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- RESTful `/dns-record` resource: `GET`, `POST` (create), `PUT` (full replace), `PATCH` (values-only update), and `DELETE` (remove) on a single path.
+- Pre-flight `get_record` existence check on every mutation. `POST` returns **409** `record_already_exists` when the record type already exists; `PUT`/`PATCH`/`DELETE` return **404** `not_found` when the record type is missing.
+- Public Pydantic request schemas (`DnsRecordCreateRequest`, `DnsRecordReplaceRequest`, `DnsRecordPatchRequest`) documented in OpenAPI; `DELETE` uses query parameters (`zone_name`, `record_name`, `record_type`).
+- New activity event `dns.record_already_exists` emitted on 409 conflicts; existing `dns.record_not_found` event now fires on 404 across `PUT`/`PATCH`/`DELETE`.
+
+### Changed
+
+- `DELETE` requests now use the HTTP `DELETE` verb with query parameters instead of a JSON body.
+- `PUT` requires `ttl`; `PATCH` does not change `ttl` and only updates `values`.
+
+### Removed
+
+- **Breaking:** the legacy `POST /dns-record` upsert that created-or-updated based on existence.
+- **Breaking:** the public `record_type: "DELETE"` pseudo-type (with the inner type in `values[0]`) on `POST /dns-record`. The internal `DnsRecordRequest` schema is no longer exposed in OpenAPI; plugins continue to use it unchanged.
+
 ## [0.3.4] - 2026-05-17
 
 ### Added

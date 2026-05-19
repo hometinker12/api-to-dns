@@ -8,6 +8,7 @@ from sqlalchemy import Index, UniqueConstraint
 from sqlmodel import Field as SQLField, SQLModel
 
 _ALLOWED_DELETE_RR = frozenset({"A", "AAAA", "CNAME", "TXT"})
+_ALLOWED_PUBLIC_RECORD_TYPES = frozenset({"A", "AAAA", "CNAME", "TXT"})
 
 LOG_LEVEL_VERBOSE = "VERBOSE"
 LOG_LEVEL_INFORMATIONAL = "INFORMATIONAL"
@@ -46,13 +47,19 @@ SECURITY_EVENT_PREFIXES = (
 
 
 class DnsRecordRequest(BaseModel):
+    """Internal plugin-facing record request. Not exposed in the public OpenAPI surface.
+
+    Supports a synthetic ``DELETE`` record type used to drive plugin delete translation;
+    the public REST API uses dedicated HTTP methods (POST/PUT/PATCH/DELETE) on ``/dns-record``.
+    """
+
     zone_name: Optional[str] = Field(
         None,
         description="DNS zone name (required). Must match a configured zone and be allowed for this API key.",
     )
     record_type: str = Field(
         ...,
-        description="DNS record type: A, AAAA, CNAME, TXT, or DELETE to remove a record.",
+        description="DNS record type: A, AAAA, CNAME, TXT, or DELETE (internal) to remove a record.",
     )
     record_name: str = Field(..., description="Record name relative to the zone, e.g. www")
     ttl: Optional[int] = Field(300, description="Time to live in seconds")
@@ -77,9 +84,119 @@ class DnsRecordRequest(BaseModel):
         return self
 
 
+def _validate_public_record_type(record_type: str) -> str:
+    rt = (record_type or "").strip().upper()
+    if rt not in _ALLOWED_PUBLIC_RECORD_TYPES:
+        raise ValueError(
+            f"record_type must be one of {', '.join(sorted(_ALLOWED_PUBLIC_RECORD_TYPES))}; got {record_type!r}."
+        )
+    return rt
+
+
+class DnsRecordCreateRequest(BaseModel):
+    """Body for ``POST /dns-record`` (create only). Returns 409 if the record type already exists."""
+
+    zone_name: Optional[str] = Field(
+        None,
+        description="DNS zone name (required). Must match a configured zone and be allowed for this API key.",
+    )
+    record_type: str = Field(..., description="DNS record type: A, AAAA, CNAME, or TXT.")
+    record_name: str = Field(..., description="Record name relative to the zone, e.g. www")
+    ttl: Optional[int] = Field(300, description="Time to live in seconds (default 300).")
+    values: List[str] = Field(
+        default_factory=list,
+        description="Record values; must contain at least one entry.",
+    )
+
+    @model_validator(mode="after")
+    def _validate(self):
+        _validate_public_record_type(self.record_type)
+        if not self.values:
+            raise ValueError("values is required and must contain at least one entry.")
+        return self
+
+
+class DnsRecordReplaceRequest(BaseModel):
+    """Body for ``PUT /dns-record`` (full replacement). Returns 404 if the record type does not exist."""
+
+    zone_name: Optional[str] = Field(
+        None,
+        description="DNS zone name (required). Must match a configured zone and be allowed for this API key.",
+    )
+    record_type: str = Field(..., description="DNS record type: A, AAAA, CNAME, or TXT.")
+    record_name: str = Field(..., description="Record name relative to the zone, e.g. www")
+    ttl: int = Field(..., description="Time to live in seconds (required for full replacement).")
+    values: List[str] = Field(
+        default_factory=list,
+        description="Replacement values; must contain at least one entry.",
+    )
+
+    @model_validator(mode="after")
+    def _validate(self):
+        _validate_public_record_type(self.record_type)
+        if not self.values:
+            raise ValueError("values is required and must contain at least one entry.")
+        return self
+
+
+class DnsRecordPatchRequest(BaseModel):
+    """Body for ``PATCH /dns-record`` (values-only update). Returns 404 if the record type does not exist.
+
+    PATCH only updates the record's values list; TTL is not changed by this request.
+    """
+
+    zone_name: Optional[str] = Field(
+        None,
+        description="DNS zone name (required). Must match a configured zone and be allowed for this API key.",
+    )
+    record_type: str = Field(..., description="DNS record type: A, AAAA, CNAME, or TXT.")
+    record_name: str = Field(..., description="Record name relative to the zone, e.g. www")
+    values: List[str] = Field(
+        default_factory=list,
+        description="New record values; must contain at least one entry. Replaces the existing values list.",
+    )
+
+    @model_validator(mode="after")
+    def _validate(self):
+        _validate_public_record_type(self.record_type)
+        if not self.values:
+            raise ValueError("values is required and must contain at least one entry.")
+        return self
+
+
+class DnsRecordInfo(BaseModel):
+    record_name: str = Field(..., description="Record name relative to the zone, e.g. www or @")
+    record_type: str = Field(..., description="DNS record type: A, AAAA, CNAME, or TXT")
+
+
+class DnsRecordGetResponse(BaseModel):
+    status: str = Field(
+        ...,
+        description='Outcome: "success" when one or more records are found; "not_found" when none match.',
+    )
+    zone_name: str
+    record_name: str
+    records: List[DnsRecordInfo] = Field(
+        default_factory=list,
+        description="Matching records (name and type only). Empty when status is not_found.",
+    )
+
+
 class DnsRecordResponse(BaseModel):
-    status: str = Field(..., description='Outcome: "success" or "error" (e.g. DELETE when the record does not exist).')
-    action: str
+    status: str = Field(
+        ...,
+        description=(
+            'Outcome: "success" on 2xx; "error" on 4xx (e.g. 409 record_already_exists '
+            'on POST, 404 not_found on PUT/PATCH/DELETE).'
+        ),
+    )
+    action: str = Field(
+        ...,
+        description=(
+            'Mutation outcome: "created" (POST), "updated" (PUT/PATCH), "deleted" (DELETE), '
+            '"record_already_exists" (POST 409), or "not_found" (404 on PUT/PATCH/DELETE).'
+        ),
+    )
     zone_name: str
     record_name: str
     record_type: str

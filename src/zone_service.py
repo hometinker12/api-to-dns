@@ -27,9 +27,10 @@ __all__ = [
     "migrate_legacy_dns_settings_if_needed",
     "normalize_zone_name",
     "set_disabled_dns_plugins",
+    "test_zone_record_lookup",
     "zones_using_dns_provider",
 ]
-from .models import ApiKey, ApiKeyAllowedZone, DnsZoneConfig
+from .models import ApiKey, ApiKeyAllowedZone, DnsRecordInfo, DnsZoneConfig
 from .security import decrypt_value, encrypt_value
 from .settings_store import delete_setting, get_setting, set_setting
 
@@ -227,3 +228,19 @@ def build_zone_config_from_form(
             value = field["default"]
         cfg[name] = value
     return cfg
+
+
+def test_zone_record_lookup(
+    cfg: Dict[str, Any],
+    *,
+    record_name: str,
+    zone_name: str,
+    record_type: Optional[str] = None,
+) -> List[DnsRecordInfo]:
+    client = create_dns_client_from_settings(cfg)
+    return client.get_record(
+        record_name=record_name,
+        record_type=record_type,
+        dns_server=cfg.get("dns_server"),
+        dns_zone=zone_name,
+    )

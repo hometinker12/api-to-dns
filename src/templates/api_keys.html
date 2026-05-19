@@ -24,6 +24,12 @@
         <h2>Existing API keys</h2>
         <button type="button" id="open-create-key" {% if not all_zones %}disabled{% endif %}>Create API Key</button>
       </div>
+      <p class="help">
+        API keys authenticate calls to <code>/dns-record</code>. The endpoint is a REST resource that supports
+        <code>GET</code> (lookup), <code>POST</code> (create &mdash; <code>409</code> if the record type already exists),
+        <code>PUT</code> (full replace &mdash; <code>404</code> if missing), <code>PATCH</code> (update values &mdash;
+        <code>404</code> if missing), and <code>DELETE</code> (remove by query string &mdash; <code>404</code> if missing).
+      </p>
       {% if not all_zones %}
         <p class="help">No zones configured. Add a DNS zone first.</p>
       {% endif %}

@@ -11,7 +11,7 @@ import dns.update
 from ..models import DnsRecordRequest
 
 from .base import DnsProviderPlugin, PluginField
-from .utils import dns_relative_name, record_existed_before_update, tcp_endpoint_host
+from .utils import dns_relative_name, query_dns_records_at_name, record_existed_before_update, tcp_endpoint_host
 
 
 class BindTsigDnsClient:
@@ -85,6 +85,22 @@ class BindTsigDnsClient:
         if response.rcode() != dns.rcode.NOERROR:
             raise RuntimeError(f"DNS UPDATE failed: {dns.rcode.to_text(response.rcode())}")
         return existed
+
+    def get_record(
+        self,
+        *,
+        record_name: str,
+        record_type: Optional[str] = None,
+        dns_server: Optional[str] = None,
+        dns_zone: Optional[str] = None,
+    ):
+        if not dns_server:
+            raise ValueError("DNS server host is required for BIND (set Target DNS Server in settings).")
+        zone_name = (dns_zone or "").strip().rstrip(".")
+        if not zone_name:
+            raise ValueError("Zone name is required for BIND (set Target DNS Zone in settings or zone_name on the request).")
+        relative = dns_relative_name(zone_name, record_name)
+        return query_dns_records_at_name(dns_server, zone_name, relative, record_type)
 
 
 def create_client(settings: Dict[str, Optional[str]]) -> BindTsigDnsClient:

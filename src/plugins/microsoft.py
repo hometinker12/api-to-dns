@@ -1,10 +1,10 @@
 import time
 from typing import Any, Dict, List, Optional
 
-from ..models import DnsRecordRequest
+from ..models import DnsRecordInfo, DnsRecordRequest
 
 from .base import DnsProviderPlugin, PluginField
-from .utils import dns_relative_name, ps_single_quoted, winrm_rr_type
+from .utils import dns_relative_name, lookup_record_types_to_query, ps_single_quoted, winrm_rr_type
 
 
 class MicrosoftWinRmDnsClient:
@@ -198,6 +198,37 @@ class MicrosoftWinRmDnsClient:
         self._run_ps_with_retry(dns_server, script)
 
         return existed
+
+    def get_record(
+        self,
+        *,
+        record_name: str,
+        record_type: Optional[str] = None,
+        dns_server: Optional[str] = None,
+        dns_zone: Optional[str] = None,
+    ) -> List[DnsRecordInfo]:
+        if not dns_server:
+            raise ValueError("DNS server host is required for Microsoft DNS (set Target DNS Server to the DNS/DC WinRM endpoint).")
+        zone = (dns_zone or "").strip()
+        if not zone:
+            raise ValueError("Zone name is required (set Target DNS Zone in settings or zone_name on the request).")
+
+        name = dns_relative_name(zone, record_name)
+        name_at = "@" if name == "@" else name
+
+        types_to_query = lookup_record_types_to_query(record_type)
+        if len(types_to_query) == 1:
+            ps_rr = winrm_rr_type(types_to_query[0])
+            if self._record_exists(dns_server, zone, name_at, ps_rr):
+                return [DnsRecordInfo(record_name=name_at, record_type=types_to_query[0])]
+            return []
+
+        results: List[DnsRecordInfo] = []
+        for rt in types_to_query:
+            ps_rr = winrm_rr_type(rt)
+            if self._record_exists(dns_server, zone, name_at, ps_rr):
+                results.append(DnsRecordInfo(record_name=name_at, record_type=rt))
+        return results
 
     def _record_exists(self, computer: str, zone: str, name: str, rr_type: str) -> bool:
         ps = (

@@ -244,6 +244,93 @@ def test_zone_form_renders_plugins_from_metadata(client: TestClient) -> None:
     assert 'name="azure_tenant_id"' in response.text
     assert 'name="dns_winrm_ssl"' in response.text
     assert 'name="dns_tsig_algorithm"' in response.text
+    assert 'id="zone-test-btn"' in response.text
+    assert 'id="test-record-type"' in response.text
+
+
+def test_zone_test_requires_auth(client: TestClient) -> None:
+    response = client.post(
+        "/zones/test",
+        data={
+            "zone_name": "example.com",
+            "test_record_name": "@",
+            "dns_provider_type": "azure",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
+
+
+def test_zone_test_success(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    from src.models import DnsRecordInfo
+
+    monkeypatch.setattr(
+        "src.app.test_zone_record_lookup",
+        lambda _cfg, **kwargs: [DnsRecordInfo(record_name="www", record_type="A")],
+    )
+    response = client.post(
+        "/zones/test",
+        data={
+            "zone_name": "example.com",
+            "test_record_name": "www",
+            "test_record_type": "A",
+            "dns_provider_type": "azure",
+            "azure_tenant_id": "tenant",
+            "azure_client_id": "client",
+            "azure_client_secret": "secret",
+            "azure_subscription_id": "sub",
+            "azure_resource_group": "rg",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["records"] == [{"record_name": "www", "record_type": "A"}]
+    assert set(body["records"][0]) == {"record_name", "record_type"}
+
+
+def test_zone_test_not_found(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    monkeypatch.setattr("src.app.test_zone_record_lookup", lambda _cfg, **kwargs: [])
+    response = client.post(
+        "/zones/test",
+        data={
+            "zone_name": "example.com",
+            "test_record_name": "missing",
+            "dns_provider_type": "azure",
+            "azure_tenant_id": "tenant",
+            "azure_client_id": "client",
+            "azure_client_secret": "secret",
+            "azure_subscription_id": "sub",
+            "azure_resource_group": "rg",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "not_found"
+    assert body["records"] == []
+
+
+def test_zone_test_invalid_record_type(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post(
+        "/zones/test",
+        data={
+            "zone_name": "example.com",
+            "test_record_name": "www",
+            "test_record_type": "MX",
+            "dns_provider_type": "azure",
+            "azure_tenant_id": "tenant",
+            "azure_client_id": "client",
+            "azure_client_secret": "secret",
+            "azure_subscription_id": "sub",
+            "azure_resource_group": "rg",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["status"] == "error"
 
 
 def test_zones_json_request_returns_zone_ids(client: TestClient) -> None:
@@ -363,6 +450,7 @@ def test_session_backed_pages_are_not_in_openapi(client: TestClient) -> None:
         assert path not in schema["paths"]
     assert set(schema["paths"]) == {"/keycheck", "/zones", "/dns-record"}
     assert set(schema["paths"]["/zones"]) == {"get"}
+    assert set(schema["paths"]["/dns-record"]) == {"get", "post", "put", "patch", "delete"}
 
 
 def test_keycheck_unauthorized_response_is_documented(client: TestClient) -> None:
@@ -383,6 +471,84 @@ def test_keycheck_success_response_is_documented(client: TestClient) -> None:
     assert content["schema"]["required"] == ["status"]
 
 
+def test_dns_record_get_schema_is_documented(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    get_op = schema["paths"]["/dns-record"]["get"]
+    param_names = {param["name"] for param in get_op["parameters"]}
+    assert {"zone_name", "record_name", "record_type", "X-API-Key", "Authorization"} <= param_names
+    response_schema = get_op["responses"]["200"]["content"]["application/json"]["schema"]
+    assert response_schema["$ref"].endswith("/DnsRecordGetResponse")
+    assert "DnsRecordGetResponse" in schema["components"]["schemas"]
+    assert "DnsRecordInfo" in schema["components"]["schemas"]
+    records_items = schema["components"]["schemas"]["DnsRecordGetResponse"]["properties"]["records"]["items"]
+    assert records_items["$ref"].endswith("/DnsRecordInfo")
+
+
+def test_dns_record_get_requires_api_key(client: TestClient) -> None:
+    response = client.get(
+        "/dns-record",
+        params={
+            "zone_name": "example.com",
+            "record_name": "www",
+        },
+    )
+    assert response.status_code == 401
+
+
+def test_dns_record_get_with_mock_client(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.models import DnsRecordInfo
+
+    monkeypatch.setattr(
+        "src.app.test_zone_record_lookup",
+        lambda _settings, **kwargs: [DnsRecordInfo(record_name="www", record_type="A")],
+    )
+    response = client.get(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        params={
+            "zone_name": "example.com",
+            "record_name": "www",
+            "record_type": "A",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["zone_name"] == "example.com"
+    assert body["record_name"] == "www"
+    assert body["records"] == [{"record_name": "www", "record_type": "A"}]
+
+
+def test_dns_record_get_not_found(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.app.test_zone_record_lookup", lambda _settings, **kwargs: [])
+    response = client.get(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        params={
+            "zone_name": "example.com",
+            "record_name": "missing",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "not_found"
+    assert body["records"] == []
+
+
+def test_dns_record_get_invalid_record_type(client: TestClient, api_key_value: str) -> None:
+    response = client.get(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        params={
+            "zone_name": "example.com",
+            "record_name": "www",
+            "record_type": "MX",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "invalid_request"
+
+
 def test_dns_record_requires_api_key(client: TestClient) -> None:
     response = client.post(
         "/dns-record",
@@ -399,6 +565,7 @@ def test_dns_record_requires_api_key(client: TestClient) -> None:
 
 def test_dns_record_with_mock_client(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = MagicMock()
+    fake.get_record.return_value = []
     fake.create_or_update_record.return_value = False
     monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
 
@@ -417,6 +584,7 @@ def test_dns_record_with_mock_client(client: TestClient, api_key_value: str, mon
     body = response.json()
     assert body["status"] == "success"
     assert body["action"] == "created"
+    fake.get_record.assert_called_once()
     fake.create_or_update_record.assert_called_once()
     with SessionLocal() as db:
         event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "dns.record_created")).first()
@@ -424,9 +592,13 @@ def test_dns_record_with_mock_client(client: TestClient, api_key_value: str, mon
         assert event.category == "dns"
 
 
-def test_dns_record_delete_with_mock_client(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dns_record_post_conflict_returns_409(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.models import DnsRecordInfo
+
     fake = MagicMock()
-    fake.create_or_update_record.return_value = True
+    fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A")]
     monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
 
     response = client.post(
@@ -434,45 +606,207 @@ def test_dns_record_delete_with_mock_client(client: TestClient, api_key_value: s
         headers={"X-API-Key": api_key_value},
         json={
             "zone_name": "example.com",
-            "record_type": "DELETE",
+            "record_type": "A",
             "record_name": "www",
-            "values": ["A"],
+            "ttl": 300,
+            "values": ["192.0.2.1"],
+        },
+    )
+    assert response.status_code == 409
+    body = response.json()
+    assert body["status"] == "error"
+    assert body["action"] == "record_already_exists"
+    assert body["record_type"] == "A"
+    fake.get_record.assert_called_once()
+    fake.create_or_update_record.assert_not_called()
+    with SessionLocal() as db:
+        event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "dns.record_already_exists")).first()
+        assert event is not None
+        assert event.category == "dns"
+
+
+def test_dns_record_put_replaces_existing_record(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.models import DnsRecordInfo
+
+    fake = MagicMock()
+    fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A")]
+    fake.create_or_update_record.return_value = True
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+
+    response = client.put(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "www",
+            "ttl": 600,
+            "values": ["192.0.2.2"],
         },
     )
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "success"
-    assert body["action"] == "deleted"
+    assert body["action"] == "updated"
+    fake.get_record.assert_called_once()
     fake.create_or_update_record.assert_called_once()
 
 
-def test_dns_record_delete_not_found_returns_404(
+def test_dns_record_put_missing_returns_404(
     client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake = MagicMock()
-    fake.create_or_update_record.return_value = False
+    fake.get_record.return_value = []
     monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
 
-    response = client.post(
+    response = client.put(
         "/dns-record",
         headers={"X-API-Key": api_key_value},
         json={
             "zone_name": "example.com",
-            "record_type": "DELETE",
+            "record_type": "A",
             "record_name": "missing",
-            "values": ["A"],
+            "ttl": 300,
+            "values": ["192.0.2.1"],
         },
     )
     assert response.status_code == 404
     body = response.json()
     assert body["status"] == "error"
     assert body["action"] == "not_found"
+    fake.create_or_update_record.assert_not_called()
+
+
+def test_dns_record_put_requires_ttl(client: TestClient, api_key_value: str) -> None:
+    response = client.put(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "www",
+            "values": ["192.0.2.1"],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_dns_record_patch_updates_values(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.models import DnsRecordInfo
+
+    fake = MagicMock()
+    fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A")]
+    fake.create_or_update_record.return_value = True
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+
+    response = client.patch(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "www",
+            "values": ["192.0.2.99"],
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["action"] == "updated"
+    assert body["values"] == ["192.0.2.99"]
+    fake.get_record.assert_called_once()
+    fake.create_or_update_record.assert_called_once()
+
+
+def test_dns_record_patch_missing_returns_404(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = MagicMock()
+    fake.get_record.return_value = []
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+
+    response = client.patch(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "missing",
+            "values": ["192.0.2.99"],
+        },
+    )
+    assert response.status_code == 404
+    body = response.json()
+    assert body["status"] == "error"
+    assert body["action"] == "not_found"
+    fake.create_or_update_record.assert_not_called()
+
+
+def test_dns_record_delete_with_mock_client(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.models import DnsRecordInfo
+
+    fake = MagicMock()
+    fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A")]
+    fake.create_or_update_record.return_value = True
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+
+    response = client.delete(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        params={"zone_name": "example.com", "record_name": "www", "record_type": "A"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["action"] == "deleted"
+    assert body["record_type"] == "A"
+    fake.get_record.assert_called_once()
+    fake.create_or_update_record.assert_called_once()
+    internal_payload = fake.create_or_update_record.call_args.args[0]
+    assert internal_payload.record_type == "DELETE"
+    assert internal_payload.values == ["A"]
+
+
+def test_dns_record_delete_not_found_returns_404(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = MagicMock()
+    fake.get_record.return_value = []
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+
+    response = client.delete(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        params={"zone_name": "example.com", "record_name": "missing", "record_type": "A"},
+    )
+    assert response.status_code == 404
+    body = response.json()
+    assert body["status"] == "error"
+    assert body["action"] == "not_found"
+    fake.create_or_update_record.assert_not_called()
+
+
+def test_dns_record_delete_rejects_unknown_record_type(
+    client: TestClient, api_key_value: str
+) -> None:
+    response = client.delete(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        params={"zone_name": "example.com", "record_name": "www", "record_type": "MX"},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "invalid_request"
 
 
 def test_dns_record_provider_runtime_error_returns_502(
     client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake = MagicMock()
+    fake.get_record.return_value = []
     fake.create_or_update_record.side_effect = RuntimeError("WinRM/PowerShell failed (1): example")
     monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
 
@@ -495,9 +829,24 @@ def test_dns_record_provider_runtime_error_returns_502(
 
 def test_dns_record_schema_excludes_azure_zone_settings(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
-    request_schema = schema["components"]["schemas"]["DnsRecordRequest"]
-    assert "subscription_id" not in request_schema["properties"]
-    assert "resource_group" not in request_schema["properties"]
+    components = schema["components"]["schemas"]
+    for model_name in ("DnsRecordCreateRequest", "DnsRecordReplaceRequest", "DnsRecordPatchRequest"):
+        assert model_name in components
+        request_schema = components[model_name]
+        assert "subscription_id" not in request_schema["properties"]
+        assert "resource_group" not in request_schema["properties"]
+    assert "DnsRecordRequest" not in components
+
+
+def test_dns_record_openapi_documents_all_methods(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    path = schema["paths"]["/dns-record"]
+    assert set(path) == {"get", "post", "put", "patch", "delete"}
+    assert "409" in path["post"]["responses"]
+    for method in ("put", "patch", "delete"):
+        assert "404" in path[method]["responses"]
+    delete_param_names = {p["name"] for p in path["delete"]["parameters"]}
+    assert {"zone_name", "record_name", "record_type"} <= delete_param_names
 
 
 def test_dns_record_access_denied_unknown_zone(client: TestClient, api_key_value: str) -> None:
@@ -1751,6 +2100,7 @@ def test_api_key_post_to_dns_record_unaffected_by_session_roles(
         _delete_users(db)
 
     fake = MagicMock()
+    fake.get_record.return_value = []
     fake.create_or_update_record.return_value = False
     monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
 
@@ -1812,6 +2162,7 @@ def test_dns_provider_failure_writes_error_activity_log(
         set_log_level(db, LOG_LEVEL_INFORMATIONAL)
 
     fake = MagicMock()
+    fake.get_record.return_value = []
     fake.create_or_update_record.side_effect = RuntimeError("WinRM failed with password=supersecret")
     monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
 

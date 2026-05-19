@@ -1,8 +1,9 @@
 from typing import Dict, List, Optional
 
-from ..models import DnsRecordRequest
+from ..models import DnsRecordInfo, DnsRecordRequest
 
 from .base import DnsProviderPlugin, PluginField
+from .utils import lookup_record_types_to_query
 
 
 class AzureDnsClient:
@@ -96,6 +97,36 @@ class AzureDnsClient:
         )
 
         return existing is not None
+
+    def get_record(
+        self,
+        *,
+        record_name: str,
+        record_type: Optional[str] = None,
+        dns_server: Optional[str] = None,
+        dns_zone: Optional[str] = None,
+    ) -> List[DnsRecordInfo]:
+        if dns_server:
+            raise ValueError("Azure DNS ignores per-server host settings; use Azure fields on the zone configuration.")
+        if not dns_zone:
+            raise ValueError("Zone name is required for Azure DNS.")
+
+        record_set_name = record_name.strip(".") or "@"
+        display_name = record_set_name
+        client = self.DnsManagementClient(self.credential, self.subscription_id)
+        types_to_query = lookup_record_types_to_query(record_type)
+        results: List[DnsRecordInfo] = []
+        for rt in types_to_query:
+            existing = self._get_existing_record_set(
+                client,
+                self.resource_group,
+                dns_zone,
+                record_set_name,
+                rt,
+            )
+            if existing is not None:
+                results.append(DnsRecordInfo(record_name=display_name, record_type=rt))
+        return results
 
     def _get_existing_record_set(
         self,

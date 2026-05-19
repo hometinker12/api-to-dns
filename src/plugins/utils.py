@@ -1,10 +1,33 @@
 import ipaddress
 import socket
+from typing import List, Optional, Tuple
 
 import dns.message
 import dns.name
 import dns.query
 import dns.rdatatype
+
+from ..models import DnsRecordInfo
+
+LOOKUP_RECORD_TYPES: Tuple[str, ...] = ("A", "AAAA", "CNAME", "TXT")
+
+
+def normalize_lookup_record_type(record_type: Optional[str]) -> Optional[str]:
+    if record_type is None or not str(record_type).strip():
+        return None
+    rt = str(record_type).strip().upper()
+    if rt not in LOOKUP_RECORD_TYPES:
+        raise ValueError(
+            f"Record type must be one of {', '.join(LOOKUP_RECORD_TYPES)}; got {record_type!r}."
+        )
+    return rt
+
+
+def lookup_record_types_to_query(record_type: Optional[str]) -> Tuple[str, ...]:
+    normalized = normalize_lookup_record_type(record_type)
+    if normalized:
+        return (normalized,)
+    return LOOKUP_RECORD_TYPES
 
 
 def ps_single_quoted(s: str) -> str:
@@ -15,6 +38,13 @@ def winrm_rr_type(upper_rr: str) -> str:
     """RR type string expected by DnsServer PowerShell cmdlets."""
     u = upper_rr.strip().upper()
     return "Txt" if u == "TXT" else u
+
+
+def winrm_record_type_to_api(ps_type: str) -> str:
+    t = ps_type.strip()
+    if t.upper() == "TXT" or t == "Txt":
+        return "TXT"
+    return t.upper()
 
 
 def dns_relative_name(zone_name: str, record_name: str) -> str:
@@ -47,7 +77,7 @@ def tcp_endpoint_host(host: str) -> str:
     return infos[0][4][0]
 
 
-def record_existed_before_update(
+def _record_exists_at_name(
     server: str,
     zone_name: str,
     relative_name: str,
@@ -64,3 +94,27 @@ def record_existed_before_update(
     except Exception:
         return False
     return bool(resp.answer)
+
+
+def query_dns_records_at_name(
+    server: str,
+    zone_name: str,
+    relative_name: str,
+    record_type: Optional[str] = None,
+) -> List[DnsRecordInfo]:
+    display_name = relative_name if relative_name not in ("@", "") else "@"
+    results: List[DnsRecordInfo] = []
+    for rt in lookup_record_types_to_query(record_type):
+        rdtype = dns.rdatatype.from_text(rt)
+        if _record_exists_at_name(server, zone_name, relative_name, rdtype):
+            results.append(DnsRecordInfo(record_name=display_name, record_type=rt))
+    return results
+
+
+def record_existed_before_update(
+    server: str,
+    zone_name: str,
+    relative_name: str,
+    rdtype: dns.rdatatype.RdataType,
+) -> bool:
+    return _record_exists_at_name(server, zone_name, relative_name, rdtype)

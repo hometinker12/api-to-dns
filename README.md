@@ -11,8 +11,9 @@ A Dockerized FastAPI service to manage DNS records through a protected admin web
 - Protected admin interface with username/password login
 - Generate and revoke API keys for REST access
 - Choose DNS provider (**Azure**, **Microsoft / WinRM**, **BIND / TSIG**) **per zone** and store connection details and credentials **encrypted at rest**
-- Create, update, or **delete** DNS records via `POST /dns-record`
-- Structured JSON errors (for example **404** when a DELETE finds no record, **502** when the DNS provider fails)
+- RESTful `/dns-record` resource with `GET`, `POST`, `PUT`, `PATCH`, and `DELETE` methods
+- Pre-flight existence checks return **409** on create-conflict and **404** on missing-record updates/deletes
+- Structured JSON errors (for example **502** when the DNS provider fails)
 - Searchable database-backed activity logs for sign-ins, API key changes, DNS record activity, provider failures, and alert events
 - Email alert rules for matching stored activity events, with SMTP failover across an ordered server list
 - Docker Compose-ready deployment
@@ -42,7 +43,7 @@ Open the admin UI at:
 http://localhost:8000/login
 ```
 
-After login, open **DNS zones** to add one row per zone (each row is a unique zone name with its own provider and credentials). Then open **API Keys**: when you create or edit a key, select which zones that key may use. **`POST /dns-record` always requires `zone_name`** in the JSON body; it must match a configured zone **and** be allowed for that API key, or the API returns **403** with `error: access_denied`.
+After login, open **DNS zones** to add one row per zone (each row is a unique zone name with its own provider and credentials). Then open **API Keys**: when you create or edit a key, select which zones that key may use. Every `/dns-record` request requires a `zone_name` (in the JSON body for `POST`/`PUT`/`PATCH`, in the query string for `GET`/`DELETE`); it must match a configured zone **and** be allowed for that API key, or the API returns **403** with `error: access_denied`.
 
 ## Configuration
 
@@ -126,13 +127,25 @@ The app redacts secret-looking detail fields before storing activity logs or sen
 
 Authenticate with **`X-API-Key: <key>`** or **`Authorization: Bearer <key>`**.
 
-All examples use `POST http://localhost:8000/dns-record` with `Content-Type: application/json`.
+All examples target `http://localhost:8000/dns-record` with `Content-Type: application/json`.
+
+`/dns-record` is a single REST resource. Each method has well-defined semantics:
+
+| Method | Scope | Idempotent | Behavior |
+|--------|-------|------------|----------|
+| `GET`    | Lookup | yes | Return which supported record types exist at a name. |
+| `POST`   | Create | no | Create a new record. Returns **409** `record_already_exists` if a record of that type already exists. |
+| `PUT`    | Full replacement | yes | Replace the record's type/TTL/values. Returns **404** `not_found` if the type does not exist. |
+| `PATCH`  | Partial update | no | Replace only the record's values. Returns **404** `not_found` if the type does not exist. |
+| `DELETE` | Remove | yes | Delete the record of the given type. Returns **404** `not_found` if the type does not exist. |
+
+`record_type` accepts **`A`**, **`AAAA`**, **`CNAME`**, or **`TXT`**. The legacy `POST` upsert and `record_type: "DELETE"` pseudo-payload have been removed.
 
 **`zone_name` is required** on every request and must match a zone you configured under **DNS zones**. The API key must include that zone in its **allowed zones** list (see **API Keys** in the admin UI). If the zone is missing or the key is not allowed, the response is **403** with `{"detail":{"error":"access_denied","message":"..."}}`.
 
-### Azure DNS: create a new A record
+### Create a new A record (`POST`)
 
-Save the Azure **subscription ID** and **resource group** on the zone configuration. Requests only include the DNS operation fields.
+Save the Azure **subscription ID** and **resource group** on the zone configuration when using Azure. Requests only include the DNS operation fields. The same body shape works for Azure, Microsoft (WinRM), and BIND/TSIG.
 
 ```bash
 curl -sS -X POST "http://localhost:8000/dns-record" \
@@ -147,12 +160,18 @@ curl -sS -X POST "http://localhost:8000/dns-record" \
   }'
 ```
 
-### Azure DNS: update an existing A record
+If a record of that type already exists at the name, the response is **409**:
 
-The same endpoint performs an upsert. Send the same `record_name` and `record_type` with new `values` (and TTL if you want to change it):
+```json
+{"status":"error","action":"record_already_exists","zone_name":"example.com","record_name":"www","record_type":"A","values":["192.0.2.10"]}
+```
+
+### Replace an existing record (`PUT`)
+
+Use `PUT` to replace the entire record (type, TTL, and values). `ttl` is required on `PUT`.
 
 ```bash
-curl -sS -X POST "http://localhost:8000/dns-record" \
+curl -sS -X PUT "http://localhost:8000/dns-record" \
   -H "Content-Type: application/json" \
   -H "X-API-Key: YOUR_API_KEY" \
   -d '{
@@ -164,106 +183,58 @@ curl -sS -X POST "http://localhost:8000/dns-record" \
   }'
 ```
 
-### Microsoft DNS (WinRM): create and update an A record
+If no record of that type exists at the name, the response is **404**:
 
-For a zone such as `corp.example`, add a **DNS zones** row with zone name **`corp.example`**, set **Microsoft (WinRM)**, **Target DNS Server**, and credentials. Grant your API key access to that zone under **API Keys**.
-
-Requests **do not** use `subscription_id` or `resource_group`. **`zone_name` in JSON must match** the configured zone (case-insensitive).
-
-**Create** (first `A` for `api` in `corp.example`):
-
-```bash
-curl -sS -X POST "http://localhost:8000/dns-record" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: YOUR_API_KEY" \
-  -d '{
-    "zone_name": "corp.example",
-    "record_type": "A",
-    "record_name": "api",
-    "ttl": 300,
-    "values": ["192.0.2.10"]
-  }'
+```json
+{"status":"error","action":"not_found","zone_name":"example.com","record_name":"www","record_type":"A","values":["192.0.2.20"]}
 ```
 
-**Update** (same name and type, new addresses / TTL):
+### Update record values only (`PATCH`)
+
+Use `PATCH` to update only the `values` of an existing record (the request body does not include `ttl`).
 
 ```bash
-curl -sS -X POST "http://localhost:8000/dns-record" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: YOUR_API_KEY" \
-  -d '{
-    "zone_name": "corp.example",
-    "record_type": "A",
-    "record_name": "api",
-    "ttl": 600,
-    "values": ["192.0.2.20"]
-  }'
-```
-
-### BIND (TSIG): create and update an A record
-
-Add a **DNS zones** row for the zone (for example **`example.com`**) with **BIND / TSIG**, **Target DNS Server**, TSIG key name, base64 secret, and optional algorithm. Grant the API key access to that zone.
-
-**Create**:
-
-```bash
-curl -sS -X POST "http://localhost:8000/dns-record" \
+curl -sS -X PATCH "http://localhost:8000/dns-record" \
   -H "Content-Type: application/json" \
   -H "X-API-Key: YOUR_API_KEY" \
   -d '{
     "zone_name": "example.com",
     "record_type": "A",
-    "record_name": "dyn",
-    "ttl": 300,
-    "values": ["192.0.2.10"]
-  }'
-```
-
-**Update**:
-
-```bash
-curl -sS -X POST "http://localhost:8000/dns-record" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: YOUR_API_KEY" \
-  -d '{
-    "zone_name": "example.com",
-    "record_type": "A",
-    "record_name": "dyn",
-    "ttl": 600,
+    "record_name": "www",
     "values": ["192.0.2.30"]
   }'
 ```
 
-### Delete a record (all providers)
+`PATCH` returns **404** with the same body shape as `PUT` when the record does not exist.
 
-Use **`record_type": "DELETE"`**. The first entry in **`values`** must be the DNS RR type to remove: **`A`**, **`AAAA`**, **`CNAME`**, or **`TXT`**.
+### Delete a record (`DELETE`)
 
-**Microsoft / BIND** — include **`zone_name`** that matches a configured zone your key may access.
+`DELETE` identifies the record via **query parameters** (the same shape as `GET /dns-record`). No JSON body is required.
 
 ```bash
-curl -sS -X POST "http://localhost:8000/dns-record" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: YOUR_API_KEY" \
-  -d '{
-    "zone_name": "example.com",
-    "record_type": "DELETE",
-    "record_name": "dyn",
-    "values": ["A"]
-  }'
+curl -sS -X DELETE \
+  "http://localhost:8000/dns-record?zone_name=example.com&record_name=www&record_type=A" \
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
-**Azure DNS** — use the same request shape. The Azure subscription ID and resource group come from the saved zone configuration.
+PowerShell:
+
+```powershell
+Invoke-RestMethod -Method DELETE `
+  "http://localhost:8000/dns-record?zone_name=example.com&record_name=www&record_type=A" `
+  -Headers @{ "X-API-Key" = $apiKey }
+```
+
+If nothing matches, the response is **404** `not_found`.
+
+### Look up records (`GET`)
+
+`GET /dns-record` reports which supported record types exist at a name (results contain `record_name` and `record_type` only — no TTL or rdata).
 
 ```bash
-curl -sS -X POST "http://localhost:8000/dns-record" \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: YOUR_API_KEY" \
-  -d '{
-    "zone_name": "example.com",
-    "record_type": "DELETE",
-    "record_name": "www",
-    "values": ["A"]
-  }'
+curl -sS \
+  "http://localhost:8000/dns-record?zone_name=example.com&record_name=www&record_type=A" \
+  -H "X-API-Key: YOUR_API_KEY"
 ```
 
 
