@@ -1,7 +1,7 @@
 # DNS REST Service
 
-[![License: MIT + Commons Clause](https://img.shields.io/badge/License-MIT%20+%20Commons%20Clause-orange)](LICENSE.md)
- [Docker](https://www.docker.com/) [Python](https://www.python.org/) [Release](VERSION) [AI Assisted](https://cursor.com)
+[![License: MIT + Commons Clause](https://img.shields.io/badge/License-MIT%20+%20Commons%20Clause-orange)](LICENSE.md) [![Release](https://img.shields.io/badge/release-0.3.4-blue)](VERSION) [![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/) [![Python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/) [![AI Assisted](https://img.shields.io/badge/AI%20Assisted-yes-blue)](https://cursor.com)
+
 
 Current release: `0.3.4`
 
