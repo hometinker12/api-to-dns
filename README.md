@@ -1,6 +1,6 @@
 # DNS REST Service
 
-[Docker](https://www.docker.com/) [Python](https://www.python.org/) [Release](VERSION) [AI Assisted](https://cursor.com)
+[![License: MIT + Commons Clause](https://shields.io)](LICENSE.md) [Docker](https://www.docker.com/) [Python](https://www.python.org/) [Release](VERSION) [AI Assisted](https://cursor.com)
 
 Current release: `0.3.4`
 
