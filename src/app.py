@@ -759,10 +759,10 @@ async def zone_test(request: Request, user: str = Depends(require_role(ROLE_DNS_
             event_status = "success"
         else:
             if test_record_type:
-                message = f"No {test_record_type} record found at {test_record_name!r} in zone {canonical!r}."
+                message = f"Authentication successful. No {test_record_type} record found for {test_record_name!r} in zone {canonical!r}."
             else:
                 message = (
-                    f"No A, AAAA, CNAME, or TXT records found at {test_record_name!r} in zone {canonical!r}."
+                    f"Authentication successful. No records found at {test_record_name!r} in zone {canonical!r}."
                 )
             status = "not_found"
             event_level = LOG_LEVEL_INFORMATIONAL
