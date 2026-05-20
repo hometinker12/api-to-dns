@@ -65,7 +65,7 @@ Create a `.env` file using `.env.example` and configure the following values:
 | `ADMIN_PASSWORD` | Initial admin password                                                                            |
 | `DATABASE_URL`   | Optional database URL (default: `sqlite:///./data/app.db`)                                        |
 | `LOG_FILE`       | Optional file path for rotating operational logs (Docker Compose sets `/app/logs/api-to-dns.log`) |
-| `SSL_CERT_DIR`   | Directory holding `server.key` / `server.crt` (default `/app/data/ssl` in Docker, `./data/ssl` locally) |
+| `APP_SSL_DIR`    | Directory holding `server.key` / `server.crt` (default `/app/data/ssl` in Docker, `./data/ssl` locally). Do not use `SSL_CERT_DIR` — OpenSSL uses that name for CA lookup and breaks outbound HTTPS. |
 | `HTTP_PORT`      | Listener port when SSL is disabled (default `8000`)                                               |
 | `TLS_PORT`       | Listener port when SSL is enabled (default `8443`)                                                |
 | `SSL_ENABLED`    | Optional override of the DB `ssl_enabled` toggle (`0`/`1`); used by tests and local dev           |
@@ -136,13 +136,13 @@ SMTP delivery settings live under **System Settings**. The SMTP server field acc
 
 ### Optional: HTTPS with self-signed or uploaded certificates
 
-SSL is off by default. A fresh install serves HTTP on port `HTTP_PORT` (default `8000`) and does not create any cert files under `SSL_CERT_DIR` until an admin opts in. Only one listener runs at a time — toggling SSL in the UI updates the database immediately but requires a restart of the application (container or `uvicorn` process) to swap listeners.
+SSL is off by default. A fresh install serves HTTP on port `HTTP_PORT` (default `8000`) and does not create any cert files under `APP_SSL_DIR` until an admin opts in. Only one listener runs at a time — toggling SSL in the UI updates the database immediately but requires a restart of the application (container or `uvicorn` process) to swap listeners.
 
 To enable HTTPS:
 
 1. Sign in as an admin and open **Settings → System Settings → SSL Certificate**.
 2. Either:
-   - **Upload PEM certificate** — provide an unencrypted PEM private key and a matching PEM certificate (concatenate any chain intermediates after the leaf certificate in the same file). The app validates the key/cert pair, rejects mismatched or expired material, and writes `server.key` / `server.crt` atomically into `SSL_CERT_DIR`.
+   - **Upload PEM certificate** — provide an unencrypted PEM private key and a matching PEM certificate (concatenate any chain intermediates after the leaf certificate in the same file). The app validates the key/cert pair, rejects mismatched or expired material, and writes `server.key` / `server.crt` atomically into `APP_SSL_DIR`.
    - **Create self-signed certificate** — generate an RSA-2048 self-signed certificate (valid 825 days) using the configured App DNS Name as the Common Name and as a DNS SAN, plus `localhost`. Requires the `openssl` command on PATH (installed in the provided Dockerfile; install separately for local dev).
 3. Tick **Enable HTTPS listener** and **Save**.
 4. Restart the application:

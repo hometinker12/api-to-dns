@@ -10,7 +10,7 @@
 # Optional:
 #   DATABASE_URL — default below uses /app/data (mount a volume here in production)
 #   LOG_FILE     — rotating operational log file (Compose sets /app/logs/api-to-dns.log)
-#   SSL_CERT_DIR — directory for server.key / server.crt (default /app/data/ssl)
+#   APP_SSL_DIR — directory for server.key / server.crt (default /app/data/ssl)
 #   HTTP_PORT    — listener port when SSL is disabled (default 8000)
 #   TLS_PORT     — listener port when SSL is enabled (default 8443)
 #   SSL_ENABLED  — optional override of the DB-stored ssl_enabled toggle (1/0)
@@ -29,7 +29,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app \
     DATABASE_URL=sqlite:////app/data/app.db \
-    SSL_CERT_DIR=/app/data/ssl \
+    APP_SSL_DIR=/app/data/ssl \
     HTTP_PORT=8000 \
     TLS_PORT=8443
 

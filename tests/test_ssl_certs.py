@@ -21,7 +21,7 @@ from src.db import SessionLocal, init_db
 @pytest.fixture
 def ssl_workspace(monkeypatch: pytest.MonkeyPatch) -> Path:
     tmp = tempfile.mkdtemp(prefix="api-to-dns-ssl-test-")
-    monkeypatch.setenv("SSL_CERT_DIR", tmp)
+    monkeypatch.setenv("APP_SSL_DIR", tmp)
     # bootstrap()/serve() honour SSL_ENABLED; default the env override off for
     # unit tests and let individual tests opt in by setting the DB toggle.
     monkeypatch.delenv("SSL_ENABLED", raising=False)

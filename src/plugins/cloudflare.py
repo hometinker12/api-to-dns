@@ -1,7 +1,6 @@
 from typing import Any, Dict, List, Optional
 
 import httpx
-
 from ..models import DnsRecordInfo, DnsRecordRequest
 
 from .base import DnsProviderPlugin, PluginField

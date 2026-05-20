@@ -12,7 +12,7 @@ os.environ["DATABASE_URL"] = "sqlite:///" + os.path.abspath(_db.name).replace("\
 # CI runners do not need openssl on PATH and never share cert state with the
 # host repository checkout.
 _ssl_cert_dir = tempfile.mkdtemp(prefix="api-to-dns-test-ssl-")
-os.environ["SSL_CERT_DIR"] = _ssl_cert_dir
+os.environ["APP_SSL_DIR"] = _ssl_cert_dir
 os.environ["SSL_ENABLED"] = "0"
 
 import pytest  # noqa: E402

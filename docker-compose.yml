@@ -12,7 +12,7 @@ services:
     environment:
       DATABASE_URL: sqlite:////app/data/app.db
       LOG_FILE: /app/logs/api-to-dns.log
-      SSL_CERT_DIR: /app/data/ssl
+      APP_SSL_DIR: /app/data/ssl
       HTTP_PORT: "8000"
       TLS_PORT: "8443"
     volumes:

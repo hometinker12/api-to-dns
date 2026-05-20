@@ -48,6 +48,11 @@ DEFAULT_CERT_VALIDITY_DAYS = 825
 _DOCKER_DEFAULT_CERT_DIR = "/app/data/ssl"
 _LOCAL_DEFAULT_CERT_DIR = "./data/ssl"
 
+# OpenSSL uses SSL_CERT_DIR for CA certificate lookup. Do not use that name for
+# app server cert storage — read legacy value once, then remove from the process
+# environment so outbound HTTPS (e.g. Cloudflare API) keeps the system CA bundle.
+_LEGACY_SSL_CERT_DIR = os.environ.pop("SSL_CERT_DIR", None)
+
 
 # ---------------------------------------------------------------------------
 # Path helpers
@@ -69,7 +74,7 @@ def _default_cert_dir() -> str:
 
 
 def cert_dir() -> Path:
-    raw = os.getenv("SSL_CERT_DIR") or _default_cert_dir()
+    raw = os.getenv("APP_SSL_DIR") or _LEGACY_SSL_CERT_DIR or _default_cert_dir()
     path = Path(raw).expanduser()
     path.mkdir(parents=True, exist_ok=True)
     return path
