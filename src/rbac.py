@@ -91,8 +91,8 @@ LEGACY_SETTINGS_AREA_ALIASES: Dict[str, str] = {
 
 SYSTEM_SETTINGS_SECTIONS: List[Dict[str, str]] = [
     {"key": "system_identity", "label": "App DNS Name"},
-    {"key": "ssl_planned", "label": "SSL Certificate Management (planned)"}, 
-    {"key": "smtp_delivery", "label": "SMTP Delivery"},    
+    {"key": "ssl_certificate", "label": "SSL Certificate"},
+    {"key": "smtp_delivery", "label": "SMTP Delivery"},
     {"key": "syslog_planned", "label": "Syslog Server (planned)"},
     {"key": "logging_configuration", "label": "Logging Level"},
     {"key": "audit_log_retention", "label": "Audit Log Retention"},
@@ -101,6 +101,10 @@ SYSTEM_SETTINGS_SECTIONS: List[Dict[str, str]] = [
 
 _SYSTEM_SETTINGS_SECTION_KEYS = {section["key"] for section in SYSTEM_SETTINGS_SECTIONS}
 
+_LEGACY_SYSTEM_SETTINGS_SECTION_ALIASES: Dict[str, str] = {
+    "ssl_planned": "ssl_certificate",
+}
+
 
 def default_system_settings_section() -> str:
     return SYSTEM_SETTINGS_SECTIONS[0]["key"]
@@ -108,6 +112,7 @@ def default_system_settings_section() -> str:
 
 def normalize_system_settings_section(section: Optional[str]) -> str:
     key = (section or "").strip().lower()
+    key = _LEGACY_SYSTEM_SETTINGS_SECTION_ALIASES.get(key, key)
     if key in _SYSTEM_SETTINGS_SECTION_KEYS:
         return key
     return default_system_settings_section()

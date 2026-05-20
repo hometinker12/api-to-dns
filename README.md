@@ -48,6 +48,8 @@ Open the admin UI at:
 http://localhost:8000/login
 ```
 
+> SSL is **off by default**; the app listens on plain HTTP on port `8000`. See **Optional: HTTPS with self-signed or uploaded certificates** below for the enable workflow.
+
 After login, open **DNS zones** to add one row per zone (each row is a unique zone name with its own provider and credentials). Then open **API Keys**: when you create or edit a key, select which zones that key may use. Every `/dns-record` request requires a `zone_name` (in the JSON body for `POST`/`PUT`/`PATCH`, in the query string for `GET`/`DELETE`); it must match a configured zone **and** be allowed for that API key, or the API returns **403** with `error: access_denied`.
 
 ## Configuration
@@ -63,6 +65,10 @@ Create a `.env` file using `.env.example` and configure the following values:
 | `ADMIN_PASSWORD` | Initial admin password                                                                            |
 | `DATABASE_URL`   | Optional database URL (default: `sqlite:///./data/app.db`)                                        |
 | `LOG_FILE`       | Optional file path for rotating operational logs (Docker Compose sets `/app/logs/api-to-dns.log`) |
+| `SSL_CERT_DIR`   | Directory holding `server.key` / `server.crt` (default `/app/data/ssl` in Docker, `./data/ssl` locally) |
+| `HTTP_PORT`      | Listener port when SSL is disabled (default `8000`)                                               |
+| `TLS_PORT`       | Listener port when SSL is enabled (default `8443`)                                                |
+| `SSL_ENABLED`    | Optional override of the DB `ssl_enabled` toggle (`0`/`1`); used by tests and local dev           |
 
 
 **Azure DNS** (per zone): tenant ID, client ID, client secret, and optional default subscription and resource group are stored on that zone’s row in **DNS zones** (encrypted). They are **not** read from `AZURE_`* environment variables.
@@ -126,7 +132,38 @@ SMTP delivery settings live under **System Settings**. The SMTP server field acc
 
 ### Planned Infrastructure Settings
 
-**System Settings** includes placeholders for syslog forwarding and SSL certificate management. Syslog host, port, protocol, facility, and minimum level are planned but not implemented yet. Certificate upload, private key upload, chain management, expiration display, and reload/renewal actions are also planned for a later release.
+**System Settings** still includes a placeholder for syslog forwarding (host, port, protocol, facility, and minimum level are planned but not implemented yet).
+
+### Optional: HTTPS with self-signed or uploaded certificates
+
+SSL is off by default. A fresh install serves HTTP on port `HTTP_PORT` (default `8000`) and does not create any cert files under `SSL_CERT_DIR` until an admin opts in. Only one listener runs at a time — toggling SSL in the UI updates the database immediately but requires a restart of the application (container or `uvicorn` process) to swap listeners.
+
+To enable HTTPS:
+
+1. Sign in as an admin and open **Settings → System Settings → SSL Certificate**.
+2. Either:
+   - **Upload PEM certificate** — provide an unencrypted PEM private key and a matching PEM certificate (concatenate any chain intermediates after the leaf certificate in the same file). The app validates the key/cert pair, rejects mismatched or expired material, and writes `server.key` / `server.crt` atomically into `SSL_CERT_DIR`.
+   - **Create self-signed certificate** — generate an RSA-2048 self-signed certificate (valid 825 days) using the configured App DNS Name as the Common Name and as a DNS SAN, plus `localhost`. Requires the `openssl` command on PATH (installed in the provided Dockerfile; install separately for local dev).
+3. Tick **Enable HTTPS listener** and **Save**.
+4. Restart the application:
+   - Docker: `docker compose restart` (or `up -d` after rebuild).
+   - Local: stop and re-run `python -m src.ssl_certs serve`.
+
+Once restarted the app listens on `https://<app_dns_name>:TLS_PORT` (default `8443`). Self-signed certificates trigger browser warnings until the certificate is trusted on each client device. Disabling SSL does not delete the cert files on disk; the next enable + restart reuses them.
+
+The Docker compose file ships a dedicated `api-to-dns-ssl` named volume mounted at `/app/data/ssl` so cert/key material is isolated from the SQLite data volume and can be backed up independently.
+
+### Local development (HTTP or HTTPS)
+
+For local runs outside Docker:
+
+```bash
+python -m src.ssl_certs serve
+```
+
+`serve` reads the persisted `ssl_enabled` toggle (and any `SSL_ENABLED` env override), then launches uvicorn on `HTTP_PORT` or `TLS_PORT` with the matching TLS flags. To force HTTP regardless of the DB setting (handy for tests and watch loops), set `SSL_ENABLED=0` in your environment.
+
+Generating a self-signed certificate from the UI requires the `openssl` binary on PATH. On Windows install OpenSSL via [Win64 OpenSSL](https://slproweb.com/products/Win32OpenSSL.html), Chocolatey (`choco install openssl`), or Git for Windows (often ships `openssl.exe`). On Linux/macOS use your distro package manager or Homebrew (`openssl` / `openssl@3`). PEM upload does not require the `openssl` CLI.
 
 ### Logging Security
 

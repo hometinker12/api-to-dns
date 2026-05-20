@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -2108,13 +2108,13 @@ def test_settings_activity_logging_sections_render(client: TestClient) -> None:
     assert response.status_code == 200
     assert "System Settings" in response.text
     assert 'class="settings-submenu"' in response.text
-    assert "Logging Configuration" in response.text
+    assert "Logging Level" in response.text
     assert "SMTP Delivery" in response.text
     assert "App DNS Name" in response.text
-    assert "SSL Certificate Management" in response.text
+    assert "SSL Certificate" in response.text
     assert 'name="log_level"' not in response.text
     submenu = response.text.split('class="settings-submenu"')[1].split("</nav>")[0]
-    assert submenu.index("App DNS Name") < submenu.index("SSL Certificate Management")
+    assert submenu.index("App DNS Name") < submenu.index("SSL Certificate")
 
     response = client.get("/settings?area=log_viewing")
     assert response.status_code == 200
@@ -2228,6 +2228,187 @@ def test_settings_operational_log_rotation_non_docker_shows_form(
     assert response.status_code == 200
     assert 'action="/settings/system/log-rotation"' in response.text
     assert 'name="log_file"' in response.text
+
+
+def _generate_test_pem_pair(common_name: str = "ssl-test.example") -> tuple[bytes, bytes]:
+    """Generate an unencrypted PKCS8 PEM key and a matching self-signed cert."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(timezone.utc) - timedelta(minutes=5))
+        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=30))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName(common_name), x509.DNSName("localhost")]),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    key_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+    return key_pem, cert_pem
+
+
+def _clear_ssl_state() -> None:
+    """Remove any installed SSL files and reset the ssl_enabled DB toggle."""
+    from src import ssl_certs as _ssl
+
+    key_path, cert_path = _ssl.cert_paths()
+    for p in (key_path, cert_path, _ssl.cert_dir() / _ssl.SOURCE_FILENAME):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+    with SessionLocal() as db:
+        _ssl.set_ssl_enabled(db, False)
+
+
+def test_settings_ssl_section_renders_without_cert(client: TestClient) -> None:
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/settings?area=system_settings&section=ssl_certificate")
+    assert response.status_code == 200
+    assert "SSL Certificate" in response.text
+    assert "Upload PEM certificate" in response.text
+    assert "Create self-signed certificate" in response.text
+    assert 'name="ssl_enabled"' in response.text
+    assert "Upload a certificate or create a self-signed certificate before enabling SSL." in response.text
+
+
+def test_settings_ssl_legacy_section_key_still_redirects(client: TestClient) -> None:
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/settings?area=system_settings&section=ssl_planned")
+    assert response.status_code == 200
+    # ssl_planned is aliased to ssl_certificate in rbac.normalize_system_settings_section.
+    assert "SSL Certificate" in response.text
+
+
+def test_settings_ssl_post_enable_without_cert_is_rejected(client: TestClient) -> None:
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post(
+        "/settings/system/ssl",
+        data={"ssl_enabled": "on", "redirect_section": "ssl_certificate"},
+    )
+    assert response.status_code == 200
+    assert "no certificate is installed" in response.text.lower()
+    with SessionLocal() as db:
+        from src.ssl_certs import is_ssl_enabled
+
+        assert is_ssl_enabled(db) is False
+
+
+def test_settings_ssl_upload_installs_and_unlocks_enable(client: TestClient) -> None:
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    key_pem, cert_pem = _generate_test_pem_pair("upload-section.example")
+    response = client.post(
+        "/settings/system/ssl-upload",
+        data={"redirect_section": "ssl_certificate"},
+        files={
+            "ssl_key": ("server.key", key_pem, "application/x-pem-file"),
+            "ssl_cert": ("server.crt", cert_pem, "application/x-pem-file"),
+        },
+    )
+    assert response.status_code == 200
+    assert "SSL certificate uploaded" in response.text
+    from src import ssl_certs as _ssl
+
+    assert _ssl.cert_exists()
+
+    response = client.get("/settings?area=system_settings&section=ssl_certificate")
+    assert "upload-section.example" in response.text
+    assert "Installed certificate" in response.text
+    # With a cert installed, the Enable SSL checkbox is no longer disabled.
+    assert 'name="ssl_enabled"' in response.text
+    assert "before enabling SSL" not in response.text
+
+
+def test_settings_ssl_upload_rejects_mismatched_key(client: TestClient) -> None:
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    _, cert_pem = _generate_test_pem_pair("leaf.example")
+    other_key_pem, _ = _generate_test_pem_pair("other.example")
+    response = client.post(
+        "/settings/system/ssl-upload",
+        data={"redirect_section": "ssl_certificate"},
+        files={
+            "ssl_key": ("server.key", other_key_pem, "application/x-pem-file"),
+            "ssl_cert": ("server.crt", cert_pem, "application/x-pem-file"),
+        },
+    )
+    assert response.status_code == 200
+    assert "does not match" in response.text.lower()
+    from src import ssl_certs as _ssl
+
+    assert not _ssl.cert_exists()
+
+
+def test_settings_ssl_enable_persists_after_cert_installed(client: TestClient) -> None:
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    key_pem, cert_pem = _generate_test_pem_pair("enable.example")
+    client.post(
+        "/settings/system/ssl-upload",
+        data={"redirect_section": "ssl_certificate"},
+        files={
+            "ssl_key": ("server.key", key_pem, "application/x-pem-file"),
+            "ssl_cert": ("server.crt", cert_pem, "application/x-pem-file"),
+        },
+    )
+
+    response = client.post(
+        "/settings/system/ssl",
+        data={"ssl_enabled": "on", "redirect_section": "ssl_certificate"},
+    )
+    assert response.status_code == 200
+    assert "SSL setting saved" in response.text
+    with SessionLocal() as db:
+        from src.ssl_certs import is_ssl_enabled
+
+        assert is_ssl_enabled(db) is True
+
+    # Disable path: no certificate check, always allowed.
+    response = client.post(
+        "/settings/system/ssl",
+        data={"redirect_section": "ssl_certificate"},
+    )
+    assert response.status_code == 200
+    assert "SSL setting saved" in response.text
+    with SessionLocal() as db:
+        from src.ssl_certs import is_ssl_enabled
+
+        assert is_ssl_enabled(db) is False
+
+
+def test_settings_ssl_regenerate_without_openssl_returns_error(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_ssl_state()
+    from src import ssl_certs as _ssl
+
+    monkeypatch.setattr(_ssl, "_openssl_executable", lambda: None)
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post(
+        "/settings/system/ssl-regenerate",
+        data={"redirect_section": "ssl_certificate"},
+    )
+    assert response.status_code == 200
+    assert "openssl" in response.text.lower()
 
 
 def test_settings_backup_area_renders_placeholder(client: TestClient) -> None:

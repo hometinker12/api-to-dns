@@ -32,6 +32,16 @@ from .rbac import (
     user_public_dict,
 )
 from .settings_store import get_setting
+from .ssl_certs import (
+    DEFAULT_HTTP_PORT,
+    DEFAULT_TLS_PORT,
+    cert_exists,
+    cert_metadata,
+    cert_paths,
+    http_port,
+    is_ssl_enabled,
+    tls_port,
+)
 from .web import templates
 from .zone_service import dns_provider_options_with_state
 
@@ -105,6 +115,25 @@ def settings_context(
             smtp = get_smtp_config(db)
             current_level = get_log_level(db)
             retention_days = get_retention_days(db)
+            ssl_enabled_flag = is_ssl_enabled(db)
+            ssl_has_cert = cert_exists()
+            ssl_key_path, ssl_cert_path = cert_paths()
+            ssl_status = {
+                "enabled": ssl_enabled_flag,
+                "cert_exists": ssl_has_cert,
+                "can_enable_ssl": ssl_has_cert,
+                "can_upload": ROLE_SYSTEM_UPDATE in user_roles,
+                "metadata": cert_metadata(),
+                "ports": {
+                    "http": http_port(),
+                    "https": tls_port(),
+                    "default_http": DEFAULT_HTTP_PORT,
+                    "default_https": DEFAULT_TLS_PORT,
+                },
+                "key_path": str(ssl_key_path),
+                "cert_path": str(ssl_cert_path),
+                "app_dns_name": identity.get("system_dns_name", ""),
+            }
             shared_system = {
                 "identity": identity,
                 "is_docker": is_running_in_docker(),
@@ -122,6 +151,7 @@ def settings_context(
                     {"value": 365, "label": "365 days"},
                 ],
                 "smtp": {**smtp, "password_set": bool(smtp.get("password"))},
+                "ssl": ssl_status,
                 "operational_log": {
                     "log_file": get_setting(db, activity_logging.SETTING_LOG_FILE) or "",
                     "max_bytes": int(get_setting(db, activity_logging.SETTING_LOG_MAX_BYTES) or 1_048_576),

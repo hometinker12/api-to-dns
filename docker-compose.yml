@@ -6,13 +6,18 @@ services:
     build: .
     ports:
       - "8000:8000"
+      - "8443:8443"
     env_file:
       - .env
     environment:
       DATABASE_URL: sqlite:////app/data/app.db
       LOG_FILE: /app/logs/api-to-dns.log
+      SSL_CERT_DIR: /app/data/ssl
+      HTTP_PORT: "8000"
+      TLS_PORT: "8443"
     volumes:
       - api-to-dns-data:/app/data
+      - api-to-dns-ssl:/app/data/ssl
       - api-to-dns-logs:/app/logs
     restart: unless-stopped
     logging:
@@ -23,4 +28,5 @@ services:
 
 volumes:
   api-to-dns-data:
+  api-to-dns-ssl:
   api-to-dns-logs:

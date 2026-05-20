@@ -7,6 +7,14 @@ _db = tempfile.NamedTemporaryFile(prefix="api-to-dns-test-", suffix=".db", delet
 _db.close()
 os.environ["DATABASE_URL"] = "sqlite:///" + os.path.abspath(_db.name).replace("\\", "/")
 
+# Keep the test client on plain HTTP regardless of any persisted ssl_enabled
+# setting, and isolate any SSL artefacts under a per-test-process temp dir so
+# CI runners do not need openssl on PATH and never share cert state with the
+# host repository checkout.
+_ssl_cert_dir = tempfile.mkdtemp(prefix="api-to-dns-test-ssl-")
+os.environ["SSL_CERT_DIR"] = _ssl_cert_dir
+os.environ["SSL_ENABLED"] = "0"
+
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from sqlmodel import select  # noqa: E402

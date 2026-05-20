@@ -1,5 +1,6 @@
 .env
 data/
+data/ssl/
 .cursor/
 __pycache__/
 *.py[cod]

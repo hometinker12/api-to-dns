@@ -496,13 +496,143 @@
             </div>
           </section>
 
-          {% elif selected_system_section == "ssl_planned" %}
+          {% elif selected_system_section == "ssl_certificate" %}
+          {% set ssl = sys.ssl %}
           <section class="form-card">
-            <h2>SSL Certificate Management (planned)</h2>
-            <div class="placeholder-panel">
-              <p>Certificate upload, chain management, expiration display, and reload actions are not implemented yet.</p>
-              <p class="help">A future release will provide certificate upload, private key upload, certificate chain, expiration details, and reload actions.</p>
-            </div>
+            <h2>SSL Certificate</h2>
+            <p class="help">
+              Optional HTTPS listener on port <code>{{ ssl.ports.https }}</code>. SSL is off by default; the
+              app serves HTTP on port <code>{{ ssl.ports.http }}</code> until an admin installs a certificate and
+              enables SSL. Changes take effect after the application is restarted.
+            </p>
+
+            {% if ssl.cert_exists %}
+              <h3>Installed certificate</h3>
+              <dl class="form-meta">
+                <dt>Source</dt>
+                <dd>
+                  <code>{{ ssl.metadata.source }}</code>
+                  {% if ssl.metadata.source == "self_signed" %}
+                    <span class="help">— browsers will warn until the cert is trusted.</span>
+                  {% endif %}
+                </dd>
+                <dt>Common Name</dt>
+                <dd><code>{{ ssl.metadata.common_name or "(none)" }}</code></dd>
+                {% if ssl.metadata.subject_alt_names %}
+                  <dt>Subject Alt Names</dt>
+                  <dd><code>{{ ssl.metadata.subject_alt_names | join(", ") }}</code></dd>
+                {% endif %}
+                <dt>Expires</dt>
+                <dd>
+                  <code>{{ ssl.metadata.not_after_iso }}</code>
+                  {% if ssl.metadata.expired %}
+                    <span class="alert error" style="display:inline-block; margin-left:0.5rem;">Expired</span>
+                  {% endif %}
+                </dd>
+                <dt>SHA-256 fingerprint</dt>
+                <dd><code>{{ ssl.metadata.fingerprint }}</code></dd>
+                <dt>Key file</dt>
+                <dd><code>{{ ssl.key_path }}</code></dd>
+                <dt>Cert file</dt>
+                <dd><code>{{ ssl.cert_path }}</code></dd>
+              </dl>
+              {% if ssl.metadata.common_name and ssl.app_dns_name and ssl.metadata.common_name != ssl.app_dns_name %}
+                <div class="alert">
+                  App DNS Name (<code>{{ ssl.app_dns_name }}</code>) differs from the certificate CN
+                  (<code>{{ ssl.metadata.common_name }}</code>). Upload a matching certificate or regenerate
+                  the self-signed certificate to align them.
+                </div>
+              {% endif %}
+            {% else %}
+              <p class="help">No certificate is installed yet. Upload a PEM key/cert pair or create a self-signed certificate below to enable SSL.</p>
+            {% endif %}
+          </section>
+
+          {% if can_system_update %}
+          <section class="form-card">
+            <h2>Upload PEM certificate</h2>
+            <p class="help">
+              Provide an unencrypted PEM private key and matching PEM certificate. To include a chain,
+              concatenate intermediate certificates after the leaf certificate in the same <code>.crt</code> /
+              <code>.pem</code> file. Restart the application after upload to apply.
+            </p>
+            <form action="/settings/system/ssl-upload" method="post" enctype="multipart/form-data">
+              <input type="hidden" name="redirect_section" value="ssl_certificate" />
+              <label>Private key (PEM, <code>.key</code> / <code>.pem</code>)
+                <input type="file" name="ssl_key" accept=".key,.pem,application/x-pem-file" required />
+              </label>
+              <label>Certificate (PEM, <code>.crt</code> / <code>.pem</code>, optional chain concatenated)
+                <input type="file" name="ssl_cert" accept=".crt,.pem,application/x-pem-file,application/x-x509-ca-cert" required />
+              </label>
+              <button type="submit">Upload certificate</button>
+            </form>
+          </section>
+
+          <section class="form-card">
+            <h2>{{ "Regenerate" if ssl.cert_exists else "Create" }} self-signed certificate</h2>
+            <p class="help">
+              Generates a new RSA-2048 self-signed certificate valid for 825 days using the App DNS Name
+              (<code>{{ ssl.app_dns_name }}</code>) as the CN and a DNS SAN, plus <code>localhost</code>.
+              Requires the <code>openssl</code> command on PATH.
+              {% if ssl.cert_exists %}
+                <strong>Regenerate replaces the currently installed certificate.</strong>
+              {% endif %}
+            </p>
+            <form
+              action="/settings/system/ssl-regenerate"
+              method="post"
+              onsubmit="return confirm('{{ "Regenerate the self-signed certificate? This overwrites the currently installed key/cert." if ssl.cert_exists else "Create a self-signed certificate now?" }}');"
+            >
+              <input type="hidden" name="redirect_section" value="ssl_certificate" />
+              <button type="submit">{{ "Regenerate self-signed certificate" if ssl.cert_exists else "Create self-signed certificate" }}</button>
+            </form>
+          </section>
+          {% endif %}
+
+          <section class="form-card">
+            <h2>Enable SSL</h2>
+            <p class="help">
+              When enabled, the application listens on HTTPS port <code>{{ ssl.ports.https }}</code> instead of
+              HTTP <code>{{ ssl.ports.http }}</code>. Only one listener runs at a time. Restart the application
+              after saving to apply.
+            </p>
+            <form action="/settings/system/ssl" method="post" id="ssl-enable-form">
+              <input type="hidden" name="redirect_section" value="ssl_certificate" />
+              <label class="inline-check">
+                <input
+                  type="checkbox"
+                  name="ssl_enabled"
+                  value="on"
+                  {% if ssl.enabled %}checked{% endif %}
+                  {% if not can_system_update %}disabled{% endif %}
+                  {% if not ssl.can_enable_ssl and not ssl.enabled %}disabled{% endif %}
+                />
+                Enable HTTPS listener
+              </label>
+              {% if not ssl.can_enable_ssl and not ssl.enabled %}
+                <p class="help">Upload a certificate or create a self-signed certificate before enabling SSL.</p>
+              {% endif %}
+              <p class="help">Restart the application after saving to apply SSL on or off.</p>
+              {% if can_system_update %}
+                <button type="submit">Save</button>
+              {% endif %}
+            </form>
+          </section>
+
+          <section class="form-card">
+            <h2>Access URL</h2>
+            {% if ssl.enabled %}
+              <p>After restart: <code>https://{{ ssl.app_dns_name }}:{{ ssl.ports.https }}/login</code></p>
+              {% if ssl.metadata and ssl.metadata.source == "self_signed" %}
+                <p class="help">Browsers will display a security warning until the self-signed certificate is added to the trust store on each client device.</p>
+              {% endif %}
+            {% else %}
+              <p>Current: <code>http://{{ ssl.app_dns_name }}:{{ ssl.ports.http }}/login</code></p>
+              {% if ssl.cert_exists %}
+                <p class="help">A certificate is installed but SSL is disabled. Enable the listener above and restart to switch to HTTPS.</p>
+              {% endif %}
+            {% endif %}
+            <p class="help">Disabling SSL does not delete the certificate files on disk; toggling back on (after restart) reuses the existing key/cert.</p>
           </section>
           {% endif %}
 
@@ -975,6 +1105,16 @@
           const dialog = document.getElementById(`edit-alert-dialog-${button.dataset.closeEditAlert}`);
           dialog?.close();
         });
+      });
+
+      const sslEnableForm = document.getElementById("ssl-enable-form");
+      sslEnableForm?.addEventListener("submit", (event) => {
+        const confirmed = window.confirm(
+          "SSL changes take effect after you restart the application (container or uvicorn process). Continue?"
+        );
+        if (!confirmed) {
+          event.preventDefault();
+        }
       });
 
       const smtpAnonymous = document.getElementById("smtp-anonymous");

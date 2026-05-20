@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import Depends, FastAPI, Form, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -75,6 +75,17 @@ from .rbac import (
 from .security import generate_api_key, hash_password, verify_password
 from .settings_context import render_settings
 from .settings_store import get_setting, set_setting
+from . import ssl_certs
+from .ssl_certs import (
+    CertificateInstallError,
+    OpenSSLUnavailableError,
+    cert_exists,
+    create_self_signed_cert,
+    install_uploaded_cert,
+    is_ssl_enabled,
+    regenerate_self_signed_cert,
+    set_ssl_enabled,
+)
 from .web import client_ip, record_activity, render_access_denied_response, render_error_response, templates
 from .zone_service import (
     api_key_allowed_zone_names,
@@ -1971,6 +1982,186 @@ def settings_update_smtp(
         )
     return render_settings(
         request, user, "system_settings", message="SMTP delivery settings saved.", section=redirect_section
+    )
+
+
+@app.post("/settings/system/ssl", response_class=HTMLResponse, include_in_schema=False)
+def settings_update_ssl(
+    request: Request,
+    ssl_enabled: Optional[str] = Form(None),
+    redirect_section: str = Form("ssl_certificate"),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    desired = ssl_enabled is not None
+    with SessionLocal() as db:
+        if desired and not cert_exists():
+            return render_settings(
+                request,
+                user,
+                "system_settings",
+                message=(
+                    "Cannot enable SSL: no certificate is installed. Upload a PEM certificate "
+                    "or create a self-signed certificate first."
+                ),
+                message_kind="error",
+                section=redirect_section,
+            )
+        previous = is_ssl_enabled(db)
+        set_ssl_enabled(db, desired)
+        if desired != previous:
+            emit_activity_event(
+                db,
+                event_type="system.ssl_toggled",
+                level=LOG_LEVEL_INFORMATIONAL,
+                status="success",
+                actor_type="user",
+                actor_label=user,
+                message=f"SSL listener {'enabled' if desired else 'disabled'} (restart required)",
+                details={"ssl_enabled": desired, "previous": previous},
+            )
+    return render_settings(
+        request,
+        user,
+        "system_settings",
+        message=(
+            "SSL setting saved. Restart the application for the change to take effect."
+        ),
+        message_kind="warning",
+        section=redirect_section,
+    )
+
+
+@app.post("/settings/system/ssl-upload", response_class=HTMLResponse, include_in_schema=False)
+async def settings_upload_ssl(
+    request: Request,
+    ssl_key: UploadFile = File(...),
+    ssl_cert: UploadFile = File(...),
+    redirect_section: str = Form("ssl_certificate"),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    try:
+        key_bytes = await ssl_key.read()
+        cert_bytes = await ssl_cert.read()
+    except Exception as exc:  # noqa: BLE001 — UploadFile.read failures are surfaced verbatim
+        return render_settings(
+            request,
+            user,
+            "system_settings",
+            message=f"Failed to read upload: {exc}",
+            message_kind="error",
+            section=redirect_section,
+        )
+
+    try:
+        metadata = install_uploaded_cert(key_bytes, cert_bytes)
+    except CertificateInstallError as exc:
+        with SessionLocal() as db:
+            emit_activity_event(
+                db,
+                event_type="system.ssl_upload_failed",
+                level=LOG_LEVEL_WARNING,
+                status="error",
+                actor_type="user",
+                actor_label=user,
+                message=f"SSL certificate upload rejected: {exc}",
+                details={"reason": str(exc)},
+            )
+        return render_settings(
+            request,
+            user,
+            "system_settings",
+            message=str(exc),
+            message_kind="error",
+            section=redirect_section,
+        )
+
+    with SessionLocal() as db:
+        emit_activity_event(
+            db,
+            event_type="system.ssl_uploaded",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"SSL certificate uploaded (CN={metadata.get('common_name') or 'unknown'})",
+            details={
+                "common_name": metadata.get("common_name") or "",
+                "not_after": metadata.get("not_after_iso") or "",
+                "fingerprint": metadata.get("fingerprint") or "",
+            },
+        )
+    return render_settings(
+        request,
+        user,
+        "system_settings",
+        message=(
+            "SSL certificate uploaded. Restart the application for the new certificate to take effect."
+        ),
+        message_kind="warning",
+        section=redirect_section,
+    )
+
+
+@app.post("/settings/system/ssl-regenerate", response_class=HTMLResponse, include_in_schema=False)
+def settings_regenerate_ssl(
+    request: Request,
+    redirect_section: str = Form("ssl_certificate"),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    already_existed = cert_exists()
+    try:
+        with SessionLocal() as db:
+            if already_existed:
+                metadata = regenerate_self_signed_cert(db)
+                event_type = "system.ssl_regenerated"
+                user_message = "Self-signed certificate regenerated."
+            else:
+                metadata = create_self_signed_cert(db)
+                event_type = "system.ssl_created"
+                user_message = "Self-signed certificate created."
+            emit_activity_event(
+                db,
+                event_type=event_type,
+                level=LOG_LEVEL_INFORMATIONAL,
+                status="success",
+                actor_type="user",
+                actor_label=user,
+                message=f"{user_message} (CN={metadata.get('common_name') or 'unknown'})",
+                details={
+                    "common_name": metadata.get("common_name") or "",
+                    "not_after": metadata.get("not_after_iso") or "",
+                    "fingerprint": metadata.get("fingerprint") or "",
+                    "source": metadata.get("source") or "",
+                },
+            )
+    except OpenSSLUnavailableError as exc:
+        return render_settings(
+            request,
+            user,
+            "system_settings",
+            message=str(exc),
+            message_kind="error",
+            section=redirect_section,
+        )
+    except RuntimeError as exc:
+        return render_settings(
+            request,
+            user,
+            "system_settings",
+            message=f"Failed to generate self-signed certificate: {exc}",
+            message_kind="error",
+            section=redirect_section,
+        )
+
+    return render_settings(
+        request,
+        user,
+        "system_settings",
+        message=(
+            f"{user_message} Restart the application for the new certificate to take effect."
+        ),
+        message_kind="warning",
+        section=redirect_section,
     )
 
 
