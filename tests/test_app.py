@@ -2285,7 +2285,7 @@ def test_settings_ssl_section_renders_without_cert(client: TestClient) -> None:
     assert "Upload PEM certificate" in response.text
     assert "Create self-signed certificate" in response.text
     assert 'name="ssl_enabled"' in response.text
-    assert "Upload a certificate or create a self-signed certificate before enabling SSL." in response.text
+    assert "Install a certificate below before enabling SSL." in response.text
 
 
 def test_settings_ssl_legacy_section_key_still_redirects(client: TestClient) -> None:

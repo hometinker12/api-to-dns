@@ -499,69 +499,109 @@
           {% elif selected_system_section == "ssl_certificate" %}
           {% set ssl = sys.ssl %}
           <section class="form-card">
-            <h2>SSL Certificate</h2>
+            <h2>Enable SSL</h2>
             <p class="help">
-              Optional HTTPS listener on port <code>{{ ssl.ports.https }}</code>. SSL is off by default; the
-              app serves HTTP on port <code>{{ ssl.ports.http }}</code> until an admin installs a certificate and
-              enables SSL. Changes take effect after the application is restarted.
+              When enabled, the app listens on HTTPS port <code>{{ ssl.ports.https }}</code> instead of HTTP
+              <code>{{ ssl.ports.http }}</code>. Only one listener runs at a time. Restart after saving to apply.
             </p>
-
-            {% if ssl.cert_exists %}
-              <h3>Installed certificate</h3>
-              <dl class="form-meta">
-                <dt>Source</dt>
-                <dd>
-                  <code>{{ ssl.metadata.source }}</code>
-                  {% if ssl.metadata.source == "self_signed" %}
-                    <span class="help">— browsers will warn until the cert is trusted.</span>
-                  {% endif %}
-                </dd>
-                <dt>Common Name</dt>
-                <dd><code>{{ ssl.metadata.common_name or "(none)" }}</code></dd>
-                {% if ssl.metadata.subject_alt_names %}
-                  <dt>Subject Alt Names</dt>
-                  <dd><code>{{ ssl.metadata.subject_alt_names | join(", ") }}</code></dd>
-                {% endif %}
-                <dt>Expires</dt>
-                <dd>
-                  <code>{{ ssl.metadata.not_after_iso }}</code>
-                  {% if ssl.metadata.expired %}
-                    <span class="alert error" style="display:inline-block; margin-left:0.5rem;">Expired</span>
-                  {% endif %}
-                </dd>
-                <dt>SHA-256 fingerprint</dt>
-                <dd><code>{{ ssl.metadata.fingerprint }}</code></dd>
-                <dt>Key file</dt>
-                <dd><code>{{ ssl.key_path }}</code></dd>
-                <dt>Cert file</dt>
-                <dd><code>{{ ssl.cert_path }}</code></dd>
-              </dl>
-              {% if ssl.metadata.common_name and ssl.app_dns_name and ssl.metadata.common_name != ssl.app_dns_name %}
-                <div class="alert">
-                  App DNS Name (<code>{{ ssl.app_dns_name }}</code>) differs from the certificate CN
-                  (<code>{{ ssl.metadata.common_name }}</code>). Upload a matching certificate or regenerate
-                  the self-signed certificate to align them.
-                </div>
+            <p>
+              {% if ssl.enabled %}
+                <strong>Access URL:</strong>
+                <code>https://{{ ssl.app_dns_name }}:{{ ssl.ports.https }}/login</code>
+              {% else %}
+                <strong>Access URL:</strong>
+                <code>http://{{ ssl.app_dns_name }}:{{ ssl.ports.http }}/login</code>
               {% endif %}
-            {% else %}
-              <p class="help">No certificate is installed yet. Upload a PEM key/cert pair or create a self-signed certificate below to enable SSL.</p>
+            </p>
+            {% if ssl.enabled and ssl.metadata and ssl.metadata.source == "self_signed" %}
+              <p class="alert warning">Self-signed: browsers will warn until the certificate is trusted on each client.</p>
+            {% endif %}
+            <form action="/settings/system/ssl" method="post" id="ssl-enable-form">
+              <input type="hidden" name="redirect_section" value="ssl_certificate" />
+              <label class="inline-check">
+                <input
+                  type="checkbox"
+                  name="ssl_enabled"
+                  value="on"
+                  {% if ssl.enabled %}checked{% endif %}
+                  {% if not can_system_update %}disabled{% endif %}
+                  {% if not ssl.can_enable_ssl and not ssl.enabled %}disabled{% endif %}
+                />
+                Enable HTTPS listener
+              </label>
+              {% if not ssl.can_enable_ssl and not ssl.enabled %}
+                <div class="help alert warning">Install a certificate below before enabling SSL.</div>
+              {% elif ssl.cert_exists and not ssl.enabled %}
+                <p class="help">A certificate is installed. Enable SSL and restart to use HTTPS.</p>
+              {% else %}
+                <p class="help">Disabling SSL does not remove certificate files from disk.</p>
+              {% endif %}
+              {% if can_system_update %}
+                <button type="submit">Save</button>
+              {% endif %}
+            </form>
+          </section>
+
+          {% if ssl.cert_exists %}
+          <section class="form-card">
+            <h2>Installed certificate</h2>
+            <dl class="form-meta">
+              <dt>Source</dt>
+              <dd>
+                {% if ssl.metadata.source == "self_signed" %}
+                  <span class="cert-source-badge warning">Self-signed</span>
+                {% else %}
+                  <span class="cert-source-badge success">3rd Party - Uploaded</span>
+                {% endif %}
+              </dd>
+              <dt>Common Name</dt>
+              <dd><code>{{ ssl.metadata.common_name or "(none)" }}</code></dd>
+              {% if ssl.metadata.subject_alt_names %}
+                <dt>Subject Alt Names</dt>
+                <dd><code>{{ ssl.metadata.subject_alt_names | join(", ") }}</code></dd>
+              {% endif %}
+              <dt>Expires</dt>
+              <dd>
+                <code>{{ ssl.metadata.not_after_iso }}</code>
+                {% if ssl.metadata.expired %}
+                  <span class="alert error" style="display:inline-block; margin-left:0.5rem;">Expired</span>
+                {% endif %}
+              </dd>
+              <dt>SHA-256 fingerprint</dt>
+              <dd><code>{{ ssl.metadata.fingerprint }}</code></dd>
+              <dt>Key file</dt>
+              <dd><code>{{ ssl.key_path }}</code></dd>
+              <dt>Cert file</dt>
+              <dd><code>{{ ssl.cert_path }}</code></dd>
+            </dl>
+            {% if ssl.metadata.common_name and ssl.app_dns_name and ssl.metadata.common_name != ssl.app_dns_name %}
+              <div class="alert">
+                App DNS Name (<code>{{ ssl.app_dns_name }}</code>) differs from the certificate CN
+                (<code>{{ ssl.metadata.common_name }}</code>). Upload a matching certificate or regenerate
+                the self-signed certificate to align them.
+              </div>
             {% endif %}
           </section>
+          {% elif not ssl.cert_exists %}
+          <section class="form-card">
+            <p class="help">No certificate installed. Upload or create one below to unlock Enable SSL.</p>
+          </section>
+          {% endif %}
 
           {% if can_system_update %}
           <section class="form-card">
-            <h2>Upload PEM certificate</h2>
+            <h2>Upload Certificate</h2>
             <p class="help">
-              Provide an unencrypted PEM private key and matching PEM certificate. To include a chain,
-              concatenate intermediate certificates after the leaf certificate in the same <code>.crt</code> /
+              Provide an unencrypted PEM private key and matching PEM certificate. Best practice is to include a chain/
+              bundle intermediate certificates after the leaf certificate in the same <code>.crt</code> /
               <code>.pem</code> file. Restart the application after upload to apply.
             </p>
             <form action="/settings/system/ssl-upload" method="post" enctype="multipart/form-data">
               <input type="hidden" name="redirect_section" value="ssl_certificate" />
-              <label>Private key (PEM, <code>.key</code> / <code>.pem</code>)
+              <label>Private key (PEM, <code>.key</code> / <code>.pem</code>)<br>
                 <input type="file" name="ssl_key" accept=".key,.pem,application/x-pem-file" required />
               </label>
-              <label>Certificate (PEM, <code>.crt</code> / <code>.pem</code>, optional chain concatenated)
+              <label>Certificate (PEM, <code>.crt</code> / <code>.pem</code>) <br>
                 <input type="file" name="ssl_cert" accept=".crt,.pem,application/x-pem-file,application/x-x509-ca-cert" required />
               </label>
               <button type="submit">Upload certificate</button>
@@ -588,52 +628,6 @@
             </form>
           </section>
           {% endif %}
-
-          <section class="form-card">
-            <h2>Enable SSL</h2>
-            <p class="help">
-              When enabled, the application listens on HTTPS port <code>{{ ssl.ports.https }}</code> instead of
-              HTTP <code>{{ ssl.ports.http }}</code>. Only one listener runs at a time. Restart the application
-              after saving to apply.
-            </p>
-            <form action="/settings/system/ssl" method="post" id="ssl-enable-form">
-              <input type="hidden" name="redirect_section" value="ssl_certificate" />
-              <label class="inline-check">
-                <input
-                  type="checkbox"
-                  name="ssl_enabled"
-                  value="on"
-                  {% if ssl.enabled %}checked{% endif %}
-                  {% if not can_system_update %}disabled{% endif %}
-                  {% if not ssl.can_enable_ssl and not ssl.enabled %}disabled{% endif %}
-                />
-                Enable HTTPS listener
-              </label>
-              {% if not ssl.can_enable_ssl and not ssl.enabled %}
-                <p class="help">Upload a certificate or create a self-signed certificate before enabling SSL.</p>
-              {% endif %}
-              <p class="help">Restart the application after saving to apply SSL on or off.</p>
-              {% if can_system_update %}
-                <button type="submit">Save</button>
-              {% endif %}
-            </form>
-          </section>
-
-          <section class="form-card">
-            <h2>Access URL</h2>
-            {% if ssl.enabled %}
-              <p>After restart: <code>https://{{ ssl.app_dns_name }}:{{ ssl.ports.https }}/login</code></p>
-              {% if ssl.metadata and ssl.metadata.source == "self_signed" %}
-                <p class="help">Browsers will display a security warning until the self-signed certificate is added to the trust store on each client device.</p>
-              {% endif %}
-            {% else %}
-              <p>Current: <code>http://{{ ssl.app_dns_name }}:{{ ssl.ports.http }}/login</code></p>
-              {% if ssl.cert_exists %}
-                <p class="help">A certificate is installed but SSL is disabled. Enable the listener above and restart to switch to HTTPS.</p>
-              {% endif %}
-            {% endif %}
-            <p class="help">Disabling SSL does not delete the certificate files on disk; toggling back on (after restart) reuses the existing key/cert.</p>
-          </section>
           {% endif %}
 
         {% elif selected_area == "log_viewing" %}

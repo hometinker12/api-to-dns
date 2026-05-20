@@ -249,6 +249,23 @@ td, th {
   background: #fee2e2;
   color: #991b1b;
 }
+.cert-source-badge {
+  display: inline-block;
+  padding: 0.2rem 0.65rem;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  background: #e2e8f0;
+  color: #334155;
+}
+.cert-source-badge.warning {
+  background: #fde68a;
+  color: #92400e;
+}
+.cert-source-badge.success {
+  background: #d1fae5;
+  color: #065f46;
+}
 dialog {
   width: min(640px, calc(100% - 2rem));
   max-height: calc(100vh - 4rem);
