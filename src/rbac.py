@@ -63,23 +63,23 @@ SETTINGS_AREAS: List[Dict[str, Any]] = [
         "required_roles": [ROLE_GLOBAL_READ, ROLE_PLUGIN_UPDATE],
     },
     {
-        "key": "system_settings",
-        "label": "System Settings",
-        "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
-    },
-    {
-        "key": "log_viewing",
-        "label": "Log Viewing / Searching",
-        "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
-    },
-    {
         "key": "email_alerting",
         "label": "Email Alerting",
         "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
     },
     {
+        "key": "log_viewing",
+        "label": "View Logs",
+        "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
+    },
+    {
         "key": "backup",
         "label": "System Backup",
+        "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
+    },
+    {
+        "key": "system_settings",
+        "label": "System Settings",
         "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
     },
 ]
@@ -88,6 +88,30 @@ LEGACY_SETTINGS_AREA_ALIASES: Dict[str, str] = {
     "logging": "log_viewing",
     "activity_logging": "log_viewing",
 }
+
+SYSTEM_SETTINGS_SECTIONS: List[Dict[str, str]] = [
+    {"key": "system_identity", "label": "App DNS Name"},
+    {"key": "ssl_planned", "label": "SSL Certificate Management (planned)"}, 
+    {"key": "smtp_delivery", "label": "SMTP Delivery"},    
+    {"key": "syslog_planned", "label": "Syslog Server (planned)"},
+    {"key": "logging_configuration", "label": "Logging Level"},
+    {"key": "audit_log_retention", "label": "Audit Log Retention"},
+    {"key": "operational_log_rotation", "label": "Operational Log Rotation"},
+]
+
+_SYSTEM_SETTINGS_SECTION_KEYS = {section["key"] for section in SYSTEM_SETTINGS_SECTIONS}
+
+
+def default_system_settings_section() -> str:
+    return SYSTEM_SETTINGS_SECTIONS[0]["key"]
+
+
+def normalize_system_settings_section(section: Optional[str]) -> str:
+    key = (section or "").strip().lower()
+    if key in _SYSTEM_SETTINGS_SECTION_KEYS:
+        return key
+    return default_system_settings_section()
+
 
 ROLE_FORBIDDEN_DETAIL = "You do not have permission to access this resource."
 

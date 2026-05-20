@@ -32,12 +32,33 @@
         <div class="settings-sidebar-title">Settings</div>
         <nav class="settings-menu">
           {% for area in accessible_areas %}
-            <a
-              class="settings-menu-item {% if area.key == selected_area %}selected{% endif %}"
-              href="/settings?area={{ area.key }}"
-            >
-              {{ area.label }}
-            </a>
+            {% if area.key == "system_settings" %}
+              <a
+                class="settings-menu-item has-submenu {% if selected_area == 'system_settings' %}selected{% endif %}"
+                href="/settings?area=system_settings&section={{ selected_system_section }}"
+              >
+                {{ area.label }}
+              </a>
+              {% if selected_area == "system_settings" %}
+                <nav class="settings-submenu" aria-label="System Settings sections">
+                  {% for section in system_settings_sections %}
+                    <a
+                      class="settings-submenu-item {% if section.key == selected_system_section %}selected{% endif %}"
+                      href="/settings?area=system_settings&section={{ section.key }}"
+                    >
+                      {{ section.label }}
+                    </a>
+                  {% endfor %}
+                </nav>
+              {% endif %}
+            {% else %}
+              <a
+                class="settings-menu-item {% if area.key == selected_area %}selected{% endif %}"
+                href="/settings?area={{ area.key }}"
+              >
+                {{ area.label }}
+              </a>
+            {% endif %}
           {% endfor %}
         </nav>
       </aside>
@@ -338,26 +359,34 @@
           <h2>System Settings</h2>
           <p class="help">Service-wide infrastructure configuration. SMTP credentials and other secrets are encrypted at rest.</p>
 
+          {% if selected_system_section == "system_identity" %}
           <section class="form-card">
-            <h2>System Identity</h2>
-            <p class="help">Auto-detected from the runtime. These values populate <code>{system_dns_name}</code> and <code>{system_ip_address}</code> in alert templates.</p>
-            <label>System DNS name
-              <input type="text" value="{{ sys.identity.system_dns_name }}" disabled readonly />
-            </label>
+            <h2>App DNS Name</h2>
+            <p class="help">Used as <code>{system_dns_name}</code> in email alert templates. Default is <code>apitodns.local</code> in Docker or the host name on a bare-metal install. System IP is still auto-detected.</p>
+            <form action="/settings/system/app-dns-name" method="post">
+              <input type="hidden" name="redirect_section" value="system_identity" />
+              <label>App DNS name
+                <input type="text" name="app_dns_name" value="{{ sys.identity.system_dns_name }}" {% if not can_system_update %}disabled{% endif %} required />
+              </label>
+              
             <label>System IP address
               <input type="text" value="{{ sys.identity.system_ip_address }}" disabled readonly />
             </label>
-            {% if sys.is_docker %}
-              <p class="help">Detected Docker container runtime.</p>
-            {% endif %}
+            <p class="help">Populates <code>{system_ip_address}</code> in alert templates.</p>
+              {% if can_system_update %}
+                <button type="submit">Save</button>
+              {% endif %}
+            </form>
           </section>
 
+          {% elif selected_system_section == "logging_configuration" %}
           <section class="form-card">
             <h2>Logging Configuration</h2>
             <p class="help">Storage threshold for non-security activity events. <code>verbose</code> records every page request and API call; security-category events are always logged.</p>
             <form action="/settings/system/log-level" method="post">
               <input type="hidden" name="redirect_area" value="system_settings" />
-              <label>Activity log level
+              <input type="hidden" name="redirect_section" value="logging_configuration" />
+              <label>Activity Log Level
                 <select name="log_level" {% if not can_system_update %}disabled{% endif %}>
                   {% for option in sys.log_levels %}
                     <option value="{{ option }}" {% if sys.log_level == option %}selected{% endif %}>{{ option|lower }}</option>
@@ -365,15 +394,17 @@
                 </select>
               </label>
               {% if can_system_update %}
-                <button type="submit">Save log level</button>
+                <button type="submit">Save</button>
               {% endif %}
             </form>
           </section>
 
+          {% elif selected_system_section == "audit_log_retention" %}
           <section class="form-card">
             <h2>Audit Log Retention</h2>
             <p class="help">Activity log rows older than this window are deleted by a daily cleanup job.</p>
             <form action="/settings/system/retention" method="post">
+              <input type="hidden" name="redirect_section" value="audit_log_retention" />
               <label>Retention days
                 <select name="retention_days" {% if not can_system_update %}disabled{% endif %}>
                   {% for option in sys.retention_options %}
@@ -385,15 +416,17 @@
                 </select>
               </label>
               {% if can_system_update %}
-                <button type="submit">Save retention</button>
+                <button type="submit">Save</button>
               {% endif %}
             </form>
           </section>
 
+          {% elif selected_system_section == "smtp_delivery" %}
           <section class="form-card">
             <h2>SMTP Delivery</h2>
             <p class="help">SMTP servers are tried in order. Anonymous mode skips authentication entirely.</p>
             <form action="/settings/system/smtp" method="post">
+              <input type="hidden" name="redirect_section" value="smtp_delivery" />
               <label>SMTP servers (CSV)
                 <input type="text" name="smtp_servers" value="{{ sys.smtp.servers | join(',') }}" placeholder="smtp1.example.com,192.0.2.25,smtp-backup.example.com" {% if not can_system_update %}disabled{% endif %} />
               </label>
@@ -424,30 +457,37 @@
                 <input type="text" name="smtp_timeout" value="{{ sys.smtp.timeout }}" {% if not can_system_update %}disabled{% endif %} />
               </label>
               {% if can_system_update %}
-                <button type="submit">Save SMTP settings</button>
+                <button type="submit">Save</button>
               {% endif %}
             </form>
           </section>
 
+          {% elif selected_system_section == "operational_log_rotation" %}
           <section class="form-card">
             <h2>Operational Log Rotation</h2>
-            <p class="help">Docker stdout/stderr logs are rotated by Docker (see <code>docker-compose.yml</code>). Optionally enable a rotating file handler for non-Docker installs.</p>
-            <form action="/settings/system/log-rotation" method="post">
-              <label>Log file path (optional)
-                <input type="text" name="log_file" value="{{ sys.operational_log.log_file }}" placeholder="/var/log/api-to-dns.log" {% if not can_system_update %}disabled{% endif %} />
-              </label>
-              <label>Max file size (bytes)
-                <input type="text" name="max_bytes" value="{{ sys.operational_log.max_bytes }}" {% if not can_system_update %}disabled{% endif %} />
-              </label>
-              <label>Backup file count
-                <input type="text" name="backup_count" value="{{ sys.operational_log.backup_count }}" {% if not can_system_update %}disabled{% endif %} />
-              </label>
-              {% if can_system_update %}
-                <button type="submit">Save log rotation</button>
-              {% endif %}
-            </form>
+            <p class="help">Optionally enable a rotating file handler for operational logs on non-Docker installs.</p>
+            {% if sys.is_docker %}
+              <p class="help">Docker stdout/stderr logs are rotated by Docker.</p>
+            {% else %}
+              <form action="/settings/system/log-rotation" method="post">
+                <input type="hidden" name="redirect_section" value="operational_log_rotation" />
+                <label>Log file path (optional)
+                  <input type="text" name="log_file" value="{{ sys.operational_log.log_file }}" placeholder="/var/log/api-to-dns.log" {% if not can_system_update %}disabled{% endif %} />
+                </label>
+                <label>Max file size (bytes)
+                  <input type="text" name="max_bytes" value="{{ sys.operational_log.max_bytes }}" {% if not can_system_update %}disabled{% endif %} />
+                </label>
+                <label>Backup file count
+                  <input type="text" name="backup_count" value="{{ sys.operational_log.backup_count }}" {% if not can_system_update %}disabled{% endif %} />
+                </label>
+                {% if can_system_update %}
+                  <button type="submit">Save</button>
+                {% endif %}
+              </form>
+            {% endif %}
           </section>
 
+          {% elif selected_system_section == "syslog_planned" %}
           <section class="form-card">
             <h2>Syslog Server (planned)</h2>
             <div class="placeholder-panel">
@@ -456,6 +496,7 @@
             </div>
           </section>
 
+          {% elif selected_system_section == "ssl_planned" %}
           <section class="form-card">
             <h2>SSL Certificate Management (planned)</h2>
             <div class="placeholder-panel">
@@ -463,10 +504,11 @@
               <p class="help">A future release will provide certificate upload, private key upload, certificate chain, expiration details, and reload actions.</p>
             </div>
           </section>
+          {% endif %}
 
         {% elif selected_area == "log_viewing" %}
           {% set lv = log_view %}
-          <h2>Log Viewing / Searching</h2>
+          <h2>View Logs</h2>
           <p class="help">Searchable activity events. Retention is currently <strong>{{ lv.shared.retention_days }} days</strong> (configured under System Settings).</p>
 
           <section class="form-card">
@@ -573,7 +615,7 @@
         {% elif selected_area == "email_alerting" %}
           {% set av = alert_view %}
           <h2>Email Alerting</h2>
-          <p class="help">SMTP delivery settings live under <a href="/settings?area=system_settings">System Settings</a>. Alert rules consume those settings.</p>
+          <p class="help">SMTP delivery settings live under <a href="/settings?area=system_settings&section=smtp_delivery">System Settings</a>. Alert rules consume those settings.</p>
 
           <section class="form-card">
             <h2>Alert Rules</h2>

@@ -70,7 +70,10 @@ SETTING_SMTP_TIMEOUT = "smtp_timeout"
 SETTING_LOG_FILE = "operational_log_file"
 SETTING_LOG_MAX_BYTES = "operational_log_max_bytes"
 SETTING_LOG_BACKUP_COUNT = "operational_log_backup_count"
+SETTING_APP_DNS_NAME = "app_dns_name"
 
+DEFAULT_APP_DNS_NAME_DOCKER = "apitodns.local"
+DOCKER_RUNTIME_LABEL = "Detected Docker container runtime."
 DEFAULT_LOG_LEVEL = LOG_LEVEL_INFORMATIONAL
 DEFAULT_RETENTION_DAYS = 90
 DEFAULT_SMTP_PORT = 25
@@ -241,9 +244,7 @@ def is_running_in_docker() -> bool:
         return False
 
 
-def detect_system_dns_name() -> str:
-    if is_running_in_docker():
-        return "Docker Container"
+def _host_system_dns_name() -> str:
     try:
         hostname = socket.gethostname()
         try:
@@ -254,9 +255,36 @@ def detect_system_dns_name() -> str:
         return "unknown"
 
 
-def detect_system_ip_address() -> str:
+def detect_system_dns_name() -> str:
     if is_running_in_docker():
         return "Docker Container"
+    return _host_system_dns_name()
+
+
+def default_app_dns_name() -> str:
+    if is_running_in_docker():
+        return DEFAULT_APP_DNS_NAME_DOCKER
+    return _host_system_dns_name()
+
+
+def get_app_dns_name(db) -> str:
+    stored = (get_setting(db, SETTING_APP_DNS_NAME) or "").strip()
+    if stored:
+        return stored
+    return default_app_dns_name()
+
+
+def set_app_dns_name(db, name: str) -> str:
+    cleaned = (name or "").strip()
+    if not cleaned:
+        raise ValueError("App DNS name cannot be empty.")
+    set_setting(db, SETTING_APP_DNS_NAME, cleaned)
+    return cleaned
+
+
+def detect_system_ip_address() -> str:
+    if is_running_in_docker():
+        return DOCKER_RUNTIME_LABEL
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.settimeout(0.5)
@@ -271,8 +299,8 @@ def detect_system_ip_address() -> str:
         sock.close()
 
 
-def system_identity() -> Dict[str, str]:
-    return {"system_dns_name": detect_system_dns_name(), "system_ip_address": detect_system_ip_address()}
+def system_identity(db) -> Dict[str, str]:
+    return {"system_dns_name": get_app_dns_name(db), "system_ip_address": detect_system_ip_address()}
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +647,7 @@ def evaluate_alert_rules(db, row: ActivityLog) -> List[AlertRule]:
     if not rules:
         return []
 
-    identity = system_identity()
+    identity = system_identity(db)
     base_values = _template_values_for_event(row)
     base_values.update(identity)
     triggered: List[AlertRule] = []
@@ -746,8 +774,10 @@ __all__ = [
     "SETTING_LOG_LEVEL",
     "SETTING_RETENTION_DAYS",
     "configure_operational_logging",
+    "default_app_dns_name",
     "detect_system_dns_name",
     "detect_system_ip_address",
+    "get_app_dns_name",
     "emit_activity_event",
     "evaluate_alert_rules",
     "get_log_level",
@@ -761,9 +791,11 @@ __all__ = [
     "render_alert_template",
     "run_retention_cleanup",
     "send_alert_email",
+    "set_app_dns_name",
     "set_log_level",
     "set_retention_days",
     "set_smtp_config",
+    "SETTING_APP_DNS_NAME",
     "should_store_event",
     "system_identity",
 ]

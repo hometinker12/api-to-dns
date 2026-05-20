@@ -18,7 +18,9 @@ from .activity_logging import (
     get_log_level,
     get_retention_days,
     get_smtp_config,
+    is_running_in_docker,
     run_retention_cleanup,
+    set_app_dns_name,
     set_log_level,
     set_retention_days,
     set_smtp_config,
@@ -1205,6 +1207,7 @@ def api_key_update(
 def settings_page(
     request: Request,
     area: Optional[str] = None,
+    section: Optional[str] = None,
     event_type: Optional[str] = None,
     level: Optional[str] = None,
     category: Optional[str] = None,
@@ -1234,7 +1237,9 @@ def settings_page(
             "end": _parse_iso_datetime(end),
             "offset": offset,
         }
-    return render_settings(request, user, normalized_area, log_search_params=log_search_params)
+    return render_settings(
+        request, user, normalized_area, log_search_params=log_search_params, section=section
+    )
 
 
 def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -1811,16 +1816,56 @@ def settings_plugin_enable(
     return render_settings(request, user, "plugins", message=f"{dns_provider_display_name(normalized_key)} enabled.")
 
 
+@app.post("/settings/system/app-dns-name", response_class=HTMLResponse, include_in_schema=False)
+def settings_update_app_dns_name(
+    request: Request,
+    app_dns_name: str = Form(...),
+    redirect_section: str = Form("system_identity"),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    try:
+        with SessionLocal() as db:
+            applied = set_app_dns_name(db, app_dns_name)
+            emit_activity_event(
+                db,
+                event_type="system.app_dns_name_changed",
+                level=LOG_LEVEL_INFORMATIONAL,
+                status="success",
+                actor_type="user",
+                actor_label=user,
+                message=f"App DNS name set to {applied}",
+                details={"app_dns_name": applied},
+            )
+    except ValueError as exc:
+        return render_settings(
+            request,
+            user,
+            "system_settings",
+            message=str(exc),
+            message_kind="error",
+            section=redirect_section,
+        )
+    return render_settings(
+        request,
+        user,
+        "system_settings",
+        message=f"App DNS name saved as {applied}.",
+        section=redirect_section,
+    )
+
+
 @app.post("/settings/system/log-level", response_class=HTMLResponse, include_in_schema=False)
 def settings_update_log_level(
     request: Request,
     log_level: str = Form(...),
     redirect_area: str = Form("system_settings"),
+    redirect_section: str = Form("logging_configuration"),
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
     target_area = (redirect_area or "system_settings").strip().lower()
     if target_area not in {"system_settings", "log_viewing"}:
         target_area = "system_settings"
+    target_section = redirect_section if target_area == "system_settings" else None
     try:
         previous = None
         with SessionLocal() as db:
@@ -1838,19 +1883,29 @@ def settings_update_log_level(
                 details={"previous_level": previous, "new_level": applied},
             )
     except ValueError as exc:
-        return render_settings(request, user, target_area, message=str(exc), message_kind="error")
-    return render_settings(request, user, target_area, message=f"Activity log level set to {applied}.")
+        return render_settings(
+            request, user, target_area, message=str(exc), message_kind="error", section=target_section
+        )
+    return render_settings(
+        request, user, target_area, message=f"Activity log level set to {applied}.", section=target_section
+    )
 
 
 @app.post("/settings/system/retention", response_class=HTMLResponse, include_in_schema=False)
 def settings_update_retention(
     request: Request,
     retention_days: int = Form(...),
+    redirect_section: str = Form("audit_log_retention"),
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
     if retention_days < 1:
         return render_settings(
-            request, user, "system_settings", message="Retention must be at least 1 day.", message_kind="error"
+            request,
+            user,
+            "system_settings",
+            message="Retention must be at least 1 day.",
+            message_kind="error",
+            section=redirect_section,
         )
     with SessionLocal() as db:
         applied = set_retention_days(db, retention_days)
@@ -1865,7 +1920,11 @@ def settings_update_retention(
             details={"retention_days": applied},
         )
     return render_settings(
-        request, user, "system_settings", message=f"Activity log retention set to {applied} days."
+        request,
+        user,
+        "system_settings",
+        message=f"Activity log retention set to {applied} days.",
+        section=redirect_section,
     )
 
 
@@ -1880,6 +1939,7 @@ def settings_update_smtp(
     smtp_password: str = Form(""),
     smtp_from: str = Form(""),
     smtp_timeout: int = Form(activity_logging.DEFAULT_SMTP_TIMEOUT),
+    redirect_section: str = Form("smtp_delivery"),
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
     anonymous = smtp_anonymous is not None
@@ -1909,7 +1969,9 @@ def settings_update_smtp(
                 "security": smtp_security,
             },
         )
-    return render_settings(request, user, "system_settings", message="SMTP delivery settings saved.")
+    return render_settings(
+        request, user, "system_settings", message="SMTP delivery settings saved.", section=redirect_section
+    )
 
 
 @app.post("/settings/system/log-rotation", response_class=HTMLResponse, include_in_schema=False)
@@ -1918,8 +1980,18 @@ def settings_update_log_rotation(
     log_file: str = Form(""),
     max_bytes: int = Form(1_048_576),
     backup_count: int = Form(5),
+    redirect_section: str = Form("operational_log_rotation"),
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
+    if is_running_in_docker():
+        return render_settings(
+            request,
+            user,
+            "system_settings",
+            message="Operational log rotation is managed by Docker in container deployments.",
+            message_kind="error",
+            section=redirect_section,
+        )
     with SessionLocal() as db:
         set_setting(db, activity_logging.SETTING_LOG_FILE, log_file or "")
         set_setting(db, activity_logging.SETTING_LOG_MAX_BYTES, str(max(1024, int(max_bytes))))
@@ -1944,7 +2016,13 @@ def settings_update_log_rotation(
                 "backup_count": max(0, int(backup_count)),
             },
         )
-    return render_settings(request, user, "system_settings", message="Operational log rotation saved.")
+    return render_settings(
+        request,
+        user,
+        "system_settings",
+        message="Operational log rotation saved.",
+        section=redirect_section,
+    )
 
 
 @app.post("/settings/alerts", response_class=HTMLResponse, include_in_schema=False)

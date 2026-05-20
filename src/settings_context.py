@@ -24,8 +24,11 @@ from .rbac import (
     ROLE_LABELS,
     ROLE_PLUGIN_UPDATE,
     ROLE_SYSTEM_UPDATE,
+    SYSTEM_SETTINGS_SECTIONS,
     accessible_settings_areas,
+    default_system_settings_section,
     get_user_roles,
+    normalize_system_settings_section,
     user_public_dict,
 )
 from .settings_store import get_setting
@@ -45,8 +48,8 @@ ALERT_TEMPLATE_VARIABLES: List[Dict[str, str]] = [
     {"name": "{zone_name}", "description": "DNS zone associated with the event (if any)"},
     {"name": "{record_name}", "description": "DNS record name (if any)"},
     {"name": "{details}", "description": "JSON-encoded sanitized event detail payload"},
-    {"name": "{system_dns_name}", "description": "Detected system DNS name (or Docker Container)"},
-    {"name": "{system_ip_address}", "description": "Detected system IP address (or Docker Container)"},
+    {"name": "{system_dns_name}", "description": "Configured app DNS name (System Settings → App DNS Name)"},
+    {"name": "{system_ip_address}", "description": "Detected system IP address (or Docker container runtime message when containerized)"},
 ]
 
 
@@ -60,6 +63,7 @@ def settings_context(
     auth_form_username: Optional[str] = None,
     auth_form_selected_roles: Optional[List[str]] = None,
     log_search_params: Optional[Dict[str, Any]] = None,
+    section: Optional[str] = None,
 ) -> Dict[str, Any]:
     with SessionLocal() as db:
         user_roles = get_user_roles(db, user)
@@ -82,6 +86,14 @@ def settings_context(
         if requested_area not in accessible_keys:
             requested_area = accessible[0]["key"] if accessible else ""
 
+        can_access_system_settings = "system_settings" in accessible_keys
+        selected_system_section = (
+            normalize_system_settings_section(section)
+            if requested_area == "system_settings" and can_access_system_settings
+            else default_system_settings_section()
+        )
+        system_settings_sections = list(SYSTEM_SETTINGS_SECTIONS) if can_access_system_settings else []
+
         system_settings_view: Optional[Dict[str, Any]] = None
         log_view: Optional[Dict[str, Any]] = None
         alert_view: Optional[Dict[str, Any]] = None
@@ -89,7 +101,7 @@ def settings_context(
         if requested_area in {"system_settings", "log_viewing", "email_alerting"} and (
             ROLE_GLOBAL_READ in user_roles or ROLE_SYSTEM_UPDATE in user_roles
         ):
-            identity = system_identity()
+            identity = system_identity(db)
             smtp = get_smtp_config(db)
             current_level = get_log_level(db)
             retention_days = get_retention_days(db)
@@ -219,6 +231,8 @@ def settings_context(
         "can_plugin_update": ROLE_PLUGIN_UPDATE in user_roles,
         "can_system_update": ROLE_SYSTEM_UPDATE in user_roles,
         "system_settings_view": system_settings_view,
+        "system_settings_sections": system_settings_sections,
+        "selected_system_section": selected_system_section,
         "log_view": log_view,
         "alert_view": alert_view,
     }

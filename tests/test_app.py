@@ -1080,7 +1080,7 @@ def test_no_role_user_can_change_own_password_only(client: TestClient) -> None:
     assert "Edit roles" not in response.text
     assert "Plugin Management" not in response.text
     assert "System Settings" not in response.text
-    assert "Log Viewing / Searching" not in response.text
+    assert "View Logs" not in response.text
     assert "Email Alerting" not in response.text
     assert "System Backup" not in response.text
 
@@ -1180,7 +1180,7 @@ def test_settings_renders_for_authenticated_session(client: TestClient) -> None:
     assert "Authentication" in response.text
     assert "Plugin Management" in response.text
     assert "System Settings" in response.text
-    assert "Log Viewing / Searching" in response.text
+    assert "View Logs" in response.text
     assert "Email Alerting" in response.text
     assert "System Backup" in response.text
 
@@ -1981,7 +1981,7 @@ def test_global_read_can_view_read_only_pages(client: TestClient) -> None:
     for path, expected_text in (
         ("/settings?area=authentication", "Authentication"),
         ("/settings?area=plugins", "Plugin Management"),
-        ("/settings?area=logging", "Log Viewing / Searching"),
+        ("/settings?area=logging", "View Logs"),
         ("/settings?area=system_settings", "System Settings"),
         ("/settings?area=email_alerting", "Email Alerting"),
         ("/settings?area=backup", "System Backup"),
@@ -2015,7 +2015,7 @@ def test_system_update_can_view_system_placeholders_without_global_read(client: 
 
     response = client.get("/settings?area=logging")
     assert response.status_code == 200
-    assert "Log Viewing / Searching" in response.text
+    assert "View Logs" in response.text
     assert "System Backup" in response.text
     assert "Authentication" in response.text
     assert "Plugin Management" not in response.text
@@ -2107,12 +2107,18 @@ def test_settings_activity_logging_sections_render(client: TestClient) -> None:
     response = client.get("/settings?area=system_settings")
     assert response.status_code == 200
     assert "System Settings" in response.text
+    assert 'class="settings-submenu"' in response.text
     assert "Logging Configuration" in response.text
     assert "SMTP Delivery" in response.text
+    assert "App DNS Name" in response.text
+    assert "SSL Certificate Management" in response.text
+    assert 'name="log_level"' not in response.text
+    submenu = response.text.split('class="settings-submenu"')[1].split("</nav>")[0]
+    assert submenu.index("App DNS Name") < submenu.index("SSL Certificate Management")
 
     response = client.get("/settings?area=log_viewing")
     assert response.status_code == 200
-    assert "Log Viewing / Searching" in response.text
+    assert "View Logs" in response.text
     assert "Advanced Search" in response.text
     assert "Category" in response.text
 
@@ -2120,6 +2126,108 @@ def test_settings_activity_logging_sections_render(client: TestClient) -> None:
     assert response.status_code == 200
     assert "Email Alerting" in response.text
     assert "Template Variables" in response.text
+
+
+def test_settings_system_section_shows_single_panel(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/settings?area=system_settings&section=smtp_delivery")
+    assert response.status_code == 200
+    assert 'name="smtp_servers"' in response.text
+    assert 'name="log_level"' not in response.text
+    assert 'settings-submenu-item selected' in response.text or "settings-submenu-item selected" in response.text
+    assert "section=smtp_delivery" in response.text
+
+    response = client.get("/settings?area=system_settings&section=logging_configuration")
+    assert response.status_code == 200
+    assert 'name="log_level"' in response.text
+    assert 'name="smtp_servers"' not in response.text
+
+
+def test_settings_plugins_area_has_no_system_submenu(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/settings?area=plugins")
+    assert response.status_code == 200
+    assert "Plugin Management" in response.text
+    assert 'class="settings-submenu"' not in response.text
+
+
+def test_settings_log_level_post_redirects_to_section(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post(
+        "/settings/system/log-level",
+        data={
+            "log_level": "informational",
+            "redirect_area": "system_settings",
+            "redirect_section": "logging_configuration",
+        },
+    )
+    assert response.status_code == 200
+    assert "Activity log level set to INFORMATIONAL" in response.text
+    assert 'name="log_level"' in response.text
+    assert 'name="smtp_servers"' not in response.text
+
+
+def test_settings_app_dns_name_section_is_editable(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/settings?area=system_settings&section=system_identity")
+    assert response.status_code == 200
+    assert "App DNS Name" in response.text
+    assert 'name="app_dns_name"' in response.text
+    assert 'action="/settings/system/app-dns-name"' in response.text
+
+
+def test_settings_app_dns_name_post_persists(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post(
+        "/settings/system/app-dns-name",
+        data={"app_dns_name": "my-dns.example", "redirect_section": "system_identity"},
+    )
+    assert response.status_code == 200
+    assert "App DNS name saved as my-dns.example" in response.text
+    with SessionLocal() as db:
+        from src.activity_logging import get_app_dns_name
+
+        assert get_app_dns_name(db) == "my-dns.example"
+
+
+def test_default_app_dns_name_uses_docker_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(activity_logging, "is_running_in_docker", lambda: True)
+    assert activity_logging.default_app_dns_name() == "apitodns.local"
+
+
+def test_default_app_dns_name_uses_hostname_off_docker(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(activity_logging, "is_running_in_docker", lambda: False)
+    monkeypatch.setattr(activity_logging, "_host_system_dns_name", lambda: "host.example")
+    assert activity_logging.default_app_dns_name() == "host.example"
+
+
+def test_settings_operational_log_rotation_docker_shows_message_only(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src import settings_context
+
+    monkeypatch.setattr(activity_logging, "is_running_in_docker", lambda: True)
+    monkeypatch.setattr(settings_context, "is_running_in_docker", lambda: True)
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/settings?area=system_settings&section=operational_log_rotation")
+    assert response.status_code == 200
+    assert "Docker stdout/stderr logs are rotated by Docker." in response.text
+    assert 'action="/settings/system/log-rotation"' not in response.text
+    assert 'name="log_file"' not in response.text
+
+
+def test_settings_operational_log_rotation_non_docker_shows_form(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src import settings_context
+
+    monkeypatch.setattr(activity_logging, "is_running_in_docker", lambda: False)
+    monkeypatch.setattr(settings_context, "is_running_in_docker", lambda: False)
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/settings?area=system_settings&section=operational_log_rotation")
+    assert response.status_code == 200
+    assert 'action="/settings/system/log-rotation"' in response.text
+    assert 'name="log_file"' in response.text
 
 
 def test_settings_backup_area_renders_placeholder(client: TestClient) -> None:
@@ -2452,7 +2560,7 @@ def test_alert_rules_trigger_render_templates_and_respect_cooldown(
     monkeypatch.setattr(
         activity_logging,
         "system_identity",
-        lambda: {"system_dns_name": "dns-host.example", "system_ip_address": "192.0.2.44"},
+        lambda db: {"system_dns_name": "dns-host.example", "system_ip_address": "192.0.2.44"},
     )
 
     with SessionLocal() as db:

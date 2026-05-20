@@ -334,6 +334,34 @@ dialog::backdrop {
   border-left-color: #2563eb;
   color: #1d4ed8;
 }
+.settings-menu-item.has-submenu.selected {
+  border-left-color: #2563eb;
+}
+.settings-submenu {
+  display: flex;
+  flex-direction: column;
+  padding: 0.15rem 0 0.5rem 0;
+  border-left: 3px solid #cbd5e1;
+  margin-left: 1rem;
+}
+.settings-submenu-item {
+  display: block;
+  padding: 0.55rem 0.85rem 0.55rem 1rem;
+  text-decoration: none;
+  color: #475569;
+  font-size: 0.9rem;
+  font-weight: 500;
+  border-left: 3px solid transparent;
+}
+.settings-submenu-item:hover {
+  background: #e2e8f0;
+  color: #1f2937;
+}
+.settings-submenu-item.selected {
+  background: #ffffff;
+  border-left-color: #2563eb;
+  color: #1d4ed8;
+}
 .settings-content {
   border: 1px solid #e2e8f0;
   border-radius: 12px;
