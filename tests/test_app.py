@@ -71,7 +71,7 @@ def test_admin_redirects_to_login_without_session(client: TestClient) -> None:
     assert response.headers["location"] == "/login"
 
 
-def test_login_sets_five_minute_session_cookie(client: TestClient) -> None:
+def test_login_sets_fifteen_minute_session_cookie(client: TestClient) -> None:
     with SessionLocal() as db:
         _delete_users(db)
         _create_user(db, "admin", "x", ALL_ROLES)

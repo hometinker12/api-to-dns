@@ -4,7 +4,7 @@ from fastapi import HTTPException, Request
 from sqlmodel import select
 
 SECRET_KEY = os.getenv("SECRET_KEY", "please-change-this-secret")
-SESSION_IDLE_TIMEOUT_SECONDS = 300
+SESSION_IDLE_TIMEOUT_SECONDS = 900
 serializer = URLSafeTimedSerializer(SECRET_KEY, salt="session-cookie")
 
 
