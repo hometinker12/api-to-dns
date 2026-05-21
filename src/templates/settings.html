@@ -656,11 +656,12 @@
               {% endif %}
               <label class="inline-check">
                 <input type="checkbox" name="scheduled_restart_enabled" {% if le_config.scheduled_restart_enabled is not sameas false %}checked{% endif %} />
-                Restart daily after renewal if needed
+                Schedule restart after certificate renewal
               </label>
               <label>Scheduled restart time
                 <input type="time" name="scheduled_restart_time" value="{{ le_config.scheduled_restart_time or '03:00' }}" />
               </label>
+              <p class="help">When enabled, the app restarts once at this time after a background renewal. It does not restart on days when no renewal occurred.</p>
               <button type="submit">Start Let's Encrypt enrollment</button>
             </form>
             <dialog id="le-auto-enroll-dialog">
@@ -687,11 +688,12 @@
                 </label>
                 <label class="inline-check">
                   <input type="checkbox" name="scheduled_restart_enabled" {% if le_config.scheduled_restart_enabled is not sameas false %}checked{% endif %} />
-                  Enable daily scheduled restart
+                  Schedule restart after certificate renewal
                 </label>
                 <label>Scheduled restart time
                   <input type="time" name="scheduled_restart_time" value="{{ le_config.scheduled_restart_time or '03:00' }}" />
                 </label>
+                <p class="help">When enabled, the app restarts once at this time after a background renewal. It does not restart on days when no renewal occurred.</p>
                 <button type="submit">Save Let's Encrypt options</button>
               </form>
             {% endif %}

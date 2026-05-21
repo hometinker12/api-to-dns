@@ -18,6 +18,7 @@ from .ssl_certs import access_url
 SETTING_RESTART_REQUIRED = "restart_required"
 SETTING_RESTART_REASON = "restart_reason"
 SETTING_LAST_SCHEDULED_RESTART_DATE = "last_scheduled_restart_date"
+SETTING_LE_RENEWAL_PENDING_RESTART = "letsencrypt_renewal_pending_restart"
 
 
 def mark_restart_required(db, *, reason: str) -> None:
@@ -36,6 +37,23 @@ def is_restart_required(db) -> bool:
 
 def restart_reason(db) -> str:
     return get_setting(db, SETTING_RESTART_REASON) or "Application restart required."
+
+
+def mark_le_renewal_pending_restart(db) -> None:
+    set_setting(db, SETTING_LE_RENEWAL_PENDING_RESTART, "true")
+
+
+def clear_le_renewal_pending_restart(db) -> None:
+    delete_setting(db, SETTING_LE_RENEWAL_PENDING_RESTART)
+
+
+def is_le_renewal_pending_restart(db) -> bool:
+    return (get_setting(db, SETTING_LE_RENEWAL_PENDING_RESTART) or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def preview_restart_urls(db) -> Dict[str, str]:

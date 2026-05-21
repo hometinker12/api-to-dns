@@ -81,7 +81,10 @@ from . import ssl_certs
 from . import letsencrypt
 from .letsencrypt import LetsEncryptError
 from .restart import (
+    clear_le_renewal_pending_restart,
     clear_restart_required,
+    is_le_renewal_pending_restart,
+    mark_le_renewal_pending_restart,
     mark_restart_required,
     perform_application_restart,
     scheduled_restart_due,
@@ -281,6 +284,7 @@ async def lifespan(app: FastAPI):
         migrate_legacy_dns_settings_if_needed(db)
         configure_operational_logging(level=get_log_level(db))
         clear_restart_required(db)
+        clear_le_renewal_pending_restart(db)
         try:
             run_retention_cleanup(db, force=True)
         except Exception:
@@ -323,13 +327,33 @@ async def _letsencrypt_renewal_loop() -> None:
             with SessionLocal() as db:
                 result = letsencrypt.maybe_renew_certificate(db)
                 if result:
-                    config = result.get("config") or {}
-                    if not (config.get("scheduled_restart_enabled") and config.get("scheduled_restart_time")):
-                        mark_restart_required(db, reason="Let's Encrypt certificate renewed.")
+                    _apply_le_renewal_restart_policy(db, result.get("config") or {})
         except asyncio.CancelledError:
             raise
         except Exception:
             LOGGER.exception("Let's Encrypt renewal loop failed")
+
+
+def _apply_le_renewal_restart_policy(db, config: Dict[str, Any]) -> None:
+    if config.get("scheduled_restart_enabled") and config.get("scheduled_restart_time"):
+        mark_le_renewal_pending_restart(db)
+    else:
+        mark_restart_required(db, reason="Let's Encrypt certificate renewed.")
+
+
+def _maybe_scheduled_le_restart(db, *, now: Optional[datetime] = None) -> bool:
+    config = letsencrypt.get_config(db)
+    if not config or not config.get("scheduled_restart_enabled") or not config.get("scheduled_restart_time"):
+        return False
+    if ssl_certs._read_source() != ssl_certs.SOURCE_LETSENCRYPT:  # type: ignore[attr-defined]
+        return False
+    if not is_le_renewal_pending_restart(db):
+        return False
+    if not scheduled_restart_due(db, configured_time=str(config["scheduled_restart_time"]), now=now):
+        return False
+    clear_le_renewal_pending_restart(db)
+    perform_application_restart(scheduled=True)
+    return True
 
 
 async def _scheduled_restart_loop() -> None:
@@ -337,14 +361,7 @@ async def _scheduled_restart_loop() -> None:
         await asyncio.sleep(60)
         try:
             with SessionLocal() as db:
-                config = letsencrypt.get_config(db)
-                if not config or not config.get("scheduled_restart_enabled") or not config.get("scheduled_restart_time"):
-                    continue
-                if ssl_certs._read_source() != ssl_certs.SOURCE_LETSENCRYPT:  # type: ignore[attr-defined]
-                    continue
-                if scheduled_restart_due(db, configured_time=str(config["scheduled_restart_time"])):
-                    clear_restart_required(db)
-                    perform_application_restart(scheduled=True)
+                _maybe_scheduled_le_restart(db)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -358,6 +375,7 @@ def startup_event() -> None:
         migrate_legacy_dns_settings_if_needed(db)
         configure_operational_logging(level=get_log_level(db))
         clear_restart_required(db)
+        clear_le_renewal_pending_restart(db)
         try:
             run_retention_cleanup(db, force=True)
         except Exception:

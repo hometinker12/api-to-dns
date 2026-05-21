@@ -405,7 +405,9 @@ Settings -> System Settings -> SSL Certificate can install uploaded PEM files,
 self-signed certificates, or Let's Encrypt certificates. Let's Encrypt supports
 DNS-01 and HTTP-01 challenge state, stores renewal settings in the database, and
 only attempts background renewal when the installed certificate source is
-`letsencrypt`.
+`letsencrypt`. Optional scheduled restart defers applying a renewed certificate
+until a configured time of day, but only after a background renewal has occurred
+(not on a fixed daily schedule).
 
 Listener mode and TLS files are loaded when the application starts. When SSL
 settings or certificate material changes, a Restart Application button appears
