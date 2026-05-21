@@ -255,7 +255,7 @@ def test_cloudflare_get_record_single_type() -> None:
 def test_cloudflare_get_record_skips_zone_lookup_when_zone_id_set() -> None:
     client, fake = _cloudflare_client(
         [
-            _ok([{"id": "r1", "name": "example.com", "type": "TXT", "content": "hello", "ttl": 600}]),
+            _ok([{"id": "r1", "name": "example.com", "type": "TXT", "content": '"hello"', "ttl": 600}]),
         ],
         zone_id="zone-from-config",
     )
@@ -264,6 +264,63 @@ def test_cloudflare_get_record_skips_zone_lookup_when_zone_id_set() -> None:
         DnsRecordInfo(record_name="@", record_type="TXT", ttl=600, values=["hello"])
     ]
     assert fake.requests[0].url.path == "/client/v4/zones/zone-from-config/dns_records"
+
+
+def test_cloudflare_create_txt_record_quotes_content() -> None:
+    client, fake = _cloudflare_client(
+        [
+            _ok([{"id": "z1", "name": "example.com"}]),
+            _ok([]),
+            _ok({"id": "new1"}),
+        ]
+    )
+    payload = DnsRecordRequest(
+        zone_name="example.com",
+        record_type="TXT",
+        record_name="_acme-challenge",
+        ttl=120,
+        values=["token-value"],
+    )
+    existed = client.create_or_update_record(payload, dns_zone="example.com")
+    assert existed is False
+
+    create_request = fake.requests[2]
+    assert create_request.method == "POST"
+    body = json.loads(create_request.content)
+    assert body["type"] == "TXT"
+    assert body["content"] == '"token-value"'
+
+
+def test_cloudflare_update_txt_matches_existing_quoted_content() -> None:
+    client, fake = _cloudflare_client(
+        [
+            _ok([{"id": "z1", "name": "example.com"}]),
+            _ok([
+                {
+                    "id": "r1",
+                    "type": "TXT",
+                    "name": "_acme-challenge.example.com",
+                    "content": '"token-value"',
+                    "ttl": 120,
+                }
+            ]),
+            _ok({"id": "r1"}),
+        ]
+    )
+    payload = DnsRecordRequest(
+        zone_name="example.com",
+        record_type="TXT",
+        record_name="_acme-challenge",
+        ttl=120,
+        values=["token-value"],
+    )
+    existed = client.create_or_update_record(payload, dns_zone="example.com")
+    assert existed is True
+
+    put_request = fake.requests[2]
+    assert put_request.method == "PUT"
+    assert put_request.url.path == "/client/v4/zones/z1/dns_records/r1"
+    assert json.loads(put_request.content)["content"] == '"token-value"'
 
 
 def test_cloudflare_get_record_all_types_aggregates_only_present() -> None:

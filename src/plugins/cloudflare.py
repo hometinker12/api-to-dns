@@ -40,6 +40,17 @@ def _relative_name(zone_name: str, fqdn: str) -> str:
     return f
 
 
+def _normalize_txt_value(value: str) -> str:
+    v = value.strip()
+    if len(v) >= 2 and v.startswith('"') and v.endswith('"'):
+        return v[1:-1]
+    return v
+
+
+def _cloudflare_txt_content(value: str) -> str:
+    return f'"{_normalize_txt_value(value)}"'
+
+
 class CloudflareDnsClient:
     """Cloudflare API v4 DNS records client using an API Token (Bearer auth)."""
 
@@ -248,10 +259,11 @@ class CloudflareDnsClient:
         self._request(client, "DELETE", f"/zones/{zone_id}/dns_records/{record_id}")
 
     def _record_body(self, fqdn: str, record_type: str, content: str, ttl: int) -> Dict[str, Any]:
+        api_content = _cloudflare_txt_content(content) if record_type == "TXT" else content
         body: Dict[str, Any] = {
             "type": record_type,
             "name": fqdn,
-            "content": content,
+            "content": api_content,
             "ttl": ttl,
         }
         if record_type in {"A", "AAAA", "CNAME"}:
@@ -266,6 +278,8 @@ class CloudflareDnsClient:
             return [values[0].strip().rstrip(".")]
         if not values:
             raise ValueError("values is required and must contain at least one entry.")
+        if record_type == "TXT":
+            return [_normalize_txt_value(v) for v in values]
         return [v for v in values]
 
     def _sync_records(
@@ -309,8 +323,9 @@ class CloudflareDnsClient:
         desired_set = set(desired_values)
         existing_by_content: Dict[str, Dict[str, Any]] = {}
         stale: List[Dict[str, Any]] = []
+        normalize_content = _normalize_txt_value if record_type == "TXT" else str
         for row in existing:
-            content = str(row.get("content", ""))
+            content = normalize_content(str(row.get("content", "")))
             if content in desired_set and content not in existing_by_content:
                 existing_by_content[content] = row
             else:
@@ -350,6 +365,8 @@ class CloudflareDnsClient:
         values = [str(row.get("content", "")) for row in rows if row.get("content") is not None]
         if record_type == "CNAME":
             values = [v.rstrip(".") for v in values]
+        elif record_type == "TXT":
+            values = [_normalize_txt_value(v) for v in values]
         return DnsRecordInfo(
             record_name=display_name,
             record_type=record_type,
