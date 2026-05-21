@@ -1,5 +1,6 @@
 import asyncio
 import os
+import signal
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
@@ -260,6 +261,18 @@ WEB_AUTH_PATH_PREFIXES = (
 )
 _REQUEST_LOG_IGNORE_PREFIXES = ("/static",)
 
+_shutting_down = False
+
+
+def _make_shutdown_handler(previous_handler):
+    def handler(signum: int, frame) -> None:
+        global _shutting_down
+        _shutting_down = True
+        if previous_handler not in (signal.SIG_DFL, signal.SIG_IGN) and callable(previous_handler):
+            previous_handler(signum, frame)
+
+    return handler
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -267,6 +280,7 @@ async def lifespan(app: FastAPI):
     with SessionLocal() as db:
         migrate_legacy_dns_settings_if_needed(db)
         configure_operational_logging(level=get_log_level(db))
+        clear_restart_required(db)
         try:
             run_retention_cleanup(db, force=True)
         except Exception:
@@ -286,12 +300,20 @@ async def lifespan(app: FastAPI):
                 db.commit()
     renewal_task = asyncio.create_task(_letsencrypt_renewal_loop())
     restart_task = asyncio.create_task(_scheduled_restart_loop())
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGTERM, _make_shutdown_handler(previous_sigterm))
+    signal.signal(signal.SIGINT, _make_shutdown_handler(previous_sigint))
     try:
         yield
     finally:
+        global _shutting_down
+        _shutting_down = True
         for task in (renewal_task, restart_task):
             task.cancel()
         await asyncio.gather(renewal_task, restart_task, return_exceptions=True)
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        signal.signal(signal.SIGINT, previous_sigint)
 
 
 async def _letsencrypt_renewal_loop() -> None:
@@ -335,6 +357,7 @@ def startup_event() -> None:
     with SessionLocal() as db:
         migrate_legacy_dns_settings_if_needed(db)
         configure_operational_logging(level=get_log_level(db))
+        clear_restart_required(db)
         try:
             run_retention_cleanup(db, force=True)
         except Exception:
@@ -379,10 +402,6 @@ async def refresh_session_cookie(request: Request, call_next):
     return response
 
 
-# Paths that are never useful in the activity log at VERBOSE.
-_REQUEST_LOG_IGNORE_PREFIXES = ("/static",)
-
-
 @app.middleware("http")
 async def record_request_activity(request: Request, call_next):
     response = await call_next(request)
@@ -408,6 +427,13 @@ async def record_request_activity(request: Request, call_next):
     except Exception:  # pragma: no cover - logging must never break a request
         LOGGER.exception("request activity logging failed")
     return response
+
+
+@app.middleware("http")
+async def reject_requests_during_shutdown(request: Request, call_next):
+    if _shutting_down:
+        return PlainTextResponse("Shutting down", status_code=503)
+    return await call_next(request)
 
 
 @app.exception_handler(HTTPException)
@@ -2223,7 +2249,9 @@ def settings_regenerate_ssl(
 def settings_letsencrypt_start(
     request: Request,
     email: str = Form(...),
-    domains: str = Form(...),
+    root_dns_domain: str = Form(...),
+    common_name: str = Form(...),
+    subject_alt_names: str = Form(""),
     challenge_type: str = Form("dns-01"),
     zone_id: str = Form(""),
     staging: Optional[str] = Form(None),
@@ -2237,7 +2265,9 @@ def settings_letsencrypt_start(
             result = letsencrypt.start_enrollment(
                 db,
                 email=email,
-                domains=domains,
+                root_dns_domain=root_dns_domain,
+                common_name=common_name,
+                subject_alt_names=subject_alt_names,
                 challenge_type=challenge_type,
                 zone_id=int(zone_id) if str(zone_id).strip() else None,
                 staging=staging is not None,
@@ -2246,9 +2276,7 @@ def settings_letsencrypt_start(
                 scheduled_restart_time=scheduled_restart_time,
             )
             if result.get("status") == "issued":
-                config = result.get("config") or {}
-                if not (config.get("scheduled_restart_enabled") and config.get("scheduled_restart_time")):
-                    mark_restart_required(db, reason="Let's Encrypt certificate installed.")
+                mark_restart_required(db, reason="Let's Encrypt certificate installed.")
                 message = "Let's Encrypt certificate installed. Restart the application to use it."
                 kind = "warning"
             else:
@@ -2262,7 +2290,11 @@ def settings_letsencrypt_start(
                 actor_type="user",
                 actor_label=user,
                 message="Let's Encrypt enrollment started",
-                details={"domains": result.get("config", {}).get("domains", [])},
+                details={
+                    "root_dns_domain": result.get("config", {}).get("root_dns_domain", ""),
+                    "common_name": result.get("config", {}).get("common_name", ""),
+                    "subject_alt_names": result.get("config", {}).get("subject_alt_names", []),
+                },
             )
     except LetsEncryptError as exc:
         return render_settings(request, user, "system_settings", message=str(exc), message_kind="error", section="ssl_certificate")
@@ -2275,8 +2307,7 @@ def settings_letsencrypt_continue(request: Request, user: str = Depends(require_
         with SessionLocal() as db:
             result = letsencrypt.continue_enrollment(db)
             config = result.get("config") or {}
-            if not (config.get("scheduled_restart_enabled") and config.get("scheduled_restart_time")):
-                mark_restart_required(db, reason="Let's Encrypt certificate installed.")
+            mark_restart_required(db, reason="Let's Encrypt certificate installed.")
             emit_activity_event(
                 db,
                 event_type="system.letsencrypt_installed",
@@ -2285,7 +2316,11 @@ def settings_letsencrypt_continue(request: Request, user: str = Depends(require_
                 actor_type="user",
                 actor_label=user,
                 message="Let's Encrypt certificate installed",
-                details={"domains": config.get("domains", [])},
+                details={
+                    "root_dns_domain": config.get("root_dns_domain", ""),
+                    "common_name": config.get("common_name", ""),
+                    "subject_alt_names": config.get("subject_alt_names", []),
+                },
             )
     except LetsEncryptError as exc:
         return render_settings(request, user, "system_settings", message=str(exc), message_kind="error", section="ssl_certificate")
@@ -2310,7 +2345,9 @@ def settings_letsencrypt_cancel(request: Request, user: str = Depends(require_ro
 def settings_letsencrypt_config(
     request: Request,
     email: str = Form(""),
-    domains: str = Form(""),
+    root_dns_domain: str = Form(""),
+    common_name: str = Form(""),
+    subject_alt_names: str = Form(""),
     challenge_type: str = Form("dns-01"),
     zone_id: str = Form(""),
     staging: Optional[str] = Form(None),
@@ -2325,7 +2362,9 @@ def settings_letsencrypt_config(
             letsencrypt.save_config(
                 db,
                 email=email or existing.get("email", ""),
-                domains=domains or existing.get("domains", []),
+                root_dns_domain=root_dns_domain or existing.get("root_dns_domain", ""),
+                common_name=common_name or existing.get("common_name", ""),
+                subject_alt_names=subject_alt_names or existing.get("subject_alt_names", []),
                 challenge_type=challenge_type or existing.get("challenge_type", "dns-01"),
                 zone_id=int(zone_id) if str(zone_id).strip() else existing.get("zone_id"),
                 staging=staging is not None,

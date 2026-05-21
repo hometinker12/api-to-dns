@@ -8,14 +8,16 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
+from .activity_logging import get_app_dns_name
 from .models import DnsRecordRequest, DnsZoneConfig
 from .settings_store import delete_setting, get_setting, set_setting
 from .ssl_certs import SOURCE_LETSENCRYPT, _read_source, cert_dir, cert_metadata, install_letsencrypt_cert
@@ -29,7 +31,12 @@ CHALLENGE_HTTP = "http-01"
 RENEW_OPTIONS = [7, 14, 21, 30, 45, 60]
 DEFAULT_RENEW_BEFORE_DAYS = 30
 DEFAULT_SCHEDULED_RESTART_TIME = "03:00"
+DNS_TXT_VERIFY_DELAY_SECONDS = 30
+DNS_TXT_VERIFY_MAX_ATTEMPTS = 5
+DNS_TXT_CHALLENGE_TTL = 1
 ACME_ACCOUNT_KEY_FILENAME = "acme_account.key"
+
+_sleep_fn: Callable[[float], None] = time.sleep
 
 PRODUCTION_DIRECTORY = "https://acme-v02.api.letsencrypt.org/directory"
 STAGING_DIRECTORY = "https://acme-staging-v02.api.letsencrypt.org/directory"
@@ -55,7 +62,10 @@ def _write_json_setting(db, name: str, value: Dict[str, Any]) -> None:
 
 
 def get_config(db) -> Optional[Dict[str, Any]]:
-    return _read_json_setting(db, SETTING_CONFIG)
+    raw = _read_json_setting(db, SETTING_CONFIG)
+    if not raw:
+        return None
+    return _normalize_config(raw, app_dns_name=get_app_dns_name(db), db=db)
 
 
 def get_enrollment(db) -> Optional[Dict[str, Any]]:
@@ -66,19 +76,79 @@ def clear_enrollment(db) -> None:
     delete_setting(db, SETTING_ENROLLMENT)
 
 
-def _split_domains(domains: str | List[str]) -> List[str]:
-    if isinstance(domains, str):
-        parts = domains.replace("\n", ",").split(",")
+def _normalize_hostname(value: str) -> str:
+    return str(value or "").strip().strip(".").lower()
+
+
+def _split_names(names: str | List[str]) -> List[str]:
+    if isinstance(names, str):
+        parts = names.replace("\n", ",").split(",")
     else:
-        parts = domains
-    cleaned = []
+        parts = names
+    cleaned: List[str] = []
     for part in parts:
-        domain = str(part).strip().strip(".").lower()
+        domain = _normalize_hostname(part)
         if domain and domain not in cleaned:
             cleaned.append(domain)
-    if not cleaned:
-        raise LetsEncryptError("At least one domain is required.")
     return cleaned
+
+
+def _name_under_root(name: str, root: str) -> bool:
+    normalized = normalize_zone_name(name)
+    root_name = normalize_zone_name(root)
+    return normalized == root_name or normalized.endswith("." + root_name)
+
+
+def _cert_identities(config: Dict[str, Any]) -> List[str]:
+    identities: List[str] = []
+    common_name = _normalize_hostname(config.get("common_name") or "")
+    if common_name:
+        identities.append(common_name)
+    subject_alt_names = config.get("subject_alt_names") or []
+    if isinstance(subject_alt_names, str):
+        subject_alt_names = _split_names(subject_alt_names)
+    for name in subject_alt_names:
+        normalized = _normalize_hostname(name)
+        if normalized and normalized not in identities:
+            identities.append(normalized)
+    return identities
+
+
+def _normalize_config(config: Dict[str, Any], *, app_dns_name: str = "", db=None) -> Dict[str, Any]:
+    default_cn = _normalize_hostname(app_dns_name)
+    if "root_dns_domain" in config:
+        normalized = dict(config)
+        normalized["root_dns_domain"] = _normalize_hostname(normalized.get("root_dns_domain") or "")
+        normalized["common_name"] = _normalize_hostname(normalized.get("common_name") or "") or default_cn
+        raw_sans = normalized.get("subject_alt_names") or []
+        if isinstance(raw_sans, str):
+            normalized["subject_alt_names"] = _split_names(raw_sans)
+        else:
+            normalized["subject_alt_names"] = [
+                _normalize_hostname(name) for name in raw_sans if _normalize_hostname(name)
+            ]
+        normalized.pop("domains", None)
+        return normalized
+
+    legacy = config.get("domains") or []
+    if isinstance(legacy, str):
+        legacy = _split_names(legacy)
+    common_name = legacy[0] if legacy else _normalize_hostname(app_dns_name)
+    subject_alt_names = legacy[1:] if len(legacy) > 1 else (
+        [_normalize_hostname(app_dns_name)] if _normalize_hostname(app_dns_name) else []
+    )
+    root_dns_domain = ""
+    zone_id = config.get("zone_id")
+    if zone_id and db is not None:
+        zone = _zone_row(db, zone_id)
+        if zone:
+            root_dns_domain = zone.zone_name
+    normalized = dict(config)
+    normalized["root_dns_domain"] = _normalize_hostname(root_dns_domain)
+    normalized["common_name"] = _normalize_hostname(common_name)
+    normalized["subject_alt_names"] = subject_alt_names
+    normalized.pop("domains", None)
+    return normalized
 
 
 def validate_renew_before_days(value: Any) -> int:
@@ -112,7 +182,7 @@ def _relative_acme_name(domain: str, zone_name: str) -> str:
     return f"_acme-challenge.{prefix}".rstrip(".") or "_acme-challenge"
 
 
-def create_dns_txt_challenge(db, *, zone_id: int, domain: str, value: str, ttl: int = 120) -> Dict[str, str]:
+def create_dns_txt_challenge(db, *, zone_id: int, domain: str, value: str, ttl: int = DNS_TXT_CHALLENGE_TTL) -> Dict[str, str]:
     zone = _zone_row(db, zone_id)
     if zone is None:
         raise LetsEncryptError("Selected DNS zone was not found.")
@@ -139,6 +209,42 @@ def delete_dns_txt_challenge(db, *, zone_id: int, domain: str) -> None:
         dns_server=cfg.get("dns_server"),
         dns_zone=zone.zone_name,
     )
+
+
+def _txt_record_matches(records: List[Any], expected_value: str) -> bool:
+    for row in records:
+        values = getattr(row, "values", None) or []
+        if expected_value in values:
+            return True
+    return False
+
+
+def _verify_dns_txt_challenge(db, *, zone_id: int, domain: str, expected_value: str) -> None:
+    zone = _zone_row(db, zone_id)
+    if zone is None:
+        raise LetsEncryptError("Selected DNS zone was not found.")
+    cfg = decode_zone_config(zone)
+    record_name = _relative_acme_name(domain, zone.zone_name)
+    client = create_dns_client_from_settings(cfg)
+    for _attempt in range(DNS_TXT_VERIFY_MAX_ATTEMPTS):
+        _sleep_fn(DNS_TXT_VERIFY_DELAY_SECONDS)
+        records = client.get_record(
+            record_name=record_name,
+            record_type="TXT",
+            dns_server=cfg.get("dns_server"),
+            dns_zone=zone.zone_name,
+        )
+        if _txt_record_matches(records, expected_value):
+            return
+    raise LetsEncryptError("DNS TXT record for _acme-challenge did not propagate after 2 minutes.")
+
+
+def _cleanup_dns_txt_challenges(db, *, zone_id: int, domains: List[str]) -> None:
+    for domain in domains:
+        try:
+            delete_dns_txt_challenge(db, zone_id=zone_id, domain=domain)
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            pass
 
 
 def _directory_url(staging: bool) -> str:
@@ -172,10 +278,17 @@ def _load_or_create_account_key():
     return key
 
 
-def _csr_pem(private_key, domains: List[str]) -> bytes:
-    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, domains[0])])
+def _csr_pem(private_key, common_name: str, subject_alt_names: List[str]) -> bytes:
+    identities = _cert_identities({"common_name": common_name, "subject_alt_names": subject_alt_names})
+    if not identities:
+        raise LetsEncryptError("At least one certificate identity is required.")
+    cn = identities[0]
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
     builder = x509.CertificateSigningRequestBuilder().subject_name(subject)
-    builder = builder.add_extension(x509.SubjectAlternativeName([x509.DNSName(domain) for domain in domains]), critical=False)
+    builder = builder.add_extension(
+        x509.SubjectAlternativeName([x509.DNSName(name) for name in identities]),
+        critical=False,
+    )
     return builder.sign(private_key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM)
 
 
@@ -271,14 +384,17 @@ def _acme_prepare_order(config: Dict[str, Any]) -> Dict[str, Any]:
         client, account_jwk, _messages = _acme_client(config)
         cert_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         cert_key_pem = _private_key_pem(cert_key)
-        order_resource = client.new_order(_csr_pem(cert_key, list(config["domains"])))
+        identities = _cert_identities(config)
+        order_resource = client.new_order(
+            _csr_pem(cert_key, config["common_name"], config.get("subject_alt_names") or [])
+        )
         challenges = _order_challenges(order_resource, account_jwk, str(config["challenge_type"]))
         return {
             "order_resource": order_resource.to_json(),
             "private_key_pem": cert_key_pem.decode("utf-8"),
             "challenges": challenges,
             "challenge": challenges[0] if challenges else {},
-            "domain": challenges[0]["domain"] if challenges else config["domains"][0],
+            "domain": challenges[0]["domain"] if challenges else config["common_name"],
         }
     except LetsEncryptError:
         raise
@@ -318,7 +434,9 @@ def save_config(
     db,
     *,
     email: str,
-    domains: str | List[str],
+    root_dns_domain: str,
+    common_name: str,
+    subject_alt_names: str | List[str],
     challenge_type: str,
     zone_id: Optional[int],
     staging: bool,
@@ -328,9 +446,27 @@ def save_config(
 ) -> Dict[str, Any]:
     challenge = challenge_type if challenge_type in {CHALLENGE_DNS, CHALLENGE_HTTP} else CHALLENGE_DNS
     schedule_time = scheduled_restart_time if _valid_time(scheduled_restart_time) else DEFAULT_SCHEDULED_RESTART_TIME
+    root = _normalize_hostname(root_dns_domain)
+    cn = _normalize_hostname(common_name) or _normalize_hostname(get_app_dns_name(db))
+    sans = _split_names(subject_alt_names)
+    if not root:
+        raise LetsEncryptError("Root DNS Domain is required.")
+    if not cn:
+        raise LetsEncryptError("Common Name is required.")
+    for name in _cert_identities({"common_name": cn, "subject_alt_names": sans}):
+        if not _name_under_root(name, root):
+            raise LetsEncryptError(f"Certificate name {name!r} must be within root DNS domain {root!r}.")
+    if challenge == CHALLENGE_DNS and zone_id:
+        zone = _zone_row(db, zone_id)
+        if zone is None:
+            raise LetsEncryptError("Selected DNS zone was not found.")
+        if normalize_zone_name(zone.zone_name) != normalize_zone_name(root):
+            raise LetsEncryptError("Selected API configured zone must match Root DNS Domain.")
     config = {
         "email": email.strip(),
-        "domains": _split_domains(domains),
+        "root_dns_domain": root,
+        "common_name": cn,
+        "subject_alt_names": sans,
         "challenge_type": challenge,
         "zone_id": zone_id,
         "staging": bool(staging),
@@ -341,9 +477,6 @@ def save_config(
     }
     if not config["email"]:
         raise LetsEncryptError("Email is required.")
-    if challenge == CHALLENGE_DNS and zone_id:
-        if _zone_row(db, zone_id) is None:
-            raise LetsEncryptError("Selected DNS zone was not found.")
     _write_json_setting(db, SETTING_CONFIG, config)
     return config
 
@@ -359,29 +492,45 @@ def start_enrollment(db, **kwargs: Any) -> Dict[str, Any]:
     }
     challenges = order.get("challenges") or ([order.get("challenge")] if order.get("challenge") else [])
     challenge = challenges[0] if challenges else {}
+    primary_name = config["common_name"]
     if config["challenge_type"] == CHALLENGE_DNS:
         if config.get("zone_id"):
-            enrollment["dns_records"] = [
-                create_dns_txt_challenge(
-                    db,
-                    zone_id=int(config["zone_id"]),
-                    domain=entry.get("domain") or config["domains"][0],
-                    value=entry.get("dns_value") or entry.get("value") or "",
-                )
-                for entry in challenges
-            ]
-            enrollment["status"] = "ready"
+            provisioned_domains: List[str] = []
+            try:
+                enrollment["dns_records"] = []
+                for entry in challenges:
+                    domain = entry.get("domain") or primary_name
+                    value = entry.get("dns_value") or entry.get("value") or ""
+                    record = create_dns_txt_challenge(
+                        db,
+                        zone_id=int(config["zone_id"]),
+                        domain=domain,
+                        value=value,
+                    )
+                    enrollment["dns_records"].append(record)
+                    provisioned_domains.append(domain)
+                    _verify_dns_txt_challenge(
+                        db,
+                        zone_id=int(config["zone_id"]),
+                        domain=domain,
+                        expected_value=value,
+                    )
+                enrollment["status"] = "ready"
+            except LetsEncryptError:
+                _cleanup_dns_txt_challenges(db, zone_id=int(config["zone_id"]), domains=provisioned_domains)
+                clear_enrollment(db)
+                raise
         else:
             enrollment["manual"] = {
                 "type": CHALLENGE_DNS,
                 "challenges": [
                     {
-                        "name": entry.get("name") or f"_acme-challenge.{entry.get('domain') or config['domains'][0]}",
+                        "name": entry.get("name") or f"_acme-challenge.{entry.get('domain') or primary_name}",
                         "value": entry.get("dns_value") or entry.get("value") or "",
                     }
                     for entry in challenges
                 ],
-                "name": challenge.get("name") or f"_acme-challenge.{challenge.get('domain') or config['domains'][0]}",
+                "name": challenge.get("name") or f"_acme-challenge.{challenge.get('domain') or primary_name}",
                 "value": challenge.get("dns_value") or challenge.get("value") or "",
             }
             enrollment["status"] = "awaiting_manual"
@@ -392,12 +541,12 @@ def start_enrollment(db, **kwargs: Any) -> Dict[str, Any]:
             "type": CHALLENGE_HTTP,
             "challenges": [
                 {
-                    "url": entry.get("url") or f"http://{entry.get('domain') or config['domains'][0]}/.well-known/acme-challenge/{entry.get('token') or ''}",
+                    "url": entry.get("url") or f"http://{entry.get('domain') or primary_name}/.well-known/acme-challenge/{entry.get('token') or ''}",
                     "response": entry.get("key_authorization") or entry.get("response") or "",
                 }
                 for entry in challenges
             ],
-            "url": f"http://{config['domains'][0]}/.well-known/acme-challenge/{token}",
+            "url": f"http://{primary_name}/.well-known/acme-challenge/{token}",
             "token": token,
             "response": response,
         }
@@ -471,7 +620,9 @@ def maybe_renew_certificate(db) -> Optional[Dict[str, Any]]:
     config = get_config(db)
     if not config:
         return None
-    renew_days = validate_renew_before_days(config.get("renew_before_expiry_days") or os.getenv("LETSENCRYPT_RENEW_DAYS") or DEFAULT_RENEW_BEFORE_DAYS)
+    renew_days = validate_renew_before_days(
+        config.get("renew_before_expiry_days") or os.getenv("LETSENCRYPT_RENEW_DAYS") or DEFAULT_RENEW_BEFORE_DAYS
+    )
     if not should_renew_cert(cert_metadata(), renew_days):
         return None
     order = _acme_prepare_order(config)
@@ -483,6 +634,7 @@ def maybe_renew_certificate(db) -> Optional[Dict[str, Any]]:
 
 def config_view(db) -> Dict[str, Any]:
     config = get_config(db) or {}
+    app_dns_name = get_app_dns_name(db)
     metadata = cert_metadata()
     renewal_hint = ""
     not_after = metadata.get("not_after") if metadata else None
@@ -491,6 +643,10 @@ def config_view(db) -> Dict[str, Any]:
         renewal_hint = (not_after - timedelta(days=days)).date().isoformat()
     return {
         "config": config,
+        "defaults": {
+            "common_name": app_dns_name,
+            "subject_alt_names": app_dns_name,
+        },
         "enrollment": get_enrollment(db),
         "renew_options": RENEW_OPTIONS,
         "renewal_hint": renewal_hint,

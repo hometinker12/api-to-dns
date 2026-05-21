@@ -611,20 +611,28 @@
                 </form>
               </div>
             {% endif %}
-            <form action="/settings/system/ssl-letsencrypt/start" method="post">
+            <form id="le-start-form" action="/settings/system/ssl-letsencrypt/start" method="post">
               <label>Email
                 <input type="email" name="email" required value="{{ le_config.email or '' }}" placeholder="admin@example.com" />
               </label>
-              <label>Domains
-                <input type="text" name="domains" required value="{{ le_config.domains | join(', ') if le_config.domains else ssl.app_dns_name }}" placeholder="api.example.com" />
+              <label>Root DNS Domain
+                <input type="text" name="root_dns_domain" required value="{{ le_config.root_dns_domain or '' }}" placeholder="example.com" />
               </label>
+              <p class="help">Apex zone used for DNS-01 automation. Must match the selected API configured zone when automating challenges.</p>
+              <label>Common Name
+                <input type="text" name="common_name" required value="{{ le_config.common_name or le.defaults.common_name or ssl.app_dns_name }}" placeholder="{{ ssl.app_dns_name }}" />
+              </label>
+              <label>Subject Alternative Names
+                <input type="text" name="subject_alt_names" value="{{ le_config.subject_alt_names | join(', ') if le_config.subject_alt_names else (le.defaults.subject_alt_names or ssl.app_dns_name) }}" placeholder="{{ ssl.app_dns_name }}" />
+              </label>
+              <p class="help">Comma-separated DNS names included on the certificate (in addition to the Common Name when different).</p>
               <label>Challenge type
                 <select name="challenge_type">
-                  <option value="dns-01" {% if le_config.challenge_type != "http-01" %}selected{% endif %}>DNS-01</option>
-                  <option value="http-01" {% if le_config.challenge_type == "http-01" %}selected{% endif %}>HTTP-01</option>
+                  <option value="dns-01" {% if le_config.challenge_type != "http-01" %}selected{% endif %}>DNS Challenge</option>
+                  <option value="http-01" {% if le_config.challenge_type == "http-01" %}selected{% endif %}>HTTP Challenge</option>
                 </select>
               </label>
-              <label>DNS zone for automation
+              <label>Select API Configured Zone
                 <select name="zone_id">
                   <option value="">Manual DNS instructions</option>
                   {% for zone in le.zones %}
@@ -655,10 +663,18 @@
               </label>
               <button type="submit">Start Let's Encrypt enrollment</button>
             </form>
+            <dialog id="le-auto-enroll-dialog">
+              <div class="dialog-content le-auto-enroll-dialog">
+                <p>Auto Enrolling with LetsEncrypt. This may take up to 2 minutes.</p>
+                <progress class="le-auto-enroll-progress" max="100"></progress>
+              </div>
+            </dialog>
             {% if ssl.metadata and ssl.metadata.source == ssl.source_letsencrypt %}
               <form action="/settings/system/ssl-letsencrypt/config" method="post">
                 <input type="hidden" name="email" value="{{ le_config.email or '' }}" />
-                <input type="hidden" name="domains" value="{{ le_config.domains | join(', ') if le_config.domains else '' }}" />
+                <input type="hidden" name="root_dns_domain" value="{{ le_config.root_dns_domain or '' }}" />
+                <input type="hidden" name="common_name" value="{{ le_config.common_name or le.defaults.common_name or ssl.app_dns_name }}" />
+                <input type="hidden" name="subject_alt_names" value="{{ le_config.subject_alt_names | join(', ') if le_config.subject_alt_names else (le.defaults.subject_alt_names or ssl.app_dns_name) }}" />
                 <input type="hidden" name="challenge_type" value="{{ le_config.challenge_type or 'dns-01' }}" />
                 {% if le_config.zone_id %}<input type="hidden" name="zone_id" value="{{ le_config.zone_id }}" />{% endif %}
                 {% if le_config.staging %}<input type="hidden" name="staging" value="on" />{% endif %}
@@ -1201,6 +1217,19 @@
         if (!confirmed) {
           event.preventDefault();
         }
+      });
+
+      const leStartForm = document.getElementById("le-start-form");
+      const leAutoEnrollDialog = document.getElementById("le-auto-enroll-dialog");
+      leStartForm?.addEventListener("submit", () => {
+        const challengeType = leStartForm.querySelector('[name="challenge_type"]')?.value;
+        const zoneId = leStartForm.querySelector('[name="zone_id"]')?.value?.trim();
+        if (challengeType === "dns-01" && zoneId) {
+          leAutoEnrollDialog?.showModal();
+        }
+      });
+      leAutoEnrollDialog?.addEventListener("cancel", (event) => {
+        event.preventDefault();
       });
 
       const smtpAnonymous = document.getElementById("smtp-anonymous");

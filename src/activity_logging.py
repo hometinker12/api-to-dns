@@ -244,15 +244,23 @@ def is_running_in_docker() -> bool:
         return False
 
 
+_host_system_dns_name_cache: Optional[str] = None
+
+
 def _host_system_dns_name() -> str:
+    global _host_system_dns_name_cache
+    if _host_system_dns_name_cache is not None:
+        return _host_system_dns_name_cache
     try:
         hostname = socket.gethostname()
         try:
-            return socket.getfqdn(hostname) or hostname
+            resolved = socket.getfqdn(hostname) or hostname
         except OSError:
-            return hostname
+            resolved = hostname
     except OSError:
-        return "unknown"
+        resolved = "unknown"
+    _host_system_dns_name_cache = resolved
+    return resolved
 
 
 def detect_system_dns_name() -> str:

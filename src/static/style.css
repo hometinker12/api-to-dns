@@ -312,6 +312,48 @@ dialog::backdrop {
   flex-wrap: wrap;
   gap: 0.75rem;
 }
+.le-auto-enroll-dialog {
+  text-align: center;
+  padding: 2rem 1.5rem;
+}
+.le-auto-enroll-dialog p {
+  margin: 0 0 1.25rem;
+  font-size: 1.05rem;
+  color: #0f172a;
+}
+.le-auto-enroll-progress {
+  width: 100%;
+  height: 0.5rem;
+  border: 0;
+  border-radius: 999px;
+  overflow: hidden;
+  appearance: none;
+  background: #e2e8f0;
+}
+.le-auto-enroll-progress::-webkit-progress-bar {
+  background: #e2e8f0;
+  border-radius: 999px;
+}
+.le-auto-enroll-progress::-webkit-progress-value {
+  background: linear-gradient(90deg, #2563eb, #38bdf8, #2563eb);
+  background-size: 200% 100%;
+  border-radius: 999px;
+  animation: le-auto-enroll-progress 1.4s linear infinite;
+}
+.le-auto-enroll-progress::-moz-progress-bar {
+  background: linear-gradient(90deg, #2563eb, #38bdf8, #2563eb);
+  background-size: 200% 100%;
+  border-radius: 999px;
+  animation: le-auto-enroll-progress 1.4s linear infinite;
+}
+@keyframes le-auto-enroll-progress {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
 .page.page-wide {
   width: min(1100px, calc(100% - 32px));
 }

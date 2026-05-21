@@ -52,7 +52,7 @@ def nav_context(db, user: str, *, show_dashboard_link: bool = True) -> dict:
         "can_system_update": can_system_update,
         "restart_required": restart_pending,
         "restart_reason": restart_reason(db) if restart_pending else "",
-        "restart_preview": preview_restart_urls(db),
+        "restart_preview": preview_restart_urls(db) if restart_pending else {},
     }
 
 

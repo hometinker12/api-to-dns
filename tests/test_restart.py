@@ -3,8 +3,10 @@ from datetime import datetime
 from fastapi.testclient import TestClient
 
 import src.app as app_module
+import src.letsencrypt as letsencrypt_module
 from src.auth import create_session_cookie
 from src.db import SessionLocal
+from src.app import startup_event
 from src.restart import (
     clear_restart_required,
     is_restart_required,
@@ -14,6 +16,48 @@ from src.restart import (
 )
 from src.settings_store import delete_setting
 from src.ssl_certs import set_ssl_enabled
+
+
+def test_letsencrypt_install_marks_restart_even_with_scheduled_restart(
+    client: TestClient, monkeypatch
+) -> None:
+    issued_config = {
+        "scheduled_restart_enabled": True,
+        "scheduled_restart_time": "03:00",
+        "root_dns_domain": "example.com",
+        "common_name": "api.example.com",
+        "subject_alt_names": [],
+    }
+
+    def fake_continue(_db):
+        return {"status": "issued", "config": issued_config, "metadata": {}}
+
+    monkeypatch.setattr(letsencrypt_module, "continue_enrollment", fake_continue)
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        clear_restart_required(db)
+    response = client.post("/settings/system/ssl-letsencrypt/continue")
+    assert response.status_code == 200
+    with SessionLocal() as db:
+        assert is_restart_required(db) is True
+
+
+def test_rejects_requests_during_shutdown(client: TestClient) -> None:
+    app_module._shutting_down = True
+    try:
+        response = client.get("/login")
+        assert response.status_code == 503
+    finally:
+        app_module._shutting_down = False
+
+
+def test_startup_clears_restart_required(client: TestClient) -> None:
+    with SessionLocal() as db:
+        mark_restart_required(db, reason="pending before boot")
+        assert is_restart_required(db) is True
+    startup_event()
+    with SessionLocal() as db:
+        assert is_restart_required(db) is False
 
 
 def test_restart_flag_round_trip(client: TestClient) -> None:
