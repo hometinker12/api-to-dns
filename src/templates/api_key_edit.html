@@ -7,15 +7,10 @@
 </head>
 <body>
   <div class="page">
-    <header>
-      <h1>api-to-dns Edit API key</h1>
-      <nav class="nav-links">
-        <a class="button" href="/api-keys">Back to API keys</a>
-        <a class="button" href="/zones">DNS Zones</a>
-        <a class="button" href="/admin">Dashboard</a>
-        <a class="button danger" href="/logout">Logout</a>
-      </nav>
-    </header>
+    {% set page_title = "api-to-dns Edit API key" %}
+    {% set page_help = "" %}
+    {% set page_links = [{"href": "/api-keys", "label": "Back to API keys"}, {"href": "/zones", "label": "DNS Zones"}] %}
+    {% include "_page_header.html" %}
 
     {% if message %}
       <div class="alert success">{{ message }}</div>

@@ -7,13 +7,10 @@
 </head>
 <body>
   <div class="page">
-    <header>
-      <h1>api-to-dns API Keys</h1>
-      <nav class="nav-links">
-        <a class="button" href="/admin">Dashboard</a>
-        <a class="button danger" href="/logout">Logout</a>
-      </nav>
-    </header>
+    {% set page_title = "api-to-dns API Keys" %}
+    {% set page_help = "" %}
+    {% set page_links = [] %}
+    {% include "_page_header.html" %}
 
     {% if message %}
       <div class="alert success">{{ message }}</div>

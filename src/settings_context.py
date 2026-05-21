@@ -42,7 +42,10 @@ from .ssl_certs import (
     is_ssl_enabled,
     tls_port,
 )
-from .web import templates
+from .letsencrypt import config_view as letsencrypt_config_view
+from .restart import is_restart_required
+from .ssl_certs import SOURCE_LETSENCRYPT, access_url
+from .web import nav_context, templates
 from .zone_service import dns_provider_options_with_state
 
 LOG_SEARCH_PAGE_SIZE = 25
@@ -124,6 +127,8 @@ def settings_context(
                 "can_enable_ssl": ssl_has_cert,
                 "can_upload": ROLE_SYSTEM_UPDATE in user_roles,
                 "metadata": cert_metadata(),
+                "source_letsencrypt": SOURCE_LETSENCRYPT,
+                "access_url": access_url(db),
                 "ports": {
                     "http": http_port(),
                     "https": tls_port(),
@@ -133,6 +138,8 @@ def settings_context(
                 "key_path": str(ssl_key_path),
                 "cert_path": str(ssl_cert_path),
                 "app_dns_name": identity.get("system_dns_name", ""),
+                "letsencrypt": letsencrypt_config_view(db),
+                "restart_required": is_restart_required(db),
             }
             shared_system = {
                 "identity": identity,
@@ -239,6 +246,7 @@ def settings_context(
                     "default_subject": DEFAULT_SUBJECT_TEMPLATE,
                     "default_body": DEFAULT_BODY_TEMPLATE,
                 }
+        nav = nav_context(db, user, show_dashboard_link=True)
 
     return {
         "request": request,
@@ -265,6 +273,7 @@ def settings_context(
         "selected_system_section": selected_system_section,
         "log_view": log_view,
         "alert_view": alert_view,
+        **nav,
     }
 
 

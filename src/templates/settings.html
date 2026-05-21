@@ -7,16 +7,10 @@
 </head>
 <body>
   <div class="page page-wide">
-    <header class="page-header">
-      <div>
-        <h1>api-to-dns App Settings</h1>
-        <p class="help">Signed in as {{ user }}</p>
-      </div>
-      <nav class="nav-links">
-        <a class="button" href="/admin">Dashboard</a>
-        <a class="button danger" href="/logout">Logout</a>
-      </nav>
-    </header>
+    {% set page_title = "api-to-dns App Settings" %}
+    {% set page_help = "Signed in as " ~ user %}
+    {% set page_links = [] %}
+    {% include "_page_header.html" %}
 
     {% if message %}
       <div class="alert {{ message_kind or 'success' }}">{{ message }}</div>
@@ -505,13 +499,8 @@
               <code>{{ ssl.ports.http }}</code>. Only one listener runs at a time. Restart after saving to apply.
             </p>
             <p>
-              {% if ssl.enabled %}
-                <strong>Access URL:</strong>
-                <code>https://{{ ssl.app_dns_name }}:{{ ssl.ports.https }}/login</code>
-              {% else %}
-                <strong>Access URL:</strong>
-                <code>http://{{ ssl.app_dns_name }}:{{ ssl.ports.http }}/login</code>
-              {% endif %}
+              <strong>Access URL:</strong>
+              <code>{{ ssl.access_url }}</code>
             </p>
             {% if ssl.enabled and ssl.metadata and ssl.metadata.source == "self_signed" %}
               <p class="alert warning">Self-signed: browsers will warn until the certificate is trusted on each client.</p>
@@ -550,6 +539,8 @@
               <dd>
                 {% if ssl.metadata.source == "self_signed" %}
                   <span class="cert-source-badge warning">Self-signed</span>
+                {% elif ssl.metadata.source == ssl.source_letsencrypt %}
+                  <span class="cert-source-badge success">Let's Encrypt</span>
                 {% else %}
                   <span class="cert-source-badge success">3rd Party - Uploaded</span>
                 {% endif %}
@@ -590,7 +581,108 @@
 
           {% if can_system_update %}
           <section class="form-card">
-            <h2>Upload Certificate</h2>
+            {% set le = ssl.letsencrypt %}
+            {% set le_config = le.config or {} %}
+            {% set le_enrollment = le.enrollment %}
+            <h2>Let's Encrypt</h2>
+            <p class="help">
+              Request a trusted certificate using DNS-01 or HTTP-01 validation. DNS-01 can be automated when you
+              select one of the configured DNS zones below.
+            </p>
+            {% if le_enrollment %}
+              <div class="alert warning">
+                Enrollment is waiting for validation.
+                {% if le_enrollment.manual %}
+                  {% if le_enrollment.manual.type == "dns-01" %}
+                    Create TXT record <code>{{ le_enrollment.manual.name }}</code> with value
+                    <code>{{ le_enrollment.manual.value }}</code>, then continue.
+                  {% else %}
+                    Serve <code>{{ le_enrollment.manual.response }}</code> at
+                    <code>{{ le_enrollment.manual.url }}</code>, then continue.
+                  {% endif %}
+                {% endif %}
+              </div>
+              <div class="action-cell">
+                <form action="/settings/system/ssl-letsencrypt/continue" method="post">
+                  <button type="submit">Continue enrollment</button>
+                </form>
+                <form action="/settings/system/ssl-letsencrypt/cancel" method="post">
+                  <button type="submit" class="danger">Cancel enrollment</button>
+                </form>
+              </div>
+            {% endif %}
+            <form action="/settings/system/ssl-letsencrypt/start" method="post">
+              <label>Email
+                <input type="email" name="email" required value="{{ le_config.email or '' }}" placeholder="admin@example.com" />
+              </label>
+              <label>Domains
+                <input type="text" name="domains" required value="{{ le_config.domains | join(', ') if le_config.domains else ssl.app_dns_name }}" placeholder="api.example.com" />
+              </label>
+              <label>Challenge type
+                <select name="challenge_type">
+                  <option value="dns-01" {% if le_config.challenge_type != "http-01" %}selected{% endif %}>DNS-01</option>
+                  <option value="http-01" {% if le_config.challenge_type == "http-01" %}selected{% endif %}>HTTP-01</option>
+                </select>
+              </label>
+              <label>DNS zone for automation
+                <select name="zone_id">
+                  <option value="">Manual DNS instructions</option>
+                  {% for zone in le.zones %}
+                    <option value="{{ zone.id }}" {% if le_config.zone_id == zone.id %}selected{% endif %}>{{ zone.zone_name }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label class="inline-check">
+                <input type="checkbox" name="staging" {% if le_config.staging %}checked{% endif %} />
+                Use Let's Encrypt staging
+              </label>
+              <label>Renew before expiry
+                <select name="renew_before_expiry_days">
+                  {% for days in le.renew_options %}
+                    <option value="{{ days }}" {% if (le_config.renew_before_expiry_days or 30) == days %}selected{% endif %}>{{ days }} days</option>
+                  {% endfor %}
+                </select>
+              </label>
+              {% if le.renewal_hint %}
+                <p class="help">Renewal will be attempted around <strong>{{ le.renewal_hint }}</strong>.</p>
+              {% endif %}
+              <label class="inline-check">
+                <input type="checkbox" name="scheduled_restart_enabled" {% if le_config.scheduled_restart_enabled is not sameas false %}checked{% endif %} />
+                Restart daily after renewal if needed
+              </label>
+              <label>Scheduled restart time
+                <input type="time" name="scheduled_restart_time" value="{{ le_config.scheduled_restart_time or '03:00' }}" />
+              </label>
+              <button type="submit">Start Let's Encrypt enrollment</button>
+            </form>
+            {% if ssl.metadata and ssl.metadata.source == ssl.source_letsencrypt %}
+              <form action="/settings/system/ssl-letsencrypt/config" method="post">
+                <input type="hidden" name="email" value="{{ le_config.email or '' }}" />
+                <input type="hidden" name="domains" value="{{ le_config.domains | join(', ') if le_config.domains else '' }}" />
+                <input type="hidden" name="challenge_type" value="{{ le_config.challenge_type or 'dns-01' }}" />
+                {% if le_config.zone_id %}<input type="hidden" name="zone_id" value="{{ le_config.zone_id }}" />{% endif %}
+                {% if le_config.staging %}<input type="hidden" name="staging" value="on" />{% endif %}
+                <label>Renew before expiry
+                  <select name="renew_before_expiry_days">
+                    {% for days in le.renew_options %}
+                      <option value="{{ days }}" {% if (le_config.renew_before_expiry_days or 30) == days %}selected{% endif %}>{{ days }} days</option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <label class="inline-check">
+                  <input type="checkbox" name="scheduled_restart_enabled" {% if le_config.scheduled_restart_enabled is not sameas false %}checked{% endif %} />
+                  Enable daily scheduled restart
+                </label>
+                <label>Scheduled restart time
+                  <input type="time" name="scheduled_restart_time" value="{{ le_config.scheduled_restart_time or '03:00' }}" />
+                </label>
+                <button type="submit">Save Let's Encrypt options</button>
+              </form>
+            {% endif %}
+          </section>
+
+          <section class="form-card">
+            <h2>Upload PEM certificate</h2>
             <p class="help">
               Provide an unencrypted PEM private key and matching PEM certificate. Best practice is to include a chain/
               bundle intermediate certificates after the leaf certificate in the same <code>.crt</code> /

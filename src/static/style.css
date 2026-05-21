@@ -88,6 +88,15 @@ button.danger:hover,
 .button.danger:hover {
   background: #fecaca;
 }
+button.warning,
+.button.warning {
+  background: #f59e0b;
+  color: #111827;
+}
+button.warning:hover,
+.button.warning:hover {
+  background: #d97706;
+}
 button:disabled,
 input[type="submit"]:disabled,
 .button.disabled {
@@ -148,6 +157,7 @@ input[type="text"],
 input[type="password"],
 input[type="url"],
 input[type="email"],
+input[type="time"],
 textarea,
 select {
   width: 100%;

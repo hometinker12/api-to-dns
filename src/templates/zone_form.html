@@ -7,14 +7,10 @@
 </head>
 <body>
   <div class="page">
-    <header class="page-header">
-      <h1>api-to-dns Add DNS Zone</h1>
-      <nav class="nav-links">
-        <a class="button" href="/zones">All zones</a>
-        <a class="button" href="/admin">Dashboard</a>
-        <a class="button danger" href="/logout">Logout</a>
-      </nav>
-    </header>
+    {% set page_title = "api-to-dns Add DNS Zone" %}
+    {% set page_help = "" %}
+    {% set page_links = [{"href": "/zones", "label": "All zones"}] %}
+    {% include "_page_header.html" %}
 
     {% if message %}
       <div class="alert success">{{ message }}</div>

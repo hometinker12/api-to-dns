@@ -1,0 +1,64 @@
+{% set _show_dashboard = show_dashboard_link|default(true) %}
+{% set _nav = page_nav(user, _show_dashboard) if user is defined else {} %}
+{% set restart_required = restart_required|default(_nav.restart_required|default(false)) %}
+{% set can_system_update = can_system_update|default(_nav.can_system_update|default(false)) %}
+{% set restart_reason = restart_reason|default(_nav.restart_reason|default("")) %}
+{% set restart_preview = restart_preview|default(_nav.restart_preview|default({})) %}
+<header class="page-header">
+  <div>
+    <h1>{{ page_title }}</h1>
+    {% if page_help %}<p class="help">{{ page_help }}</p>{% endif %}
+  </div>
+  <nav class="nav-links">
+    {% if restart_required and can_system_update %}
+      <button
+        type="button"
+        class="warning"
+        id="restart-app-btn"
+        data-current-url="{{ restart_preview.current_url }}"
+        data-after-url="{{ restart_preview.after_restart_url }}"
+        data-reason="{{ restart_reason }}"
+      >Restart Application</button>
+    {% endif %}
+    {% for link in page_links or [] %}
+      <a class="button{% if link.class %} {{ link.class }}{% endif %}" href="{{ link.href }}">{{ link.label }}</a>
+    {% endfor %}
+    {% if _show_dashboard %}
+      <a class="button" href="/admin">Dashboard</a>
+    {% endif %}
+    <a class="button danger" href="/logout">Logout</a>
+  </nav>
+</header>
+
+{% if restart_required and can_system_update %}
+  <dialog id="restart-app-dialog">
+    <div class="dialog-content">
+      <div class="dialog-header">
+        <h2>Restart Application</h2>
+        <button type="button" class="danger" id="restart-app-close">Close</button>
+      </div>
+      <p class="alert warning">{{ restart_reason }}</p>
+      <p class="help">The system URL may change after restart (HTTP vs HTTPS, port, or certificate).</p>
+      <dl class="form-meta">
+        <dt>Current access URL</dt>
+        <dd><code id="restart-current-url">{{ restart_preview.current_url }}</code></dd>
+        <dt>URL after restart</dt>
+        <dd><code id="restart-after-url">{{ restart_preview.after_restart_url }}</code></dd>
+      </dl>
+      <form action="/system/restart" method="post">
+        <div class="dialog-actions">
+          <button type="button" class="secondary" id="restart-app-cancel">Cancel</button>
+          <button type="submit" class="warning">Restart now</button>
+        </div>
+      </form>
+    </div>
+  </dialog>
+  <script>
+    (() => {
+      const dialog = document.getElementById("restart-app-dialog");
+      document.getElementById("restart-app-btn")?.addEventListener("click", () => dialog?.showModal());
+      document.getElementById("restart-app-close")?.addEventListener("click", () => dialog?.close());
+      document.getElementById("restart-app-cancel")?.addEventListener("click", () => dialog?.close());
+    })();
+  </script>
+{% endif %}

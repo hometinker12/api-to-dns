@@ -40,6 +40,7 @@ SOURCE_FILENAME = "server.source"
 
 SOURCE_SELF_SIGNED = "self_signed"
 SOURCE_UPLOADED = "uploaded"
+SOURCE_LETSENCRYPT = "letsencrypt"
 
 DEFAULT_HTTP_PORT = 8000
 DEFAULT_TLS_PORT = 8443
@@ -103,7 +104,7 @@ def _read_source() -> Optional[str]:
     if not path.is_file():
         return None
     value = path.read_text(encoding="utf-8").strip()
-    return value if value in {SOURCE_SELF_SIGNED, SOURCE_UPLOADED} else None
+    return value if value in {SOURCE_SELF_SIGNED, SOURCE_UPLOADED, SOURCE_LETSENCRYPT} else None
 
 
 def _coerce_truthy(raw: Optional[str]) -> Optional[bool]:
@@ -339,6 +340,15 @@ def install_uploaded_cert(key_pem: bytes, cert_pem: bytes) -> Dict[str, Any]:
     return metadata
 
 
+def install_letsencrypt_cert(key_pem: bytes, cert_pem: bytes) -> Dict[str, Any]:
+    """Validate and install a Let's Encrypt-issued key/certificate pair."""
+    metadata = install_uploaded_cert(key_pem, cert_pem)
+    _write_source(SOURCE_LETSENCRYPT)
+    metadata = cert_metadata() or metadata
+    metadata["source"] = SOURCE_LETSENCRYPT
+    return metadata
+
+
 # ---------------------------------------------------------------------------
 # Metadata
 # ---------------------------------------------------------------------------
@@ -431,6 +441,23 @@ def tls_port() -> int:
         except ValueError:
             pass
     return DEFAULT_TLS_PORT
+
+
+def _display_host(db) -> str:
+    return (get_app_dns_name(db) or "").strip() or "localhost"
+
+
+def _format_url(scheme: str, host: str, port: int) -> str:
+    default = (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    port_part = "" if default else f":{port}"
+    return f"{scheme}://{host}{port_part}/login"
+
+
+def access_url(db, *, use_env_override: bool = False) -> str:
+    enabled = _resolved_ssl_enabled(db) if use_env_override else is_ssl_enabled(db)
+    if enabled:
+        return _format_url("https", _display_host(db), tls_port())
+    return _format_url("http", _display_host(db), http_port())
 
 
 def bootstrap() -> str:

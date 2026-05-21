@@ -1,3 +1,4 @@
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -5,7 +6,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import select
 from starlette.status import HTTP_303_SEE_OTHER, HTTP_404_NOT_FOUND, HTTP_409_CONFLICT
@@ -76,6 +77,14 @@ from .security import generate_api_key, hash_password, verify_password
 from .settings_context import render_settings
 from .settings_store import get_setting, set_setting
 from . import ssl_certs
+from . import letsencrypt
+from .letsencrypt import LetsEncryptError
+from .restart import (
+    clear_restart_required,
+    mark_restart_required,
+    perform_application_restart,
+    scheduled_restart_due,
+)
 from .ssl_certs import (
     CertificateInstallError,
     OpenSSLUnavailableError,
@@ -86,7 +95,7 @@ from .ssl_certs import (
     regenerate_self_signed_cert,
     set_ssl_enabled,
 )
-from .web import client_ip, record_activity, render_access_denied_response, render_error_response, templates
+from .web import client_ip, nav_context, record_activity, render_access_denied_response, render_error_response, templates
 from .zone_service import (
     api_key_allowed_zone_names,
     api_key_public_dict,
@@ -275,7 +284,49 @@ async def lifespan(app: FastAPI):
                     )
                 )
                 db.commit()
-    yield
+    renewal_task = asyncio.create_task(_letsencrypt_renewal_loop())
+    restart_task = asyncio.create_task(_scheduled_restart_loop())
+    try:
+        yield
+    finally:
+        for task in (renewal_task, restart_task):
+            task.cancel()
+        await asyncio.gather(renewal_task, restart_task, return_exceptions=True)
+
+
+async def _letsencrypt_renewal_loop() -> None:
+    while True:
+        await asyncio.sleep(12 * 60 * 60)
+        try:
+            with SessionLocal() as db:
+                result = letsencrypt.maybe_renew_certificate(db)
+                if result:
+                    config = result.get("config") or {}
+                    if not (config.get("scheduled_restart_enabled") and config.get("scheduled_restart_time")):
+                        mark_restart_required(db, reason="Let's Encrypt certificate renewed.")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("Let's Encrypt renewal loop failed")
+
+
+async def _scheduled_restart_loop() -> None:
+    while True:
+        await asyncio.sleep(60)
+        try:
+            with SessionLocal() as db:
+                config = letsencrypt.get_config(db)
+                if not config or not config.get("scheduled_restart_enabled") or not config.get("scheduled_restart_time"):
+                    continue
+                if ssl_certs._read_source() != ssl_certs.SOURCE_LETSENCRYPT:  # type: ignore[attr-defined]
+                    continue
+                if scheduled_restart_due(db, configured_time=str(config["scheduled_restart_time"])):
+                    clear_restart_required(db)
+                    perform_application_restart(scheduled=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("Scheduled restart loop failed")
 
 
 def startup_event() -> None:
@@ -2009,6 +2060,7 @@ def settings_update_ssl(
         previous = is_ssl_enabled(db)
         set_ssl_enabled(db, desired)
         if desired != previous:
+            mark_restart_required(db, reason="SSL listener setting changed.")
             emit_activity_event(
                 db,
                 event_type="system.ssl_toggled",
@@ -2076,6 +2128,7 @@ async def settings_upload_ssl(
         )
 
     with SessionLocal() as db:
+        mark_restart_required(db, reason="SSL certificate uploaded.")
         emit_activity_event(
             db,
             event_type="system.ssl_uploaded",
@@ -2119,6 +2172,7 @@ def settings_regenerate_ssl(
                 metadata = create_self_signed_cert(db)
                 event_type = "system.ssl_created"
                 user_message = "Self-signed certificate created."
+            mark_restart_required(db, reason=user_message)
             emit_activity_event(
                 db,
                 event_type=event_type,
@@ -2163,6 +2217,155 @@ def settings_regenerate_ssl(
         message_kind="warning",
         section=redirect_section,
     )
+
+
+@app.post("/settings/system/ssl-letsencrypt/start", response_class=HTMLResponse, include_in_schema=False)
+def settings_letsencrypt_start(
+    request: Request,
+    email: str = Form(...),
+    domains: str = Form(...),
+    challenge_type: str = Form("dns-01"),
+    zone_id: str = Form(""),
+    staging: Optional[str] = Form(None),
+    renew_before_expiry_days: int = Form(letsencrypt.DEFAULT_RENEW_BEFORE_DAYS),
+    scheduled_restart_enabled: Optional[str] = Form(None),
+    scheduled_restart_time: str = Form(letsencrypt.DEFAULT_SCHEDULED_RESTART_TIME),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    try:
+        with SessionLocal() as db:
+            result = letsencrypt.start_enrollment(
+                db,
+                email=email,
+                domains=domains,
+                challenge_type=challenge_type,
+                zone_id=int(zone_id) if str(zone_id).strip() else None,
+                staging=staging is not None,
+                renew_before_expiry_days=renew_before_expiry_days,
+                scheduled_restart_enabled=scheduled_restart_enabled is not None,
+                scheduled_restart_time=scheduled_restart_time,
+            )
+            if result.get("status") == "issued":
+                config = result.get("config") or {}
+                if not (config.get("scheduled_restart_enabled") and config.get("scheduled_restart_time")):
+                    mark_restart_required(db, reason="Let's Encrypt certificate installed.")
+                message = "Let's Encrypt certificate installed. Restart the application to use it."
+                kind = "warning"
+            else:
+                message = "Let's Encrypt enrollment started. Complete the challenge, then continue enrollment."
+                kind = "success"
+            emit_activity_event(
+                db,
+                event_type="system.letsencrypt_started",
+                level=LOG_LEVEL_INFORMATIONAL,
+                status="success",
+                actor_type="user",
+                actor_label=user,
+                message="Let's Encrypt enrollment started",
+                details={"domains": result.get("config", {}).get("domains", [])},
+            )
+    except LetsEncryptError as exc:
+        return render_settings(request, user, "system_settings", message=str(exc), message_kind="error", section="ssl_certificate")
+    return render_settings(request, user, "system_settings", message=message, message_kind=kind, section="ssl_certificate")
+
+
+@app.post("/settings/system/ssl-letsencrypt/continue", response_class=HTMLResponse, include_in_schema=False)
+def settings_letsencrypt_continue(request: Request, user: str = Depends(require_role(ROLE_SYSTEM_UPDATE))):
+    try:
+        with SessionLocal() as db:
+            result = letsencrypt.continue_enrollment(db)
+            config = result.get("config") or {}
+            if not (config.get("scheduled_restart_enabled") and config.get("scheduled_restart_time")):
+                mark_restart_required(db, reason="Let's Encrypt certificate installed.")
+            emit_activity_event(
+                db,
+                event_type="system.letsencrypt_installed",
+                level=LOG_LEVEL_INFORMATIONAL,
+                status="success",
+                actor_type="user",
+                actor_label=user,
+                message="Let's Encrypt certificate installed",
+                details={"domains": config.get("domains", [])},
+            )
+    except LetsEncryptError as exc:
+        return render_settings(request, user, "system_settings", message=str(exc), message_kind="error", section="ssl_certificate")
+    return render_settings(
+        request,
+        user,
+        "system_settings",
+        message="Let's Encrypt certificate installed. Restart the application to use it.",
+        message_kind="warning",
+        section="ssl_certificate",
+    )
+
+
+@app.post("/settings/system/ssl-letsencrypt/cancel", response_class=HTMLResponse, include_in_schema=False)
+def settings_letsencrypt_cancel(request: Request, user: str = Depends(require_role(ROLE_SYSTEM_UPDATE))):
+    with SessionLocal() as db:
+        letsencrypt.cancel_enrollment(db)
+    return render_settings(request, user, "system_settings", message="Let's Encrypt enrollment cancelled.", section="ssl_certificate")
+
+
+@app.post("/settings/system/ssl-letsencrypt/config", response_class=HTMLResponse, include_in_schema=False)
+def settings_letsencrypt_config(
+    request: Request,
+    email: str = Form(""),
+    domains: str = Form(""),
+    challenge_type: str = Form("dns-01"),
+    zone_id: str = Form(""),
+    staging: Optional[str] = Form(None),
+    renew_before_expiry_days: int = Form(letsencrypt.DEFAULT_RENEW_BEFORE_DAYS),
+    scheduled_restart_enabled: Optional[str] = Form(None),
+    scheduled_restart_time: str = Form(letsencrypt.DEFAULT_SCHEDULED_RESTART_TIME),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    try:
+        with SessionLocal() as db:
+            existing = letsencrypt.get_config(db) or {}
+            letsencrypt.save_config(
+                db,
+                email=email or existing.get("email", ""),
+                domains=domains or existing.get("domains", []),
+                challenge_type=challenge_type or existing.get("challenge_type", "dns-01"),
+                zone_id=int(zone_id) if str(zone_id).strip() else existing.get("zone_id"),
+                staging=staging is not None,
+                renew_before_expiry_days=renew_before_expiry_days,
+                scheduled_restart_enabled=scheduled_restart_enabled is not None,
+                scheduled_restart_time=scheduled_restart_time,
+            )
+    except LetsEncryptError as exc:
+        return render_settings(request, user, "system_settings", message=str(exc), message_kind="error", section="ssl_certificate")
+    return render_settings(request, user, "system_settings", message="Let's Encrypt settings saved.", section="ssl_certificate")
+
+
+@app.get("/.well-known/acme-challenge/{token}", response_class=PlainTextResponse, include_in_schema=False)
+def letsencrypt_http_challenge(token: str):
+    with SessionLocal() as db:
+        response = letsencrypt.http_challenge_response(db, token)
+    if response is None:
+        raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="Challenge token not found")
+    return PlainTextResponse(response)
+
+
+@app.post("/system/restart", include_in_schema=False)
+def system_restart(request: Request, user: str = Depends(require_role(ROLE_SYSTEM_UPDATE))):
+    with SessionLocal() as db:
+        preview = nav_context(db, user).get("restart_preview", {})
+        clear_restart_required(db)
+        emit_activity_event(
+            db,
+            event_type="system.restart_requested",
+            level=LOG_LEVEL_WARNING,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message="Application restart requested",
+            details=preview,
+        )
+    perform_application_restart(scheduled=False)
+    if wants_json_response(request):
+        return JSONResponse({"status": "restarting", **preview})
+    return RedirectResponse(url=request.headers.get("referer") or "/admin", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.post("/settings/system/log-rotation", response_class=HTMLResponse, include_in_schema=False)

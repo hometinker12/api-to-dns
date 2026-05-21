@@ -398,3 +398,22 @@ Invoke-RestMethod -Method GET `
 ## License
 
 This project is licensed under the **MIT License with the Commons Clause**. The full license text is in [LICENSE.md](LICENSE.md).
+
+## SSL, Let's Encrypt, and Restarts
+
+Settings -> System Settings -> SSL Certificate can install uploaded PEM files,
+self-signed certificates, or Let's Encrypt certificates. Let's Encrypt supports
+DNS-01 and HTTP-01 challenge state, stores renewal settings in the database, and
+only attempts background renewal when the installed certificate source is
+`letsencrypt`.
+
+Listener mode and TLS files are loaded when the application starts. When SSL
+settings or certificate material changes, a Restart Application button appears
+on authenticated pages for users with `system.update`. In Docker Compose this
+sends `SIGTERM`; `restart: unless-stopped` starts the container again. Bare
+uvicorn runs need a supervisor, systemd, or a manual restart.
+
+HTTP-01 validation requires Let's Encrypt to reach
+`/.well-known/acme-challenge/{token}` on port 80, either directly or through a
+reverse proxy. DNS-01 can create `_acme-challenge` TXT records automatically
+when a configured DNS zone is selected.

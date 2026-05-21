@@ -7,16 +7,10 @@
 </head>
 <body>
   <div class="page">
-    <header class="page-header">
-      <div>
-        <h1>api-to-dns DNS Zones</h1>
-        <p class="help">Each zone has its own provider type, connection, and credentials. API keys are granted access by zone.</p>
-      </div>
-      <nav class="nav-links">
-        <a class="button" href="/admin">Dashboard</a>
-        <a class="button danger" href="/logout">Logout</a>
-      </nav>
-    </header>
+    {% set page_title = "api-to-dns DNS Zones" %}
+    {% set page_help = "Each zone has its own provider type, connection, and credentials. API keys are granted access by zone." %}
+    {% set page_links = [] %}
+    {% include "_page_header.html" %}
     
     {% if message %}
       <div class="alert success">{{ message }}</div>

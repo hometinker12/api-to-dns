@@ -9,7 +9,8 @@ from fastapi.templating import Jinja2Templates
 from .activity_logging import LOGGER, emit_activity_event
 from .db import SessionLocal
 from .paths import TEMPLATES_DIR
-from .rbac import ROLE_FORBIDDEN_DETAIL
+from .rbac import ROLE_FORBIDDEN_DETAIL, ROLE_SYSTEM_UPDATE, get_user_roles
+from .restart import is_restart_required, preview_restart_urls, restart_reason
 
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
@@ -40,6 +41,27 @@ def render_access_denied_response() -> HTMLResponse:
         ),
         status_code=403,
     )
+
+
+def nav_context(db, user: str, *, show_dashboard_link: bool = True) -> dict:
+    roles = get_user_roles(db, user)
+    can_system_update = ROLE_SYSTEM_UPDATE in roles
+    restart_pending = is_restart_required(db)
+    return {
+        "show_dashboard_link": show_dashboard_link,
+        "can_system_update": can_system_update,
+        "restart_required": restart_pending,
+        "restart_reason": restart_reason(db) if restart_pending else "",
+        "restart_preview": preview_restart_urls(db),
+    }
+
+
+def _page_nav(user: str, show_dashboard_link: bool = True) -> dict:
+    with SessionLocal() as db:
+        return nav_context(db, user, show_dashboard_link=show_dashboard_link)
+
+
+templates.env.globals["page_nav"] = _page_nav
 
 
 def render_error_response(request: Request, error: Exception, status_code: int = 500):
