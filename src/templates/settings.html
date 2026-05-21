@@ -611,6 +611,40 @@
                 </form>
               </div>
             {% endif %}
+            {% set le_installed = ssl.metadata and ssl.metadata.source == ssl.source_letsencrypt %}
+            {% if le_installed %}
+              <form action="/settings/system/ssl-letsencrypt/config" method="post">
+                <input type="hidden" name="email" value="{{ le_config.email or '' }}" />
+                <input type="hidden" name="root_dns_domain" value="{{ le_config.root_dns_domain or '' }}" />
+                <input type="hidden" name="common_name" value="{{ le_config.common_name or le.defaults.common_name or ssl.app_dns_name }}" />
+                <input type="hidden" name="subject_alt_names" value="{{ le_config.subject_alt_names | join(', ') if le_config.subject_alt_names else (le.defaults.subject_alt_names or ssl.app_dns_name) }}" />
+                <input type="hidden" name="challenge_type" value="{{ le_config.challenge_type or 'dns-01' }}" />
+                {% if le_config.zone_id %}<input type="hidden" name="zone_id" value="{{ le_config.zone_id }}" />{% endif %}
+                {% if le_config.staging %}<input type="hidden" name="staging" value="on" />{% endif %}
+                {% if le.renewal_hint %}
+                  <p class="help">Renewal will be attempted around <strong>{{ le.renewal_hint }}</strong>.</p>
+                {% endif %}
+                <label>Renew before expiry
+                  <select name="renew_before_expiry_days">
+                    {% for days in le.renew_options %}
+                      <option value="{{ days }}" {% if (le_config.renew_before_expiry_days or 30) == days %}selected{% endif %}>{{ days }} days</option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <label class="inline-check">
+                  <input type="checkbox" name="scheduled_restart_enabled" {% if le_config.scheduled_restart_enabled is not sameas false %}checked{% endif %} />
+                  Schedule restart after certificate renewal
+                </label>
+                <label>Scheduled restart time
+                  <input type="time" name="scheduled_restart_time" value="{{ le_config.scheduled_restart_time or '03:00' }}" />
+                </label>
+                <p class="help">When enabled, the app restarts once at this time after a background renewal. It does not restart on days when no renewal occurred.</p>
+                <button type="submit">Save</button>
+              </form>
+
+              <details class="plugin-fields">
+                <summary>Re-enroll with Let's Encrypt</summary>
+            {% endif %}
             <form id="le-start-form" action="/settings/system/ssl-letsencrypt/start" method="post">
               <label>Email
                 <input type="email" name="email" required value="{{ le_config.email or '' }}" placeholder="admin@example.com" />
@@ -632,71 +666,32 @@
                   <option value="http-01" {% if le_config.challenge_type == "http-01" %}selected{% endif %}>HTTP Challenge</option>
                 </select>
               </label>
-              <label>Select API Configured Zone
-                <select name="zone_id">
-                  <option value="">Manual DNS instructions</option>
-                  {% for zone in le.zones %}
-                    <option value="{{ zone.id }}" {% if le_config.zone_id == zone.id %}selected{% endif %}>{{ zone.zone_name }}</option>
-                  {% endfor %}
-                </select>
-              </label>
+              <div id="le-zone-field"{% if le_config.challenge_type == "http-01" %} hidden{% endif %}>
+                <label>Select API Configured Zone
+                  <select name="zone_id">
+                    <option value="">Manual DNS instructions</option>
+                    {% for zone in le.zones %}
+                      <option value="{{ zone.id }}" {% if le_config.zone_id == zone.id %}selected{% endif %}>{{ zone.zone_name }}</option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <p class="help">Select a configured DNS zone to automatically create the Let's Encrypt DNS-01 challenge record. Leave as <em>Manual DNS instructions</em> to receive TXT record instructions instead.</p>
+              </div>
               <label class="inline-check">
                 <input type="checkbox" name="staging" {% if le_config.staging %}checked{% endif %} />
                 Use Let's Encrypt staging
               </label>
-              <label>Renew before expiry
-                <select name="renew_before_expiry_days">
-                  {% for days in le.renew_options %}
-                    <option value="{{ days }}" {% if (le_config.renew_before_expiry_days or 30) == days %}selected{% endif %}>{{ days }} days</option>
-                  {% endfor %}
-                </select>
-              </label>
-              {% if le.renewal_hint %}
-                <p class="help">Renewal will be attempted around <strong>{{ le.renewal_hint }}</strong>.</p>
-              {% endif %}
-              <label class="inline-check">
-                <input type="checkbox" name="scheduled_restart_enabled" {% if le_config.scheduled_restart_enabled is not sameas false %}checked{% endif %} />
-                Schedule restart after certificate renewal
-              </label>
-              <label>Scheduled restart time
-                <input type="time" name="scheduled_restart_time" value="{{ le_config.scheduled_restart_time or '03:00' }}" />
-              </label>
-              <p class="help">When enabled, the app restarts once at this time after a background renewal. It does not restart on days when no renewal occurred.</p>
-              <button type="submit">Start Let's Encrypt enrollment</button>
+              <button type="submit">{{ "Request New Certificate" if le_installed else "Start Let's Encrypt enrollment" }}</button>
             </form>
+            {% if le_installed %}
+              </details>
+            {% endif %}
             <dialog id="le-auto-enroll-dialog">
               <div class="dialog-content le-auto-enroll-dialog">
                 <p>Auto Enrolling with LetsEncrypt. This may take up to 2 minutes.</p>
                 <progress class="le-auto-enroll-progress" max="100"></progress>
               </div>
             </dialog>
-            {% if ssl.metadata and ssl.metadata.source == ssl.source_letsencrypt %}
-              <form action="/settings/system/ssl-letsencrypt/config" method="post">
-                <input type="hidden" name="email" value="{{ le_config.email or '' }}" />
-                <input type="hidden" name="root_dns_domain" value="{{ le_config.root_dns_domain or '' }}" />
-                <input type="hidden" name="common_name" value="{{ le_config.common_name or le.defaults.common_name or ssl.app_dns_name }}" />
-                <input type="hidden" name="subject_alt_names" value="{{ le_config.subject_alt_names | join(', ') if le_config.subject_alt_names else (le.defaults.subject_alt_names or ssl.app_dns_name) }}" />
-                <input type="hidden" name="challenge_type" value="{{ le_config.challenge_type or 'dns-01' }}" />
-                {% if le_config.zone_id %}<input type="hidden" name="zone_id" value="{{ le_config.zone_id }}" />{% endif %}
-                {% if le_config.staging %}<input type="hidden" name="staging" value="on" />{% endif %}
-                <label>Renew before expiry
-                  <select name="renew_before_expiry_days">
-                    {% for days in le.renew_options %}
-                      <option value="{{ days }}" {% if (le_config.renew_before_expiry_days or 30) == days %}selected{% endif %}>{{ days }} days</option>
-                    {% endfor %}
-                  </select>
-                </label>
-                <label class="inline-check">
-                  <input type="checkbox" name="scheduled_restart_enabled" {% if le_config.scheduled_restart_enabled is not sameas false %}checked{% endif %} />
-                  Schedule restart after certificate renewal
-                </label>
-                <label>Scheduled restart time
-                  <input type="time" name="scheduled_restart_time" value="{{ le_config.scheduled_restart_time or '03:00' }}" />
-                </label>
-                <p class="help">When enabled, the app restarts once at this time after a background renewal. It does not restart on days when no renewal occurred.</p>
-                <button type="submit">Save Let's Encrypt options</button>
-              </form>
-            {% endif %}
           </section>
 
           <section class="form-card">
@@ -1223,8 +1218,18 @@
 
       const leStartForm = document.getElementById("le-start-form");
       const leAutoEnrollDialog = document.getElementById("le-auto-enroll-dialog");
+      const leChallengeSelect = leStartForm?.querySelector('[name="challenge_type"]');
+      const leZoneField = document.getElementById("le-zone-field");
+      function syncLeZoneField() {
+        if (!leZoneField) {
+          return;
+        }
+        leZoneField.hidden = leChallengeSelect?.value === "http-01";
+      }
+      leChallengeSelect?.addEventListener("change", syncLeZoneField);
+      syncLeZoneField();
       leStartForm?.addEventListener("submit", () => {
-        const challengeType = leStartForm.querySelector('[name="challenge_type"]')?.value;
+        const challengeType = leChallengeSelect?.value;
         const zoneId = leStartForm.querySelector('[name="zone_id"]')?.value?.trim();
         if (challengeType === "dns-01" && zoneId) {
           leAutoEnrollDialog?.showModal();
