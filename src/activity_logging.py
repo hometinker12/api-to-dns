@@ -87,7 +87,7 @@ DEFAULT_BODY_TEMPLATE = (
     "Event: {event_type}\n"
     "Level: {level}\n"
     "Message: {message}\n"
-    "Zone: {zone_name}\n"
+    "Zone Name: {zone_name}\n"
     "Record: {record_name}\n"
     "Details: {details}"
 )

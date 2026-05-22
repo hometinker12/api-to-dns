@@ -4,6 +4,11 @@
 
 ### Added
 
+- **`dns_zone`** on public API responses: the provider DNS zone domain (e.g. `example.com`) is returned alongside **`zone_name`** (the zone configuration identifier used in requests).
+  - `GET /zones` (`DnsZoneSummary`): `id`, `zone_name`, `dns_zone`
+  - `GET /dns-record` (`DnsRecordGetResponse`): `dns_zone` at the response envelope (not inside each `records[]` item)
+  - `POST` / `PUT` / `PATCH` / `DELETE /dns-record` (`DnsRecordResponse`): `dns_zone` on success and error bodies (409, 404)
+- Request bodies for `/dns-record` mutations are unchanged; clients still send **`zone_name`** only. `dns_zone` is derived server-side from the zone configuration.
 - **DNS zone (domain)** field on each DNS provider plugin (Azure, BIND, Microsoft, Cloudflare), stored in zone configuration. The unique **zone configuration name** and API `zone_name` are separate from the provider domain, so multiple configurations can target the same DNS zone with different providers.
 - SSL Certificate page audit logging: all certificate and Let's Encrypt actions emit `system.ssl_*` activity events at WARNING level in the security category.
 - RESTful `/dns-record` resource: `GET`, `POST` (create), `PUT` (full replace), `PATCH` (partial update with merge), and `DELETE` (remove) on a single path.
@@ -14,6 +19,8 @@
 
 ### Changed
 
+- DNS activity log **message** text for record lookups and mutations now references the provider **`dns_zone`** (e.g. `www.example.com`) instead of the configuration **`zone_name`**. The logged **`zone_name`** attribute on DNS events is unchanged and still stores the configuration identifier; the Activity Log UI column label is **Zone Name**.
+- Admin dashboard DNS zone list shows each configuration as `zone_name` (`dns_zone`).
 - Let's Encrypt enrollment: Root DNS Domain is decoupled from the zone configuration name; DNS-01 automation uses the provider `dns_zone`, and the admin form auto-fills the root domain from the selected API zone.
 - `DELETE` requests now use the HTTP `DELETE` verb with query parameters instead of a JSON body.
 - `PUT` requires `ttl`; `PATCH` accepts optional `ttl` and/or `values` and merges omitted fields from the live record.

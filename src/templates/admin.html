@@ -31,7 +31,7 @@
         <ul class="summary-list">
           {% for z in zones %}
             <li>
-              <code>{{ z.zone_name }}</code>
+              <code>{{ z.zone_name }}</code> <span class="help">({{ z.dns_zone }})</span>
             </li>
           {% endfor %}
         </ul>

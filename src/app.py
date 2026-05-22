@@ -2919,6 +2919,7 @@ def get_dns_record(
             record_name=record_name,
             endpoint="GET /dns-record",
         )
+        provider_domain = provider_dns_zone(settings)
 
         try:
             lookup_type = normalize_lookup_record_type(record_type)
@@ -2970,12 +2971,12 @@ def get_dns_record(
 
         status = "success" if records else "not_found"
         message = (
-            f"Found {len(records)} record(s) at {record_name!r} in zone {zone_row.zone_name!r}."
+            f"Found {len(records)} record(s) at {record_name!r} in zone {provider_domain!r}."
             if records
             else (
-                f"No {lookup_type} record found at {record_name!r} in zone {zone_row.zone_name!r}."
+                f"No {lookup_type} record found at {record_name!r} in zone {provider_domain!r}."
                 if lookup_type
-                else f"No A, AAAA, CNAME, or TXT records found at {record_name!r} in zone {zone_row.zone_name!r}."
+                else f"No A, AAAA, CNAME, or TXT records found at {record_name!r} in zone {provider_domain!r}."
             )
         )
         emit_activity_event(
@@ -2998,6 +2999,7 @@ def get_dns_record(
         return DnsRecordGetResponse(
             status=status,
             zone_name=zone_row.zone_name,
+            dns_zone=provider_domain,
             record_name=record_name,
             records=records,
         )
@@ -3082,6 +3084,7 @@ def _apply_dns_mutation(
                         status="error",
                         action="not_found",
                         zone_name=zone_row.zone_name,
+                        dns_zone=provider_domain,
                         record_name=record_name,
                         record_type=rt_upper,
                         values=list(patch_values or []),
@@ -3096,7 +3099,7 @@ def _apply_dns_mutation(
                         actor_label=actor_label,
                         zone_name=zone_row.zone_name,
                         record_name=record_name,
-                        message=f"DNS record {record_name}.{zone_row.zone_name} {rt_upper} not found",
+                        message=f"DNS record {record_name}.{provider_domain} {rt_upper} not found",
                         details={"record_type": rt_upper, "provider": provider},
                     )
                     return JSONResponse(status_code=HTTP_404_NOT_FOUND, content=body.model_dump())
@@ -3128,6 +3131,7 @@ def _apply_dns_mutation(
                     status="success",
                     action="updated",
                     zone_name=zone_row.zone_name,
+                    dns_zone=provider_domain,
                     record_name=record_name,
                     record_type=rt_upper,
                     values=final_values,
@@ -3142,7 +3146,7 @@ def _apply_dns_mutation(
                     actor_label=actor_label,
                     zone_name=zone_row.zone_name,
                     record_name=record_name,
-                    message=f"DNS record {record_name}.{zone_row.zone_name} updated",
+                    message=f"DNS record {record_name}.{provider_domain} updated",
                     details={
                         "record_type": rt_upper,
                         "values_count": len(final_values),
@@ -3163,6 +3167,7 @@ def _apply_dns_mutation(
                     status="error",
                     action="record_already_exists",
                     zone_name=zone_row.zone_name,
+                    dns_zone=provider_domain,
                     record_name=record_name,
                     record_type=rt_upper,
                     values=list(values),
@@ -3177,7 +3182,7 @@ def _apply_dns_mutation(
                     actor_label=actor_label,
                     zone_name=zone_row.zone_name,
                     record_name=record_name,
-                    message=f"DNS record {record_name}.{zone_row.zone_name} {rt_upper} already exists",
+                    message=f"DNS record {record_name}.{provider_domain} {rt_upper} already exists",
                     details={"record_type": rt_upper, "provider": provider},
                 )
                 return JSONResponse(status_code=HTTP_409_CONFLICT, content=body.model_dump())
@@ -3187,6 +3192,7 @@ def _apply_dns_mutation(
                     status="error",
                     action="not_found",
                     zone_name=zone_row.zone_name,
+                    dns_zone=provider_domain,
                     record_name=record_name,
                     record_type=rt_upper,
                     values=[] if mode == "delete" else list(values),
@@ -3201,7 +3207,7 @@ def _apply_dns_mutation(
                     actor_label=actor_label,
                     zone_name=zone_row.zone_name,
                     record_name=record_name,
-                    message=f"DNS record {record_name}.{zone_row.zone_name} {rt_upper} not found",
+                    message=f"DNS record {record_name}.{provider_domain} {rt_upper} not found",
                     details={"record_type": rt_upper, "provider": provider},
                 )
                 return JSONResponse(status_code=HTTP_404_NOT_FOUND, content=body.model_dump())
@@ -3240,6 +3246,7 @@ def _apply_dns_mutation(
                 status="success",
                 action=action,
                 zone_name=zone_row.zone_name,
+                dns_zone=provider_domain,
                 record_name=record_name,
                 record_type=rt_upper,
                 values=response_values,
@@ -3254,7 +3261,7 @@ def _apply_dns_mutation(
                 actor_label=actor_label,
                 zone_name=zone_row.zone_name,
                 record_name=record_name,
-                message=f"DNS record {record_name}.{zone_row.zone_name} {action}",
+                message=f"DNS record {record_name}.{provider_domain} {action}",
                 details={
                     "record_type": rt_upper,
                     "values_count": len(values),

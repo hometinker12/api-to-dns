@@ -195,6 +195,7 @@ class DnsRecordGetResponse(BaseModel):
         description='Outcome: "success" when one or more records are found; "not_found" when none match.',
     )
     zone_name: str
+    dns_zone: str
     record_name: str
     records: List[DnsRecordInfo] = Field(
         default_factory=list,
@@ -221,6 +222,7 @@ class DnsRecordResponse(BaseModel):
         ),
     )
     zone_name: str
+    dns_zone: str
     record_name: str
     record_type: str
     values: List[str]
@@ -229,6 +231,7 @@ class DnsRecordResponse(BaseModel):
 class DnsZoneSummary(BaseModel):
     id: int
     zone_name: str
+    dns_zone: str
 
 
 class User(SQLModel, table=True):

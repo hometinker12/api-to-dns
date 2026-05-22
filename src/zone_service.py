@@ -193,7 +193,8 @@ def dns_zone_public_dict(z: DnsZoneConfig) -> Dict[str, Any]:
 
 
 def dns_zone_summary_dict(z: DnsZoneConfig) -> Dict[str, Any]:
-    return {"id": z.id, "zone_name": z.zone_name}
+    cfg = decode_zone_config(z)
+    return {"id": z.id, "zone_name": z.zone_name, "dns_zone": provider_dns_zone(cfg)}
 
 
 def api_key_public_dict(k: ApiKey) -> Dict[str, Any]:

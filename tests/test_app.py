@@ -355,7 +355,8 @@ def test_zones_json_request_returns_zone_ids(client: TestClient) -> None:
     zones = response.json()
     example = next(zone for zone in zones if zone["zone_name"] == "example.com")
     assert isinstance(example["id"], int)
-    assert set(zones[0]) == {"id", "zone_name"}
+    assert example["dns_zone"] == "example.com"
+    assert set(zones[0]) == {"id", "zone_name", "dns_zone"}
 
 
 def test_zones_json_request_without_api_key_returns_access_denied(client: TestClient) -> None:
@@ -372,6 +373,7 @@ def test_zones_json_schema_is_documented(client: TestClient) -> None:
     zones_response = schema["paths"]["/zones"]["get"]["responses"]["200"]
     assert zones_response["content"]["application/json"]["schema"]["items"]["$ref"].endswith("/DnsZoneSummary")
     assert "DnsZoneSummary" in schema["components"]["schemas"]
+    assert "dns_zone" in schema["components"]["schemas"]["DnsZoneSummary"]["required"]
 
 
 def test_provider_dns_zone_requires_config_field() -> None:
@@ -529,6 +531,7 @@ def test_dns_record_get_schema_is_documented(client: TestClient) -> None:
     assert response_schema["$ref"].endswith("/DnsRecordGetResponse")
     assert "DnsRecordGetResponse" in schema["components"]["schemas"]
     assert "DnsRecordInfo" in schema["components"]["schemas"]
+    assert "dns_zone" in schema["components"]["schemas"]["DnsRecordGetResponse"]["required"]
     records_items = schema["components"]["schemas"]["DnsRecordGetResponse"]["properties"]["records"]["items"]
     assert records_items["$ref"].endswith("/DnsRecordInfo")
 
@@ -566,6 +569,7 @@ def test_dns_record_get_with_mock_client(client: TestClient, api_key_value: str,
     body = response.json()
     assert body["status"] == "success"
     assert body["zone_name"] == "example.com"
+    assert body["dns_zone"] == "example.com"
     assert body["record_name"] == "www"
     assert body["records"] == [
         {"record_name": "www", "record_type": "A", "ttl": 300, "values": ["192.0.2.1"]}
@@ -590,6 +594,7 @@ def test_dns_record_get_untyped_multi_type(client: TestClient, api_key_value: st
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "success"
+    assert body["dns_zone"] == "example.com"
     assert len(body["records"]) == 2
     assert body["records"][0]["ttl"] == 500
     assert body["records"][1]["ttl"] == 1000
@@ -608,6 +613,7 @@ def test_dns_record_get_not_found(client: TestClient, api_key_value: str, monkey
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "not_found"
+    assert body["dns_zone"] == "example.com"
     assert body["records"] == []
 
 
@@ -660,12 +666,85 @@ def test_dns_record_with_mock_client(client: TestClient, api_key_value: str, mon
     body = response.json()
     assert body["status"] == "success"
     assert body["action"] == "created"
+    assert body["dns_zone"] == "example.com"
     fake.get_record.assert_called_once()
     fake.create_or_update_record.assert_called_once()
     with SessionLocal() as db:
         event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "dns.record_created")).first()
         assert event is not None
         assert event.category == "dns"
+
+
+def test_dns_record_audit_message_uses_provider_dns_zone(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_name = "audit-config-label"
+    provider_domain = "audit-provider.example"
+    with SessionLocal() as db:
+        key = db.exec(select(ApiKey).where(ApiKey.key == api_key_value)).first()
+        assert key is not None
+        row = db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == config_name)).first()
+        if row is None:
+            row = DnsZoneConfig(
+                zone_name=config_name,
+                encrypted_config=encode_zone_config_dict(
+                    {
+                        "dns_provider_type": "azure",
+                        "dns_zone": provider_domain,
+                        "dns_server": "",
+                        "dns_username": "",
+                        "dns_password": "",
+                        "dns_tsig_algorithm": "",
+                        "dns_winrm_ssl": "",
+                        "azure_tenant_id": "",
+                        "azure_client_id": "",
+                        "azure_client_secret": "",
+                        "azure_subscription_id": "00000000-0000-0000-0000-000000000001",
+                        "azure_resource_group": "rg-test",
+                    }
+                ),
+            )
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+        if not db.exec(
+            select(ApiKeyAllowedZone).where(
+                ApiKeyAllowedZone.api_key_id == key.id,
+                ApiKeyAllowedZone.dns_zone_config_id == row.id,
+            )
+        ).first():
+            db.add(ApiKeyAllowedZone(api_key_id=key.id, dns_zone_config_id=row.id))
+            db.commit()
+
+    fake = MagicMock()
+    fake.get_record.return_value = []
+    fake.create_or_update_record.return_value = True
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+
+    response = client.post(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": config_name,
+            "record_type": "A",
+            "record_name": "www",
+            "ttl": 300,
+            "values": ["192.0.2.10"],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["dns_zone"] == provider_domain
+    with SessionLocal() as db:
+        event = db.exec(
+            select(ActivityLog).where(
+                ActivityLog.event_type == "dns.record_created",
+                ActivityLog.zone_name == config_name,
+                ActivityLog.record_name == "www",
+            )
+        ).first()
+        assert event is not None
+        assert event.zone_name == config_name
+        assert event.message == f"DNS record www.{provider_domain} created"
 
 
 def test_dns_record_post_conflict_returns_409(
@@ -1237,6 +1316,7 @@ def test_admin_page_links_to_settings(client: TestClient) -> None:
     response = client.get("/admin")
     assert response.status_code == 200
     assert 'href="/settings"' in response.text
+    assert '<code>example.com</code> <span class="help">(example.com)</span>' in response.text
 
 
 def test_dashboard_disables_zone_and_api_key_buttons_without_roles(client: TestClient) -> None:
