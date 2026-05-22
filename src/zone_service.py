@@ -26,6 +26,7 @@ __all__ = [
     "list_dns_zones",
     "migrate_legacy_dns_settings_if_needed",
     "normalize_zone_name",
+    "provider_dns_zone",
     "set_disabled_dns_plugins",
     "test_zone_record_lookup",
     "zones_using_dns_provider",
@@ -54,6 +55,13 @@ LEGACY_DNS_SETTING_NAMES = [
 
 def normalize_zone_name(zone: str) -> str:
     return zone.strip().rstrip(".").lower()
+
+
+def provider_dns_zone(settings: Dict[str, Any]) -> str:
+    zone = normalize_zone_name(str(settings.get("dns_zone") or ""))
+    if not zone:
+        raise ValueError("DNS zone (domain) is required in the zone configuration.")
+    return zone
 
 
 def get_dns_provider_options() -> List[dict]:
@@ -173,9 +181,11 @@ def api_key_allowed_zone_names(db, api_key_id: int) -> List[str]:
 def dns_zone_public_dict(z: DnsZoneConfig) -> Dict[str, Any]:
     cfg = decode_zone_config(z)
     provider_key = cfg.get("dns_provider_type", "") or "azure"
+    dns_zone = (cfg.get("dns_zone") or "").strip()
     return {
         "id": z.id,
         "zone_name": z.zone_name,
+        "dns_zone": dns_zone,
         "dns_provider_type": provider_key,
         "dns_provider_label": dns_provider_display_name(provider_key),
         "dns_server": cfg.get("dns_server", "") or "",
@@ -234,7 +244,6 @@ def test_zone_record_lookup(
     cfg: Dict[str, Any],
     *,
     record_name: str,
-    zone_name: str,
     record_type: Optional[str] = None,
 ) -> List[DnsRecordInfo]:
     client = create_dns_client_from_settings(cfg)
@@ -242,5 +251,5 @@ def test_zone_record_lookup(
         record_name=record_name,
         record_type=record_type,
         dns_server=cfg.get("dns_server"),
-        dns_zone=zone_name,
+        dns_zone=provider_dns_zone(cfg),
     )

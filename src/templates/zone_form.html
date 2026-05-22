@@ -20,13 +20,14 @@
       {% set provider = settings.dns_provider_type or 'azure' %}
       {% if not zone %}
         <section class="form-card">
-          <label>DNS zone name (unique key)
-            <input type="text" name="zone_name" required value="" placeholder="example.com" />
+          <label>Zone configuration name (unique)
+            <p class="help">Unique name for this configuration and for API <code>zone_name</code> requests. Not necessarily the DNS domain.</p>
+            <input type="text" name="zone_name" required value="" placeholder="example-azure" />
           </label>
         </section>
       {% else %}
         <section class="form-card">
-          <p><strong>Zone:</strong> <code>{{ zone.zone_name }}</code></p>
+          <p><strong>Configuration name:</strong> <code>{{ zone.zone_name }}</code></p>
           <input type="hidden" name="zone_id" value="{{ zone.id }}" />
           <input type="hidden" name="zone_name" value="{{ zone.zone_name }}" />
         </section>

@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 from ..models import DnsRecordInfo, DnsRecordRequest
 
-from .base import DnsProviderPlugin, PluginField
+from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
 from .utils import lookup_record_types_to_query
 
 
@@ -78,9 +78,9 @@ class CloudflareDnsClient:
             raise ValueError(
                 "Cloudflare DNS ignores per-server host settings; use the Cloudflare fields on the zone configuration."
             )
-        zone_name = (dns_zone or payload.zone_name or "").strip().rstrip(".")
+        zone_name = (dns_zone or "").strip().rstrip(".")
         if not zone_name:
-            raise ValueError("Zone name is required for Cloudflare DNS.")
+            raise ValueError("DNS zone (domain) is required in the zone configuration.")
 
         record_type = payload.record_type.upper()
         ttl = int(payload.ttl or 300)
@@ -130,7 +130,7 @@ class CloudflareDnsClient:
                 "Cloudflare DNS ignores per-server host settings; use the Cloudflare fields on the zone configuration."
             )
         if not dns_zone:
-            raise ValueError("Zone name is required for Cloudflare DNS.")
+            raise ValueError("DNS zone (domain) is required in the zone configuration.")
 
         zone_name = dns_zone.strip().rstrip(".")
         fqdn = _fqdn(zone_name, record_name)
@@ -392,6 +392,7 @@ PLUGIN = DnsProviderPlugin(
         "Target DNS Server and TSIG settings are not used for Cloudflare DNS."
     ),
     fields=[
+        DNS_ZONE_DOMAIN_FIELD,
         PluginField(
             "cloudflare_api_token",
             "API token",

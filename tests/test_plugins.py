@@ -60,6 +60,34 @@ def test_query_dns_records_at_name_filters_by_type(mock_tcp) -> None:
 
 
 @patch.object(AzureDnsClient, "_get_existing_record_set")
+def test_azure_create_or_update_uses_dns_zone_not_payload_zone_name(mock_get) -> None:
+    client = AzureDnsClient(
+        tenant_id="t",
+        client_id="c",
+        client_secret="s",
+        subscription_id="sub",
+        resource_group="rg",
+    )
+    client.DnsManagementClient = MagicMock()
+    mock_get.return_value = None
+    payload = DnsRecordRequest(
+        zone_name="config-key-not-domain",
+        record_type="A",
+        record_name="www",
+        ttl=300,
+        values=["192.0.2.10"],
+    )
+    client.create_or_update_record(payload, dns_zone="example.com")
+    mock_get.assert_called_with(
+        client.DnsManagementClient.return_value,
+        "rg",
+        "example.com",
+        "www",
+        "A",
+    )
+
+
+@patch.object(AzureDnsClient, "_get_existing_record_set")
 def test_azure_get_record_single_type(mock_get) -> None:
     client = AzureDnsClient(
         tenant_id="t",

@@ -41,6 +41,7 @@ def _seed_example_zone_and_permission(db, api_key_value: str) -> None:
     if not zone:
         cfg = {
             "dns_provider_type": "azure",
+            "dns_zone": "example.com",
             "dns_server": "",
             "dns_username": "",
             "dns_password": "",

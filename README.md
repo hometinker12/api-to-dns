@@ -50,7 +50,7 @@ http://localhost:8000/login
 
 > SSL is **off by default**; the app listens on plain HTTP on port `8000`. See **Optional: HTTPS with self-signed or uploaded certificates** below for the enable workflow.
 
-After login, open **DNS zones** to add one row per zone (each row is a unique zone name with its own provider and credentials). Then open **API Keys**: when you create or edit a key, select which zones that key may use. Every `/dns-record` request requires a `zone_name` (in the JSON body for `POST`/`PUT`/`PATCH`, in the query string for `GET`/`DELETE`); it must match a configured zone **and** be allowed for that API key, or the API returns **403** with `error: access_denied`.
+After login, open **DNS zones** to add one row per zone configuration (each row has a **unique configuration name**, its own provider, a **DNS zone (domain)** for that provider, and credentials). You can add multiple configurations with different names that all target the same DNS domain (for example `example-azure` and `example-cloudflare`, both with domain `example.com`). Then open **API Keys**: when you create or edit a key, select which configurations that key may use. Every `/dns-record` request requires a `zone_name` (in the JSON body for `POST`/`PUT`/`PATCH`, in the query string for `GET`/`DELETE`); it must match a configured zone **name** **and** be allowed for that API key, or the API returns **403** with `error: access_denied`. The `zone_name` on API requests is the configuration name, not the provider DNS domain.
 
 ## Configuration
 
@@ -98,7 +98,7 @@ print(f'ENCRYPTION_KEY={key}')
 The web interface allows you to:
 
 - Sign in with admin credentials
-- Add and edit **DNS zones** (each zone name is unique; each has its own provider type, server, and credentials). Use the **Test Configuration** button on a zone form to verify credentials and zone access by looking up a known record before saving.
+- Add and edit **DNS zones** (each configuration name is unique; each has its own provider type, DNS domain, server, and credentials). Use the **Test Configuration** button on a zone form to verify credentials and zone access by looking up a known record before saving.
 - Create and revoke **API keys**, and **edit** keys to change their label or **allowed zones**
 - Review and search activity logs under **Settings → Log Viewing / Searching**
 - Configure logging level, retention, SMTP delivery, and operational log rotation under **Settings → System Settings**
@@ -189,7 +189,7 @@ All examples target `http://localhost:8000/dns-record` with `Content-Type: appli
 
 `record_type` accepts `**A`**, `**AAAA**`, `**CNAME**`, or `**TXT**`. The legacy `POST` upsert and `record_type: "DELETE"` pseudo-payload have been removed.
 
-`**zone_name` is required** on every request and must match a zone you configured under **DNS zones**. The API key must include that zone in its **allowed zones** list (see **API Keys** in the admin UI). If the zone is missing or the key is not allowed, the response is **403** with `{"detail":{"error":"access_denied","message":"..."}}`.
+**`zone_name` is required** on every request and must match a **configuration name** you set under **DNS zones** (not the provider DNS domain). The API key must include that configuration in its **allowed zones** list (see **API Keys** in the admin UI). If the zone is missing or the key is not allowed, the response is **403** with `{"detail":{"error":"access_denied","message":"..."}}`.
 
 ### Create a new A record (`POST`)
 

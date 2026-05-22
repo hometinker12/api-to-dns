@@ -89,7 +89,7 @@
             {% for z in all_zones %}
               <label class="inline-check">
                 <input type="checkbox" name="zone_ids" value="{{ z.id }}" />
-                <code>{{ z.zone_name }}</code>
+                <code>{{ z.zone_name }}</code>{% if z.dns_zone %} <span class="help">({{ z.dns_zone }})</span>{% endif %}
               </label>
             {% endfor %}
           </fieldset>
@@ -124,7 +124,7 @@
                 {% for z in all_zones %}
                   <label class="inline-check">
                     <input type="checkbox" name="zone_ids" value="{{ z.id }}" {% if edit_key_error_id == key.id %}{% if z.id in edit_key_selected_zone_ids %}checked{% endif %}{% elif z.zone_name in key_zones[key.id] %}checked{% endif %} />
-                    <code>{{ z.zone_name }}</code>
+                    <code>{{ z.zone_name }}</code>{% if z.dns_zone %} <span class="help">({{ z.dns_zone }})</span>{% endif %}
                   </label>
                 {% endfor %}
               </fieldset>

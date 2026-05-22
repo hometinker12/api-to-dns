@@ -10,7 +10,7 @@ import dns.update
 
 from ..models import DnsRecordRequest
 
-from .base import DnsProviderPlugin, PluginField
+from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
 from .utils import dns_relative_name, query_dns_records_at_name, record_existed_before_update, tcp_endpoint_host
 
 
@@ -38,9 +38,9 @@ class BindTsigDnsClient:
     ) -> bool:
         if not dns_server:
             raise ValueError("DNS server host is required for BIND (set Target DNS Server in settings).")
-        zone_name = (dns_zone or payload.zone_name or "").strip().rstrip(".")
+        zone_name = (dns_zone or "").strip().rstrip(".")
         if not zone_name:
-            raise ValueError("Zone name is required for BIND (set Target DNS Zone in settings or zone_name on the request).")
+            raise ValueError("DNS zone (domain) is required in the zone configuration.")
 
         record_type = payload.record_type.upper()
         ttl = int(payload.ttl or 300)
@@ -98,7 +98,7 @@ class BindTsigDnsClient:
             raise ValueError("DNS server host is required for BIND (set Target DNS Server in settings).")
         zone_name = (dns_zone or "").strip().rstrip(".")
         if not zone_name:
-            raise ValueError("Zone name is required for BIND (set Target DNS Zone in settings or zone_name on the request).")
+            raise ValueError("DNS zone (domain) is required in the zone configuration.")
         relative = dns_relative_name(zone_name, record_name)
         return query_dns_records_at_name(dns_server, zone_name, relative, record_type)
 
@@ -117,6 +117,7 @@ PLUGIN = DnsProviderPlugin(
     heading="BIND / RFC 2136",
     help_text="Use a BIND server that accepts dynamic updates. Provide the TSIG key name, shared secret in base64, and the TSIG algorithm.",
     fields=[
+        DNS_ZONE_DOMAIN_FIELD,
         PluginField("dns_server", "Target DNS Server", placeholder="bind01.example.com or 192.0.2.10"),
         PluginField("dns_username", "TSIG key name", autocomplete="off", placeholder="api-to-dns."),
         PluginField(

@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from ..models import DnsRecordInfo, DnsRecordRequest
 
-from .base import DnsProviderPlugin, PluginField
+from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
 from .utils import dns_relative_name, lookup_record_types_to_query, ps_single_quoted, winrm_rr_type
 
 
@@ -97,9 +97,9 @@ class MicrosoftWinRmDnsClient:
     ) -> bool:
         if not dns_server:
             raise ValueError("DNS server host is required for Microsoft DNS (set Target DNS Server to the DNS/DC WinRM endpoint).")
-        zone = (dns_zone or payload.zone_name or "").strip()
+        zone = (dns_zone or "").strip()
         if not zone:
-            raise ValueError("Zone name is required (set Target DNS Zone in settings or zone_name on the request).")
+            raise ValueError("DNS zone (domain) is required in the zone configuration.")
 
         record_type = payload.record_type.upper()
         ttl = int(payload.ttl or 300)
@@ -212,7 +212,7 @@ class MicrosoftWinRmDnsClient:
             raise ValueError("DNS server host is required for Microsoft DNS (set Target DNS Server to the DNS/DC WinRM endpoint).")
         zone = (dns_zone or "").strip()
         if not zone:
-            raise ValueError("Zone name is required (set Target DNS Zone in settings or zone_name on the request).")
+            raise ValueError("DNS zone (domain) is required in the zone configuration.")
 
         name = dns_relative_name(zone, record_name)
         name_at = "@" if name == "@" else name
@@ -298,6 +298,7 @@ PLUGIN = DnsProviderPlugin(
     heading="Microsoft DNS (WinRM)",
     help_text="Use a DNS server or domain controller that accepts WinRM connections. The account must have rights to manage records in the zone.",
     fields=[
+        DNS_ZONE_DOMAIN_FIELD,
         PluginField("dns_server", "Target DNS Server", placeholder="dc01.corp.local or 192.0.2.10"),
         PluginField("dns_username", "Username", autocomplete="off", placeholder="DOMAIN\\dns-admin"),
         PluginField(

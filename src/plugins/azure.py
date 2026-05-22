@@ -2,7 +2,7 @@ from typing import Dict, List, Optional
 
 from ..models import DnsRecordInfo, DnsRecordRequest
 
-from .base import DnsProviderPlugin, PluginField
+from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
 from .utils import lookup_record_types_to_query
 
 
@@ -50,8 +50,8 @@ class AzureDnsClient:
         if dns_server:
             raise ValueError("Azure DNS ignores per-server host settings; use Azure fields on the zone configuration.")
 
-        if not payload.zone_name:
-            raise ValueError("zone_name is required for Azure DNS.")
+        if not dns_zone:
+            raise ValueError("DNS zone (domain) is required in the zone configuration.")
 
         client = self.DnsManagementClient(self.credential, self.subscription_id)
         record_set_name = payload.record_name.strip(".") or "@"
@@ -62,7 +62,7 @@ class AzureDnsClient:
             existing = self._get_existing_record_set(
                 client,
                 self.resource_group,
-                payload.zone_name,
+                dns_zone,
                 record_set_name,
                 inner,
             )
@@ -71,7 +71,7 @@ class AzureDnsClient:
             try:
                 client.record_sets.delete(
                     self.resource_group,
-                    payload.zone_name,
+                    dns_zone,
                     record_set_name,
                     inner,
                 )
@@ -82,7 +82,7 @@ class AzureDnsClient:
         existing = self._get_existing_record_set(
             client,
             self.resource_group,
-            payload.zone_name,
+            dns_zone,
             record_set_name,
             record_type,
         )
@@ -90,7 +90,7 @@ class AzureDnsClient:
 
         client.record_sets.create_or_update(
             self.resource_group,
-            payload.zone_name,
+            dns_zone,
             record_set_name,
             record_type,
             record_set,
@@ -109,7 +109,7 @@ class AzureDnsClient:
         if dns_server:
             raise ValueError("Azure DNS ignores per-server host settings; use Azure fields on the zone configuration.")
         if not dns_zone:
-            raise ValueError("Zone name is required for Azure DNS.")
+            raise ValueError("DNS zone (domain) is required in the zone configuration.")
 
         record_set_name = record_name.strip(".") or "@"
         display_name = record_set_name
@@ -193,6 +193,7 @@ PLUGIN = DnsProviderPlugin(
     heading="Azure DNS",
     help_text="Use an Azure service principal with permission to manage records in the zone. Target DNS Server and TSIG settings are not used for Azure DNS.",
     fields=[
+        DNS_ZONE_DOMAIN_FIELD,
         PluginField("azure_tenant_id", "Azure tenant ID", autocomplete="off"),
         PluginField("azure_client_id", "Azure client ID (application ID)", autocomplete="off"),
         PluginField(

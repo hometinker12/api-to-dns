@@ -10,6 +10,7 @@ from src import letsencrypt, ssl_certs
 from src.db import SessionLocal, init_db
 from src.models import DnsZoneConfig
 from src.settings_store import delete_setting, set_setting
+from src.zone_service import encode_zone_config_dict
 
 
 def _ensure_db() -> None:
@@ -78,6 +79,37 @@ def test_save_config_defaults_common_name_to_app_dns_name(monkeypatch) -> None:
             **_sample_config_kwargs(common_name="", subject_alt_names=""),
         )
         assert config["common_name"] == "api.example.com"
+
+
+def test_save_config_dns_zone_must_match_root_not_config_name() -> None:
+    _ensure_db()
+    with SessionLocal() as db:
+        row = DnsZoneConfig(
+            zone_name="le-config-name",
+            encrypted_config=encode_zone_config_dict(
+                {
+                    "dns_provider_type": "azure",
+                    "dns_zone": "other.com",
+                    "azure_tenant_id": "t",
+                    "azure_client_id": "c",
+                    "azure_client_secret": "s",
+                    "azure_subscription_id": "sub",
+                    "azure_resource_group": "rg",
+                }
+            ),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        with pytest.raises(letsencrypt.LetsEncryptError, match="DNS domain must match Root DNS Domain"):
+            letsencrypt.save_config(
+                db,
+                **_sample_config_kwargs(
+                    challenge_type=letsencrypt.CHALLENGE_DNS,
+                    zone_id=int(row.id),
+                    root_dns_domain="example.com",
+                ),
+            )
 
 
 def test_save_config_rejects_name_outside_root() -> None:

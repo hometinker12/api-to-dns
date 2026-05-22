@@ -55,7 +55,10 @@ class DnsRecordRequest(BaseModel):
 
     zone_name: Optional[str] = Field(
         None,
-        description="DNS zone name (required). Must match a configured zone and be allowed for this API key.",
+        description=(
+            "Configured zone name (required). Unique key for this zone configuration in the admin UI; "
+            "must match a configured zone and be allowed for this API key. Not necessarily the DNS domain."
+        ),
     )
     record_type: str = Field(
         ...,
@@ -98,7 +101,10 @@ class DnsRecordCreateRequest(BaseModel):
 
     zone_name: Optional[str] = Field(
         None,
-        description="DNS zone name (required). Must match a configured zone and be allowed for this API key.",
+        description=(
+            "Configured zone name (required). Unique key for this zone configuration; "
+            "must match a configured zone and be allowed for this API key. Not necessarily the DNS domain."
+        ),
     )
     record_type: str = Field(..., description="DNS record type: A, AAAA, CNAME, or TXT.")
     record_name: str = Field(..., description="Record name relative to the zone, e.g. www")
@@ -121,7 +127,10 @@ class DnsRecordReplaceRequest(BaseModel):
 
     zone_name: Optional[str] = Field(
         None,
-        description="DNS zone name (required). Must match a configured zone and be allowed for this API key.",
+        description=(
+            "Configured zone name (required). Unique key for this zone configuration; "
+            "must match a configured zone and be allowed for this API key. Not necessarily the DNS domain."
+        ),
     )
     record_type: str = Field(..., description="DNS record type: A, AAAA, CNAME, or TXT.")
     record_name: str = Field(..., description="Record name relative to the zone, e.g. www")
@@ -147,7 +156,10 @@ class DnsRecordPatchRequest(BaseModel):
 
     zone_name: Optional[str] = Field(
         None,
-        description="DNS zone name (required). Must match a configured zone and be allowed for this API key.",
+        description=(
+            "Configured zone name (required). Unique key for this zone configuration; "
+            "must match a configured zone and be allowed for this API key. Not necessarily the DNS domain."
+        ),
     )
     record_type: str = Field(..., description="DNS record type: A, AAAA, CNAME, or TXT.")
     record_name: str = Field(..., description="Record name relative to the zone, e.g. www")

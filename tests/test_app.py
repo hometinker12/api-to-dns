@@ -42,6 +42,7 @@ from src.app import (
 from src.auth import SESSION_IDLE_TIMEOUT_SECONDS, create_session_cookie
 from src.db import SessionLocal, init_db
 from src.dns_client import create_dns_client, discover_plugins, dns_provider_display_name
+from src.zone_service import provider_dns_zone
 from src.models import (
     LOG_LEVEL_ERROR,
     LOG_LEVEL_INFORMATIONAL,
@@ -244,6 +245,7 @@ def test_zone_form_renders_plugins_from_metadata(client: TestClient) -> None:
     assert '<option value="cloudflare" >Cloudflare DNS (REST API)</option>' in response.text
     assert 'data-provider-panel="azure"' in response.text
     assert 'data-provider-panel="cloudflare"' in response.text
+    assert 'name="dns_zone"' in response.text
     assert 'name="azure_tenant_id"' in response.text
     assert 'name="cloudflare_api_token"' in response.text
     assert 'name="cloudflare_proxied"' in response.text
@@ -284,6 +286,7 @@ def test_zone_test_success(client: TestClient, monkeypatch: pytest.MonkeyPatch) 
             "test_record_name": "www",
             "test_record_type": "A",
             "dns_provider_type": "azure",
+            "dns_zone": "example.com",
             "azure_tenant_id": "tenant",
             "azure_client_id": "client",
             "azure_client_secret": "secret",
@@ -309,6 +312,7 @@ def test_zone_test_not_found(client: TestClient, monkeypatch: pytest.MonkeyPatch
             "zone_name": "example.com",
             "test_record_name": "missing",
             "dns_provider_type": "azure",
+            "dns_zone": "example.com",
             "azure_tenant_id": "tenant",
             "azure_client_id": "client",
             "azure_client_secret": "secret",
@@ -331,6 +335,7 @@ def test_zone_test_invalid_record_type(client: TestClient) -> None:
             "test_record_name": "www",
             "test_record_type": "MX",
             "dns_provider_type": "azure",
+            "dns_zone": "example.com",
             "azure_tenant_id": "tenant",
             "azure_client_id": "client",
             "azure_client_secret": "secret",
@@ -366,6 +371,40 @@ def test_zones_json_schema_is_documented(client: TestClient) -> None:
     zones_response = schema["paths"]["/zones"]["get"]["responses"]["200"]
     assert zones_response["content"]["application/json"]["schema"]["items"]["$ref"].endswith("/DnsZoneSummary")
     assert "DnsZoneSummary" in schema["components"]["schemas"]
+
+
+def test_provider_dns_zone_requires_config_field() -> None:
+    with pytest.raises(ValueError, match="DNS zone \\(domain\\) is required"):
+        provider_dns_zone({"dns_provider_type": "azure"})
+
+
+def test_two_zone_configs_can_share_dns_domain(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    domain = "shared.example"
+    config_names = ("shared-azure-cfg", "shared-cf-cfg")
+    for config_name, provider in zip(config_names, ("azure", "cloudflare"), strict=True):
+        response = client.post(
+            "/zones",
+            data={
+                "zone_name": config_name,
+                "dns_provider_type": provider,
+                "dns_zone": domain,
+                "azure_tenant_id": "t",
+                "azure_client_id": "c",
+                "azure_client_secret": "s",
+                "azure_subscription_id": "sub",
+                "azure_resource_group": "rg",
+                "cloudflare_api_token": "token",
+            },
+        )
+        assert response.status_code == 200, response.text[:500]
+
+    with SessionLocal() as db:
+        rows = [
+            db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == name)).first()
+            for name in config_names
+        ]
+        assert all(row is not None for row in rows)
 
 
 def test_legacy_zone_page_routes_are_not_redirects(client: TestClient) -> None:
@@ -995,6 +1034,7 @@ def test_dns_record_access_denied_zone_not_allowed(client: TestClient, api_key_v
         if not db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == other)).first():
             cfg = {
                 "dns_provider_type": "azure",
+                "dns_zone": "other.example",
                 "dns_server": "",
                 "dns_username": "",
                 "dns_password": "",
@@ -2087,6 +2127,7 @@ def test_manual_zone_create_with_disabled_provider_is_rejected(client: TestClien
         data={
             "zone_name": "disabled-provider.example",
             "dns_provider_type": "bind",
+            "dns_zone": "example.com",
             "dns_server": "127.0.0.1",
             "dns_username": "api-to-dns.",
             "dns_password": "secret",

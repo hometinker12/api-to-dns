@@ -21,7 +21,13 @@ from .activity_logging import get_app_dns_name
 from .models import DnsRecordRequest, DnsZoneConfig
 from .settings_store import delete_setting, get_setting, set_setting
 from .ssl_certs import SOURCE_LETSENCRYPT, _read_source, cert_dir, cert_metadata, install_letsencrypt_cert
-from .zone_service import create_dns_client_from_settings, decode_zone_config, list_dns_zones, normalize_zone_name
+from .zone_service import (
+    create_dns_client_from_settings,
+    decode_zone_config,
+    list_dns_zones,
+    normalize_zone_name,
+    provider_dns_zone,
+)
 
 SETTING_CONFIG = "letsencrypt_config"
 SETTING_ENROLLMENT = "letsencrypt_enrollment"
@@ -532,8 +538,12 @@ def save_config(
         zone = _zone_row(db, zone_id)
         if zone is None:
             raise LetsEncryptError("Selected DNS zone was not found.")
-        if normalize_zone_name(zone.zone_name) != normalize_zone_name(root):
-            raise LetsEncryptError("Selected API configured zone must match Root DNS Domain.")
+        try:
+            configured_domain = provider_dns_zone(decode_zone_config(zone))
+        except ValueError as exc:
+            raise LetsEncryptError(str(exc)) from exc
+        if configured_domain != normalize_zone_name(root):
+            raise LetsEncryptError("Selected zone configuration DNS domain must match Root DNS Domain.")
     config = {
         "email": email.strip(),
         "root_dns_domain": root,

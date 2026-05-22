@@ -120,6 +120,7 @@ from .zone_service import (
     list_dns_zones,
     migrate_legacy_dns_settings_if_needed,
     normalize_zone_name,
+    provider_dns_zone,
     set_disabled_dns_plugins,
     test_zone_record_lookup,
     zones_using_dns_provider,
@@ -823,7 +824,6 @@ async def zone_test(request: Request, user: str = Depends(require_role(ROLE_DNS_
             records = test_zone_record_lookup(
                 cfg,
                 record_name=test_record_name,
-                zone_name=canonical,
                 record_type=test_record_type,
             )
         except ValueError as exc:
@@ -2841,7 +2841,6 @@ def get_dns_record(
             records = test_zone_record_lookup(
                 settings,
                 record_name=record_name,
-                zone_name=zone_row.zone_name,
                 record_type=lookup_type,
             )
         except ValueError as exc:
@@ -2933,7 +2932,6 @@ def _record_exists_at_type(
     client,
     *,
     settings: Dict[str, Any],
-    zone_name: str,
     record_name: str,
     record_type: str,
 ) -> bool:
@@ -2943,7 +2941,7 @@ def _record_exists_at_type(
         record_name=record_name,
         record_type=record_type,
         dns_server=settings.get("dns_server"),
-        dns_zone=zone_name,
+        dns_zone=provider_dns_zone(settings),
     )
     return bool(records)
 
@@ -2986,13 +2984,14 @@ def _apply_dns_mutation(
 
         try:
             client = get_dns_client_from_settings(settings)
+            provider_domain = provider_dns_zone(settings)
 
             if mode == "patch":
                 records = client.get_record(
                     record_name=record_name,
                     record_type=rt_upper,
                     dns_server=settings.get("dns_server"),
-                    dns_zone=zone_row.zone_name,
+                    dns_zone=provider_domain,
                 )
                 if not records:
                     body = DnsRecordResponse(
@@ -3039,7 +3038,7 @@ def _apply_dns_mutation(
                 client.create_or_update_record(
                     internal,
                     dns_server=settings.get("dns_server"),
-                    dns_zone=zone_row.zone_name,
+                    dns_zone=provider_domain,
                 )
                 body = DnsRecordResponse(
                     status="success",
@@ -3071,7 +3070,6 @@ def _apply_dns_mutation(
             exists = _record_exists_at_type(
                 client,
                 settings=settings,
-                zone_name=zone_row.zone_name,
                 record_name=record_name,
                 record_type=rt_upper,
             )
@@ -3144,7 +3142,7 @@ def _apply_dns_mutation(
             client.create_or_update_record(
                 internal,
                 dns_server=settings.get("dns_server"),
-                dns_zone=zone_row.zone_name,
+                dns_zone=provider_domain,
             )
 
             action = {
