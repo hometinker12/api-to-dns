@@ -19,6 +19,9 @@
 
 ### Changed
 
+- DNS zone delete and API key revoke use restart-style confirmation dialogs with contextual details (API keys per zone / Let's Encrypt warning; zones per key / last used).
+- API key “last used” on the revoke dialog now includes successful DNS lookups that return no matching record (`dns.record_lookup` with status `not_found`), not only mutations and lookups that found records.
+- `GET /zones` with an API key now emits a `dns.zones_list` activity event so zone listing counts toward last used.
 - Deleting a DNS zone configuration that Let's Encrypt references clears the DNS challenge zone (manual), disables auto-renew when it was enabled, and cancels in-progress enrollment for that zone.
 - DNS activity log **message** text for record lookups and mutations now references the provider **`dns_zone`** (e.g. `www.example.com`) instead of the configuration **`zone_name`**. The logged **`zone_name`** attribute on DNS events is unchanged and still stores the configuration identifier; the Activity Log UI column label is **Zone Name**.
 - Admin dashboard DNS zone list shows each configuration as `zone_name` (`dns_zone`).

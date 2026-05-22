@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
 from sqlmodel import select
@@ -8,8 +9,13 @@ from .dns_client import create_dns_client, dns_provider_display_name, provider_o
 __all__ = [
     "DISABLED_DNS_PLUGINS_SETTING",
     "LEGACY_DNS_SETTING_NAMES",
+    "api_key_admin_dict",
     "api_key_allowed_zone_names",
+    "api_key_count_for_zone",
+    "api_key_last_used_at",
     "api_key_public_dict",
+    "api_key_zone_count",
+    "dns_zone_admin_dict",
     "build_zone_config_from_form",
     "create_dns_client_from_settings",
     "decode_zone_config",
@@ -31,7 +37,7 @@ __all__ = [
     "test_zone_record_lookup",
     "zones_using_dns_provider",
 ]
-from .models import ApiKey, ApiKeyAllowedZone, DnsRecordInfo, DnsZoneConfig
+from .models import ActivityLog, ApiKey, ApiKeyAllowedZone, DnsRecordInfo, DnsZoneConfig
 from .security import decrypt_value, encrypt_value
 from .settings_store import delete_setting, get_setting, set_setting
 
@@ -178,6 +184,61 @@ def api_key_allowed_zone_names(db, api_key_id: int) -> List[str]:
     return sorted(names)
 
 
+def api_key_count_for_zone(db, zone_id: int) -> int:
+    links = db.exec(
+        select(ApiKeyAllowedZone).where(ApiKeyAllowedZone.dns_zone_config_id == zone_id)
+    ).all()
+    return len(links)
+
+
+def api_key_zone_count(db, api_key_id: int) -> int:
+    links = db.exec(select(ApiKeyAllowedZone).where(ApiKeyAllowedZone.api_key_id == api_key_id)).all()
+    return len(links)
+
+
+def _is_api_key_dns_usage(row: ActivityLog) -> bool:
+    event_type = row.event_type or ""
+    if not event_type.startswith("dns."):
+        return False
+    status = (row.status or "").lower()
+    # GET lookups log status=not_found when no record exists (still a successful API call).
+    return status in ("success", "not_found")
+
+
+def api_key_last_used_at(db, api_key_id: int) -> Optional[datetime]:
+    rows = db.exec(
+        select(ActivityLog)
+        .where(ActivityLog.actor_type == "api_key")
+        .where(ActivityLog.actor_id == str(api_key_id))
+        .order_by(ActivityLog.timestamp.desc())  # type: ignore[arg-type]
+    ).all()
+    for row in rows:
+        if _is_api_key_dns_usage(row):
+            return row.timestamp
+    return None
+
+
+def format_api_key_last_used_label(last_used: Optional[datetime]) -> str:
+    if last_used is None:
+        return "Never used"
+    if last_used.tzinfo is None:
+        last_used = last_used.replace(tzinfo=timezone.utc)
+    else:
+        last_used = last_used.astimezone(timezone.utc)
+    return last_used.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def dns_zone_admin_dict(db, z: DnsZoneConfig) -> Dict[str, Any]:
+    from . import letsencrypt
+
+    base = dns_zone_public_dict(z)
+    zone_id = z.id
+    assert zone_id is not None
+    base["api_key_count"] = api_key_count_for_zone(db, zone_id)
+    base["letsencrypt_referenced"] = letsencrypt.zone_referenced_by_letsencrypt(db, zone_id)
+    return base
+
+
 def dns_zone_public_dict(z: DnsZoneConfig) -> Dict[str, Any]:
     cfg = decode_zone_config(z)
     provider_key = cfg.get("dns_provider_type", "") or "azure"
@@ -199,6 +260,17 @@ def dns_zone_summary_dict(z: DnsZoneConfig) -> Dict[str, Any]:
 
 def api_key_public_dict(k: ApiKey) -> Dict[str, Any]:
     return {"id": k.id, "label": k.label, "key": k.key, "active": k.active}
+
+
+def api_key_admin_dict(db, k: ApiKey) -> Dict[str, Any]:
+    base = api_key_public_dict(k)
+    key_id = k.id
+    assert key_id is not None
+    last_used = api_key_last_used_at(db, key_id)
+    base["zone_count"] = api_key_zone_count(db, key_id)
+    base["last_used_at"] = last_used
+    base["last_used_label"] = format_api_key_last_used_label(last_used)
+    return base
 
 
 def get_api_key(db, api_key: str):

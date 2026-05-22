@@ -52,10 +52,15 @@
                   {% if key.active %}
                     <div class="action-cell">
                       <button type="button" data-open-edit-key="{{ key.id }}">Edit</button>
-                      <form action="/api-keys/revoke" method="post" onsubmit="return confirm('Revoke this API key? Existing clients using it will lose access.');">
-                        <input type="hidden" name="key_id" value="{{ key.id }}" />
-                        <button type="submit" class="danger">Revoke</button>
-                      </form>
+                      <button
+                        type="button"
+                        class="danger"
+                        data-open-revoke-key
+                        data-key-id="{{ key.id }}"
+                        data-key-label="{{ key.label | e }}"
+                        data-zone-count="{{ key.zone_count }}"
+                        data-last-used="{{ key.last_used_label }}"
+                      >Revoke</button>
                     </div>
                   {% else %}
                     <span>revoked</span>
@@ -138,6 +143,25 @@
       {% endif %}
     {% endfor %}
 
+    <dialog id="revoke-api-key-dialog">
+      <div class="dialog-content">
+        <div class="dialog-header">
+          <h2>Revoke API key</h2>
+          <button type="button" class="danger" id="revoke-key-close">Close</button>
+        </div>
+        <p class="alert warning">Revoke API key <code id="revoke-key-label"></code>? Existing clients using it will lose access.</p>
+        <p id="revoke-key-zones" class="help"></p>
+        <p id="revoke-key-last-used" class="help"></p>
+        <form id="revoke-key-form" action="/api-keys/revoke" method="post">
+          <input type="hidden" name="key_id" id="revoke-key-id" value="" />
+          <div class="dialog-actions">
+            <button type="button" class="secondary" id="revoke-key-cancel">Cancel</button>
+            <button type="submit" class="danger" id="revoke-key-submit">Revoke key</button>
+          </div>
+        </form>
+      </div>
+    </dialog>
+
     <script>
       const createDialog = document.getElementById("create-key-dialog");
       const openCreateKey = document.getElementById("open-create-key");
@@ -168,6 +192,40 @@
           dialog.showModal();
         }
       });
+
+      (() => {
+        const revokeDialog = document.getElementById("revoke-api-key-dialog");
+        const revokeForm = document.getElementById("revoke-key-form");
+        const revokeKeyId = document.getElementById("revoke-key-id");
+        const revokeLabelEl = document.getElementById("revoke-key-label");
+        const revokeZonesEl = document.getElementById("revoke-key-zones");
+        const revokeLastUsedEl = document.getElementById("revoke-key-last-used");
+        const revokeClose = document.getElementById("revoke-key-close");
+        const revokeCancel = document.getElementById("revoke-key-cancel");
+
+        const zoneCountLabel = (count) => {
+          const n = Number(count);
+          if (n === 1) return "This key is allowed to use 1 DNS zone.";
+          return `This key is allowed to use ${n} DNS zones.`;
+        };
+
+        document.querySelectorAll("[data-open-revoke-key]").forEach((button) => {
+          button.addEventListener("click", () => {
+            const keyId = button.dataset.keyId || "";
+            const label = button.dataset.keyLabel || "";
+            const zoneCount = button.dataset.zoneCount ?? "0";
+            const lastUsed = button.dataset.lastUsed || "Never used";
+            if (revokeKeyId) revokeKeyId.value = keyId;
+            if (revokeLabelEl) revokeLabelEl.textContent = label;
+            if (revokeZonesEl) revokeZonesEl.textContent = zoneCountLabel(zoneCount);
+            if (revokeLastUsedEl) revokeLastUsedEl.textContent = `Last used: ${lastUsed}`;
+            revokeDialog?.showModal();
+          });
+        });
+
+        revokeClose?.addEventListener("click", () => revokeDialog?.close());
+        revokeCancel?.addEventListener("click", () => revokeDialog?.close());
+      })();
     </script>
   </div>
 </body>

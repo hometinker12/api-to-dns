@@ -22,6 +22,7 @@ EVENT_API_KEY_REVOKED = "api_key.revoked"
 EVENT_DNS_ACCESS_DENIED = "dns.access_denied"
 EVENT_DNS_INVALID_REQUEST = "dns.invalid_request"
 EVENT_DNS_PROVIDER_FAILED = "dns.provider_failed"
+EVENT_DNS_ZONES_LIST = "dns.zones_list"
 
 # Users
 EVENT_USER_PASSWORD_CHANGED = "user.password_changed"

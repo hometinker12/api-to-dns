@@ -539,6 +539,34 @@ def _le_zone_row(db, *, zone_name: str = "le-detach-zone") -> DnsZoneConfig:
     return row
 
 
+def test_zone_referenced_by_letsencrypt_config_and_enrollment() -> None:
+    _ensure_db()
+    with SessionLocal() as db:
+        row = _le_zone_row(db, zone_name="le-ref-check")
+        zone_id = int(row.id)
+        assert letsencrypt.zone_referenced_by_letsencrypt(db, zone_id) is False
+        letsencrypt.save_config(
+            db,
+            **_sample_config_kwargs(
+                challenge_type=letsencrypt.CHALLENGE_DNS,
+                zone_id=zone_id,
+                root_dns_domain="example.com",
+            ),
+        )
+        assert letsencrypt.zone_referenced_by_letsencrypt(db, zone_id) is True
+        letsencrypt._write_json_setting(
+            db,
+            letsencrypt.SETTING_CONFIG,
+            {"zone_id": None, "email": "a@b.com", "root_dns_domain": "example.com", "common_name": "api.example.com"},
+        )
+        letsencrypt._write_json_setting(
+            db,
+            letsencrypt.SETTING_ENROLLMENT,
+            {"config": {"zone_id": zone_id}, "order": {}},
+        )
+        assert letsencrypt.zone_referenced_by_letsencrypt(db, zone_id) is True
+
+
 def test_detach_dns_zone_clears_zone_id_and_disables_auto_renew() -> None:
     _ensure_db()
     with SessionLocal() as db:

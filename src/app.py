@@ -103,6 +103,7 @@ from .ssl_certs import (
 )
 from .web import client_ip, nav_context, record_activity, render_access_denied_response, render_error_response, templates
 from .zone_service import (
+    api_key_admin_dict,
     api_key_allowed_zone_names,
     api_key_public_dict,
     build_zone_config_from_form,
@@ -110,6 +111,7 @@ from .zone_service import (
     decode_zone_config,
     dns_provider_display_name,
     dns_provider_options_with_state,
+    dns_zone_admin_dict,
     dns_zone_public_dict,
     dns_zone_summary_dict,
     enabled_dns_provider_options,
@@ -126,6 +128,28 @@ from .zone_service import (
     test_zone_record_lookup,
     zones_using_dns_provider,
 )
+
+
+def _zones_html_context(db, *, message: Optional[str] = None) -> Dict[str, Any]:
+    zones = list_dns_zones(db)
+    return {
+        "zones": [dns_zone_admin_dict(db, z) for z in zones],
+        "message": message,
+    }
+
+
+def _api_keys_html_context(db, *, message: Optional[str] = None, **extra: Any) -> Dict[str, Any]:
+    api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda key: key.created_at, reverse=True)
+    key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
+    all_zones = list_dns_zones(db)
+    return {
+        "api_keys": [api_key_admin_dict(db, k) for k in api_keys],
+        "key_zones": key_zones,
+        "all_zones": [dns_zone_public_dict(z) for z in all_zones],
+        "message": message,
+        **extra,
+    }
+
 
 def _resolve_dns_api_zone(
     db,
@@ -672,26 +696,55 @@ def zones_page(
         if wants_json_response(request):
             api_key = api_key_from_headers(x_api_key, authorization)
             if not api_key:
+                record_activity(
+                    event_type="dns.access_denied",
+                    level=LOG_LEVEL_WARNING,
+                    status="error",
+                    actor_type="api_key",
+                    actor_label="missing",
+                    message="API key missing on GET /zones",
+                )
                 raise HTTPException(status_code=403, detail=ACCESS_DENIED_DETAIL)
             key = get_api_key(db, api_key)
             if key is None:
+                emit_activity_event(
+                    db,
+                    event_type="dns.access_denied",
+                    level=LOG_LEVEL_WARNING,
+                    status="error",
+                    actor_type="api_key",
+                    actor_label="invalid",
+                    message="Invalid or revoked API key used on GET /zones",
+                    details={"key_fingerprint": api_key_fingerprint(api_key)},
+                )
                 raise HTTPException(status_code=403, detail=ACCESS_DENIED_DETAIL)
             zone_ids = [
                 link.dns_zone_config_id
                 for link in db.exec(select(ApiKeyAllowedZone).where(ApiKeyAllowedZone.api_key_id == key.id)).all()
             ]
             zones = [zone for zone_id in zone_ids if (zone := db.get(DnsZoneConfig, zone_id)) is not None]
+            actor_id = str(key.id) if key.id is not None else None
+            emit_activity_event(
+                db,
+                event_type="dns.zones_list",
+                level=LOG_LEVEL_INFORMATIONAL,
+                status="success",
+                actor_type="api_key",
+                actor_id=actor_id,
+                actor_label=key.label,
+                message=f"Listed {len(zones)} allowed DNS zone(s)",
+                details={"zone_count": len(zones)},
+            )
             return [DnsZoneSummary(**dns_zone_summary_dict(z)) for z in zones]
 
         user = get_current_user(request)
         if not user_has_role(db, user, ROLE_DNS_ZONES_READ):
             raise HTTPException(status_code=403, detail=ROLE_FORBIDDEN_DETAIL)
-        zones = list_dns_zones(db)
-        zones_view = [dns_zone_public_dict(z) for z in zones]
+        ctx = _zones_html_context(db)
     return templates.TemplateResponse(
         request=request,
         name="zones.html",
-        context={"request": request, "zones": zones_view, "message": None},
+        context={"request": request, **ctx},
     )
 
 
@@ -720,22 +773,20 @@ async def zone_create(request: Request, user: str = Depends(require_role(ROLE_DN
     canonical = normalize_zone_name(zone_name)
     if not canonical:
         with SessionLocal() as db:
-            zones = list_dns_zones(db)
-            zones_view = [dns_zone_public_dict(z) for z in zones]
+            ctx = _zones_html_context(db, message="Zone name is required.")
         return templates.TemplateResponse(
             request=request,
             name="zones.html",
-            context={"request": request, "zones": zones_view, "message": "Zone name is required."},
+            context={"request": request, **ctx},
         )
     with SessionLocal() as db:
         provider_plugins = enabled_dns_provider_options(db)
         if db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == canonical)).first():
-            zones = list_dns_zones(db)
-            zones_view = [dns_zone_public_dict(z) for z in zones]
+            ctx = _zones_html_context(db, message=f"A zone named {canonical!r} already exists.")
             return templates.TemplateResponse(
                 request=request,
                 name="zones.html",
-                context={"request": request, "zones": zones_view, "message": f"A zone named {canonical!r} already exists."},
+                context={"request": request, **ctx},
             )
         try:
             cfg = build_zone_config_from_form(form, provider_plugins=provider_plugins)
@@ -766,12 +817,11 @@ async def zone_create(request: Request, user: str = Depends(require_role(ROLE_DN
             message=f"Zone {canonical!r} added",
             details={"dns_provider_type": cfg.get("dns_provider_type")},
         )
-        zones = list_dns_zones(db)
-        zones_view = [dns_zone_public_dict(z) for z in zones]
+        ctx = _zones_html_context(db, message=f"Zone {canonical!r} added.")
     return templates.TemplateResponse(
         request=request,
         name="zones.html",
-        context={"request": request, "zones": zones_view, "message": f"Zone {canonical!r} added."},
+        context={"request": request, **ctx},
     )
 
 
@@ -1009,12 +1059,11 @@ def zone_delete(request: Request, zone_id: int, user: str = Depends(require_role
                 zone_name=removed_zone_name,
                 message=f"Zone {removed_zone_name!r} deleted",
             )
-        zones = list_dns_zones(db)
-        zones_view = [dns_zone_public_dict(z) for z in zones]
+        ctx = _zones_html_context(db, message="Zone removed.")
     return templates.TemplateResponse(
         request=request,
         name="zones.html",
-        context={"request": request, "zones": zones_view, "message": "Zone removed."},
+        context={"request": request, **ctx},
     )
 
 
@@ -1022,21 +1071,11 @@ def zone_delete(request: Request, zone_id: int, user: str = Depends(require_role
 def api_keys_page(request: Request, user: str = Depends(require_role(ROLE_API_KEYS_READ))):
     try:
         with SessionLocal() as db:
-            api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda key: key.created_at, reverse=True)
-            key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
-            all_zones = list_dns_zones(db)
-            api_keys_view = [api_key_public_dict(k) for k in api_keys]
-            all_zones_view = [dns_zone_public_dict(z) for z in all_zones]
+            ctx = _api_keys_html_context(db)
         return templates.TemplateResponse(
             request=request,
             name="api_keys.html",
-            context={
-                "request": request,
-                "api_keys": api_keys_view,
-                "key_zones": key_zones,
-                "all_zones": all_zones_view,
-                "message": None,
-            },
+            context={"request": request, **ctx},
         )
     except Exception as exc:
         return render_error_response(request, exc)
@@ -1061,22 +1100,12 @@ def revoke_api_key(request: Request, key_id: int = Form(...), user: str = Depend
                     message=f"API key {api_key.label!r} revoked",
                     details={"api_key_id": api_key.id, "api_key_label": api_key.label},
                 )
-            api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda k: k.created_at, reverse=True)
-            key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
-            all_zones = list_dns_zones(db)
-            api_keys_view = [api_key_public_dict(k) for k in api_keys]
-            all_zones_view = [dns_zone_public_dict(z) for z in all_zones]
+            ctx = _api_keys_html_context(db, message="API key revoked.")
 
         return templates.TemplateResponse(
             request=request,
             name="api_keys.html",
-            context={
-                "request": request,
-                "api_keys": api_keys_view,
-                "key_zones": key_zones,
-                "all_zones": all_zones_view,
-                "message": "API key revoked.",
-            },
+            context={"request": request, **ctx},
         )
     except Exception as exc:
         return render_error_response(request, exc)
@@ -1097,25 +1126,17 @@ def create_api_key_route(
                 if not row:
                     return RedirectResponse(url="/api-keys", status_code=HTTP_303_SEE_OTHER)
                 if not zone_ids:
-                    api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda k: k.created_at, reverse=True)
-                    key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
-                    all_zones = list_dns_zones(db)
-                    api_keys_view = [api_key_public_dict(k) for k in api_keys]
-                    all_zones_view = [dns_zone_public_dict(z) for z in all_zones]
+                    ctx = _api_keys_html_context(
+                        db,
+                        edit_key_error_id=key_id,
+                        edit_key_error="Select at least one DNS zone.",
+                        edit_key_label=label,
+                        edit_key_selected_zone_ids=zone_ids,
+                    )
                     return templates.TemplateResponse(
                         request=request,
                         name="api_keys.html",
-                        context={
-                            "request": request,
-                            "api_keys": api_keys_view,
-                            "key_zones": key_zones,
-                            "all_zones": all_zones_view,
-                            "message": None,
-                            "edit_key_error_id": key_id,
-                            "edit_key_error": "Select at least one DNS zone.",
-                            "edit_key_label": label,
-                            "edit_key_selected_zone_ids": zone_ids,
-                        },
+                        context={"request": request, **ctx},
                     )
                 row.label = label
                 db.add(row)
@@ -1136,41 +1157,23 @@ def create_api_key_route(
                     message=f"API key {label!r} updated",
                     details={"api_key_id": key_id, "api_key_label": label, "allowed_zone_ids": list(zone_ids)},
                 )
-                api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda k: k.created_at, reverse=True)
-                key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
-                all_zones = list_dns_zones(db)
-                api_keys_view = [api_key_public_dict(k) for k in api_keys]
-                all_zones_view = [dns_zone_public_dict(z) for z in all_zones]
+                ctx = _api_keys_html_context(db, message="API key updated.")
             return templates.TemplateResponse(
                 request=request,
                 name="api_keys.html",
-                context={
-                    "request": request,
-                    "api_keys": api_keys_view,
-                    "key_zones": key_zones,
-                    "all_zones": all_zones_view,
-                    "message": "API key updated.",
-                },
+                context={"request": request, **ctx},
             )
         if not zone_ids:
             with SessionLocal() as db:
-                api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda k: k.created_at, reverse=True)
-                key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
-                all_zones = list_dns_zones(db)
-                api_keys_view = [api_key_public_dict(k) for k in api_keys]
-                all_zones_view = [dns_zone_public_dict(z) for z in all_zones]
+                ctx = _api_keys_html_context(
+                    db,
+                    create_key_error="Select at least one DNS zone for this API key.",
+                    create_key_label=label,
+                )
             return templates.TemplateResponse(
                 request=request,
                 name="api_keys.html",
-                context={
-                    "request": request,
-                    "api_keys": api_keys_view,
-                    "key_zones": key_zones,
-                    "all_zones": all_zones_view,
-                    "message": None,
-                    "create_key_error": "Select at least one DNS zone for this API key.",
-                    "create_key_label": label,
-                },
+                context={"request": request, **ctx},
             )
         new_key = generate_api_key()
         with SessionLocal() as db:
@@ -1196,22 +1199,12 @@ def create_api_key_route(
                     "allowed_zone_ids": list(zone_ids),
                 },
             )
-            api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda k: k.created_at, reverse=True)
-            key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
-            all_zones = list_dns_zones(db)
-            api_keys_view = [api_key_public_dict(k) for k in api_keys]
-            all_zones_view = [dns_zone_public_dict(z) for z in all_zones]
+            ctx = _api_keys_html_context(db, message=f"API key created: {new_key}")
 
         return templates.TemplateResponse(
             request=request,
             name="api_keys.html",
-            context={
-                "request": request,
-                "api_keys": api_keys_view,
-                "key_zones": key_zones,
-                "all_zones": all_zones_view,
-                "message": f"API key created: {new_key}",
-            },
+            context={"request": request, **ctx},
         )
     except Exception as exc:
         return render_error_response(request, exc)

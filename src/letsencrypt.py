@@ -771,6 +771,15 @@ def cancel_enrollment(db) -> None:
     clear_enrollment(db)
 
 
+def zone_referenced_by_letsencrypt(db, zone_id: int) -> bool:
+    config_raw = _read_json_setting(db, SETTING_CONFIG)
+    if config_raw and config_raw.get("zone_id") == zone_id:
+        return True
+    enrollment = get_enrollment(db)
+    enroll_config = (enrollment or {}).get("config") or {}
+    return enroll_config.get("zone_id") == zone_id
+
+
 def detach_dns_zone_from_letsencrypt(db, zone_id: int) -> bool:
     config_raw = _read_json_setting(db, SETTING_CONFIG)
     enrollment = get_enrollment(db)

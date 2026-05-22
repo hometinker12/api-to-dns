@@ -216,6 +216,22 @@ def test_zones_page_displays_zone_provider_metadata(client: TestClient) -> None:
     assert "&mdash;" in response.text
 
 
+def test_zones_page_has_delete_confirmation_dialog(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/zones")
+    assert response.status_code == 200
+    assert 'id="delete-zone-dialog"' in response.text
+    assert "data-open-delete-zone" in response.text
+
+
+def test_api_keys_page_has_revoke_confirmation_dialog(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/api-keys")
+    assert response.status_code == 200
+    assert 'id="revoke-api-key-dialog"' in response.text
+    assert "data-open-revoke-key" in response.text
+
+
 def test_builtin_dns_plugins_are_discovered() -> None:
     plugins = discover_plugins()
     assert set(plugins) >= {"azure", "bind", "cloudflare", "microsoft"}
@@ -349,6 +365,8 @@ def test_zone_test_invalid_record_type(client: TestClient) -> None:
 
 
 def test_zones_json_request_returns_zone_ids(client: TestClient) -> None:
+    from src.zone_service import api_key_last_used_at, get_api_key
+
     response = client.get("/zones", headers={"Accept": "application/json", "X-API-Key": "test-api-key-for-dns-endpoint"})
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/json")
@@ -357,6 +375,10 @@ def test_zones_json_request_returns_zone_ids(client: TestClient) -> None:
     assert isinstance(example["id"], int)
     assert example["dns_zone"] == "example.com"
     assert set(zones[0]) == {"id", "zone_name", "dns_zone"}
+    with SessionLocal() as db:
+        key = get_api_key(db, "test-api-key-for-dns-endpoint")
+        assert key is not None
+        assert api_key_last_used_at(db, int(key.id)) is not None
 
 
 def test_zones_json_request_without_api_key_returns_access_denied(client: TestClient) -> None:
