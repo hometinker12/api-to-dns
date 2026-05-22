@@ -335,24 +335,14 @@ dialog::backdrop {
   border-radius: 999px;
 }
 .le-auto-enroll-progress::-webkit-progress-value {
-  background: linear-gradient(90deg, #2563eb, #38bdf8, #2563eb);
-  background-size: 200% 100%;
+  background: #2563eb;
   border-radius: 999px;
-  animation: le-auto-enroll-progress 1.4s linear infinite;
+  transition: width 0.25s ease;
 }
 .le-auto-enroll-progress::-moz-progress-bar {
-  background: linear-gradient(90deg, #2563eb, #38bdf8, #2563eb);
-  background-size: 200% 100%;
+  background: #2563eb;
   border-radius: 999px;
-  animation: le-auto-enroll-progress 1.4s linear infinite;
-}
-@keyframes le-auto-enroll-progress {
-  0% {
-    background-position: 200% 0;
-  }
-  100% {
-    background-position: -200% 0;
-  }
+  transition: width 0.25s ease;
 }
 .page.page-wide {
   width: min(1100px, calc(100% - 32px));

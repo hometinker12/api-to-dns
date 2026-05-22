@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import select
-from starlette.status import HTTP_303_SEE_OTHER, HTTP_404_NOT_FOUND, HTTP_409_CONFLICT
+from starlette.status import HTTP_202_ACCEPTED, HTTP_303_SEE_OTHER, HTTP_404_NOT_FOUND, HTTP_409_CONFLICT
 
 from . import activity_logging
 from .activity_logging import (
@@ -84,6 +84,7 @@ from .restart import (
     clear_le_renewal_pending_restart,
     clear_restart_required,
     is_le_renewal_pending_restart,
+    is_restart_required,
     mark_le_renewal_pending_restart,
     mark_restart_required,
     perform_application_restart,
@@ -285,6 +286,7 @@ async def lifespan(app: FastAPI):
         configure_operational_logging(level=get_log_level(db))
         clear_restart_required(db)
         clear_le_renewal_pending_restart(db)
+        letsencrypt.clear_enrollment_progress(db)
         try:
             run_retention_cleanup(db, force=True)
         except Exception:
@@ -376,6 +378,7 @@ def startup_event() -> None:
         configure_operational_logging(level=get_log_level(db))
         clear_restart_required(db)
         clear_le_renewal_pending_restart(db)
+        letsencrypt.clear_enrollment_progress(db)
         try:
             run_retention_cleanup(db, force=True)
         except Exception:
@@ -2263,6 +2266,180 @@ def settings_regenerate_ssl(
     )
 
 
+_le_enrollment_in_progress = False
+
+
+def _le_start_form_kwargs(
+    *,
+    email: str,
+    root_dns_domain: str,
+    common_name: str,
+    subject_alt_names: str,
+    challenge_type: str,
+    zone_id: str,
+    staging: Optional[str],
+    renew_before_expiry_days: int,
+    scheduled_restart_enabled: Optional[str],
+    scheduled_restart_time: str,
+) -> Dict[str, Any]:
+    return {
+        "email": email,
+        "root_dns_domain": root_dns_domain,
+        "common_name": common_name,
+        "subject_alt_names": subject_alt_names,
+        "challenge_type": challenge_type,
+        "zone_id": int(zone_id) if str(zone_id).strip() else None,
+        "staging": staging is not None,
+        "renew_before_expiry_days": renew_before_expiry_days,
+        "scheduled_restart_enabled": scheduled_restart_enabled is not None,
+        "scheduled_restart_time": scheduled_restart_time,
+    }
+
+
+def _apply_le_start_result(db, result: Dict[str, Any], *, user: str) -> tuple[str, str]:
+    if result.get("status") == "issued":
+        mark_restart_required(db, reason="Let's Encrypt certificate installed.")
+        return (
+            "Let's Encrypt certificate installed. Restart the application to use it.",
+            "warning",
+        )
+    return (
+        "Let's Encrypt enrollment started. Complete the challenge, then continue enrollment.",
+        "success",
+    )
+
+
+def _emit_le_started(db, result: Dict[str, Any], *, user: str) -> None:
+    config = result.get("config") or {}
+    emit_activity_event(
+        db,
+        event_type="system.letsencrypt_started",
+        level=LOG_LEVEL_INFORMATIONAL,
+        status="success",
+        actor_type="user",
+        actor_label=user,
+        message="Let's Encrypt enrollment started",
+        details={
+            "root_dns_domain": config.get("root_dns_domain", ""),
+            "common_name": config.get("common_name", ""),
+            "subject_alt_names": config.get("subject_alt_names", []),
+        },
+    )
+
+
+def _run_le_auto_enrollment_sync(kwargs: Dict[str, Any], *, user: str) -> None:
+    def progress(phase: str, percent: int, message: str) -> None:
+        with SessionLocal() as progress_db:
+            letsencrypt.write_enrollment_progress(
+                progress_db,
+                phase=phase,
+                percent=percent,
+                message=message,
+            )
+
+    try:
+        with SessionLocal() as db:
+            result = letsencrypt.start_enrollment(db, progress_cb=progress, **kwargs)
+            message, _kind = _apply_le_start_result(db, result, user=user)
+            _emit_le_started(db, result, user=user)
+            status = result.get("status") or ""
+        with SessionLocal() as progress_db:
+            letsencrypt.write_enrollment_progress(
+                progress_db,
+                phase="complete",
+                percent=100,
+                message=message,
+                done=True,
+                result_status=status,
+            )
+    except letsencrypt.LetsEncryptError as exc:
+        with SessionLocal() as progress_db:
+            letsencrypt.write_enrollment_progress(
+                progress_db,
+                phase="error",
+                percent=0,
+                message=str(exc),
+                done=True,
+                error=str(exc),
+            )
+    except Exception as exc:
+        LOGGER.exception("Let's Encrypt auto enrollment failed")
+        with SessionLocal() as progress_db:
+            letsencrypt.write_enrollment_progress(
+                progress_db,
+                phase="error",
+                percent=0,
+                message=str(exc),
+                done=True,
+                error=str(exc),
+            )
+
+
+async def _run_le_auto_enrollment(kwargs: Dict[str, Any], *, user: str) -> None:
+    global _le_enrollment_in_progress
+    try:
+        await asyncio.to_thread(_run_le_auto_enrollment_sync, kwargs, user=user)
+    finally:
+        _le_enrollment_in_progress = False
+
+
+@app.get("/settings/system/ssl-letsencrypt/progress", include_in_schema=False)
+def settings_letsencrypt_progress(user: str = Depends(require_role(ROLE_SYSTEM_UPDATE))):
+    with SessionLocal() as db:
+        payload = letsencrypt.get_enrollment_progress(db)
+        if payload.get("done") and not payload.get("error"):
+            payload["restart_required"] = is_restart_required(db)
+        return JSONResponse(payload)
+
+
+@app.post("/settings/system/ssl-letsencrypt/start-async", include_in_schema=False)
+async def settings_letsencrypt_start_async(
+    request: Request,
+    email: str = Form(...),
+    root_dns_domain: str = Form(...),
+    common_name: str = Form(...),
+    subject_alt_names: str = Form(""),
+    challenge_type: str = Form("dns-01"),
+    zone_id: str = Form(""),
+    staging: Optional[str] = Form(None),
+    renew_before_expiry_days: int = Form(letsencrypt.DEFAULT_RENEW_BEFORE_DAYS),
+    scheduled_restart_enabled: Optional[str] = Form(None),
+    scheduled_restart_time: str = Form(letsencrypt.DEFAULT_SCHEDULED_RESTART_TIME),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    global _le_enrollment_in_progress
+    if challenge_type != letsencrypt.CHALLENGE_DNS or not str(zone_id).strip():
+        return JSONResponse(
+            {"detail": "Async enrollment requires DNS-01 with an API configured zone."},
+            status_code=400,
+        )
+    if _le_enrollment_in_progress:
+        return JSONResponse({"detail": "Let's Encrypt enrollment is already in progress."}, status_code=HTTP_409_CONFLICT)
+    kwargs = _le_start_form_kwargs(
+        email=email,
+        root_dns_domain=root_dns_domain,
+        common_name=common_name,
+        subject_alt_names=subject_alt_names,
+        challenge_type=challenge_type,
+        zone_id=zone_id,
+        staging=staging,
+        renew_before_expiry_days=renew_before_expiry_days,
+        scheduled_restart_enabled=scheduled_restart_enabled,
+        scheduled_restart_time=scheduled_restart_time,
+    )
+    with SessionLocal() as db:
+        letsencrypt.clear_enrollment_progress(db)
+        letsencrypt.write_enrollment_progress(
+            db,
+            phase="starting",
+            percent=0,
+            message="Starting enrollment...",
+        )
+    _le_enrollment_in_progress = True
+    asyncio.create_task(_run_le_auto_enrollment(kwargs, user=user))
+    return JSONResponse({"status": "started"}, status_code=HTTP_202_ACCEPTED)
+
+
 @app.post("/settings/system/ssl-letsencrypt/start", response_class=HTMLResponse, include_in_schema=False)
 def settings_letsencrypt_start(
     request: Request,
@@ -2279,41 +2456,22 @@ def settings_letsencrypt_start(
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
     try:
+        kwargs = _le_start_form_kwargs(
+            email=email,
+            root_dns_domain=root_dns_domain,
+            common_name=common_name,
+            subject_alt_names=subject_alt_names,
+            challenge_type=challenge_type,
+            zone_id=zone_id,
+            staging=staging,
+            renew_before_expiry_days=renew_before_expiry_days,
+            scheduled_restart_enabled=scheduled_restart_enabled,
+            scheduled_restart_time=scheduled_restart_time,
+        )
         with SessionLocal() as db:
-            result = letsencrypt.start_enrollment(
-                db,
-                email=email,
-                root_dns_domain=root_dns_domain,
-                common_name=common_name,
-                subject_alt_names=subject_alt_names,
-                challenge_type=challenge_type,
-                zone_id=int(zone_id) if str(zone_id).strip() else None,
-                staging=staging is not None,
-                renew_before_expiry_days=renew_before_expiry_days,
-                scheduled_restart_enabled=scheduled_restart_enabled is not None,
-                scheduled_restart_time=scheduled_restart_time,
-            )
-            if result.get("status") == "issued":
-                mark_restart_required(db, reason="Let's Encrypt certificate installed.")
-                message = "Let's Encrypt certificate installed. Restart the application to use it."
-                kind = "warning"
-            else:
-                message = "Let's Encrypt enrollment started. Complete the challenge, then continue enrollment."
-                kind = "success"
-            emit_activity_event(
-                db,
-                event_type="system.letsencrypt_started",
-                level=LOG_LEVEL_INFORMATIONAL,
-                status="success",
-                actor_type="user",
-                actor_label=user,
-                message="Let's Encrypt enrollment started",
-                details={
-                    "root_dns_domain": result.get("config", {}).get("root_dns_domain", ""),
-                    "common_name": result.get("config", {}).get("common_name", ""),
-                    "subject_alt_names": result.get("config", {}).get("subject_alt_names", []),
-                },
-            )
+            result = letsencrypt.start_enrollment(db, **kwargs)
+            message, kind = _apply_le_start_result(db, result, user=user)
+            _emit_le_started(db, result, user=user)
     except LetsEncryptError as exc:
         return render_settings(request, user, "system_settings", message=str(exc), message_kind="error", section="ssl_certificate")
     return render_settings(request, user, "system_settings", message=message, message_kind=kind, section="ssl_certificate")

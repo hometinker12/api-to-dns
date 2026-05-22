@@ -688,8 +688,8 @@
             {% endif %}
             <dialog id="le-auto-enroll-dialog">
               <div class="dialog-content le-auto-enroll-dialog">
-                <p>Auto Enrolling with LetsEncrypt. This may take up to 2 minutes.</p>
-                <progress class="le-auto-enroll-progress" max="100"></progress>
+                <p id="le-auto-enroll-status">Auto enrolling with Let's Encrypt. This may take up to 2 minutes.</p>
+                <progress id="le-auto-enroll-progress" class="le-auto-enroll-progress" max="100" value="0"></progress>
               </div>
             </dialog>
           </section>
@@ -723,10 +723,12 @@
                 <strong>Regenerate replaces the currently installed certificate.</strong>
               {% endif %}
             </p>
+            {% set ssl_regenerate_confirm_msg = 'Regenerate the self-signed certificate? This overwrites the currently installed key/cert.' if ssl.cert_exists else 'Create a self-signed certificate now?' %}
             <form
+              id="ssl-regenerate-form"
               action="/settings/system/ssl-regenerate"
               method="post"
-              onsubmit="return confirm('{{ "Regenerate the self-signed certificate? This overwrites the currently installed key/cert." if ssl.cert_exists else "Create a self-signed certificate now?" }}');"
+              data-confirm="{{ ssl_regenerate_confirm_msg | e }}"
             >
               <input type="hidden" name="redirect_section" value="ssl_certificate" />
               <button type="submit">{{ "Regenerate self-signed certificate" if ssl.cert_exists else "Create self-signed certificate" }}</button>
@@ -1216,6 +1218,29 @@
         }
       });
 
+      const sslRegenerateForm = document.getElementById("ssl-regenerate-form");
+      sslRegenerateForm?.addEventListener("submit", (event) => {
+        const msg = sslRegenerateForm.dataset.confirm;
+        // #region agent log
+        fetch("http://127.0.0.1:7651/ingest/de51f7dd-8944-4cce-96c0-4abb1ab8db74", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "81baf0" },
+          body: JSON.stringify({
+            sessionId: "81baf0",
+            runId: "post-fix",
+            hypothesisId: "B",
+            location: "settings.html:ssl-regenerate",
+            message: "confirm handler invoked",
+            data: { hasMsg: Boolean(msg), msgLen: (msg || "").length },
+            timestamp: Date.now(),
+          }),
+        }).catch(() => {});
+        // #endregion
+        if (msg && !window.confirm(msg)) {
+          event.preventDefault();
+        }
+      });
+
       const leStartForm = document.getElementById("le-start-form");
       const leAutoEnrollDialog = document.getElementById("le-auto-enroll-dialog");
       const leChallengeSelect = leStartForm?.querySelector('[name="challenge_type"]');
@@ -1228,11 +1253,104 @@
       }
       leChallengeSelect?.addEventListener("change", syncLeZoneField);
       syncLeZoneField();
-      leStartForm?.addEventListener("submit", () => {
+      const leAutoEnrollProgress = document.getElementById("le-auto-enroll-progress");
+      const leAutoEnrollStatus = document.getElementById("le-auto-enroll-status");
+      const leStartSubmit = leStartForm?.querySelector('button[type="submit"]');
+      let lePollTimer = null;
+
+      function stopLePoll() {
+        if (lePollTimer !== null) {
+          window.clearInterval(lePollTimer);
+          lePollTimer = null;
+        }
+      }
+
+      function resetLeDialog() {
+        if (leAutoEnrollProgress) {
+          leAutoEnrollProgress.value = 0;
+        }
+        if (leAutoEnrollStatus) {
+          leAutoEnrollStatus.textContent = "Auto enrolling with Let's Encrypt. This may take up to 2 minutes.";
+        }
+      }
+
+      async function pollLeProgress() {
+        try {
+          const response = await fetch("/settings/system/ssl-letsencrypt/progress", {
+            credentials: "same-origin",
+            headers: { accept: "application/json" },
+          });
+          if (!response.ok) {
+            return;
+          }
+          const payload = await response.json();
+          if (leAutoEnrollProgress && typeof payload.percent === "number") {
+            leAutoEnrollProgress.value = payload.percent;
+          }
+          if (leAutoEnrollStatus && payload.message) {
+            leAutoEnrollStatus.textContent = payload.message;
+          }
+          if (payload.done) {
+            stopLePoll();
+            if (payload.error) {
+              leAutoEnrollDialog?.close();
+              if (leStartSubmit) {
+                leStartSubmit.disabled = false;
+              }
+              window.alert(payload.error);
+              return;
+            }
+            if (leAutoEnrollProgress) {
+              leAutoEnrollProgress.value = 100;
+            }
+            window.location.reload();
+          }
+        } catch (_err) {
+          stopLePoll();
+          leAutoEnrollDialog?.close();
+          if (leStartSubmit) {
+            leStartSubmit.disabled = false;
+          }
+        }
+      }
+
+      leStartForm?.addEventListener("submit", async (event) => {
         const challengeType = leChallengeSelect?.value;
         const zoneId = leStartForm.querySelector('[name="zone_id"]')?.value?.trim();
-        if (challengeType === "dns-01" && zoneId) {
-          leAutoEnrollDialog?.showModal();
+        if (challengeType !== "dns-01" || !zoneId) {
+          return;
+        }
+        event.preventDefault();
+        stopLePoll();
+        resetLeDialog();
+        if (leStartSubmit) {
+          leStartSubmit.disabled = true;
+        }
+        leAutoEnrollDialog?.showModal();
+        try {
+          const response = await fetch("/settings/system/ssl-letsencrypt/start-async", {
+            method: "POST",
+            body: new FormData(leStartForm),
+            credentials: "same-origin",
+            headers: { accept: "application/json" },
+          });
+          if (!response.ok) {
+            const detail = await response.json().catch(() => ({}));
+            leAutoEnrollDialog?.close();
+            if (leStartSubmit) {
+              leStartSubmit.disabled = false;
+            }
+            window.alert(detail.detail || "Failed to start Let's Encrypt enrollment.");
+            return;
+          }
+          await pollLeProgress();
+          lePollTimer = window.setInterval(pollLeProgress, 1000);
+        } catch (_err) {
+          leAutoEnrollDialog?.close();
+          if (leStartSubmit) {
+            leStartSubmit.disabled = false;
+          }
+          window.alert("Failed to start Let's Encrypt enrollment.");
         }
       });
       leAutoEnrollDialog?.addEventListener("cancel", (event) => {

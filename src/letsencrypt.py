@@ -25,6 +25,9 @@ from .zone_service import create_dns_client_from_settings, decode_zone_config, l
 
 SETTING_CONFIG = "letsencrypt_config"
 SETTING_ENROLLMENT = "letsencrypt_enrollment"
+SETTING_ENROLLMENT_PROGRESS = "letsencrypt_enrollment_progress"
+
+ProgressCallback = Callable[[str, int, str], None]
 
 CHALLENGE_DNS = "dns-01"
 CHALLENGE_HTTP = "http-01"
@@ -74,6 +77,56 @@ def get_enrollment(db) -> Optional[Dict[str, Any]]:
 
 def clear_enrollment(db) -> None:
     delete_setting(db, SETTING_ENROLLMENT)
+
+
+def write_enrollment_progress(
+    db,
+    *,
+    phase: str,
+    percent: int,
+    message: str,
+    done: bool = False,
+    error: Optional[str] = None,
+    result_status: Optional[str] = None,
+) -> None:
+    payload = {
+        "phase": phase,
+        "percent": max(0, min(100, int(percent))),
+        "message": message,
+        "done": bool(done),
+        "error": error,
+        "result_status": result_status,
+    }
+    _write_json_setting(db, SETTING_ENROLLMENT_PROGRESS, payload)
+
+
+def get_enrollment_progress(db) -> Dict[str, Any]:
+    raw = _read_json_setting(db, SETTING_ENROLLMENT_PROGRESS)
+    if not raw:
+        return {
+            "phase": "idle",
+            "percent": 0,
+            "message": "Idle",
+            "done": False,
+            "error": None,
+            "result_status": None,
+        }
+    return {
+        "phase": raw.get("phase") or "idle",
+        "percent": max(0, min(100, int(raw.get("percent") or 0))),
+        "message": raw.get("message") or "",
+        "done": bool(raw.get("done")),
+        "error": raw.get("error"),
+        "result_status": raw.get("result_status"),
+    }
+
+
+def clear_enrollment_progress(db) -> None:
+    delete_setting(db, SETTING_ENROLLMENT_PROGRESS)
+
+
+def _noop_progress(_phase: str, _percent: int, _message: str) -> None:
+    return None
 
 
 def _normalize_hostname(value: str) -> str:
@@ -219,14 +272,32 @@ def _txt_record_matches(records: List[Any], expected_value: str) -> bool:
     return False
 
 
-def _verify_dns_txt_challenge(db, *, zone_id: int, domain: str, expected_value: str) -> None:
+def _verify_dns_txt_challenge(
+    db,
+    *,
+    zone_id: int,
+    domain: str,
+    expected_value: str,
+    progress_cb: Optional[ProgressCallback] = None,
+    attempt_offset: int = 0,
+    attempt_total: Optional[int] = None,
+) -> None:
     zone = _zone_row(db, zone_id)
     if zone is None:
         raise LetsEncryptError("Selected DNS zone was not found.")
     cfg = decode_zone_config(zone)
     record_name = _relative_acme_name(domain, zone.zone_name)
     client = create_dns_client_from_settings(cfg)
-    for _attempt in range(DNS_TXT_VERIFY_MAX_ATTEMPTS):
+    total = attempt_total or DNS_TXT_VERIFY_MAX_ATTEMPTS
+    for attempt in range(total):
+        if progress_cb:
+            attempt_num = attempt_offset + attempt + 1
+            percent = 25 + int(50 * attempt_num / max(total, 1))
+            progress_cb(
+                "verify_dns",
+                percent,
+                f"Waiting for DNS propagation (attempt {attempt_num}/{total})...",
+            )
         _sleep_fn(DNS_TXT_VERIFY_DELAY_SECONDS)
         records = client.get_record(
             record_name=record_name,
@@ -481,8 +552,11 @@ def save_config(
     return config
 
 
-def start_enrollment(db, **kwargs: Any) -> Dict[str, Any]:
+def start_enrollment(db, *, progress_cb: Optional[ProgressCallback] = None, **kwargs: Any) -> Dict[str, Any]:
+    report = progress_cb or _noop_progress
+    report("save_config", 5, "Saving configuration...")
     config = save_config(db, **kwargs)
+    report("prepare_order", 15, "Preparing ACME order...")
     order = _acme_prepare_order(config)
     enrollment = {
         "status": "awaiting_validation",
@@ -497,7 +571,10 @@ def start_enrollment(db, **kwargs: Any) -> Dict[str, Any]:
         if config.get("zone_id"):
             provisioned_domains: List[str] = []
             try:
+                report("create_dns_records", 25, "Creating DNS TXT records...")
                 enrollment["dns_records"] = []
+                verify_total = DNS_TXT_VERIFY_MAX_ATTEMPTS * max(len(challenges), 1)
+                verify_attempt = 0
                 for entry in challenges:
                     domain = entry.get("domain") or primary_name
                     value = entry.get("dns_value") or entry.get("value") or ""
@@ -514,7 +591,11 @@ def start_enrollment(db, **kwargs: Any) -> Dict[str, Any]:
                         zone_id=int(config["zone_id"]),
                         domain=domain,
                         expected_value=value,
+                        progress_cb=progress_cb,
+                        attempt_offset=verify_attempt,
+                        attempt_total=verify_total,
                     )
+                    verify_attempt += DNS_TXT_VERIFY_MAX_ATTEMPTS
                 enrollment["status"] = "ready"
             except LetsEncryptError:
                 _cleanup_dns_txt_challenges(db, zone_id=int(config["zone_id"]), domains=provisioned_domains)
@@ -558,15 +639,18 @@ def start_enrollment(db, **kwargs: Any) -> Dict[str, Any]:
         enrollment["status"] = "awaiting_manual"
     _write_json_setting(db, SETTING_ENROLLMENT, enrollment)
     if enrollment["status"] == "ready":
-        return continue_enrollment(db)
+        return continue_enrollment(db, progress_cb=progress_cb)
     return enrollment
 
 
-def continue_enrollment(db) -> Dict[str, Any]:
+def continue_enrollment(db, *, progress_cb: Optional[ProgressCallback] = None) -> Dict[str, Any]:
+    report = progress_cb or _noop_progress
     enrollment = get_enrollment(db)
     if not enrollment:
         raise LetsEncryptError("No Let's Encrypt enrollment is in progress.")
+    report("finalize_order", 85, "Finalizing certificate...")
     issued = _acme_finalize_order(enrollment)
+    report("install_cert", 95, "Installing certificate...")
     metadata = install_letsencrypt_cert(issued["key_pem"], issued["cert_pem"])
     config = enrollment.get("config") or {}
     _write_json_setting(db, SETTING_CONFIG, config)

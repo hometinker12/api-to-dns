@@ -45,20 +45,154 @@
         <dt>URL after restart</dt>
         <dd><code id="restart-after-url">{{ restart_preview.after_restart_url }}</code></dd>
       </dl>
-      <form action="/system/restart" method="post">
+      <form id="restart-app-form" action="/system/restart" method="post">
         <div class="dialog-actions">
           <button type="button" class="secondary" id="restart-app-cancel">Cancel</button>
-          <button type="submit" class="warning">Restart now</button>
+          <button type="submit" class="warning" id="restart-app-submit">Restart now</button>
         </div>
       </form>
     </div>
   </dialog>
+  <dialog
+    id="restart-wait-dialog"
+    data-after-restart-url="{{ restart_preview.after_restart_url }}"
+  >
+    <div class="dialog-content le-auto-enroll-dialog">
+      <p id="restart-wait-status">Restarting application. Please wait…</p>
+      <progress id="restart-wait-progress" class="le-auto-enroll-progress" max="100" value="0"></progress>
+      <p class="help">You will be redirected to the new access URL: <code id="restart-wait-target"></code></p>
+    </div>
+  </dialog>
   <script>
     (() => {
-      const dialog = document.getElementById("restart-app-dialog");
-      document.getElementById("restart-app-btn")?.addEventListener("click", () => dialog?.showModal());
-      document.getElementById("restart-app-close")?.addEventListener("click", () => dialog?.close());
-      document.getElementById("restart-app-cancel")?.addEventListener("click", () => dialog?.close());
+      const RESTART_WAIT_MS = 20000;
+      const RESTART_TICK_MS = 200;
+
+      const confirmDialog = document.getElementById("restart-app-dialog");
+      const waitDialog = document.getElementById("restart-wait-dialog");
+      const restartForm = document.getElementById("restart-app-form");
+      const restartSubmit = document.getElementById("restart-app-submit");
+      const afterUrlEl = document.getElementById("restart-after-url");
+      const restartBtn = document.getElementById("restart-app-btn");
+      const waitStatus = document.getElementById("restart-wait-status");
+      const waitProgress = document.getElementById("restart-wait-progress");
+      const waitTarget = document.getElementById("restart-wait-target");
+
+      let restartTimer = null;
+      let restartRedirecting = false;
+
+      function resolveAfterRestartUrl() {
+        const fromPreview = afterUrlEl?.textContent?.trim();
+        if (fromPreview) {
+          return fromPreview;
+        }
+        const fromButton = restartBtn?.dataset.afterUrl?.trim();
+        if (fromButton) {
+          return fromButton;
+        }
+        return waitDialog?.dataset.afterRestartUrl?.trim() || "";
+      }
+
+      function isAbsoluteAccessUrl(url) {
+        return /^https?:\/\//i.test(url);
+      }
+
+      function stopRestartTimer() {
+        if (restartTimer !== null) {
+          window.clearInterval(restartTimer);
+          restartTimer = null;
+        }
+      }
+
+      function beginRestartWait(initialAfterRestartUrl) {
+        if (!isAbsoluteAccessUrl(initialAfterRestartUrl) || restartRedirecting) {
+          return;
+        }
+        restartRedirecting = true;
+        stopRestartTimer();
+        confirmDialog?.close();
+        if (restartSubmit) {
+          restartSubmit.disabled = true;
+        }
+        if (waitProgress) {
+          waitProgress.value = 0;
+        }
+
+        // Post-restart access URL (e.g. https://host/login after enabling SSL), not the current page URL.
+        let afterRestartUrl = initialAfterRestartUrl;
+        const updateAfterRestartUrl = (url) => {
+          if (!isAbsoluteAccessUrl(url)) {
+            return;
+          }
+          afterRestartUrl = url;
+          if (waitTarget) {
+            waitTarget.textContent = afterRestartUrl;
+          }
+          if (waitDialog) {
+            waitDialog.dataset.afterRestartUrl = afterRestartUrl;
+          }
+        };
+        updateAfterRestartUrl(afterRestartUrl);
+
+        if (waitStatus) {
+          waitStatus.textContent = "Restarting application. Please wait…";
+        }
+        waitDialog?.showModal();
+
+        const startedAt = Date.now();
+
+        fetch("/system/restart", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { accept: "application/json" },
+        })
+          .then((response) => (response.ok ? response.json() : null))
+          .then((payload) => {
+            if (payload?.after_restart_url) {
+              updateAfterRestartUrl(payload.after_restart_url);
+            }
+          })
+          .catch(() => {});
+
+        restartTimer = window.setInterval(() => {
+          const elapsed = Date.now() - startedAt;
+          const percent = Math.min(100, Math.round((elapsed / RESTART_WAIT_MS) * 100));
+          if (waitProgress) {
+            waitProgress.value = percent;
+          }
+          const remainingSec = Math.max(0, Math.ceil((RESTART_WAIT_MS - elapsed) / 1000));
+          if (waitStatus) {
+            waitStatus.textContent = `Restarting application… (${remainingSec}s remaining)`;
+          }
+          if (elapsed >= RESTART_WAIT_MS) {
+            stopRestartTimer();
+            if (waitProgress) {
+              waitProgress.value = 100;
+            }
+            window.location.replace(afterRestartUrl);
+          }
+        }, RESTART_TICK_MS);
+      }
+
+      restartBtn?.addEventListener("click", () => confirmDialog?.showModal());
+      document.getElementById("restart-app-close")?.addEventListener("click", () => confirmDialog?.close());
+      document.getElementById("restart-app-cancel")?.addEventListener("click", () => confirmDialog?.close());
+
+      restartForm?.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const afterRestartUrl = resolveAfterRestartUrl();
+        if (!isAbsoluteAccessUrl(afterRestartUrl)) {
+          window.alert("The new access URL after restart is not available.");
+          return;
+        }
+        beginRestartWait(afterRestartUrl);
+      });
+
+      waitDialog?.addEventListener("cancel", (event) => {
+        if (restartRedirecting) {
+          event.preventDefault();
+        }
+      });
     })();
   </script>
 {% endif %}
