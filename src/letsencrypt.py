@@ -17,8 +17,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-from .activity_logging import get_app_dns_name
-from .models import DnsRecordRequest, DnsZoneConfig
+from .activity_logging import emit_activity_event, get_app_dns_name
+from .models import LOG_LEVEL_INFORMATIONAL, DnsRecordRequest, DnsZoneConfig
 from .settings_store import delete_setting, get_setting, set_setting
 from .ssl_certs import SOURCE_LETSENCRYPT, _read_source, cert_dir, cert_metadata, install_letsencrypt_cert
 from .zone_service import (
@@ -53,6 +53,43 @@ STAGING_DIRECTORY = "https://acme-staging-v02.api.letsencrypt.org/directory"
 
 class LetsEncryptError(RuntimeError):
     """Raised when enrollment or renewal cannot proceed."""
+
+
+def _le_dns_provider(cfg: Dict[str, Any]) -> str:
+    return (cfg.get("dns_provider_type") or "azure").strip().lower()
+
+
+def _emit_le_dns_audit(
+    db,
+    *,
+    event_type: str,
+    zone_name: str,
+    record_name: str,
+    record_type: str,
+    provider: str,
+    message: str,
+    status: str = "success",
+    records_found: int = 0,
+    values_count: int = 0,
+) -> None:
+    emit_activity_event(
+        db,
+        event_type=event_type,
+        level=LOG_LEVEL_INFORMATIONAL,
+        status=status,
+        actor_type="system",
+        actor_label="letsencrypt",
+        zone_name=zone_name,
+        record_name=record_name,
+        message=message,
+        details={
+            "provider": provider,
+            "record_type": record_type,
+            "source": "letsencrypt",
+            "records_found": records_found,
+            "values_count": values_count,
+        },
+    )
 
 
 def _read_json_setting(db, name: str) -> Optional[Dict[str, Any]]:
@@ -187,6 +224,8 @@ def _normalize_config(config: Dict[str, Any], *, app_dns_name: str = "", db=None
                 _normalize_hostname(name) for name in raw_sans if _normalize_hostname(name)
             ]
         normalized.pop("domains", None)
+        if "scheduled_restart_enabled" not in normalized:
+            normalized["scheduled_restart_enabled"] = True
         return normalized
 
     legacy = config.get("domains") or []
@@ -201,12 +240,17 @@ def _normalize_config(config: Dict[str, Any], *, app_dns_name: str = "", db=None
     if zone_id and db is not None:
         zone = _zone_row(db, zone_id)
         if zone:
-            root_dns_domain = zone.zone_name
+            try:
+                root_dns_domain = provider_dns_zone(decode_zone_config(zone))
+            except ValueError:
+                root_dns_domain = ""
     normalized = dict(config)
     normalized["root_dns_domain"] = _normalize_hostname(root_dns_domain)
     normalized["common_name"] = _normalize_hostname(common_name)
     normalized["subject_alt_names"] = subject_alt_names
     normalized.pop("domains", None)
+    if "scheduled_restart_enabled" not in normalized:
+        normalized["scheduled_restart_enabled"] = True
     return normalized
 
 
@@ -246,12 +290,24 @@ def create_dns_txt_challenge(db, *, zone_id: int, domain: str, value: str, ttl: 
     if zone is None:
         raise LetsEncryptError("Selected DNS zone was not found.")
     cfg = decode_zone_config(zone)
-    record_name = _relative_acme_name(domain, zone.zone_name)
+    provider_domain = provider_dns_zone(cfg)
+    record_name = _relative_acme_name(domain, provider_domain)
     client = create_dns_client_from_settings(cfg)
     client.create_or_update_record(
         DnsRecordRequest(zone_name=zone.zone_name, record_type="TXT", record_name=record_name, ttl=ttl, values=[value]),
         dns_server=cfg.get("dns_server"),
-        dns_zone=zone.zone_name,
+        dns_zone=provider_domain,
+    )
+    provider = _le_dns_provider(cfg)
+    _emit_le_dns_audit(
+        db,
+        event_type="dns.record_created",
+        zone_name=zone.zone_name,
+        record_name=record_name,
+        record_type="TXT",
+        provider=provider,
+        message=f"DNS record {record_name}.{zone.zone_name} created",
+        values_count=1,
     )
     return {"zone_name": zone.zone_name, "record_name": record_name, "value": value}
 
@@ -261,12 +317,23 @@ def delete_dns_txt_challenge(db, *, zone_id: int, domain: str) -> None:
     if zone is None:
         return
     cfg = decode_zone_config(zone)
-    record_name = _relative_acme_name(domain, zone.zone_name)
+    provider_domain = provider_dns_zone(cfg)
+    record_name = _relative_acme_name(domain, provider_domain)
     client = create_dns_client_from_settings(cfg)
     client.create_or_update_record(
         DnsRecordRequest(zone_name=zone.zone_name, record_type="DELETE", record_name=record_name, ttl=120, values=["TXT"]),
         dns_server=cfg.get("dns_server"),
-        dns_zone=zone.zone_name,
+        dns_zone=provider_domain,
+    )
+    provider = _le_dns_provider(cfg)
+    _emit_le_dns_audit(
+        db,
+        event_type="dns.record_deleted",
+        zone_name=zone.zone_name,
+        record_name=record_name,
+        record_type="TXT",
+        provider=provider,
+        message=f"DNS record {record_name}.{zone.zone_name} deleted",
     )
 
 
@@ -292,7 +359,8 @@ def _verify_dns_txt_challenge(
     if zone is None:
         raise LetsEncryptError("Selected DNS zone was not found.")
     cfg = decode_zone_config(zone)
-    record_name = _relative_acme_name(domain, zone.zone_name)
+    provider_domain = provider_dns_zone(cfg)
+    record_name = _relative_acme_name(domain, provider_domain)
     client = create_dns_client_from_settings(cfg)
     total = attempt_total or DNS_TXT_VERIFY_MAX_ATTEMPTS
     for attempt in range(total):
@@ -309,9 +377,29 @@ def _verify_dns_txt_challenge(
             record_name=record_name,
             record_type="TXT",
             dns_server=cfg.get("dns_server"),
-            dns_zone=zone.zone_name,
+            dns_zone=provider_domain,
         )
-        if _txt_record_matches(records, expected_value):
+        matched = _txt_record_matches(records, expected_value)
+        provider = _le_dns_provider(cfg)
+        records_found = len(records or [])
+        lookup_status = "success" if records_found else "not_found"
+        lookup_message = (
+            f"Found {records_found} record(s) at {record_name!r} in zone {zone.zone_name!r}."
+            if records_found
+            else f"No TXT record found at {record_name!r} in zone {zone.zone_name!r}."
+        )
+        _emit_le_dns_audit(
+            db,
+            event_type="dns.record_lookup",
+            zone_name=zone.zone_name,
+            record_name=record_name,
+            record_type="TXT",
+            provider=provider,
+            status=lookup_status,
+            message=lookup_message,
+            records_found=records_found,
+        )
+        if matched:
             return
     raise LetsEncryptError("DNS TXT record for _acme-challenge did not propagate after 2 minutes.")
 
@@ -749,5 +837,12 @@ def config_view(db) -> Dict[str, Any]:
         "enrollment": get_enrollment(db),
         "renew_options": RENEW_OPTIONS,
         "renewal_hint": renewal_hint,
-        "zones": [{"id": z.id, "zone_name": z.zone_name} for z in list_dns_zones(db)],
+        "zones": [
+            {
+                "id": z.id,
+                "zone_name": z.zone_name,
+                "dns_zone": (decode_zone_config(z).get("dns_zone") or "").strip(),
+            }
+            for z in list_dns_zones(db)
+        ],
     }

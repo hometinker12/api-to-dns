@@ -44,6 +44,7 @@ from src.db import SessionLocal, init_db
 from src.dns_client import create_dns_client, discover_plugins, dns_provider_display_name
 from src.zone_service import provider_dns_zone
 from src.models import (
+    LOG_CATEGORY_SECURITY,
     LOG_LEVEL_ERROR,
     LOG_LEVEL_INFORMATIONAL,
     LOG_LEVEL_VERBOSE,
@@ -2504,6 +2505,92 @@ def test_settings_ssl_regenerate_without_openssl_returns_error(
     )
     assert response.status_code == 200
     assert "openssl" in response.text.lower()
+    with SessionLocal() as db:
+        event = db.exec(
+            select(ActivityLog).where(ActivityLog.event_type == "system.ssl_regenerate_failed")
+        ).first()
+        assert event is not None
+        assert event.level == LOG_LEVEL_WARNING
+        assert event.category == LOG_CATEGORY_SECURITY
+
+
+def _latest_ssl_audit(db, event_type: str) -> ActivityLog | None:
+    return db.exec(
+        select(ActivityLog)
+        .where(ActivityLog.event_type == event_type)
+        .order_by(ActivityLog.id.desc())
+    ).first()
+
+
+def test_ssl_audit_toggle_rejected_without_cert(client: TestClient) -> None:
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    client.post(
+        "/settings/system/ssl",
+        data={"ssl_enabled": "on", "redirect_section": "ssl_certificate"},
+    )
+    with SessionLocal() as db:
+        event = _latest_ssl_audit(db, "system.ssl_toggled")
+        assert event is not None
+        assert event.level == LOG_LEVEL_WARNING
+        assert event.category == LOG_CATEGORY_SECURITY
+        assert event.status == "error"
+
+
+def test_ssl_audit_upload_success(client: TestClient) -> None:
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    key_pem, cert_pem = _generate_test_pem_pair("audit-upload.example")
+    client.post(
+        "/settings/system/ssl-upload",
+        data={"redirect_section": "ssl_certificate"},
+        files={
+            "ssl_key": ("server.key", key_pem, "application/x-pem-file"),
+            "ssl_cert": ("server.crt", cert_pem, "application/x-pem-file"),
+        },
+    )
+    with SessionLocal() as db:
+        event = _latest_ssl_audit(db, "system.ssl_uploaded")
+        assert event is not None
+        assert event.level == LOG_LEVEL_WARNING
+        assert event.category == LOG_CATEGORY_SECURITY
+
+
+def test_ssl_audit_letsencrypt_cancel_and_config(client: TestClient) -> None:
+    from src import letsencrypt
+
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        letsencrypt.save_config(
+            db,
+            email="admin@example.com",
+            root_dns_domain="example.com",
+            common_name="api.example.com",
+            subject_alt_names="",
+            challenge_type=letsencrypt.CHALLENGE_HTTP,
+            zone_id=None,
+            staging=True,
+        )
+    client.post("/settings/system/ssl-letsencrypt/cancel")
+    client.post(
+        "/settings/system/ssl-letsencrypt/config",
+        data={
+            "email": "admin@example.com",
+            "root_dns_domain": "example.com",
+            "common_name": "api.example.com",
+            "config_notice": "auto_renew_on",
+        },
+    )
+    with SessionLocal() as db:
+        cancel = _latest_ssl_audit(db, "system.ssl_letsencrypt_cancel")
+        assert cancel is not None
+        assert cancel.level == LOG_LEVEL_WARNING
+        assert cancel.category == LOG_CATEGORY_SECURITY
+        config_event = _latest_ssl_audit(db, "system.ssl_letsencrypt_config")
+        assert config_event is not None
+        assert config_event.level == LOG_LEVEL_WARNING
+        assert config_event.category == LOG_CATEGORY_SECURITY
 
 
 def test_settings_backup_area_renders_placeholder(client: TestClient) -> None:

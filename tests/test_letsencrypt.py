@@ -8,7 +8,7 @@ from sqlmodel import select
 
 from src import letsencrypt, ssl_certs
 from src.db import SessionLocal, init_db
-from src.models import DnsZoneConfig
+from src.models import ActivityLog, DnsZoneConfig
 from src.settings_store import delete_setting, set_setting
 from src.zone_service import encode_zone_config_dict
 
@@ -68,6 +68,142 @@ def test_create_dns_txt_challenge_uses_ttl_one(monkeypatch) -> None:
             value="txt-value",
         )
     assert captured["ttl"] == 1
+
+
+def test_le_dns_challenge_emits_audit_events(monkeypatch) -> None:
+    class FakeClient:
+        def create_or_update_record(self, *_args, **_kwargs) -> bool:
+            return False
+
+        def get_record(self, **_kwargs):
+            return []
+
+    monkeypatch.setattr(letsencrypt, "create_dns_client_from_settings", lambda _cfg: FakeClient())
+    monkeypatch.setattr(letsencrypt, "_sleep_fn", lambda _seconds: None)
+    _ensure_db()
+    with SessionLocal() as db:
+        zone = db.exec(select(DnsZoneConfig)).first()
+        if zone is None:
+            from tests.conftest import _seed_example_zone_and_permission
+
+            _seed_example_zone_and_permission(db, "test-api-key-for-dns-endpoint")
+            zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+        record_name = "_acme-challenge.api"
+        letsencrypt.create_dns_txt_challenge(
+            db,
+            zone_id=int(zone.id),
+            domain="api.example.com",
+            value="txt-value",
+        )
+        created = db.exec(
+            select(ActivityLog).where(
+                ActivityLog.event_type == "dns.record_created",
+                ActivityLog.record_name == record_name,
+                ActivityLog.zone_name == zone.zone_name,
+            )
+        ).first()
+        assert created is not None
+        assert created.actor_type == "system"
+        assert created.actor_label == "letsencrypt"
+        assert created.category == "dns"
+
+        with pytest.raises(letsencrypt.LetsEncryptError, match="did not propagate"):
+            letsencrypt._verify_dns_txt_challenge(
+                db,
+                zone_id=int(zone.id),
+                domain="api.example.com",
+                expected_value="txt-value",
+                attempt_total=1,
+            )
+        lookup = db.exec(
+            select(ActivityLog).where(
+                ActivityLog.event_type == "dns.record_lookup",
+                ActivityLog.record_name == record_name,
+            )
+        ).first()
+        assert lookup is not None
+
+        letsencrypt.delete_dns_txt_challenge(db, zone_id=int(zone.id), domain="api.example.com")
+        deleted = db.exec(
+            select(ActivityLog).where(
+                ActivityLog.event_type == "dns.record_deleted",
+                ActivityLog.record_name == record_name,
+            )
+        ).first()
+        assert deleted is not None
+
+
+def test_create_dns_txt_challenge_uses_provider_dns_zone_not_config_name(monkeypatch) -> None:
+    captured: dict = {}
+
+    class FakeClient:
+        def create_or_update_record(self, request, **_kwargs) -> bool:
+            captured["dns_zone"] = _kwargs.get("dns_zone")
+            captured["zone_name"] = request.zone_name
+            return False
+
+    monkeypatch.setattr(letsencrypt, "create_dns_client_from_settings", lambda _cfg: FakeClient())
+    _ensure_db()
+    with SessionLocal() as db:
+        row = DnsZoneConfig(
+            zone_name="config-label-only",
+            encrypted_config=encode_zone_config_dict(
+                {
+                    "dns_provider_type": "azure",
+                    "dns_zone": "provider.example.com",
+                    "azure_tenant_id": "t",
+                    "azure_client_id": "c",
+                    "azure_client_secret": "s",
+                    "azure_subscription_id": "sub",
+                    "azure_resource_group": "rg",
+                }
+            ),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        letsencrypt.create_dns_txt_challenge(
+            db,
+            zone_id=int(row.id),
+            domain="api.provider.example.com",
+            value="txt-value",
+        )
+    assert captured["dns_zone"] == "provider.example.com"
+    assert captured["zone_name"] == "config-label-only"
+
+
+def test_save_config_accepts_when_dns_zone_matches_root_not_config_name() -> None:
+    _ensure_db()
+    with SessionLocal() as db:
+        row = DnsZoneConfig(
+            zone_name="le-config-azure",
+            encrypted_config=encode_zone_config_dict(
+                {
+                    "dns_provider_type": "azure",
+                    "dns_zone": "example.com",
+                    "azure_tenant_id": "t",
+                    "azure_client_id": "c",
+                    "azure_client_secret": "s",
+                    "azure_subscription_id": "sub",
+                    "azure_resource_group": "rg",
+                }
+            ),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        config = letsencrypt.save_config(
+            db,
+            **_sample_config_kwargs(
+                challenge_type=letsencrypt.CHALLENGE_DNS,
+                zone_id=int(row.id),
+                root_dns_domain="example.com",
+                common_name="api.example.com",
+            ),
+        )
+        assert config["root_dns_domain"] == "example.com"
+        assert config["zone_id"] == int(row.id)
 
 
 def test_save_config_defaults_common_name_to_app_dns_name(monkeypatch) -> None:
@@ -157,6 +293,43 @@ def test_renew_threshold_honors_configured_days() -> None:
     }
     assert letsencrypt.should_renew_cert(metadata, 30) is True
     assert letsencrypt.should_renew_cert(metadata, 7) is False
+
+
+def test_save_config_defaults_scheduled_restart_enabled() -> None:
+    _ensure_db()
+    with SessionLocal() as db:
+        config = letsencrypt.save_config(
+            db,
+            **_sample_config_kwargs(),
+            scheduled_restart_enabled=True,
+        )
+        assert config["scheduled_restart_enabled"] is True
+
+
+def test_legacy_config_missing_scheduled_restart_defaults_enabled() -> None:
+    _ensure_db()
+    with SessionLocal() as db:
+        delete_setting(db, letsencrypt.SETTING_CONFIG)
+        set_setting(
+            db,
+            letsencrypt.SETTING_CONFIG,
+            json.dumps(
+                {
+                    "email": "admin@example.com",
+                    "root_dns_domain": "example.com",
+                    "common_name": "api.example.com",
+                    "subject_alt_names": [],
+                    "challenge_type": "dns-01",
+                    "zone_id": None,
+                    "staging": True,
+                    "renew_before_expiry_days": 30,
+                    "directory_url": letsencrypt.STAGING_DIRECTORY,
+                }
+            ),
+        )
+        config = letsencrypt.get_config(db)
+        assert config is not None
+        assert config["scheduled_restart_enabled"] is True
 
 
 def test_save_config_persists_auto_renew_disabled() -> None:

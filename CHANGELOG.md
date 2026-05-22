@@ -5,6 +5,7 @@
 ### Added
 
 - **DNS zone (domain)** field on each DNS provider plugin (Azure, BIND, Microsoft, Cloudflare), stored in zone configuration. The unique **zone configuration name** and API `zone_name` are separate from the provider domain, so multiple configurations can target the same DNS zone with different providers.
+- SSL Certificate page audit logging: all certificate and Let's Encrypt actions emit `system.ssl_*` activity events at WARNING level in the security category.
 - RESTful `/dns-record` resource: `GET`, `POST` (create), `PUT` (full replace), `PATCH` (partial update with merge), and `DELETE` (remove) on a single path.
 - Pre-flight `get_record` existence check on every mutation. `POST` returns **409** `record_already_exists` when the record type already exists; `PUT`/`PATCH`/`DELETE` return **404** `not_found` when the record type is missing.
 - Public Pydantic request schemas (`DnsRecordCreateRequest`, `DnsRecordReplaceRequest`, `DnsRecordPatchRequest`) documented in OpenAPI; `DELETE` uses query parameters (`zone_name`, `record_name`, `record_type`).
@@ -13,6 +14,7 @@
 
 ### Changed
 
+- Let's Encrypt enrollment: Root DNS Domain is decoupled from the zone configuration name; DNS-01 automation uses the provider `dns_zone`, and the admin form auto-fills the root domain from the selected API zone.
 - `DELETE` requests now use the HTTP `DELETE` verb with query parameters instead of a JSON body.
 - `PUT` requires `ttl`; `PATCH` accepts optional `ttl` and/or `values` and merges omitted fields from the live record.
 

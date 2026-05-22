@@ -15,7 +15,6 @@
         type="button"
         class="warning"
         id="restart-app-btn"
-        data-current-url="{{ restart_preview.current_url }}"
         data-after-url="{{ restart_preview.after_restart_url }}"
         data-reason="{{ restart_reason }}"
       >Restart Application</button>
@@ -38,11 +37,9 @@
         <button type="button" class="danger" id="restart-app-close">Close</button>
       </div>
       <p class="alert warning">{{ restart_reason }}</p>
-      <p class="help">The system URL may change after restart (HTTP vs HTTPS, port, or certificate).</p>
+      <p class="help">After restart, you may need to use a different URL (for example when enabling HTTPS or changing the port).</p>
       <dl class="form-meta">
-        <dt>Current access URL</dt>
-        <dd><code id="restart-current-url">{{ restart_preview.current_url }}</code></dd>
-        <dt>URL after restart</dt>
+        <dt>Access URL after restart</dt>
         <dd><code id="restart-after-url">{{ restart_preview.after_restart_url }}</code></dd>
       </dl>
       <form id="restart-app-form" action="/system/restart" method="post">

@@ -168,6 +168,15 @@ select {
   border: 1px solid #cbd5e1;
   background: white;
 }
+input[type="text"].input-readonly,
+input[type="text"][readonly],
+input[type="email"][readonly],
+input.input-readonly {
+  background: #e8ecf1;
+  color: #64748b;
+  border-color: #cbd5e1;
+  cursor: not-allowed;
+}
 input[type="checkbox"] {
   margin-right: 0.5rem;
 }
@@ -181,6 +190,14 @@ h2 {
   color: #475569;
   margin: 0 0 1rem;
   line-height: 1.45;
+}
+.help-inline {
+  display: inline;
+  margin: 0 0 0 0;
+  font-weight: normal;
+}
+#le-zone-field > label {
+  margin-bottom: 0.4rem;
 }
 .help code {
   font-size: 0.85em;

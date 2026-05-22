@@ -31,6 +31,7 @@ from .auth import create_session_cookie, get_current_user, session_cookie_settin
 from .db import SessionLocal, init_db
 from .http_utils import api_key_fingerprint, api_key_from_headers, http_exception_from_dns_error, wants_json_response
 from .models import (
+    LOG_CATEGORY_SECURITY,
     LOG_LEVEL_ERROR,
     LOG_LEVEL_INFORMATIONAL,
     LOG_LEVEL_VERBOSE,
@@ -2093,6 +2094,14 @@ def settings_update_ssl(
     desired = ssl_enabled is not None
     with SessionLocal() as db:
         if desired and not cert_exists():
+            _emit_ssl_audit(
+                db,
+                action="toggled",
+                user=user,
+                status="error",
+                message="SSL enable rejected: no certificate installed",
+                details={"ssl_enabled": desired},
+            )
             return render_settings(
                 request,
                 user,
@@ -2108,16 +2117,13 @@ def settings_update_ssl(
         set_ssl_enabled(db, desired)
         if desired != previous:
             mark_restart_required(db, reason="SSL listener setting changed.")
-            emit_activity_event(
-                db,
-                event_type="system.ssl_toggled",
-                level=LOG_LEVEL_INFORMATIONAL,
-                status="success",
-                actor_type="user",
-                actor_label=user,
-                message=f"SSL listener {'enabled' if desired else 'disabled'} (restart required)",
-                details={"ssl_enabled": desired, "previous": previous},
-            )
+        _emit_ssl_audit(
+            db,
+            action="toggled",
+            user=user,
+            message=f"SSL listener {'enabled' if desired else 'disabled'} (restart required)",
+            details={"ssl_enabled": desired, "previous": previous, "changed": desired != previous},
+        )
     return render_settings(
         request,
         user,
@@ -2142,6 +2148,15 @@ async def settings_upload_ssl(
         key_bytes = await ssl_key.read()
         cert_bytes = await ssl_cert.read()
     except Exception as exc:  # noqa: BLE001 — UploadFile.read failures are surfaced verbatim
+        with SessionLocal() as db:
+            _emit_ssl_audit(
+                db,
+                action="upload_failed",
+                user=user,
+                status="error",
+                message=f"SSL certificate upload failed: {exc}",
+                details={"reason": str(exc)},
+            )
         return render_settings(
             request,
             user,
@@ -2155,13 +2170,11 @@ async def settings_upload_ssl(
         metadata = install_uploaded_cert(key_bytes, cert_bytes)
     except CertificateInstallError as exc:
         with SessionLocal() as db:
-            emit_activity_event(
+            _emit_ssl_audit(
                 db,
-                event_type="system.ssl_upload_failed",
-                level=LOG_LEVEL_WARNING,
+                action="upload_failed",
+                user=user,
                 status="error",
-                actor_type="user",
-                actor_label=user,
                 message=f"SSL certificate upload rejected: {exc}",
                 details={"reason": str(exc)},
             )
@@ -2176,13 +2189,10 @@ async def settings_upload_ssl(
 
     with SessionLocal() as db:
         mark_restart_required(db, reason="SSL certificate uploaded.")
-        emit_activity_event(
+        _emit_ssl_audit(
             db,
-            event_type="system.ssl_uploaded",
-            level=LOG_LEVEL_INFORMATIONAL,
-            status="success",
-            actor_type="user",
-            actor_label=user,
+            action="uploaded",
+            user=user,
             message=f"SSL certificate uploaded (CN={metadata.get('common_name') or 'unknown'})",
             details={
                 "common_name": metadata.get("common_name") or "",
@@ -2209,24 +2219,22 @@ def settings_regenerate_ssl(
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
     already_existed = cert_exists()
+    user_message = ""
     try:
         with SessionLocal() as db:
             if already_existed:
                 metadata = regenerate_self_signed_cert(db)
-                event_type = "system.ssl_regenerated"
+                action = "regenerated"
                 user_message = "Self-signed certificate regenerated."
             else:
                 metadata = create_self_signed_cert(db)
-                event_type = "system.ssl_created"
+                action = "created"
                 user_message = "Self-signed certificate created."
             mark_restart_required(db, reason=user_message)
-            emit_activity_event(
+            _emit_ssl_audit(
                 db,
-                event_type=event_type,
-                level=LOG_LEVEL_INFORMATIONAL,
-                status="success",
-                actor_type="user",
-                actor_label=user,
+                action=action,
+                user=user,
                 message=f"{user_message} (CN={metadata.get('common_name') or 'unknown'})",
                 details={
                     "common_name": metadata.get("common_name") or "",
@@ -2236,6 +2244,15 @@ def settings_regenerate_ssl(
                 },
             )
     except OpenSSLUnavailableError as exc:
+        with SessionLocal() as db:
+            _emit_ssl_audit(
+                db,
+                action="regenerate_failed",
+                user=user,
+                status="error",
+                message=f"Self-signed certificate generation failed: {exc}",
+                details={"reason": str(exc)},
+            )
         return render_settings(
             request,
             user,
@@ -2245,6 +2262,15 @@ def settings_regenerate_ssl(
             section=redirect_section,
         )
     except RuntimeError as exc:
+        with SessionLocal() as db:
+            _emit_ssl_audit(
+                db,
+                action="regenerate_failed",
+                user=user,
+                status="error",
+                message=f"Self-signed certificate generation failed: {exc}",
+                details={"reason": str(exc)},
+            )
         return render_settings(
             request,
             user,
@@ -2269,6 +2295,28 @@ def settings_regenerate_ssl(
 _le_enrollment_in_progress = False
 
 
+def _emit_ssl_audit(
+    db,
+    *,
+    action: str,
+    user: str,
+    message: str,
+    status: str = "success",
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    emit_activity_event(
+        db,
+        event_type=f"system.ssl_{action}",
+        level=LOG_LEVEL_WARNING,
+        category=LOG_CATEGORY_SECURITY,
+        status=status,
+        actor_type="user",
+        actor_label=user,
+        message=message,
+        details=details or {},
+    )
+
+
 def _le_start_form_kwargs(
     *,
     email: str,
@@ -2291,7 +2339,9 @@ def _le_start_form_kwargs(
         "zone_id": int(zone_id) if str(zone_id).strip() else None,
         "staging": staging is not None,
         "renew_before_expiry_days": renew_before_expiry_days,
-        "scheduled_restart_enabled": scheduled_restart_enabled is not None,
+        "scheduled_restart_enabled": (
+            True if scheduled_restart_enabled is None else scheduled_restart_enabled is not None
+        ),
         "scheduled_restart_time": scheduled_restart_time,
     }
 
@@ -2311,18 +2361,17 @@ def _apply_le_start_result(db, result: Dict[str, Any], *, user: str) -> tuple[st
 
 def _emit_le_started(db, result: Dict[str, Any], *, user: str) -> None:
     config = result.get("config") or {}
-    emit_activity_event(
+    _emit_ssl_audit(
         db,
-        event_type="system.letsencrypt_started",
-        level=LOG_LEVEL_INFORMATIONAL,
-        status="success",
-        actor_type="user",
-        actor_label=user,
+        action="letsencrypt_start",
+        user=user,
         message="Let's Encrypt enrollment started",
         details={
             "root_dns_domain": config.get("root_dns_domain", ""),
             "common_name": config.get("common_name", ""),
             "subject_alt_names": config.get("subject_alt_names", []),
+            "zone_id": config.get("zone_id"),
+            "challenge_type": config.get("challenge_type", ""),
         },
     )
 
@@ -2409,11 +2458,28 @@ async def settings_letsencrypt_start_async(
 ):
     global _le_enrollment_in_progress
     if challenge_type != letsencrypt.CHALLENGE_DNS or not str(zone_id).strip():
+        with SessionLocal() as db:
+            _emit_ssl_audit(
+                db,
+                action="letsencrypt_start_failed",
+                user=user,
+                status="error",
+                message="Let's Encrypt async enrollment rejected: DNS-01 with API zone required",
+                details={"challenge_type": challenge_type, "zone_id": zone_id},
+            )
         return JSONResponse(
             {"detail": "Async enrollment requires DNS-01 with an API configured zone."},
             status_code=400,
         )
     if _le_enrollment_in_progress:
+        with SessionLocal() as db:
+            _emit_ssl_audit(
+                db,
+                action="letsencrypt_start_failed",
+                user=user,
+                status="error",
+                message="Let's Encrypt async enrollment rejected: already in progress",
+            )
         return JSONResponse({"detail": "Let's Encrypt enrollment is already in progress."}, status_code=HTTP_409_CONFLICT)
     kwargs = _le_start_form_kwargs(
         email=email,
@@ -2436,6 +2502,19 @@ async def settings_letsencrypt_start_async(
             message="Starting enrollment...",
         )
     _le_enrollment_in_progress = True
+    with SessionLocal() as db:
+        _emit_ssl_audit(
+            db,
+            action="letsencrypt_start_async",
+            user=user,
+            message="Let's Encrypt async enrollment started",
+            details={
+                "root_dns_domain": kwargs.get("root_dns_domain", ""),
+                "common_name": kwargs.get("common_name", ""),
+                "zone_id": kwargs.get("zone_id"),
+                "challenge_type": kwargs.get("challenge_type", ""),
+            },
+        )
     asyncio.create_task(_run_le_auto_enrollment(kwargs, user=user))
     return JSONResponse({"status": "started"}, status_code=HTTP_202_ACCEPTED)
 
@@ -2484,13 +2563,10 @@ def settings_letsencrypt_continue(request: Request, user: str = Depends(require_
             result = letsencrypt.continue_enrollment(db)
             config = result.get("config") or {}
             mark_restart_required(db, reason="Let's Encrypt certificate installed.")
-            emit_activity_event(
+            _emit_ssl_audit(
                 db,
-                event_type="system.letsencrypt_installed",
-                level=LOG_LEVEL_INFORMATIONAL,
-                status="success",
-                actor_type="user",
-                actor_label=user,
+                action="letsencrypt_continue",
+                user=user,
                 message="Let's Encrypt certificate installed",
                 details={
                     "root_dns_domain": config.get("root_dns_domain", ""),
@@ -2514,6 +2590,7 @@ def settings_letsencrypt_continue(request: Request, user: str = Depends(require_
 def settings_letsencrypt_cancel(request: Request, user: str = Depends(require_role(ROLE_SYSTEM_UPDATE))):
     with SessionLocal() as db:
         letsencrypt.cancel_enrollment(db)
+        _emit_ssl_audit(db, action="letsencrypt_cancel", user=user, message="Let's Encrypt enrollment cancelled")
     return render_settings(request, user, "system_settings", message="Let's Encrypt enrollment cancelled.", section="ssl_certificate")
 
 
@@ -2534,6 +2611,7 @@ def settings_letsencrypt_config(
     config_notice: str = Form(""),
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
+    notice = (config_notice or "").strip()
     try:
         with SessionLocal() as db:
             existing = letsencrypt.get_config(db) or {}
@@ -2551,9 +2629,15 @@ def settings_letsencrypt_config(
                 scheduled_restart_time=scheduled_restart_time,
                 auto_renew_enabled=auto_renew_enabled is not None,
             )
+            _emit_ssl_audit(
+                db,
+                action="letsencrypt_config",
+                user=user,
+                message="Let's Encrypt settings saved",
+                details={"config_notice": notice, "auto_renew_enabled": auto_renew_enabled is not None},
+            )
     except LetsEncryptError as exc:
         return render_settings(request, user, "system_settings", message=str(exc), message_kind="error", section="ssl_certificate")
-    notice = (config_notice or "").strip()
     if notice == "auto_renew_on":
         message = "Automatic certificate renewal was turned on."
     elif notice == "auto_renew_off":
