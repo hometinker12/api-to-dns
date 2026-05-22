@@ -771,6 +771,28 @@ def cancel_enrollment(db) -> None:
     clear_enrollment(db)
 
 
+def detach_dns_zone_from_letsencrypt(db, zone_id: int) -> bool:
+    config_raw = _read_json_setting(db, SETTING_CONFIG)
+    enrollment = get_enrollment(db)
+    enroll_config = (enrollment or {}).get("config") or {}
+    config_zone_id = config_raw.get("zone_id") if config_raw else None
+    enroll_zone_id = enroll_config.get("zone_id")
+    if config_zone_id != zone_id and enroll_zone_id != zone_id:
+        return False
+    changed = False
+    if enrollment and enroll_zone_id == zone_id:
+        cancel_enrollment(db)
+        changed = True
+    if config_raw and config_zone_id == zone_id:
+        updated = dict(config_raw)
+        updated["zone_id"] = None
+        if updated.get("auto_renew_enabled", True):
+            updated["auto_renew_enabled"] = False
+        _write_json_setting(db, SETTING_CONFIG, updated)
+        changed = True
+    return changed
+
+
 def http_challenge_response(db, token: str) -> Optional[str]:
     enrollment = get_enrollment(db)
     challenge = (enrollment or {}).get("http_challenge") or {}

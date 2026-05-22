@@ -516,3 +516,111 @@ def test_dns_automation_fails_and_cleans_up_after_verify_timeout(monkeypatch) ->
             )
         assert letsencrypt.get_enrollment(db) is None
     assert deleted == ["api.example.com"]
+
+
+def _le_zone_row(db, *, zone_name: str = "le-detach-zone") -> DnsZoneConfig:
+    row = DnsZoneConfig(
+        zone_name=zone_name,
+        encrypted_config=encode_zone_config_dict(
+            {
+                "dns_provider_type": "azure",
+                "dns_zone": "example.com",
+                "azure_tenant_id": "t",
+                "azure_client_id": "c",
+                "azure_client_secret": "s",
+                "azure_subscription_id": "sub",
+                "azure_resource_group": "rg",
+            }
+        ),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+def test_detach_dns_zone_clears_zone_id_and_disables_auto_renew() -> None:
+    _ensure_db()
+    with SessionLocal() as db:
+        row = _le_zone_row(db, zone_name="le-detach-clear")
+        letsencrypt.save_config(
+            db,
+            **_sample_config_kwargs(
+                challenge_type=letsencrypt.CHALLENGE_DNS,
+                zone_id=int(row.id),
+                root_dns_domain="example.com",
+            ),
+            auto_renew_enabled=True,
+        )
+        assert letsencrypt.detach_dns_zone_from_letsencrypt(db, int(row.id)) is True
+        config = letsencrypt.get_config(db)
+        assert config is not None
+        assert config["zone_id"] is None
+        assert config["auto_renew_enabled"] is False
+
+
+def test_detach_dns_zone_leaves_auto_renew_off_when_already_disabled() -> None:
+    _ensure_db()
+    with SessionLocal() as db:
+        row = _le_zone_row(db, zone_name="le-detach-off")
+        letsencrypt.save_config(
+            db,
+            **_sample_config_kwargs(
+                challenge_type=letsencrypt.CHALLENGE_DNS,
+                zone_id=int(row.id),
+                root_dns_domain="example.com",
+            ),
+            auto_renew_enabled=False,
+        )
+        assert letsencrypt.detach_dns_zone_from_letsencrypt(db, int(row.id)) is True
+        config = letsencrypt.get_config(db)
+        assert config is not None
+        assert config["zone_id"] is None
+        assert config["auto_renew_enabled"] is False
+
+
+def test_detach_dns_zone_noop_when_zone_not_referenced() -> None:
+    _ensure_db()
+    with SessionLocal() as db:
+        row = _le_zone_row(db, zone_name="le-detach-referenced")
+        other = _le_zone_row(db, zone_name="le-detach-other")
+        letsencrypt.save_config(
+            db,
+            **_sample_config_kwargs(
+                challenge_type=letsencrypt.CHALLENGE_DNS,
+                zone_id=int(row.id),
+                root_dns_domain="example.com",
+            ),
+        )
+        assert letsencrypt.detach_dns_zone_from_letsencrypt(db, int(other.id)) is False
+        config = letsencrypt.get_config(db)
+        assert config is not None
+        assert config["zone_id"] == int(row.id)
+
+
+def test_detach_dns_zone_cancels_enrollment_referencing_zone(monkeypatch) -> None:
+    deleted: list[str] = []
+
+    def track_delete(_db, *, zone_id: int, domain: str) -> None:
+        deleted.append(domain)
+
+    monkeypatch.setattr(letsencrypt, "delete_dns_txt_challenge", track_delete)
+
+    _ensure_db()
+    with SessionLocal() as db:
+        row = _le_zone_row(db, zone_name="le-detach-enroll")
+        letsencrypt._write_json_setting(
+            db,
+            letsencrypt.SETTING_ENROLLMENT,
+            {
+                "status": "awaiting_manual",
+                "config": {
+                    "zone_id": int(row.id),
+                    "challenge_type": letsencrypt.CHALLENGE_DNS,
+                },
+                "order": {"challenges": [{"domain": "api.example.com"}]},
+            },
+        )
+        assert letsencrypt.detach_dns_zone_from_letsencrypt(db, int(row.id)) is True
+        assert letsencrypt.get_enrollment(db) is None
+    assert deleted == ["api.example.com"]

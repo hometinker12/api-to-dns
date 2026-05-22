@@ -993,6 +993,7 @@ def zone_delete(request: Request, zone_id: int, user: str = Depends(require_role
         removed_zone_name = None
         if row:
             removed_zone_name = row.zone_name
+            letsencrypt.detach_dns_zone_from_letsencrypt(db, zone_id)
             for link in db.exec(select(ApiKeyAllowedZone).where(ApiKeyAllowedZone.dns_zone_config_id == zone_id)).all():
                 db.delete(link)
             db.delete(row)

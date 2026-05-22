@@ -19,6 +19,7 @@
 
 ### Changed
 
+- Deleting a DNS zone configuration that Let's Encrypt references clears the DNS challenge zone (manual), disables auto-renew when it was enabled, and cancels in-progress enrollment for that zone.
 - DNS activity log **message** text for record lookups and mutations now references the provider **`dns_zone`** (e.g. `www.example.com`) instead of the configuration **`zone_name`**. The logged **`zone_name`** attribute on DNS events is unchanged and still stores the configuration identifier; the Activity Log UI column label is **Zone Name**.
 - Admin dashboard DNS zone list shows each configuration as `zone_name` (`dns_zone`).
 - Let's Encrypt enrollment: Root DNS Domain is decoupled from the zone configuration name; DNS-01 automation uses the provider `dns_zone`, and the admin form auto-fills the root domain from the selected API zone.

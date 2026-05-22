@@ -410,6 +410,53 @@ def test_two_zone_configs_can_share_dns_domain(client: TestClient) -> None:
         assert all(row is not None for row in rows)
 
 
+def test_zone_delete_detaches_letsencrypt_config(client: TestClient) -> None:
+    from src import letsencrypt
+
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        row = DnsZoneConfig(
+            zone_name="le-zone-delete-integration",
+            encrypted_config=encode_zone_config_dict(
+                {
+                    "dns_provider_type": "azure",
+                    "dns_zone": "example.com",
+                    "azure_tenant_id": "t",
+                    "azure_client_id": "c",
+                    "azure_client_secret": "s",
+                    "azure_subscription_id": "sub",
+                    "azure_resource_group": "rg",
+                }
+            ),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        zone_id = int(row.id)
+        letsencrypt.save_config(
+            db,
+            email="admin@example.com",
+            root_dns_domain="example.com",
+            common_name="api.example.com",
+            subject_alt_names="",
+            challenge_type=letsencrypt.CHALLENGE_DNS,
+            zone_id=zone_id,
+            staging=True,
+            auto_renew_enabled=True,
+        )
+
+    response = client.post(f"/zones/{zone_id}/delete")
+    assert response.status_code == 200
+    assert "Zone removed." in response.text
+
+    with SessionLocal() as db:
+        config = letsencrypt.get_config(db)
+        assert config is not None
+        assert config["zone_id"] is None
+        assert config["auto_renew_enabled"] is False
+        assert db.get(DnsZoneConfig, zone_id) is None
+
+
 def test_legacy_zone_page_routes_are_not_redirects(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
     response = client.get("/dns-zones", follow_redirects=False)
