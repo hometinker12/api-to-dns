@@ -276,6 +276,10 @@ td, th {
   background: #d1fae5;
   color: #065f46;
 }
+.le-auto-renew-enable,
+.le-auto-renew-disable {
+  margin-bottom: 0.75rem;
+}
 dialog {
   width: min(640px, calc(100% - 2rem));
   max-height: calc(100vh - 4rem);

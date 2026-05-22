@@ -514,6 +514,7 @@ def save_config(
     renew_before_expiry_days: Any = DEFAULT_RENEW_BEFORE_DAYS,
     scheduled_restart_enabled: bool = True,
     scheduled_restart_time: str = DEFAULT_SCHEDULED_RESTART_TIME,
+    auto_renew_enabled: bool = True,
 ) -> Dict[str, Any]:
     challenge = challenge_type if challenge_type in {CHALLENGE_DNS, CHALLENGE_HTTP} else CHALLENGE_DNS
     schedule_time = scheduled_restart_time if _valid_time(scheduled_restart_time) else DEFAULT_SCHEDULED_RESTART_TIME
@@ -544,6 +545,7 @@ def save_config(
         "renew_before_expiry_days": validate_renew_before_days(renew_before_expiry_days),
         "scheduled_restart_enabled": bool(scheduled_restart_enabled),
         "scheduled_restart_time": schedule_time,
+        "auto_renew_enabled": bool(auto_renew_enabled),
         "directory_url": _directory_url(bool(staging)),
     }
     if not config["email"]:
@@ -704,6 +706,8 @@ def maybe_renew_certificate(db) -> Optional[Dict[str, Any]]:
     config = get_config(db)
     if not config:
         return None
+    if not config.get("auto_renew_enabled", True):
+        return None
     renew_days = validate_renew_before_days(
         config.get("renew_before_expiry_days") or os.getenv("LETSENCRYPT_RENEW_DAYS") or DEFAULT_RENEW_BEFORE_DAYS
     )
@@ -721,8 +725,9 @@ def config_view(db) -> Dict[str, Any]:
     app_dns_name = get_app_dns_name(db)
     metadata = cert_metadata()
     renewal_hint = ""
+    auto_renew_enabled = config.get("auto_renew_enabled", True)
     not_after = metadata.get("not_after") if metadata else None
-    if isinstance(not_after, datetime):
+    if auto_renew_enabled and isinstance(not_after, datetime):
         days = validate_renew_before_days(config.get("renew_before_expiry_days") or DEFAULT_RENEW_BEFORE_DAYS)
         renewal_hint = (not_after - timedelta(days=days)).date().isoformat()
     return {

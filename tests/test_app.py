@@ -2282,10 +2282,64 @@ def test_settings_ssl_section_renders_without_cert(client: TestClient) -> None:
     response = client.get("/settings?area=system_settings&section=ssl_certificate")
     assert response.status_code == 200
     assert "SSL Certificate" in response.text
-    assert "Upload PEM certificate" in response.text
+    assert "Upload Certificate" in response.text
+    assert "Enable HTTPS" in response.text
     assert "Create self-signed certificate" in response.text
     assert 'name="ssl_enabled"' in response.text
     assert "Install a certificate below before enabling SSL." in response.text
+
+
+def _le_config_post_data(**overrides) -> dict:
+    data = {
+        "email": "admin@example.com",
+        "root_dns_domain": "example.com",
+        "common_name": "api.example.com",
+        "subject_alt_names": "api.example.com",
+        "challenge_type": "dns-01",
+        "renew_before_expiry_days": "30",
+        "scheduled_restart_time": "03:00",
+    }
+    data.update(overrides)
+    return data
+
+
+def test_letsencrypt_config_notice_auto_renew_on_and_off(client: TestClient) -> None:
+    from src import letsencrypt, ssl_certs
+
+    _clear_ssl_state()
+    with SessionLocal() as db:
+        letsencrypt.save_config(
+            db,
+            email="admin@example.com",
+            root_dns_domain="example.com",
+            common_name="api.example.com",
+            subject_alt_names="api.example.com",
+            challenge_type=letsencrypt.CHALLENGE_HTTP,
+            zone_id=None,
+            staging=True,
+            auto_renew_enabled=False,
+        )
+    ssl_certs._write_source(ssl_certs.SOURCE_LETSENCRYPT)
+    client.cookies.set("session", create_session_cookie("admin"))
+
+    on_response = client.post(
+        "/settings/system/ssl-letsencrypt/config",
+        data=_le_config_post_data(config_notice="auto_renew_on", auto_renew_enabled="on"),
+    )
+    assert on_response.status_code == 200
+    assert "Automatic certificate renewal was turned on." in on_response.text
+
+    off_response = client.post(
+        "/settings/system/ssl-letsencrypt/config",
+        data=_le_config_post_data(config_notice="auto_renew_off"),
+    )
+    assert off_response.status_code == 200
+    assert "Automatic certificate renewal was turned off." in off_response.text
+
+    with SessionLocal() as db:
+        config = letsencrypt.get_config(db)
+        assert config is not None
+        assert config["auto_renew_enabled"] is False
 
 
 def test_settings_ssl_legacy_section_key_still_redirects(client: TestClient) -> None:

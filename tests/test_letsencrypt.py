@@ -127,6 +127,61 @@ def test_renew_threshold_honors_configured_days() -> None:
     assert letsencrypt.should_renew_cert(metadata, 7) is False
 
 
+def test_save_config_persists_auto_renew_disabled() -> None:
+    _ensure_db()
+    with SessionLocal() as db:
+        config = letsencrypt.save_config(
+            db,
+            **_sample_config_kwargs(),
+            auto_renew_enabled=False,
+        )
+        assert config["auto_renew_enabled"] is False
+        reloaded = letsencrypt.get_config(db)
+        assert reloaded is not None
+        assert reloaded["auto_renew_enabled"] is False
+
+
+def test_maybe_renew_certificate_skips_when_auto_renew_disabled(client: TestClient, monkeypatch) -> None:
+    called = False
+
+    def prepare(_config):
+        nonlocal called
+        called = True
+        return {}
+
+    monkeypatch.setattr(letsencrypt, "_acme_prepare_order", prepare)
+    monkeypatch.setattr(letsencrypt, "_read_source", lambda: ssl_certs.SOURCE_LETSENCRYPT)
+    monkeypatch.setattr(
+        letsencrypt,
+        "cert_metadata",
+        lambda: {
+            "source": ssl_certs.SOURCE_LETSENCRYPT,
+            "not_after": datetime.now(timezone.utc) + timedelta(days=10),
+        },
+    )
+    _ensure_db()
+    with SessionLocal() as db:
+        letsencrypt.save_config(db, **_sample_config_kwargs(), auto_renew_enabled=False)
+        assert letsencrypt.maybe_renew_certificate(db) is None
+    assert called is False
+
+
+def test_config_view_omits_renewal_hint_when_auto_renew_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(
+        letsencrypt,
+        "cert_metadata",
+        lambda: {
+            "source": ssl_certs.SOURCE_LETSENCRYPT,
+            "not_after": datetime.now(timezone.utc) + timedelta(days=60),
+        },
+    )
+    _ensure_db()
+    with SessionLocal() as db:
+        letsencrypt.save_config(db, **_sample_config_kwargs(), auto_renew_enabled=False)
+        view = letsencrypt.config_view(db)
+        assert view["renewal_hint"] == ""
+
+
 def test_self_signed_cert_never_renews(client: TestClient, monkeypatch) -> None:
     called = False
 

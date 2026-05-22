@@ -516,14 +516,14 @@
                   {% if not can_system_update %}disabled{% endif %}
                   {% if not ssl.can_enable_ssl and not ssl.enabled %}disabled{% endif %}
                 />
-                Enable HTTPS listener
+                Enable HTTPS
               </label>
               {% if not ssl.can_enable_ssl and not ssl.enabled %}
                 <div class="help alert warning">Install a certificate below before enabling SSL.</div>
               {% elif ssl.cert_exists and not ssl.enabled %}
                 <p class="help">A certificate is installed. Enable SSL and restart to use HTTPS.</p>
               {% else %}
-                <p class="help">Disabling SSL does not remove certificate files from disk.</p>
+                <p class="help">Disabling SSL does not remove existing installed certificates.</p>
               {% endif %}
               {% if can_system_update %}
                 <button type="submit">Save</button>
@@ -586,8 +586,8 @@
             {% set le_enrollment = le.enrollment %}
             <h2>Let's Encrypt</h2>
             <p class="help">
-              Request a trusted certificate using DNS-01 or HTTP-01 validation. DNS-01 can be automated when you
-              select one of the configured DNS zones below.
+              Request a trusted certificate using DNS or HTTP validation. DNS validation can be automated if you
+              have the zone configured in the application DNS zones as a target.
             </p>
             {% if le_enrollment %}
               <div class="alert warning">
@@ -613,34 +613,75 @@
             {% endif %}
             {% set le_installed = ssl.metadata and ssl.metadata.source == ssl.source_letsencrypt %}
             {% if le_installed %}
-              <form action="/settings/system/ssl-letsencrypt/config" method="post">
-                <input type="hidden" name="email" value="{{ le_config.email or '' }}" />
-                <input type="hidden" name="root_dns_domain" value="{{ le_config.root_dns_domain or '' }}" />
-                <input type="hidden" name="common_name" value="{{ le_config.common_name or le.defaults.common_name or ssl.app_dns_name }}" />
-                <input type="hidden" name="subject_alt_names" value="{{ le_config.subject_alt_names | join(', ') if le_config.subject_alt_names else (le.defaults.subject_alt_names or ssl.app_dns_name) }}" />
-                <input type="hidden" name="challenge_type" value="{{ le_config.challenge_type or 'dns-01' }}" />
-                {% if le_config.zone_id %}<input type="hidden" name="zone_id" value="{{ le_config.zone_id }}" />{% endif %}
-                {% if le_config.staging %}<input type="hidden" name="staging" value="on" />{% endif %}
-                {% if le.renewal_hint %}
-                  <p class="help">Renewal will be attempted around <strong>{{ le.renewal_hint }}</strong>.</p>
-                {% endif %}
-                <label>Renew before expiry
-                  <select name="renew_before_expiry_days">
-                    {% for days in le.renew_options %}
-                      <option value="{{ days }}" {% if (le_config.renew_before_expiry_days or 30) == days %}selected{% endif %}>{{ days }} days</option>
-                    {% endfor %}
-                  </select>
-                </label>
-                <label class="inline-check">
-                  <input type="checkbox" name="scheduled_restart_enabled" {% if le_config.scheduled_restart_enabled is not sameas false %}checked{% endif %} />
-                  Schedule restart after certificate renewal
-                </label>
-                <label>Scheduled restart time
-                  <input type="time" name="scheduled_restart_time" value="{{ le_config.scheduled_restart_time or '03:00' }}" />
-                </label>
-                <p class="help">When enabled, the app restarts once at this time after a background renewal. It does not restart on days when no renewal occurred.</p>
-                <button type="submit">Save</button>
-              </form>
+              {% set auto_renew_enabled = le_config.auto_renew_enabled is not sameas false %}
+              {% if auto_renew_enabled %}
+                <form action="/settings/system/ssl-letsencrypt/config" method="post" class="le-auto-renew-disable">
+                  <input type="hidden" name="email" value="{{ le_config.email or '' }}" />
+                  <input type="hidden" name="root_dns_domain" value="{{ le_config.root_dns_domain or '' }}" />
+                  <input type="hidden" name="common_name" value="{{ le_config.common_name or le.defaults.common_name or ssl.app_dns_name }}" />
+                  <input type="hidden" name="subject_alt_names" value="{{ le_config.subject_alt_names | join(', ') if le_config.subject_alt_names else (le.defaults.subject_alt_names or ssl.app_dns_name) }}" />
+                  <input type="hidden" name="challenge_type" value="{{ le_config.challenge_type or 'dns-01' }}" />
+                  {% if le_config.zone_id %}<input type="hidden" name="zone_id" value="{{ le_config.zone_id }}" />{% endif %}
+                  {% if le_config.staging %}<input type="hidden" name="staging" value="on" />{% endif %}
+                  <input type="hidden" name="renew_before_expiry_days" value="{{ le_config.renew_before_expiry_days or 30 }}" />
+                  <input type="hidden" name="scheduled_restart_time" value="{{ le_config.scheduled_restart_time or '03:00' }}" />
+                  {% if le_config.scheduled_restart_enabled is not sameas false %}
+                    <input type="hidden" name="scheduled_restart_enabled" value="on" />
+                  {% endif %}
+                  <input type="hidden" name="config_notice" value="auto_renew_off" />
+                  <button type="submit">Disable Auto Certificate Renewal</button>
+                </form>
+                <details class="plugin-fields">
+                  <summary>Auto Renew Settings</summary>
+                  <form action="/settings/system/ssl-letsencrypt/config" method="post">
+                    <input type="hidden" name="email" value="{{ le_config.email or '' }}" />
+                    <input type="hidden" name="root_dns_domain" value="{{ le_config.root_dns_domain or '' }}" />
+                    <input type="hidden" name="common_name" value="{{ le_config.common_name or le.defaults.common_name or ssl.app_dns_name }}" />
+                    <input type="hidden" name="subject_alt_names" value="{{ le_config.subject_alt_names | join(', ') if le_config.subject_alt_names else (le.defaults.subject_alt_names or ssl.app_dns_name) }}" />
+                    <input type="hidden" name="challenge_type" value="{{ le_config.challenge_type or 'dns-01' }}" />
+                    {% if le_config.zone_id %}<input type="hidden" name="zone_id" value="{{ le_config.zone_id }}" />{% endif %}
+                    {% if le_config.staging %}<input type="hidden" name="staging" value="on" />{% endif %}
+                    <input type="hidden" name="auto_renew_enabled" value="on" />
+                    {% if le.renewal_hint %}
+                      <p class="help">Renewal will be attempted around <strong>{{ le.renewal_hint }}</strong>.</p>
+                    {% endif %}
+                    <label>Renew before expiry
+                      <select name="renew_before_expiry_days">
+                        {% for days in le.renew_options %}
+                          <option value="{{ days }}" {% if (le_config.renew_before_expiry_days or 30) == days %}selected{% endif %}>{{ days }} days</option>
+                        {% endfor %}
+                      </select>
+                    </label>
+                    <label class="inline-check">
+                      <input type="checkbox" name="scheduled_restart_enabled" {% if le_config.scheduled_restart_enabled is not sameas false %}checked{% endif %} />
+                      Restart application after certificate renewal
+                    </label>
+                    <p class="help">When enabled, the application will restart once at the configured time after a background renewal.</p>
+                    <label>Scheduled restart time
+                      <input type="time" name="scheduled_restart_time" value="{{ le_config.scheduled_restart_time or '03:00' }}" />
+                    </label>
+                    <button type="submit">Save</button>
+                  </form>
+                </details>
+              {% else %}
+                <form action="/settings/system/ssl-letsencrypt/config" method="post" class="le-auto-renew-enable">
+                  <input type="hidden" name="email" value="{{ le_config.email or '' }}" />
+                  <input type="hidden" name="root_dns_domain" value="{{ le_config.root_dns_domain or '' }}" />
+                  <input type="hidden" name="common_name" value="{{ le_config.common_name or le.defaults.common_name or ssl.app_dns_name }}" />
+                  <input type="hidden" name="subject_alt_names" value="{{ le_config.subject_alt_names | join(', ') if le_config.subject_alt_names else (le.defaults.subject_alt_names or ssl.app_dns_name) }}" />
+                  <input type="hidden" name="challenge_type" value="{{ le_config.challenge_type or 'dns-01' }}" />
+                  {% if le_config.zone_id %}<input type="hidden" name="zone_id" value="{{ le_config.zone_id }}" />{% endif %}
+                  {% if le_config.staging %}<input type="hidden" name="staging" value="on" />{% endif %}
+                  <input type="hidden" name="auto_renew_enabled" value="on" />
+                  <input type="hidden" name="renew_before_expiry_days" value="{{ le_config.renew_before_expiry_days or 30 }}" />
+                  <input type="hidden" name="scheduled_restart_time" value="{{ le_config.scheduled_restart_time or '03:00' }}" />
+                  {% if le_config.scheduled_restart_enabled is not sameas false %}
+                    <input type="hidden" name="scheduled_restart_enabled" value="on" />
+                  {% endif %}
+                  <input type="hidden" name="config_notice" value="auto_renew_on" />
+                  <button type="submit">Enable Auto Certificate Renewal</button>
+                </form>
+              {% endif %}
 
               <details class="plugin-fields">
                 <summary>Re-enroll with Let's Encrypt</summary>
@@ -695,11 +736,11 @@
           </section>
 
           <section class="form-card">
-            <h2>Upload PEM certificate</h2>
+            <h2>Upload Certificate</h2>
             <p class="help">
               Provide an unencrypted PEM private key and matching PEM certificate. Best practice is to include a chain/
               bundle intermediate certificates after the leaf certificate in the same <code>.crt</code> /
-              <code>.pem</code> file. Restart the application after upload to apply.
+              <code>.pem</code> file.
             </p>
             <form action="/settings/system/ssl-upload" method="post" enctype="multipart/form-data">
               <input type="hidden" name="redirect_section" value="ssl_certificate" />
@@ -718,7 +759,6 @@
             <p class="help">
               Generates a new RSA-2048 self-signed certificate valid for 825 days using the App DNS Name
               (<code>{{ ssl.app_dns_name }}</code>) as the CN and a DNS SAN, plus <code>localhost</code>.
-              Requires the <code>openssl</code> command on PATH.
               {% if ssl.cert_exists %}
                 <strong>Regenerate replaces the currently installed certificate.</strong>
               {% endif %}
@@ -731,7 +771,7 @@
               data-confirm="{{ ssl_regenerate_confirm_msg | e }}"
             >
               <input type="hidden" name="redirect_section" value="ssl_certificate" />
-              <button type="submit">{{ "Regenerate self-signed certificate" if ssl.cert_exists else "Create self-signed certificate" }}</button>
+              <button type="submit">{{ "Generate Self-Signed Certificate" if ssl.cert_exists else "Create self-signed certificate" }}</button>
             </form>
           </section>
           {% endif %}
@@ -1221,21 +1261,6 @@
       const sslRegenerateForm = document.getElementById("ssl-regenerate-form");
       sslRegenerateForm?.addEventListener("submit", (event) => {
         const msg = sslRegenerateForm.dataset.confirm;
-        // #region agent log
-        fetch("http://127.0.0.1:7651/ingest/de51f7dd-8944-4cce-96c0-4abb1ab8db74", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "81baf0" },
-          body: JSON.stringify({
-            sessionId: "81baf0",
-            runId: "post-fix",
-            hypothesisId: "B",
-            location: "settings.html:ssl-regenerate",
-            message: "confirm handler invoked",
-            data: { hasMsg: Boolean(msg), msgLen: (msg || "").length },
-            timestamp: Date.now(),
-          }),
-        }).catch(() => {});
-        // #endregion
         if (msg && !window.confirm(msg)) {
           event.preventDefault();
         }

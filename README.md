@@ -142,9 +142,9 @@ To enable HTTPS:
 
 1. Sign in as an admin and open **Settings → System Settings → SSL Certificate**.
 2. Either:
-   - **Upload PEM certificate** — provide an unencrypted PEM private key and a matching PEM certificate (concatenate any chain intermediates after the leaf certificate in the same file). The app validates the key/cert pair, rejects mismatched or expired material, and writes `server.key` / `server.crt` atomically into `APP_SSL_DIR`.
+   - **Upload Certificate** — provide an unencrypted PEM private key and a matching PEM certificate (concatenate any chain intermediates after the leaf certificate in the same file). The app validates the key/cert pair, rejects mismatched or expired material, and writes `server.key` / `server.crt` atomically into `APP_SSL_DIR`.
    - **Create self-signed certificate** — generate an RSA-2048 self-signed certificate (valid 825 days) using the configured App DNS Name as the Common Name and as a DNS SAN, plus `localhost`. Requires the `openssl` command on PATH (installed in the provided Dockerfile; install separately for local dev).
-3. Tick **Enable HTTPS listener** and **Save**.
+3. Tick **Enable HTTPS** and **Save**.
 4. Restart the application:
    - Docker: `docker compose restart` (or `up -d` after rebuild).
    - Local: stop and re-run `python -m src.ssl_certs serve`.
@@ -398,24 +398,3 @@ Invoke-RestMethod -Method GET `
 ## License
 
 This project is licensed under the **MIT License with the Commons Clause**. The full license text is in [LICENSE.md](LICENSE.md).
-
-## SSL, Let's Encrypt, and Restarts
-
-Settings -> System Settings -> SSL Certificate can install uploaded PEM files,
-self-signed certificates, or Let's Encrypt certificates. Let's Encrypt supports
-DNS-01 and HTTP-01 challenge state, stores renewal settings in the database, and
-only attempts background renewal when the installed certificate source is
-`letsencrypt`. Optional scheduled restart defers applying a renewed certificate
-until a configured time of day, but only after a background renewal has occurred
-(not on a fixed daily schedule).
-
-Listener mode and TLS files are loaded when the application starts. When SSL
-settings or certificate material changes, a Restart Application button appears
-on authenticated pages for users with `system.update`. In Docker Compose this
-sends `SIGTERM`; `restart: unless-stopped` starts the container again. Bare
-uvicorn runs need a supervisor, systemd, or a manual restart.
-
-HTTP-01 validation requires Let's Encrypt to reach
-`/.well-known/acme-challenge/{token}` on port 80, either directly or through a
-reverse proxy. DNS-01 can create `_acme-challenge` TXT records automatically
-when a configured DNS zone is selected.

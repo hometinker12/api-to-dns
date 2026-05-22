@@ -2530,6 +2530,8 @@ def settings_letsencrypt_config(
     renew_before_expiry_days: int = Form(letsencrypt.DEFAULT_RENEW_BEFORE_DAYS),
     scheduled_restart_enabled: Optional[str] = Form(None),
     scheduled_restart_time: str = Form(letsencrypt.DEFAULT_SCHEDULED_RESTART_TIME),
+    auto_renew_enabled: Optional[str] = Form(None),
+    config_notice: str = Form(""),
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
     try:
@@ -2547,10 +2549,18 @@ def settings_letsencrypt_config(
                 renew_before_expiry_days=renew_before_expiry_days,
                 scheduled_restart_enabled=scheduled_restart_enabled is not None,
                 scheduled_restart_time=scheduled_restart_time,
+                auto_renew_enabled=auto_renew_enabled is not None,
             )
     except LetsEncryptError as exc:
         return render_settings(request, user, "system_settings", message=str(exc), message_kind="error", section="ssl_certificate")
-    return render_settings(request, user, "system_settings", message="Let's Encrypt settings saved.", section="ssl_certificate")
+    notice = (config_notice or "").strip()
+    if notice == "auto_renew_on":
+        message = "Automatic certificate renewal was turned on."
+    elif notice == "auto_renew_off":
+        message = "Automatic certificate renewal was turned off."
+    else:
+        message = "Let's Encrypt settings saved."
+    return render_settings(request, user, "system_settings", message=message, section="ssl_certificate")
 
 
 @app.get("/.well-known/acme-challenge/{token}", response_class=PlainTextResponse, include_in_schema=False)
