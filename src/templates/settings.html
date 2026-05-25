@@ -591,15 +591,20 @@
             </p>
             {% if le_enrollment %}
               <div class="alert warning">
-                Enrollment is waiting for validation.
+                <p>Enrollment is waiting for validation.</p>
                 {% if le_enrollment.manual %}
                   {% if le_enrollment.manual.type == "dns-01" %}
-                    Create TXT record <code>{{ le_enrollment.manual.name }}</code> with value
-                    <code>{{ le_enrollment.manual.value }}</code>, then continue.
+                    {% for ch in le_enrollment.manual.challenges or [le_enrollment.manual] %}
+                      <p>Create TXT record <code>{{ ch.name }}</code> with value <code>{{ ch.value }}</code>.</p>
+                    {% endfor %}
+                  {% elif le_enrollment.manual.type == "http-01" %}
+                    {% for ch in le_enrollment.manual.challenges or [le_enrollment.manual] %}
+                      <p>Serve <code>{{ ch.response }}</code> at <code>{{ ch.url }}</code>.</p>
+                    {% endfor %}
                   {% else %}
-                    Serve <code>{{ le_enrollment.manual.response }}</code> at
-                    <code>{{ le_enrollment.manual.url }}</code>, then continue.
+                    <p>Serve <code>{{ le_enrollment.manual.response }}</code> at <code>{{ le_enrollment.manual.url }}</code>.</p>
                   {% endif %}
+                  <p>Then continue enrollment below.</p>
                 {% endif %}
               </div>
               <div class="action-cell">
@@ -613,7 +618,14 @@
             {% endif %}
             {% set le_installed = ssl.metadata and ssl.metadata.source == ssl.source_letsencrypt %}
             {% if le_installed %}
+              {% set auto_renew_allowed = le.auto_renew_allowed %}
               {% set auto_renew_enabled = le_config.auto_renew_enabled is not sameas false %}
+              {% if auto_renew_enabled and not auto_renew_allowed %}
+                <div class="alert warning">
+                  Automatic certificate renewal is enabled but not available while DNS-01 challenge uses Manual DNS instructions.
+                  Disable auto-renew or select an automated DNS challenge zone below.
+                </div>
+              {% endif %}
               {% if auto_renew_enabled %}
                 <form action="/settings/system/ssl-letsencrypt/config" method="post" class="le-auto-renew-disable">
                   <input type="hidden" name="email" value="{{ le_config.email or '' }}" />
@@ -631,9 +643,17 @@
                   <input type="hidden" name="config_notice" value="auto_renew_off" />
                   <button type="submit">Disable Auto Certificate Renewal</button>
                 </form>
-                {% if le.renewal_hint %}
+                {% if le.renewal_hint and auto_renew_allowed %}
                   <p class="help">Renewal will be attempted around <strong>{{ le.renewal_hint }}</strong>.</p>
                 {% endif %}
+                {% if le_config.challenge_type == 'http-01' %}
+                <div class="alert warning">
+                  Automatic renewal over HTTP-01 requires thhis server to be reachable from the internet, with HTTP
+                  requests redirected to HTTPS via an external web proxy to the challenge endpoint at
+                  <code>https://{{ ssl.app_dns_name }}/.well-known/acme-challenge/*</code>.
+                </div>
+              {% endif %}
+                {% if auto_renew_allowed %}
                 <details class="plugin-fields">
                   <summary>Auto Renew Settings</summary>
                   <form action="/settings/system/ssl-letsencrypt/config" method="post">
@@ -663,7 +683,9 @@
                     <button type="submit">Save</button>
                   </form>
                 </details>
+                {% endif %}
               {% else %}
+                {% if auto_renew_allowed %}
                 <form action="/settings/system/ssl-letsencrypt/config" method="post" class="le-auto-renew-enable">
                   <input type="hidden" name="email" value="{{ le_config.email or '' }}" />
                   <input type="hidden" name="root_dns_domain" value="{{ le_config.root_dns_domain or '' }}" />
@@ -681,7 +703,11 @@
                   <input type="hidden" name="config_notice" value="auto_renew_on" />
                   <button type="submit">Enable Auto Certificate Renewal</button>
                 </form>
+                {% else %}
+                  <p class="help">Automatic certificate renewal requires an automated DNS challenge zone (not Manual DNS instructions), or use HTTP challenge.</p>
+                {% endif %}
               {% endif %}
+
 
               <details class="plugin-fields">
                 <summary>Re-enroll with Let's Encrypt</summary>
@@ -1274,10 +1300,13 @@
       const leRootDnsInput = document.getElementById("le-root-dns-domain");
 
       function syncLeZoneField() {
-        if (!leZoneField) {
-          return;
+        const isHttp = leChallengeSelect?.value === "http-01";
+        if (leZoneField) {
+          leZoneField.hidden = isHttp;
         }
-        leZoneField.hidden = leChallengeSelect?.value === "http-01";
+        if (isHttp && leZoneSelect) {
+          leZoneSelect.value = "";
+        }
       }
 
       function syncLeRootDnsDomain() {

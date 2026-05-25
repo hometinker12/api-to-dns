@@ -2340,13 +2340,17 @@ def _le_start_form_kwargs(
     }
 
 
+def _le_issued_message(db, config: Dict[str, Any]) -> str:
+    message = "Let's Encrypt certificate installed. Restart the application to use it."
+    message += letsencrypt.http_auto_renew_notice(db, config)
+    return message
+
+
 def _apply_le_start_result(db, result: Dict[str, Any], *, user: str) -> tuple[str, str]:
     if result.get("status") == "issued":
         mark_restart_required(db, reason="Let's Encrypt certificate installed.")
-        return (
-            "Let's Encrypt certificate installed. Restart the application to use it.",
-            "warning",
-        )
+        config = result.get("config") or {}
+        return (_le_issued_message(db, config), "warning")
     return (
         "Let's Encrypt enrollment started. Complete the challenge, then continue enrollment.",
         "success",
@@ -2570,11 +2574,13 @@ def settings_letsencrypt_continue(request: Request, user: str = Depends(require_
             )
     except LetsEncryptError as exc:
         return render_settings(request, user, "system_settings", message=str(exc), message_kind="error", section="ssl_certificate")
+    with SessionLocal() as db:
+        issued_message = _le_issued_message(db, config)
     return render_settings(
         request,
         user,
         "system_settings",
-        message="Let's Encrypt certificate installed. Restart the application to use it.",
+        message=issued_message,
         message_kind="warning",
         section="ssl_certificate",
     )
@@ -2609,6 +2615,15 @@ def settings_letsencrypt_config(
     try:
         with SessionLocal() as db:
             existing = letsencrypt.get_config(db) or {}
+            challenge = challenge_type or existing.get("challenge_type", letsencrypt.CHALLENGE_DNS)
+            zone_id_val = int(zone_id) if str(zone_id).strip() else existing.get("zone_id")
+            if challenge == letsencrypt.CHALLENGE_HTTP:
+                zone_id_val = None
+            if notice == "auto_renew_on" and not letsencrypt.auto_renew_supported(challenge, zone_id_val):
+                raise LetsEncryptError(
+                    "Automatic certificate renewal requires an automated DNS challenge zone "
+                    "(not Manual DNS instructions)."
+                )
             letsencrypt.save_config(
                 db,
                 email=email or existing.get("email", ""),

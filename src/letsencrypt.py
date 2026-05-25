@@ -512,13 +512,20 @@ def _challenge_token(challb: Any) -> str:
     return str(token or "")
 
 
+def _acme_challenge_not_offered_error(challenge_type: str, domain: str) -> LetsEncryptError:
+    message = f"ACME server did not offer {challenge_type} for {domain}."
+    if challenge_type == CHALLENGE_HTTP:
+        message += " DNS challenge must be used for domains previously validated with DNS-01."
+    return LetsEncryptError(message)
+
+
 def _order_challenges(order_resource: Any, account_jwk: Any, challenge_type: str) -> List[Dict[str, Any]]:
     selected: List[Dict[str, Any]] = []
     for authz in order_resource.authorizations:
         domain = str(authz.body.identifier.value)
         challb = next((body for body in authz.body.challenges if _challenge_type(body) == challenge_type), None)
         if challb is None:
-            raise LetsEncryptError(f"ACME server did not offer {challenge_type} for {domain}.")
+            raise _acme_challenge_not_offered_error(challenge_type, domain)
         validation = challb.validation(account_jwk)
         challenge: Dict[str, Any] = {
             "domain": domain,
@@ -595,6 +602,23 @@ def _acme_finalize_order(enrollment: Dict[str, Any]) -> Dict[str, bytes]:
         raise LetsEncryptError(f"Failed to finalize ACME order: {exc}") from exc
 
 
+def auto_renew_supported(challenge_type: str, zone_id: Optional[int]) -> bool:
+    if challenge_type == CHALLENGE_HTTP:
+        return True
+    return bool(zone_id)
+
+
+def http_auto_renew_notice(db, config: Dict[str, Any]) -> str:
+    if config.get("challenge_type") != CHALLENGE_HTTP:
+        return ""
+    app_dns_name = get_app_dns_name(db)
+    return (
+        " For automatic renewal over HTTP-01 to work, the API server must be accessible from the "
+        "internet and HTTP requests must be redirected to HTTPS via an external web proxy to "
+        f"https://{app_dns_name}/.well-known/acme-challenge/*."
+    )
+
+
 def save_config(
     db,
     *,
@@ -608,9 +632,15 @@ def save_config(
     renew_before_expiry_days: Any = DEFAULT_RENEW_BEFORE_DAYS,
     scheduled_restart_enabled: bool = True,
     scheduled_restart_time: str = DEFAULT_SCHEDULED_RESTART_TIME,
-    auto_renew_enabled: bool = True,
+    auto_renew_enabled: Optional[bool] = None,
 ) -> Dict[str, Any]:
     challenge = challenge_type if challenge_type in {CHALLENGE_DNS, CHALLENGE_HTTP} else CHALLENGE_DNS
+    if challenge == CHALLENGE_HTTP:
+        zone_id = None
+    if auto_renew_enabled is None:
+        auto_renew_enabled = challenge != CHALLENGE_HTTP and auto_renew_supported(challenge, zone_id)
+    elif not auto_renew_supported(challenge, zone_id):
+        auto_renew_enabled = False
     schedule_time = scheduled_restart_time if _valid_time(scheduled_restart_time) else DEFAULT_SCHEDULED_RESTART_TIME
     root = _normalize_hostname(root_dns_domain)
     cn = _normalize_hostname(common_name) or _normalize_hostname(get_app_dns_name(db))
@@ -837,6 +867,8 @@ def maybe_renew_certificate(db) -> Optional[Dict[str, Any]]:
         return None
     if not config.get("auto_renew_enabled", True):
         return None
+    if not auto_renew_supported(config.get("challenge_type", CHALLENGE_DNS), config.get("zone_id")):
+        return None
     renew_days = validate_renew_before_days(
         config.get("renew_before_expiry_days") or os.getenv("LETSENCRYPT_RENEW_DAYS") or DEFAULT_RENEW_BEFORE_DAYS
     )
@@ -855,8 +887,9 @@ def config_view(db) -> Dict[str, Any]:
     metadata = cert_metadata()
     renewal_hint = ""
     auto_renew_enabled = config.get("auto_renew_enabled", True)
+    auto_renew_allowed = auto_renew_supported(config.get("challenge_type", CHALLENGE_DNS), config.get("zone_id"))
     not_after = metadata.get("not_after") if metadata else None
-    if auto_renew_enabled and isinstance(not_after, datetime):
+    if auto_renew_allowed and auto_renew_enabled and isinstance(not_after, datetime):
         days = validate_renew_before_days(config.get("renew_before_expiry_days") or DEFAULT_RENEW_BEFORE_DAYS)
         renewal_hint = (not_after - timedelta(days=days)).date().isoformat()
     return {
@@ -868,6 +901,7 @@ def config_view(db) -> Dict[str, Any]:
         "enrollment": get_enrollment(db),
         "renew_options": RENEW_OPTIONS,
         "renewal_hint": renewal_hint,
+        "auto_renew_allowed": auto_renew_allowed,
         "zones": [
             {
                 "id": z.id,

@@ -346,6 +346,162 @@ def test_save_config_persists_auto_renew_disabled() -> None:
         assert reloaded["auto_renew_enabled"] is False
 
 
+def test_acme_http_not_offered_error_includes_dns_hint() -> None:
+    err = letsencrypt._acme_challenge_not_offered_error("http-01", "api.example.com")
+    assert "did not offer http-01 for api.example.com" in str(err)
+    assert "DNS challenge must be used" in str(err)
+
+
+def test_acme_dns_not_offered_error_omits_dns_hint() -> None:
+    err = letsencrypt._acme_challenge_not_offered_error("dns-01", "api.example.com")
+    assert "did not offer dns-01 for api.example.com" in str(err)
+    assert "DNS challenge must be used" not in str(err)
+
+
+def test_auto_renew_supported() -> None:
+    assert letsencrypt.auto_renew_supported(letsencrypt.CHALLENGE_HTTP, None) is True
+    assert letsencrypt.auto_renew_supported(letsencrypt.CHALLENGE_HTTP, 1) is True
+    assert letsencrypt.auto_renew_supported(letsencrypt.CHALLENGE_DNS, 1) is True
+    assert letsencrypt.auto_renew_supported(letsencrypt.CHALLENGE_DNS, None) is False
+
+
+def test_save_config_manual_dns_coerces_auto_renew_off() -> None:
+    _ensure_db()
+    with SessionLocal() as db:
+        config = letsencrypt.save_config(
+            db,
+            **_sample_config_kwargs(challenge_type=letsencrypt.CHALLENGE_DNS, zone_id=None),
+        )
+        assert config["auto_renew_enabled"] is False
+        assert config["zone_id"] is None
+
+
+def test_save_config_http_defaults_auto_renew_off() -> None:
+    _ensure_db()
+    with SessionLocal() as db:
+        config = letsencrypt.save_config(db, **_sample_config_kwargs())
+        assert config["challenge_type"] == letsencrypt.CHALLENGE_HTTP
+        assert config["auto_renew_enabled"] is False
+
+
+def test_save_config_http_can_enable_auto_renew() -> None:
+    _ensure_db()
+    with SessionLocal() as db:
+        config = letsencrypt.save_config(db, **_sample_config_kwargs(), auto_renew_enabled=True)
+        assert config["auto_renew_enabled"] is True
+
+
+def test_http_auto_renew_notice_includes_app_dns_name(monkeypatch) -> None:
+    monkeypatch.setattr(letsencrypt, "get_app_dns_name", lambda _db: "api.example.com")
+    _ensure_db()
+    with SessionLocal() as db:
+        notice = letsencrypt.http_auto_renew_notice(
+            db,
+            {"challenge_type": letsencrypt.CHALLENGE_HTTP},
+        )
+        assert "internet" in notice
+        assert "https://api.example.com/.well-known/acme-challenge/*" in notice
+        assert letsencrypt.http_auto_renew_notice(db, {"challenge_type": letsencrypt.CHALLENGE_DNS}) == ""
+
+
+def test_save_config_http_clears_zone_id() -> None:
+    _ensure_db()
+    with SessionLocal() as db:
+        row = _le_zone_row(db, zone_name="le-http-clear-zone")
+        config = letsencrypt.save_config(
+            db,
+            **_sample_config_kwargs(challenge_type=letsencrypt.CHALLENGE_HTTP, zone_id=int(row.id)),
+        )
+        assert config["zone_id"] is None
+
+
+def test_start_enrollment_http_pauses_at_awaiting_manual(monkeypatch) -> None:
+    finalized = False
+
+    def finalize(_enrollment):
+        nonlocal finalized
+        finalized = True
+        return {}
+
+    monkeypatch.setattr(letsencrypt, "_acme_finalize_order", finalize)
+    monkeypatch.setattr(
+        letsencrypt,
+        "_acme_prepare_order",
+        lambda _config: {
+            "challenges": [
+                {
+                    "domain": "api.example.com",
+                    "token": "tok1",
+                    "key_authorization": "tok1.auth",
+                    "response": "tok1.auth",
+                }
+            ],
+            "challenge": {"token": "tok1", "key_authorization": "tok1.auth", "response": "tok1.auth"},
+        },
+    )
+    _ensure_db()
+    with SessionLocal() as db:
+        enrollment = letsencrypt.start_enrollment(db, **_sample_config_kwargs())
+        assert enrollment["status"] == "awaiting_manual"
+        assert enrollment["manual"]["type"] == letsencrypt.CHALLENGE_HTTP
+        assert enrollment["manual"]["challenges"]
+        assert letsencrypt.get_enrollment(db) is not None
+    assert finalized is False
+
+
+def test_maybe_renew_certificate_skips_when_auto_renew_not_supported(monkeypatch) -> None:
+    called = False
+
+    def prepare(_config):
+        nonlocal called
+        called = True
+        return {}
+
+    monkeypatch.setattr(letsencrypt, "_acme_prepare_order", prepare)
+    monkeypatch.setattr(letsencrypt, "_read_source", lambda: ssl_certs.SOURCE_LETSENCRYPT)
+    monkeypatch.setattr(
+        letsencrypt,
+        "cert_metadata",
+        lambda: {
+            "source": ssl_certs.SOURCE_LETSENCRYPT,
+            "not_after": datetime.now(timezone.utc) + timedelta(days=10),
+        },
+    )
+    _ensure_db()
+    with SessionLocal() as db:
+        set_setting(
+            db,
+            letsencrypt.SETTING_CONFIG,
+            json.dumps(
+                {
+                    "email": "admin@example.com",
+                    "root_dns_domain": "example.com",
+                    "common_name": "api.example.com",
+                    "subject_alt_names": [],
+                    "challenge_type": letsencrypt.CHALLENGE_DNS,
+                    "zone_id": None,
+                    "staging": True,
+                    "auto_renew_enabled": True,
+                    "renew_before_expiry_days": 30,
+                    "directory_url": letsencrypt.STAGING_DIRECTORY,
+                }
+            ),
+        )
+        assert letsencrypt.maybe_renew_certificate(db) is None
+    assert called is False
+
+
+def test_config_view_exposes_auto_renew_allowed() -> None:
+    _ensure_db()
+    with SessionLocal() as db:
+        letsencrypt.save_config(
+            db,
+            **_sample_config_kwargs(challenge_type=letsencrypt.CHALLENGE_DNS, zone_id=None),
+        )
+        view = letsencrypt.config_view(db)
+        assert view["auto_renew_allowed"] is False
+
+
 def test_maybe_renew_certificate_skips_when_auto_renew_disabled(client: TestClient, monkeypatch) -> None:
     called = False
 

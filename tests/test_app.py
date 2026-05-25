@@ -2494,6 +2494,81 @@ def _le_config_post_data(**overrides) -> dict:
     return data
 
 
+def test_letsencrypt_config_auto_renew_on_rejected_for_manual_dns(client: TestClient) -> None:
+    from src import letsencrypt, ssl_certs
+
+    _clear_ssl_state()
+    with SessionLocal() as db:
+        letsencrypt.save_config(
+            db,
+            email="admin@example.com",
+            root_dns_domain="example.com",
+            common_name="api.example.com",
+            subject_alt_names="api.example.com",
+            challenge_type=letsencrypt.CHALLENGE_DNS,
+            zone_id=None,
+            staging=True,
+            auto_renew_enabled=False,
+        )
+    ssl_certs._write_source(ssl_certs.SOURCE_LETSENCRYPT)
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post(
+        "/settings/system/ssl-letsencrypt/config",
+        data=_le_config_post_data(
+            challenge_type="dns-01",
+            config_notice="auto_renew_on",
+            auto_renew_enabled="on",
+        ),
+    )
+    assert response.status_code == 200
+    assert "not Manual DNS instructions" in response.text
+    with SessionLocal() as db:
+        config = letsencrypt.get_config(db)
+        assert config is not None
+        assert config["auto_renew_enabled"] is False
+
+
+def test_letsencrypt_http_start_shows_awaiting_validation_banner(client: TestClient, monkeypatch) -> None:
+    from src import letsencrypt
+
+    monkeypatch.setattr(
+        letsencrypt,
+        "_acme_prepare_order",
+        lambda _config: {
+            "challenges": [
+                {
+                    "domain": "api.example.com",
+                    "token": "banner-tok",
+                    "key_authorization": "banner-tok.auth",
+                    "response": "banner-tok.auth",
+                }
+            ],
+            "challenge": {
+                "token": "banner-tok",
+                "key_authorization": "banner-tok.auth",
+                "response": "banner-tok.auth",
+            },
+        },
+    )
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post(
+        "/settings/system/ssl-letsencrypt/start",
+        data={
+            "email": "admin@example.com",
+            "root_dns_domain": "example.com",
+            "common_name": "api.example.com",
+            "subject_alt_names": "api.example.com",
+            "challenge_type": "http-01",
+            "staging": "on",
+        },
+    )
+    assert response.status_code == 200
+    assert "Enrollment is waiting for validation" in response.text
+    assert "/.well-known/acme-challenge/" in response.text
+    assert "banner-tok.auth" in response.text
+
+
 def test_letsencrypt_config_notice_auto_renew_on_and_off(client: TestClient) -> None:
     from src import letsencrypt, ssl_certs
 
@@ -2515,14 +2590,18 @@ def test_letsencrypt_config_notice_auto_renew_on_and_off(client: TestClient) -> 
 
     on_response = client.post(
         "/settings/system/ssl-letsencrypt/config",
-        data=_le_config_post_data(config_notice="auto_renew_on", auto_renew_enabled="on"),
+        data=_le_config_post_data(
+            challenge_type="http-01",
+            config_notice="auto_renew_on",
+            auto_renew_enabled="on",
+        ),
     )
     assert on_response.status_code == 200
     assert "Automatic certificate renewal was turned on." in on_response.text
 
     off_response = client.post(
         "/settings/system/ssl-letsencrypt/config",
-        data=_le_config_post_data(config_notice="auto_renew_off"),
+        data=_le_config_post_data(challenge_type="http-01", config_notice="auto_renew_off"),
     )
     assert off_response.status_code == 200
     assert "Automatic certificate renewal was turned off." in off_response.text
@@ -2531,6 +2610,7 @@ def test_letsencrypt_config_notice_auto_renew_on_and_off(client: TestClient) -> 
         config = letsencrypt.get_config(db)
         assert config is not None
         assert config["auto_renew_enabled"] is False
+        assert config["challenge_type"] == letsencrypt.CHALLENGE_HTTP
 
 
 def test_settings_ssl_legacy_section_key_still_redirects(client: TestClient) -> None:

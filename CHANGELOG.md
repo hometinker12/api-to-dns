@@ -26,6 +26,10 @@
 - DNS activity log **message** text for record lookups and mutations now references the provider **`dns_zone`** (e.g. `www.example.com`) instead of the configuration **`zone_name`**. The logged **`zone_name`** attribute on DNS events is unchanged and still stores the configuration identifier; the Activity Log UI column label is **Zone Name**.
 - Admin dashboard DNS zone list shows each configuration as `zone_name` (`dns_zone`).
 - Let's Encrypt enrollment: Root DNS Domain is decoupled from the zone configuration name; DNS-01 automation uses the provider `dns_zone`, and the admin form auto-fills the root domain from the selected API zone.
+- Let's Encrypt auto-renew cannot stay enabled with Manual DNS; saving manual DNS disables it (including manual enrollment start).
+- HTTP-01 enrollment pauses for manual validation with continue-enrollment instructions (including all HTTP challenge URLs in the banner).
+- Let's Encrypt HTTP-01 errors when the ACME server does not offer HTTP for a domain now note that DNS challenge must be used (e.g. after prior DNS-01 validation).
+- HTTP-01 Let's Encrypt enrollment defaults automatic renewal to off; success messaging and the SSL settings page note internet reachability and HTTPS redirect requirements for HTTP auto-renew.
 - `DELETE` requests now use the HTTP `DELETE` verb with query parameters instead of a JSON body.
 - `PUT` requires `ttl`; `PATCH` accepts optional `ttl` and/or `values` and merges omitted fields from the live record.
 
