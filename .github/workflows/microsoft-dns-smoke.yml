@@ -280,7 +280,7 @@ jobs:
             #region agent log
             python3 /tmp/agent-debug-bind-zone.py "${zone}" "${zone_status}" "${zone_body}"
             #endregion agent log
-            if [ "${zone_status}" != "200" ] || ! grep -q "Zone '${zone}' added" "${zone_body}"; then
+            if [ "${zone_status}" != "200" ] || ! { grep -q "Zone '${zone}' added" "${zone_body}" || grep -q "Zone &#39;${zone}&#39; added" "${zone_body}"; }; then
               echo "[bind] Zone create assertion failed for ${zone}; response excerpt:"
               python3 /tmp/agent-print-excerpt.py "${zone_body}"
               exit 1
@@ -761,7 +761,10 @@ jobs:
                 hasLoginForm      = ($zoneResp.Content -match 'name="username"' -and $zoneResp.Content -match 'name="password"')
                 snippet           = $zoneResp.Content.Substring(0, [Math]::Min(500, $zoneResp.Content.Length))
               }
-              if ($zoneResp.StatusCode -ne 200 -or $zoneResp.Content -notmatch "Zone '$([regex]::Escape($z))' added") {
+              if ($zoneResp.StatusCode -ne 200 -or (
+                $zoneResp.Content -notmatch "Zone '$([regex]::Escape($z))' added" -and
+                $zoneResp.Content -notmatch "Zone &#39;$([regex]::Escape($z))&#39; added"
+              )) {
                 Write-Host "[microsoft-local] Zone create response excerpt:"
                 Write-Host $zoneResp.Content.Substring(0, [Math]::Min(1200, $zoneResp.Content.Length))
                 throw "Zone create failed for ${z}: HTTP $($zoneResp.StatusCode)"
@@ -853,7 +856,10 @@ jobs:
                   hasLoginForm      = ($zoneResp.Content -match 'name="username"' -and $zoneResp.Content -match 'name="password"')
                   snippet           = $zoneResp.Content.Substring(0, [Math]::Min(500, $zoneResp.Content.Length))
                 }
-                if ($zoneResp.StatusCode -ne 200 -or $zoneResp.Content -notmatch "Zone '$([regex]::Escape($z))' added") {
+                if ($zoneResp.StatusCode -ne 200 -or (
+                  $zoneResp.Content -notmatch "Zone '$([regex]::Escape($z))' added" -and
+                  $zoneResp.Content -notmatch "Zone &#39;$([regex]::Escape($z))&#39; added"
+                )) {
                   Write-Host "[microsoft-remote] Zone create response excerpt:"
                   Write-Host $zoneResp.Content.Substring(0, [Math]::Min(1200, $zoneResp.Content.Length))
                   throw "Remote zone create failed for ${z}: HTTP $($zoneResp.StatusCode)"
