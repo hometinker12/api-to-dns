@@ -2,23 +2,34 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-26
+
 ### Added
 
+- **Cloudflare DNS** provider plugin (API v4 token auth): A, AAAA, CNAME, and TXT records; optional zone ID; optional **Proxied** (orange cloud) for A/AAAA/CNAME.
+- **Activity logging**: searchable database audit trail (auth, API keys, users, DNS zones, plugins, DNS API, alerts, SSL/Let's Encrypt); configurable level (`verbose` / `informational` / `warning` / `error`); security events always stored; retention presets with automatic cleanup.
+- **Email alerting**: rules matched against activity events (type, category, level, text search, cooldown); SMTP with ordered server failover; placeholder tokens in subject/body; redaction of secrets in stored details and alert email.
+- **System settings** sections: App DNS Name, SSL Certificate, SMTP Delivery, Logging Level, Audit Log Retention, Operational Log Rotation (syslog forwarding remains planned).
+- **SSL/TLS for the admin app**: optional HTTPS via uploaded PEM key/cert or self-signed generation (`openssl`); cert storage under `APP_SSL_DIR`; HTTP (`HTTP_PORT`, default 8000) or HTTPS (`TLS_PORT`, default 8443); restart required to switch listeners; dedicated Docker volume for cert material.
+- **Let's Encrypt**: DNS-01 (automated via configured zone plugins, including Cloudflare TXT) and HTTP-01; staging toggle; async enrollment with progress UI; auto-renew with configurable lead time and scheduled restart window; graceful shutdown hook for renewal restarts.
+- **DNS zone (domain)** field on each DNS provider plugin (Azure, BIND, Microsoft, Cloudflare), stored in zone configuration. The unique **zone configuration name** and API `zone_name` are separate from the provider domain, so multiple configurations can target the same DNS zone with different providers.
 - **`dns_zone`** on public API responses: the provider DNS zone domain (e.g. `example.com`) is returned alongside **`zone_name`** (the zone configuration identifier used in requests).
   - `GET /zones` (`DnsZoneSummary`): `id`, `zone_name`, `dns_zone`
   - `GET /dns-record` (`DnsRecordGetResponse`): `dns_zone` at the response envelope (not inside each `records[]` item)
   - `POST` / `PUT` / `PATCH` / `DELETE /dns-record` (`DnsRecordResponse`): `dns_zone` on success and error bodies (409, 404)
 - Request bodies for `/dns-record` mutations are unchanged; clients still send **`zone_name`** only. `dns_zone` is derived server-side from the zone configuration.
-- **DNS zone (domain)** field on each DNS provider plugin (Azure, BIND, Microsoft, Cloudflare), stored in zone configuration. The unique **zone configuration name** and API `zone_name` are separate from the provider domain, so multiple configurations can target the same DNS zone with different providers.
 - SSL Certificate page audit logging: all certificate and Let's Encrypt actions emit `system.ssl_*` activity events at WARNING level in the security category.
 - RESTful `/dns-record` resource: `GET`, `POST` (create), `PUT` (full replace), `PATCH` (partial update with merge), and `DELETE` (remove) on a single path.
 - Pre-flight `get_record` existence check on every mutation. `POST` returns **409** `record_already_exists` when the record type already exists; `PUT`/`PATCH`/`DELETE` return **404** `not_found` when the record type is missing.
 - Public Pydantic request schemas (`DnsRecordCreateRequest`, `DnsRecordReplaceRequest`, `DnsRecordPatchRequest`) documented in OpenAPI; `DELETE` uses query parameters (`zone_name`, `record_name`, `record_type`).
 - New activity event `dns.record_already_exists` emitted on 409 conflicts; existing `dns.record_not_found` event now fires on 404 across `PUT`/`PATCH`/`DELETE`.
 - `GET /dns-record` returns a `records` array; each found record includes `record_name`, `record_type`, `ttl`, and `values` when available from the provider.
+- **Docker Compose**: container health check; persistent volumes for data, SSL certs, and operational logs; `DATABASE_URL` and `LOG_FILE` defaults; published port **8443** for TLS.
 
 ### Changed
 
+- **Session idle timeout** extended from 5 minutes to **15 minutes** (sliding renewal on authenticated web activity).
+- **Settings** areas: Log Viewing / Searching, Email Alerting, and structured System Settings subsections.
 - DNS zone delete and API key revoke use restart-style confirmation dialogs with contextual details (API keys per zone / Let's Encrypt warning; zones per key / last used).
 - API key “last used” on the revoke dialog now includes successful DNS lookups that return no matching record (`dns.record_lookup` with status `not_found`), not only mutations and lookups that found records.
 - `GET /zones` with an API key now emits a `dns.zones_list` activity event so zone listing counts toward last used.

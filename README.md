@@ -1,9 +1,34 @@
 # DNS REST Service
 
-[![License: MIT + Commons Clause](https://img.shields.io/badge/License-MIT%20+%20Commons%20Clause-orange)](LICENSE.md) [![Release](https://img.shields.io/badge/release-0.3.4-blue)](VERSION) [![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/) [![Python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/) [![AI Assisted](https://img.shields.io/badge/AI%20Assisted-yes-blue)](https://cursor.com)
+[![License: MIT + Commons Clause](https://img.shields.io/badge/License-MIT%20+%20Commons%20Clause-orange)](LICENSE.md) [![Release](https://img.shields.io/badge/release-0.5.0-blue)](VERSION) [![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/) [![Python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/) [![AI Assisted](https://img.shields.io/badge/AI%20Assisted-yes-blue)](https://cursor.com)
 
 
-A Dockerized FastAPI service to manage DNS records through a protected admin web UI and secure API key authentication. 
+A Dockerized FastAPI service to manage DNS records through a protected admin web UI and secure API key authentication.
+
+## Table of Contents
+
+- [Supported Backend DNS Providers](#supported-backend-dns-providers)
+- [Features](#features)
+- [Getting Started](#getting-started)
+  - [Prerequisites](#prerequisites)
+  - [Quick start](#quick-start)
+- [Configuration](#configuration)
+  - [Generating the ENCRYPTION_KEY](#generating-the-encryption_key)
+- [Admin UI](#admin-ui)
+- [Activity Logs, Operational Logs, And Alerts](#activity-logs-operational-logs-and-alerts)
+  - [Logging Level And Retention](#logging-level-and-retention)
+  - [Email Alerting](#email-alerting)
+  - [Planned Infrastructure Settings](#planned-infrastructure-settings)
+  - [Optional: HTTPS with self-signed or uploaded certificates](#optional-https-with-self-signed-or-uploaded-certificates)
+  - [Local development (HTTP or HTTPS)](#local-development-http-or-https)
+  - [Logging Security](#logging-security)
+- [API Usage](#api-usage)
+  - [Create a new A record (`POST`)](#create-a-new-a-record-post)
+  - [Replace an existing record (`PUT`)](#replace-an-existing-record-put)
+  - [Partial update (`PATCH`)](#partial-update-patch)
+  - [Delete a record (`DELETE`)](#delete-a-record-delete)
+  - [Look up records (`GET`)](#look-up-records-get)
+- [License](#license)
 
 ## Supported Backend DNS Providers
 - **Azure DNS**
@@ -71,13 +96,11 @@ Create a `.env` file using `.env.example` and configure the following values:
 | `SSL_ENABLED`    | Optional override of the DB `ssl_enabled` toggle (`0`/`1`); used by tests and local dev           |
 
 
-**Azure DNS** (per zone): tenant ID, client ID, client secret, and optional default subscription and resource group are stored on that zone’s row in **DNS zones** (encrypted). They are **not** read from `AZURE_`* environment variables.
-
-**Cloudflare DNS** (per zone): scoped **API token** (Zone → DNS → Read **and** Edit on the target zone), an optional zone ID (skips the zone name lookup when set), and an optional **Proxied** checkbox (orange-cloud on created or updated A, AAAA, and CNAME records) are stored on that zone’s row in **DNS zones** (encrypted). Cloudflare ignores the **Target DNS Server** and TSIG settings.
-
 ### Generating the ENCRYPTION_KEY
 
-The `ENCRYPTION_KEY` must be a 32-byte URL-safe base64-encoded key for Fernet encryption. You can generate one using Python:
+The `ENCRYPTION_KEY` must be a 32-byte URL-safe base64-encoded key for Fernet encryption. Generate one with Python or PowerShell and set it in your `.env` file.
+
+**Python (Linux, macOS, or Windows):**
 
 ```bash
 # Using Python
@@ -91,7 +114,19 @@ print(f'ENCRYPTION_KEY={key}')
 "
 ```
 
-**Important:** Never use the placeholder value `change-me-before-production` in production. Always generate a unique key for each deployment.
+On Windows, use `python` instead of `python3` if that is how Python is installed.
+
+**PowerShell (native, no Python required):**
+
+```powershell
+$bytes = New-Object byte[] 32
+$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+$rng.GetBytes($bytes)
+$rng.Dispose()
+$key = [Convert]::ToBase64String($bytes).Replace('+', '-').Replace('/', '_')
+Write-Output "ENCRYPTION_KEY=$key"
+```
+**Important:** Never use the placeholder value `change-me-before-production` in production. Always generate a unique key for each deployment. If you change `ENCRYPTION_KEY` after data is stored, existing encrypted credentials in the database cannot be decrypted.
 
 ## Admin UI
 
