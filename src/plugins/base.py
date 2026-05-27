@@ -14,6 +14,14 @@ class PluginField:
     preserve_on_blank: bool = False
 
 
+DNS_ZONE_DOMAIN_FIELD = PluginField(
+    "dns_zone",
+    "DNS zone (domain)",
+    placeholder="example.com",
+    help="DNS zone managed at the provider (e.g. example.com). Required for record operations.",
+)
+
+
 @dataclass(frozen=True)
 class DnsProviderPlugin:
     key: str

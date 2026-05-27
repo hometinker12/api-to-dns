@@ -7,16 +7,10 @@
 </head>
 <body>
   <div class="page page-wide">
-    <header class="page-header">
-      <div>
-        <h1>api-to-dns App Settings</h1>
-        <p class="help">Signed in as {{ user }}</p>
-      </div>
-      <nav class="nav-links">
-        <a class="button" href="/admin">Dashboard</a>
-        <a class="button danger" href="/logout">Logout</a>
-      </nav>
-    </header>
+    {% set page_title = "api-to-dns App Settings" %}
+    {% set page_help = "Signed in as " ~ user %}
+    {% set page_links = [] %}
+    {% include "_page_header.html" %}
 
     {% if message %}
       <div class="alert {{ message_kind or 'success' }}">{{ message }}</div>
@@ -32,12 +26,33 @@
         <div class="settings-sidebar-title">Settings</div>
         <nav class="settings-menu">
           {% for area in accessible_areas %}
-            <a
-              class="settings-menu-item {% if area.key == selected_area %}selected{% endif %}"
-              href="/settings?area={{ area.key }}"
-            >
-              {{ area.label }}
-            </a>
+            {% if area.key == "system_settings" %}
+              <a
+                class="settings-menu-item has-submenu {% if selected_area == 'system_settings' %}selected{% endif %}"
+                href="/settings?area=system_settings&section={{ selected_system_section }}"
+              >
+                {{ area.label }}
+              </a>
+              {% if selected_area == "system_settings" %}
+                <nav class="settings-submenu" aria-label="System Settings sections">
+                  {% for section in system_settings_sections %}
+                    <a
+                      class="settings-submenu-item {% if section.key == selected_system_section %}selected{% endif %}"
+                      href="/settings?area=system_settings&section={{ section.key }}"
+                    >
+                      {{ section.label }}
+                    </a>
+                  {% endfor %}
+                </nav>
+              {% endif %}
+            {% else %}
+              <a
+                class="settings-menu-item {% if area.key == selected_area %}selected{% endif %}"
+                href="/settings?area={{ area.key }}"
+              >
+                {{ area.label }}
+              </a>
+            {% endif %}
           {% endfor %}
         </nav>
       </aside>
@@ -333,12 +348,747 @@
             <div class="alert">No plugins discovered.</div>
           {% endif %}
 
-        {% elif selected_area == "logging" %}
-          <h2>Activity Logging</h2>
-          <div class="placeholder-panel">
-            <p>Activity and audit logging is planned but not implemented yet.</p>
-            <p class="help">When delivered, this area will let you review session sign-ins, DNS record changes, API key activity, and other notable events.</p>
-          </div>
+        {% elif selected_area == "system_settings" %}
+          {% set sys = system_settings_view %}
+          <h2>System Settings</h2>
+          <p class="help">Service-wide infrastructure configuration. SMTP credentials and other secrets are encrypted at rest.</p>
+
+          {% if selected_system_section == "system_identity" %}
+          <section class="form-card">
+            <h2>App DNS Name</h2>
+            <p class="help">Used as <code>{system_dns_name}</code> in email alert templates. Default is <code>apitodns.local</code> in Docker or the host name on a bare-metal install. System IP is still auto-detected.</p>
+            <form action="/settings/system/app-dns-name" method="post">
+              <input type="hidden" name="redirect_section" value="system_identity" />
+              <label>App DNS name
+                <input type="text" name="app_dns_name" value="{{ sys.identity.system_dns_name }}" {% if not can_system_update %}disabled{% endif %} required />
+              </label>
+              
+            <label>System IP address
+              <input type="text" value="{{ sys.identity.system_ip_address }}" disabled readonly />
+            </label>
+            <p class="help">Populates <code>{system_ip_address}</code> in alert templates.</p>
+              {% if can_system_update %}
+                <button type="submit">Save</button>
+              {% endif %}
+            </form>
+          </section>
+
+          {% elif selected_system_section == "logging_configuration" %}
+          <section class="form-card">
+            <h2>Logging Configuration</h2>
+            <p class="help">Storage threshold for non-security activity events. <code>verbose</code> records every page request and API call; security-category events are always logged.</p>
+            <form action="/settings/system/log-level" method="post">
+              <input type="hidden" name="redirect_area" value="system_settings" />
+              <input type="hidden" name="redirect_section" value="logging_configuration" />
+              <label>Activity Log Level
+                <select name="log_level" {% if not can_system_update %}disabled{% endif %}>
+                  {% for option in sys.log_levels %}
+                    <option value="{{ option }}" {% if sys.log_level == option %}selected{% endif %}>{{ option|lower }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              {% if can_system_update %}
+                <button type="submit">Save</button>
+              {% endif %}
+            </form>
+          </section>
+
+          {% elif selected_system_section == "audit_log_retention" %}
+          <section class="form-card">
+            <h2>Audit Log Retention</h2>
+            <p class="help">Activity log rows older than this window are deleted by a daily cleanup job.</p>
+            <form action="/settings/system/retention" method="post">
+              <input type="hidden" name="redirect_section" value="audit_log_retention" />
+              <label>Retention days
+                <select name="retention_days" {% if not can_system_update %}disabled{% endif %}>
+                  {% for option in sys.retention_options %}
+                    <option value="{{ option.value }}" {% if sys.retention_days == option.value %}selected{% endif %}>{{ option.label }}</option>
+                  {% endfor %}
+                  {% if sys.retention_days not in (sys.retention_options | map(attribute='value') | list) %}
+                    <option value="{{ sys.retention_days }}" selected>{{ sys.retention_days }} days (custom)</option>
+                  {% endif %}
+                </select>
+              </label>
+              {% if can_system_update %}
+                <button type="submit">Save</button>
+              {% endif %}
+            </form>
+          </section>
+
+          {% elif selected_system_section == "smtp_delivery" %}
+          <section class="form-card">
+            <h2>SMTP Delivery</h2>
+            <p class="help">SMTP servers are tried in order. Anonymous mode skips authentication entirely.</p>
+            <form action="/settings/system/smtp" method="post">
+              <input type="hidden" name="redirect_section" value="smtp_delivery" />
+              <label>SMTP servers (CSV)
+                <input type="text" name="smtp_servers" value="{{ sys.smtp.servers | join(',') }}" placeholder="smtp1.example.com,192.0.2.25,smtp-backup.example.com" {% if not can_system_update %}disabled{% endif %} />
+              </label>
+              <label>Port
+                <input type="text" name="smtp_port" value="{{ sys.smtp.port }}" {% if not can_system_update %}disabled{% endif %} />
+              </label>
+              <label>Security
+                <select name="smtp_security" {% if not can_system_update %}disabled{% endif %}>
+                  {% for option in ["none", "starttls", "ssl"] %}
+                    <option value="{{ option }}" {% if sys.smtp.security == option %}selected{% endif %}>{{ option }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label class="inline-check">
+                <input type="checkbox" name="smtp_anonymous" id="smtp-anonymous" {% if sys.smtp.anonymous %}checked{% endif %} {% if not can_system_update %}disabled{% endif %} />
+                Anonymous SMTP (no authentication)
+              </label>
+              <label>Username
+                <input type="text" name="smtp_username" id="smtp-username" value="{{ sys.smtp.username }}" {% if not can_system_update %}disabled{% endif %} />
+              </label>
+              <label>Password
+                <input type="password" name="smtp_password" id="smtp-password" placeholder="{% if sys.smtp.password_set %}(unchanged){% else %}(not set){% endif %}" {% if not can_system_update %}disabled{% endif %} />
+              </label>
+              <label>From address
+                <input type="email" name="smtp_from" value="{{ sys.smtp.from_address }}" {% if not can_system_update %}disabled{% endif %} />
+              </label>
+              <label>Timeout (seconds)
+                <input type="text" name="smtp_timeout" value="{{ sys.smtp.timeout }}" {% if not can_system_update %}disabled{% endif %} />
+              </label>
+              {% if can_system_update %}
+                <button type="submit">Save</button>
+              {% endif %}
+            </form>
+          </section>
+
+          {% elif selected_system_section == "operational_log_rotation" %}
+          <section class="form-card">
+            <h2>Operational Log Rotation</h2>
+            <p class="help">Optionally enable a rotating file handler for operational logs on non-Docker installs.</p>
+            {% if sys.is_docker %}
+              <p class="help">Docker stdout/stderr logs are rotated by Docker.</p>
+            {% else %}
+              <form action="/settings/system/log-rotation" method="post">
+                <input type="hidden" name="redirect_section" value="operational_log_rotation" />
+                <label>Log file path (optional)
+                  <input type="text" name="log_file" value="{{ sys.operational_log.log_file }}" placeholder="/var/log/api-to-dns.log" {% if not can_system_update %}disabled{% endif %} />
+                </label>
+                <label>Max file size (bytes)
+                  <input type="text" name="max_bytes" value="{{ sys.operational_log.max_bytes }}" {% if not can_system_update %}disabled{% endif %} />
+                </label>
+                <label>Backup file count
+                  <input type="text" name="backup_count" value="{{ sys.operational_log.backup_count }}" {% if not can_system_update %}disabled{% endif %} />
+                </label>
+                {% if can_system_update %}
+                  <button type="submit">Save</button>
+                {% endif %}
+              </form>
+            {% endif %}
+          </section>
+
+          {% elif selected_system_section == "syslog_planned" %}
+          <section class="form-card">
+            <h2>Syslog Server (planned)</h2>
+            <div class="placeholder-panel">
+              <p>Syslog forwarding is not implemented yet.</p>
+              <p class="help">A future release will add host, port, protocol, facility, and minimum-level fields here.</p>
+            </div>
+          </section>
+
+          {% elif selected_system_section == "ssl_certificate" %}
+          {% set ssl = sys.ssl %}
+          <section class="form-card">
+            <h2>Enable SSL</h2>
+            <p class="help">
+              When enabled, the app listens on HTTPS port <code>{{ ssl.ports.https }}</code> instead of HTTP
+              <code>{{ ssl.ports.http }}</code>. Only one listener runs at a time. Restart after saving to apply.
+            </p>
+            <p>
+              <strong>Access URL:</strong>
+              <code>{{ ssl.access_url }}</code>
+            </p>
+            {% if ssl.enabled and ssl.metadata and ssl.metadata.source == "self_signed" %}
+              <p class="alert warning">Self-signed: browsers will warn until the certificate is trusted on each client.</p>
+            {% endif %}
+            <form action="/settings/system/ssl" method="post" id="ssl-enable-form">
+              <input type="hidden" name="redirect_section" value="ssl_certificate" />
+              <label class="inline-check">
+                <input
+                  type="checkbox"
+                  name="ssl_enabled"
+                  value="on"
+                  {% if ssl.enabled %}checked{% endif %}
+                  {% if not can_system_update %}disabled{% endif %}
+                  {% if not ssl.can_enable_ssl and not ssl.enabled %}disabled{% endif %}
+                />
+                Enable HTTPS
+              </label>
+              {% if not ssl.can_enable_ssl and not ssl.enabled %}
+                <div class="help alert warning">Install a certificate below before enabling SSL.</div>
+              {% elif ssl.cert_exists and not ssl.enabled %}
+                <p class="help">A certificate is installed. Enable SSL and restart to use HTTPS.</p>
+              {% else %}
+                <p class="help">Disabling SSL does not remove existing installed certificates.</p>
+              {% endif %}
+              {% if can_system_update %}
+                <button type="submit">Save</button>
+              {% endif %}
+            </form>
+          </section>
+
+          {% if ssl.cert_exists %}
+          <section class="form-card">
+            <h2>Installed certificate</h2>
+            <dl class="form-meta">
+              <dt>Source</dt>
+              <dd>
+                {% if ssl.metadata.source == "self_signed" %}
+                  <span class="cert-source-badge warning">Self-signed</span>
+                {% elif ssl.metadata.source == ssl.source_letsencrypt %}
+                  <span class="cert-source-badge success">Let's Encrypt</span>
+                {% else %}
+                  <span class="cert-source-badge success">3rd Party - Uploaded</span>
+                {% endif %}
+              </dd>
+              <dt>Common Name</dt>
+              <dd><code>{{ ssl.metadata.common_name or "(none)" }}</code></dd>
+              {% if ssl.metadata.subject_alt_names %}
+                <dt>Subject Alt Names</dt>
+                <dd><code>{{ ssl.metadata.subject_alt_names | join(", ") }}</code></dd>
+              {% endif %}
+              <dt>Expires</dt>
+              <dd>
+                <code>{{ ssl.metadata.not_after_iso }}</code>
+                {% if ssl.metadata.expired %}
+                  <span class="alert error" style="display:inline-block; margin-left:0.5rem;">Expired</span>
+                {% endif %}
+              </dd>
+              <dt>SHA-256 fingerprint</dt>
+              <dd><code>{{ ssl.metadata.fingerprint }}</code></dd>
+              <dt>Key file</dt>
+              <dd><code>{{ ssl.key_path }}</code></dd>
+              <dt>Cert file</dt>
+              <dd><code>{{ ssl.cert_path }}</code></dd>
+            </dl>
+            {% if ssl.metadata.common_name and ssl.app_dns_name and ssl.metadata.common_name != ssl.app_dns_name %}
+              <div class="alert">
+                App DNS Name (<code>{{ ssl.app_dns_name }}</code>) differs from the certificate CN
+                (<code>{{ ssl.metadata.common_name }}</code>). Upload a matching certificate or regenerate
+                the self-signed certificate to align them.
+              </div>
+            {% endif %}
+          </section>
+          {% elif not ssl.cert_exists %}
+          <section class="form-card">
+            <p class="help">No certificate installed. Upload or create one below to unlock Enable SSL.</p>
+          </section>
+          {% endif %}
+
+          {% if can_system_update %}
+          <section class="form-card">
+            {% set le = ssl.letsencrypt %}
+            {% set le_config = le.config or {} %}
+            {% set le_enrollment = le.enrollment %}
+            <h2>Let's Encrypt</h2>
+            <p class="help">
+              Request a trusted certificate using DNS or HTTP validation. DNS validation can be automated if you
+              have the zone configured in the application DNS zones as a target.
+            </p>
+            {% if le_enrollment %}
+              <div class="alert warning">
+                <p>Enrollment is waiting for validation.</p>
+                {% if le_enrollment.manual %}
+                  {% if le_enrollment.manual.type == "dns-01" %}
+                    {% for ch in le_enrollment.manual.challenges or [le_enrollment.manual] %}
+                      <p>Create TXT record <code>{{ ch.name }}</code> with value <code>{{ ch.value }}</code>.</p>
+                    {% endfor %}
+                  {% elif le_enrollment.manual.type == "http-01" %}
+                    {% for ch in le_enrollment.manual.challenges or [le_enrollment.manual] %}
+                      <p>Serve <code>{{ ch.response }}</code> at <code>{{ ch.url }}</code>.</p>
+                    {% endfor %}
+                  {% else %}
+                    <p>Serve <code>{{ le_enrollment.manual.response }}</code> at <code>{{ le_enrollment.manual.url }}</code>.</p>
+                  {% endif %}
+                  <p>Then continue enrollment below.</p>
+                {% endif %}
+              </div>
+              <div class="action-cell">
+                <form action="/settings/system/ssl-letsencrypt/continue" method="post">
+                  <button type="submit">Continue enrollment</button>
+                </form>
+                <form action="/settings/system/ssl-letsencrypt/cancel" method="post">
+                  <button type="submit" class="danger">Cancel enrollment</button>
+                </form>
+              </div>
+            {% endif %}
+            {% set le_installed = ssl.metadata and ssl.metadata.source == ssl.source_letsencrypt %}
+            {% if le_installed %}
+              {% set auto_renew_allowed = le.auto_renew_allowed %}
+              {% set auto_renew_enabled = le_config.auto_renew_enabled is not sameas false %}
+              {% if auto_renew_enabled and not auto_renew_allowed %}
+                <div class="alert warning">
+                  Automatic certificate renewal is enabled but not available while DNS-01 challenge uses Manual DNS instructions.
+                  Disable auto-renew or select an automated DNS challenge zone below.
+                </div>
+              {% endif %}
+              {% if auto_renew_enabled %}
+                <form action="/settings/system/ssl-letsencrypt/config" method="post" class="le-auto-renew-disable">
+                  <input type="hidden" name="email" value="{{ le_config.email or '' }}" />
+                  <input type="hidden" name="root_dns_domain" value="{{ le_config.root_dns_domain or '' }}" />
+                  <input type="hidden" name="common_name" value="{{ le_config.common_name or le.defaults.common_name or ssl.app_dns_name }}" />
+                  <input type="hidden" name="subject_alt_names" value="{{ le_config.subject_alt_names | join(', ') if le_config.subject_alt_names else (le.defaults.subject_alt_names or ssl.app_dns_name) }}" />
+                  <input type="hidden" name="challenge_type" value="{{ le_config.challenge_type or 'dns-01' }}" />
+                  {% if le_config.zone_id %}<input type="hidden" name="zone_id" value="{{ le_config.zone_id }}" />{% endif %}
+                  {% if le_config.staging %}<input type="hidden" name="staging" value="on" />{% endif %}
+                  <input type="hidden" name="renew_before_expiry_days" value="{{ le_config.renew_before_expiry_days or 30 }}" />
+                  <input type="hidden" name="scheduled_restart_time" value="{{ le_config.scheduled_restart_time or '03:00' }}" />
+                  {% if le_config.scheduled_restart_enabled is not sameas false %}
+                    <input type="hidden" name="scheduled_restart_enabled" value="on" />
+                  {% endif %}
+                  <input type="hidden" name="config_notice" value="auto_renew_off" />
+                  <button type="submit">Disable Auto Certificate Renewal</button>
+                </form>
+                {% if le.renewal_hint and auto_renew_allowed %}
+                  <p class="help">Renewal will be attempted around <strong>{{ le.renewal_hint }}</strong>.</p>
+                {% endif %}
+                {% if le_config.challenge_type == 'http-01' %}
+                <div class="alert warning">
+                  Automatic renewal over HTTP-01 requires thhis server to be reachable from the internet, with HTTP
+                  requests redirected to HTTPS via an external web proxy to the challenge endpoint at
+                  <code>https://{{ ssl.app_dns_name }}/.well-known/acme-challenge/*</code>.
+                </div>
+              {% endif %}
+                {% if auto_renew_allowed %}
+                <details class="plugin-fields">
+                  <summary>Auto Renew Settings</summary>
+                  <form action="/settings/system/ssl-letsencrypt/config" method="post">
+                    <input type="hidden" name="email" value="{{ le_config.email or '' }}" />
+                    <input type="hidden" name="root_dns_domain" value="{{ le_config.root_dns_domain or '' }}" />
+                    <input type="hidden" name="common_name" value="{{ le_config.common_name or le.defaults.common_name or ssl.app_dns_name }}" />
+                    <input type="hidden" name="subject_alt_names" value="{{ le_config.subject_alt_names | join(', ') if le_config.subject_alt_names else (le.defaults.subject_alt_names or ssl.app_dns_name) }}" />
+                    <input type="hidden" name="challenge_type" value="{{ le_config.challenge_type or 'dns-01' }}" />
+                    {% if le_config.zone_id %}<input type="hidden" name="zone_id" value="{{ le_config.zone_id }}" />{% endif %}
+                    {% if le_config.staging %}<input type="hidden" name="staging" value="on" />{% endif %}
+                    <input type="hidden" name="auto_renew_enabled" value="on" />
+                    <label>Renew before expiry
+                      <select name="renew_before_expiry_days">
+                        {% for days in le.renew_options %}
+                          <option value="{{ days }}" {% if (le_config.renew_before_expiry_days or 30) == days %}selected{% endif %}>{{ days }} days</option>
+                        {% endfor %}
+                      </select>
+                    </label>
+                    <label class="inline-check">
+                      <input type="checkbox" name="scheduled_restart_enabled" {% if le_config.scheduled_restart_enabled is not sameas false %}checked{% endif %} />
+                      Restart application after certificate renewal
+                    </label>
+                    <p class="help">When enabled, the application will restart once at the configured time after a background renewal.</p>
+                    <label>Scheduled restart time
+                      <input type="time" name="scheduled_restart_time" value="{{ le_config.scheduled_restart_time or '03:00' }}" />
+                    </label>
+                    <button type="submit">Save</button>
+                  </form>
+                </details>
+                {% endif %}
+              {% else %}
+                {% if auto_renew_allowed %}
+                <form action="/settings/system/ssl-letsencrypt/config" method="post" class="le-auto-renew-enable">
+                  <input type="hidden" name="email" value="{{ le_config.email or '' }}" />
+                  <input type="hidden" name="root_dns_domain" value="{{ le_config.root_dns_domain or '' }}" />
+                  <input type="hidden" name="common_name" value="{{ le_config.common_name or le.defaults.common_name or ssl.app_dns_name }}" />
+                  <input type="hidden" name="subject_alt_names" value="{{ le_config.subject_alt_names | join(', ') if le_config.subject_alt_names else (le.defaults.subject_alt_names or ssl.app_dns_name) }}" />
+                  <input type="hidden" name="challenge_type" value="{{ le_config.challenge_type or 'dns-01' }}" />
+                  {% if le_config.zone_id %}<input type="hidden" name="zone_id" value="{{ le_config.zone_id }}" />{% endif %}
+                  {% if le_config.staging %}<input type="hidden" name="staging" value="on" />{% endif %}
+                  <input type="hidden" name="auto_renew_enabled" value="on" />
+                  <input type="hidden" name="renew_before_expiry_days" value="{{ le_config.renew_before_expiry_days or 30 }}" />
+                  <input type="hidden" name="scheduled_restart_time" value="{{ le_config.scheduled_restart_time or '03:00' }}" />
+                  {% if le_config.scheduled_restart_enabled is not sameas false %}
+                    <input type="hidden" name="scheduled_restart_enabled" value="on" />
+                  {% endif %}
+                  <input type="hidden" name="config_notice" value="auto_renew_on" />
+                  <button type="submit">Enable Auto Certificate Renewal</button>
+                </form>
+                {% else %}
+                  <p class="help">Automatic certificate renewal requires an automated DNS challenge zone (not Manual DNS instructions), or use HTTP challenge.</p>
+                {% endif %}
+              {% endif %}
+
+
+              <details class="plugin-fields">
+                <summary>Re-enroll with Let's Encrypt</summary>
+            {% endif %}
+            <form id="le-start-form" action="/settings/system/ssl-letsencrypt/start" method="post">
+              <label>Challenge type
+                <select name="challenge_type" id="le-challenge-type">
+                  <option value="dns-01" {% if le_config.challenge_type != "http-01" %}selected{% endif %}>DNS Challenge</option>
+                  <option value="http-01" {% if le_config.challenge_type == "http-01" %}selected{% endif %}>HTTP Challenge</option>
+                </select>
+              </label>
+              <div id="le-zone-field"{% if le_config.challenge_type == "http-01" %} hidden{% endif %}>
+                <label>Select DNS Challenge Zone<br/>
+                  <span class="help help-inline">Choose a dns zone for automated DNS challenge record creation.</span>
+                  <select name="zone_id" id="le-zone-select">
+                    <option value="" data-dns-zone="">Manual DNS instructions</option>
+                    {% for zone in le.zones %}
+                      <option value="{{ zone.id }}" data-dns-zone="{{ zone.dns_zone }}" {% if le_config.zone_id == zone.id %}selected{% endif %}>{{ zone.zone_name }}{% if zone.dns_zone %} ({{ zone.dns_zone }}){% endif %}</option>
+                    {% endfor %}
+                  </select>
+              </label>
+              </div>
+              <label>Root DNS Domain<br/>
+                <span class="help help-inline">Apex domain for certificate names (CN/SAN must be within this zone).</span>
+                <input type="text" name="root_dns_domain" id="le-root-dns-domain" required value="{{ le_config.root_dns_domain or '' }}" placeholder="example.com" />
+              </label>
+              <label>Email
+                <input type="email" name="email" required value="{{ le_config.email or '' }}" placeholder="admin@example.com" />
+              </label>
+              <label>Common Name
+                <input type="text" name="common_name" required value="{{ le_config.common_name or le.defaults.common_name or ssl.app_dns_name }}" placeholder="{{ ssl.app_dns_name }}" />
+              </label>
+              <label>Subject Alternative Names
+                <input type="text" name="subject_alt_names" value="{{ le_config.subject_alt_names | join(', ') if le_config.subject_alt_names else (le.defaults.subject_alt_names or ssl.app_dns_name) }}" placeholder="{{ ssl.app_dns_name }}" />
+              </label>
+              <p class="help">Comma-separated DNS names included on the certificate (in addition to the Common Name when different).</p>
+              <label class="inline-check">
+                <input type="checkbox" name="staging" {% if le_config.staging %}checked{% endif %} />
+                Use Let's Encrypt staging
+              </label>
+              <button type="submit">{{ "Request New Certificate" if le_installed else "Start Let's Encrypt enrollment" }}</button>
+            </form>
+            {% if le_installed %}
+              </details>
+            {% endif %}
+            <dialog id="le-auto-enroll-dialog">
+              <div class="dialog-content le-auto-enroll-dialog">
+                <p id="le-auto-enroll-status">Auto enrolling with Let's Encrypt. This may take up to 2 minutes.</p>
+                <progress id="le-auto-enroll-progress" class="le-auto-enroll-progress" max="100" value="0"></progress>
+              </div>
+            </dialog>
+          </section>
+
+          <section class="form-card">
+            <h2>Upload Certificate</h2>
+            <p class="help">
+              Provide an unencrypted PEM private key and matching PEM certificate. Best practice is to include a chain/
+              bundle intermediate certificates after the leaf certificate in the same <code>.crt</code> /
+              <code>.pem</code> file.
+            </p>
+            <form action="/settings/system/ssl-upload" method="post" enctype="multipart/form-data">
+              <input type="hidden" name="redirect_section" value="ssl_certificate" />
+              <label>Private key (PEM, <code>.key</code> / <code>.pem</code>)<br>
+                <input type="file" name="ssl_key" accept=".key,.pem,application/x-pem-file" required />
+              </label>
+              <label>Certificate (PEM, <code>.crt</code> / <code>.pem</code>) <br>
+                <input type="file" name="ssl_cert" accept=".crt,.pem,application/x-pem-file,application/x-x509-ca-cert" required />
+              </label>
+              <button type="submit">Upload certificate</button>
+            </form>
+          </section>
+
+          <section class="form-card">
+            <h2>{{ "Regenerate" if ssl.cert_exists else "Create" }} self-signed certificate</h2>
+            <p class="help">
+              Generates a new RSA-2048 self-signed certificate valid for 825 days using the App DNS Name
+              (<code>{{ ssl.app_dns_name }}</code>) as the CN and a DNS SAN, plus <code>localhost</code>.
+              {% if ssl.cert_exists %}
+                <strong>Regenerate replaces the currently installed certificate.</strong>
+              {% endif %}
+            </p>
+            {% set ssl_regenerate_confirm_msg = 'Regenerate the self-signed certificate? This overwrites the currently installed key/cert.' if ssl.cert_exists else 'Create a self-signed certificate now?' %}
+            <form
+              id="ssl-regenerate-form"
+              action="/settings/system/ssl-regenerate"
+              method="post"
+              data-confirm="{{ ssl_regenerate_confirm_msg | e }}"
+            >
+              <input type="hidden" name="redirect_section" value="ssl_certificate" />
+              <button type="submit">{{ "Generate Self-Signed Certificate" if ssl.cert_exists else "Create self-signed certificate" }}</button>
+            </form>
+          </section>
+          {% endif %}
+          {% endif %}
+
+        {% elif selected_area == "log_viewing" %}
+          {% set lv = log_view %}
+          <h2>View Logs</h2>
+          <p class="help">Searchable activity events. Retention is currently <strong>{{ lv.shared.retention_days }} days</strong> (configured under System Settings).</p>
+
+          <section class="form-card">
+            <h2>Search</h2>
+            <form action="/settings" method="get">
+              <input type="hidden" name="area" value="log_viewing" />
+              <label>Text query
+                <input type="text" name="text_query" value="{{ lv.params.text_query or '' }}" placeholder="Search message, details, event type, zone, actor, or category" />
+              </label>
+              <details class="advanced-search" {% if lv.params.level or lv.params.category or lv.params.event_type or lv.params.status or lv.params.zone_name or lv.params.actor or lv.params.start or lv.params.end %}open{% endif %}>
+                <summary>Advanced Search</summary>
+                <label>Level
+                  <select name="level">
+                    <option value="">(any)</option>
+                    {% for option in lv.shared.log_levels %}
+                      <option value="{{ option }}" {% if lv.params.level == option %}selected{% endif %}>{{ option|lower }}</option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <label>Category
+                  <select name="category">
+                    <option value="">(any)</option>
+                    {% for option in lv.shared.log_categories %}
+                      <option value="{{ option }}" {% if lv.params.category == option %}selected{% endif %}>{{ option }}</option>
+                    {% endfor %}
+                  </select>
+                </label>
+                <label>Event type
+                  <input type="text" name="event_type" value="{{ lv.params.event_type or '' }}" placeholder="dns.record_created" />
+                </label>
+                <label>Status
+                  <input type="text" name="log_status" value="{{ lv.params.status or '' }}" placeholder="success or error" />
+                </label>
+                <label>Zone Name
+                  <input type="text" name="zone_name" value="{{ lv.params.zone_name or '' }}" />
+                </label>
+                <label>Actor
+                  <input type="text" name="actor" value="{{ lv.params.actor or '' }}" placeholder="username or API key label" />
+                </label>
+                <label>From (ISO 8601)
+                  <input type="text" name="start" value="{{ lv.params.start.isoformat() if lv.params.start else '' }}" placeholder="2026-01-01T00:00:00" />
+                </label>
+                <label>To (ISO 8601)
+                  <input type="text" name="end" value="{{ lv.params.end.isoformat() if lv.params.end else '' }}" placeholder="2026-01-31T23:59:59" />
+                </label>
+              </details>
+              <button type="submit">Search</button>
+            </form>
+          </section>
+
+          <section class="form-card">
+            <h2>Recent Activity</h2>
+            <p class="help">Showing {{ lv.offset }} to {{ lv.offset + lv.rows | length }} of {{ lv.total }}.</p>
+            <div class="pagination-nav" aria-label="Activity log pagination">
+              <form action="/settings" method="get">
+                <input type="hidden" name="area" value="log_viewing" />
+                <input type="hidden" name="text_query" value="{{ lv.params.text_query or '' }}" />
+                <input type="hidden" name="level" value="{{ lv.params.level or '' }}" />
+                <input type="hidden" name="category" value="{{ lv.params.category or '' }}" />
+                <input type="hidden" name="event_type" value="{{ lv.params.event_type or '' }}" />
+                <input type="hidden" name="log_status" value="{{ lv.params.status or '' }}" />
+                <input type="hidden" name="zone_name" value="{{ lv.params.zone_name or '' }}" />
+                <input type="hidden" name="actor" value="{{ lv.params.actor or '' }}" />
+                <input type="hidden" name="start" value="{{ lv.params.start.isoformat() if lv.params.start else '' }}" />
+                <input type="hidden" name="end" value="{{ lv.params.end.isoformat() if lv.params.end else '' }}" />
+                <button type="submit" name="offset" value="{{ lv.previous_offset }}" class="secondary" {% if not lv.has_previous %}disabled{% endif %}>Previous</button>
+                <button type="submit" name="offset" value="{{ lv.next_offset }}" class="secondary" {% if not lv.has_next %}disabled{% endif %}>Next</button>
+              </form>
+            </div>
+            <div class="table-wrap">
+              <table class="activity-log-table">
+                <thead>
+                  <tr>
+                    <th>Timestamp</th>
+                    <th>Level</th>
+                    <th>Category</th>
+                    <th>Event</th>
+                    <th>Actor</th>
+                    <th>Zone Name</th>
+                    <th>Status</th>
+                    <th>Message</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for row in lv.rows %}
+                    <tr>
+                      <td><code>{{ row.timestamp }}</code></td>
+                      <td><code>{{ row.level }}</code></td>
+                      <td><code></code>{{ row.category }}</code></td>
+                      <td><code>{{ row.event_type }}</code></td>
+                      <td><code>{{ row.actor_label }} ({{ row.actor_type }})</code></td>
+                      <td><code>{{ row.zone_name }}</code></td>
+                      <td><code>{{ row.status }}</code></td>
+                      <td><code>{{ row.message }}</code></td>
+                    </tr>
+                  {% else %}
+                    <tr><td colspan="8"><code>No events match.</code></td></tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+        {% elif selected_area == "email_alerting" %}
+          {% set av = alert_view %}
+          <h2>Email Alerting</h2>
+          <p class="help">SMTP delivery settings live under <a href="/settings?area=system_settings&section=smtp_delivery">System Settings</a>. Alert rules consume those settings.</p>
+
+          <section class="form-card">
+            <h2>Alert Rules</h2>
+            <div class="section-title-row">
+              <h3>Existing rules</h3>
+              {% if can_system_update %}
+                <button type="button" id="open-create-alert">Create alert rule</button>
+              {% endif %}
+            </div>
+            <div class="table-wrap">
+              <table class="compact-table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Event Type</th>
+                    <th>Category</th>
+                    <th>Minimum Level</th>
+                    <th>Recipients</th>
+                    <th>Cooldown</th>
+                    <th>Enabled</th>
+                    <th class="actions-column">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for rule in av.rules %}
+                    <tr>
+                      <td><code>{{ rule.name }}</code></td>
+                      <td>{{ rule.event_type or '(any)' }}</td>
+                      <td>{{ rule.category or '(any)' }}</td>
+                      <td>{{ rule.minimum_level }}</td>
+                      <td>{{ rule.email_recipients }}</td>
+                      <td>{{ rule.cooldown_minutes }} min</td>
+                      <td>{{ 'yes' if rule.enabled else 'no' }}</td>
+                      <td class="actions-column">
+                        <div class="action-cell">
+                          {% if can_system_update %}
+                            <button type="button" data-open-edit-alert="{{ rule.id }}">Edit</button>
+                            <form action="/settings/alerts/{{ rule.id }}/delete" method="post" onsubmit="return confirm('Delete alert rule {{ rule.name }}?');">
+                              <button type="submit" class="danger">Delete</button>
+                            </form>
+                          {% endif %}
+                        </div>
+                      </td>
+                    </tr>
+                  {% else %}
+                    <tr><td colspan="8">No alert rules configured.</td></tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="form-card">
+            <h2>Template Variables</h2>
+            <p class="help">Use these placeholders in alert subject and body templates. Missing values render as the empty string. Templates are rendered as plain text.</p>
+            <ul>
+              {% for variable in av.template_variables %}
+                <li><code>{{ variable.name }}</code> &mdash; {{ variable.description }}</li>
+              {% endfor %}
+            </ul>
+            <p class="help">Default subject: <code>{{ av.default_subject }}</code></p>
+          </section>
+
+          {% if can_system_update %}
+            <dialog id="create-alert-dialog">
+              <div class="dialog-content">
+                <div class="dialog-header">
+                  <h2>Create alert rule</h2>
+                  <button type="button" class="danger" id="close-create-alert">Close</button>
+                </div>
+                <form action="/settings/alerts" method="post">
+                  <label>Name
+                    <input type="text" name="name" required />
+                  </label>
+                  <label>Event type (leave blank for any)
+                    <input type="text" name="event_type" placeholder="dns.provider_failed" />
+                  </label>
+                  <label>Category (leave blank for any)
+                    <select name="category">
+                      <option value="">(any)</option>
+                      {% for option in av.shared.log_categories %}
+                        <option value="{{ option }}">{{ option }}</option>
+                      {% endfor %}
+                    </select>
+                  </label>
+                  <label>Minimum level
+                    <select name="minimum_level">
+                      {% for option in av.shared.log_levels %}
+                        <option value="{{ option }}" {% if option == "WARNING" %}selected{% endif %}>{{ option|lower }}</option>
+                      {% endfor %}
+                    </select>
+                  </label>
+                  <label>Contains text (optional)
+                    <input type="text" name="message_contains" />
+                  </label>
+                  <label>Email recipients (CSV)
+                    <input type="text" name="email_recipients" required placeholder="oncall@example.com,team@example.com" />
+                  </label>
+                  <label>Cooldown minutes
+                    <input type="text" name="cooldown_minutes" value="0" />
+                  </label>
+                  <label class="inline-check">
+                    <input type="checkbox" name="enabled" checked />
+                    Enabled
+                  </label>
+                  <label>Subject template
+                    <input type="text" name="email_subject_template" placeholder="{{ av.default_subject }}" value="{{ av.default_subject }}" />
+                  </label>
+                  <label>Body template
+                    <textarea name="email_body_template" rows="6" placeholder="{{ av.default_body }}">{{ av.default_body }}</textarea>
+                  </label>
+                  <div class="dialog-actions">
+                    <button type="button" class="secondary" id="cancel-create-alert">Cancel</button>
+                    <button type="submit">Create alert rule</button>
+                  </div>
+                </form>
+              </div>
+            </dialog>
+
+            {% for rule in av.rules %}
+              <dialog id="edit-alert-dialog-{{ rule.id }}">
+                <div class="dialog-content">
+                  <div class="dialog-header">
+                    <h2>Edit alert rule</h2>
+                    <button type="button" class="danger" data-close-edit-alert="{{ rule.id }}">Close</button>
+                  </div>
+                  <form action="/settings/alerts/{{ rule.id }}" method="post">
+                    <label>Name
+                      <input type="text" name="name" required value="{{ rule.name }}" />
+                    </label>
+                    <label>Event type (leave blank for any)
+                      <input type="text" name="event_type" value="{{ rule.event_type }}" />
+                    </label>
+                    <label>Category (leave blank for any)
+                      <select name="category">
+                        <option value="">(any)</option>
+                        {% for option in av.shared.log_categories %}
+                          <option value="{{ option }}" {% if option == rule.category %}selected{% endif %}>{{ option }}</option>
+                        {% endfor %}
+                      </select>
+                    </label>
+                    <label>Minimum level
+                      <select name="minimum_level">
+                        {% for option in av.shared.log_levels %}
+                          <option value="{{ option }}" {% if option == rule.minimum_level %}selected{% endif %}>{{ option|lower }}</option>
+                        {% endfor %}
+                      </select>
+                    </label>
+                    <label>Contains text (optional)
+                      <input type="text" name="message_contains" value="{{ rule.message_contains }}" />
+                    </label>
+                    <label>Email recipients (CSV)
+                      <input type="text" name="email_recipients" required value="{{ rule.email_recipients }}" />
+                    </label>
+                    <label>Cooldown minutes
+                      <input type="text" name="cooldown_minutes" value="{{ rule.cooldown_minutes }}" />
+                    </label>
+                    <label class="inline-check">
+                      <input type="checkbox" name="enabled" {% if rule.enabled %}checked{% endif %} />
+                      Enabled
+                    </label>
+                    <label>Subject template
+                      <input type="text" name="email_subject_template" value="{{ rule.email_subject_template }}" />
+                    </label>
+                    <label>Body template
+                      <textarea name="email_body_template" rows="6">{{ rule.email_body_template }}</textarea>
+                    </label>
+                    <div class="dialog-actions">
+                      <button type="button" class="secondary" data-close-edit-alert="{{ rule.id }}">Cancel</button>
+                      <button type="submit">Save alert rule</button>
+                    </div>
+                  </form>
+                </div>
+              </dialog>
+            {% endfor %}
+          {% endif %}
 
         {% elif selected_area == "backup" %}
           <h2>System Backup</h2>
@@ -505,6 +1255,216 @@
           dialog.showModal();
         }
       });
+
+      const createAlertDialog = document.getElementById("create-alert-dialog");
+      document.getElementById("open-create-alert")?.addEventListener("click", () => createAlertDialog?.showModal());
+      document.getElementById("close-create-alert")?.addEventListener("click", () => createAlertDialog?.close());
+      document.getElementById("cancel-create-alert")?.addEventListener("click", () => createAlertDialog?.close());
+
+      document.querySelectorAll("[data-open-edit-alert]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const dialog = document.getElementById(`edit-alert-dialog-${button.dataset.openEditAlert}`);
+          dialog?.showModal();
+        });
+      });
+      document.querySelectorAll("[data-close-edit-alert]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const dialog = document.getElementById(`edit-alert-dialog-${button.dataset.closeEditAlert}`);
+          dialog?.close();
+        });
+      });
+
+      const sslEnableForm = document.getElementById("ssl-enable-form");
+      sslEnableForm?.addEventListener("submit", (event) => {
+        const confirmed = window.confirm(
+          "SSL changes take effect after you restart the application (container or uvicorn process). Continue?"
+        );
+        if (!confirmed) {
+          event.preventDefault();
+        }
+      });
+
+      const sslRegenerateForm = document.getElementById("ssl-regenerate-form");
+      sslRegenerateForm?.addEventListener("submit", (event) => {
+        const msg = sslRegenerateForm.dataset.confirm;
+        if (msg && !window.confirm(msg)) {
+          event.preventDefault();
+        }
+      });
+
+      const leStartForm = document.getElementById("le-start-form");
+      const leAutoEnrollDialog = document.getElementById("le-auto-enroll-dialog");
+      const leChallengeSelect = leStartForm?.querySelector('[name="challenge_type"]');
+      const leZoneField = document.getElementById("le-zone-field");
+      const leZoneSelect = document.getElementById("le-zone-select");
+      const leRootDnsInput = document.getElementById("le-root-dns-domain");
+
+      function syncLeZoneField() {
+        const isHttp = leChallengeSelect?.value === "http-01";
+        if (leZoneField) {
+          leZoneField.hidden = isHttp;
+        }
+        if (isHttp && leZoneSelect) {
+          leZoneSelect.value = "";
+        }
+      }
+
+      function syncLeRootDnsDomain() {
+        if (!leRootDnsInput) {
+          return;
+        }
+        const challenge = leChallengeSelect?.value;
+        if (challenge === "http-01") {
+          leRootDnsInput.readOnly = false;
+          leRootDnsInput.classList.remove("input-readonly");
+          return;
+        }
+        const zoneId = leZoneSelect?.value?.trim();
+        if (!zoneId) {
+          leRootDnsInput.readOnly = false;
+          leRootDnsInput.classList.remove("input-readonly");
+          return;
+        }
+        const domain = leZoneSelect?.selectedOptions?.[0]?.dataset?.dnsZone?.trim() || "";
+        if (domain) {
+          leRootDnsInput.value = domain;
+          leRootDnsInput.readOnly = true;
+          leRootDnsInput.classList.add("input-readonly");
+        } else {
+          leRootDnsInput.readOnly = false;
+          leRootDnsInput.classList.remove("input-readonly");
+        }
+      }
+
+      function syncLeChallengeUi() {
+        syncLeZoneField();
+        syncLeRootDnsDomain();
+      }
+
+      leChallengeSelect?.addEventListener("change", syncLeChallengeUi);
+      leZoneSelect?.addEventListener("change", syncLeRootDnsDomain);
+      syncLeChallengeUi();
+      const leAutoEnrollProgress = document.getElementById("le-auto-enroll-progress");
+      const leAutoEnrollStatus = document.getElementById("le-auto-enroll-status");
+      const leStartSubmit = leStartForm?.querySelector('button[type="submit"]');
+      let lePollTimer = null;
+
+      function stopLePoll() {
+        if (lePollTimer !== null) {
+          window.clearInterval(lePollTimer);
+          lePollTimer = null;
+        }
+      }
+
+      function resetLeDialog() {
+        if (leAutoEnrollProgress) {
+          leAutoEnrollProgress.value = 0;
+        }
+        if (leAutoEnrollStatus) {
+          leAutoEnrollStatus.textContent = "Auto enrolling with Let's Encrypt. This may take up to 2 minutes.";
+        }
+      }
+
+      async function pollLeProgress() {
+        try {
+          const response = await fetch("/settings/system/ssl-letsencrypt/progress", {
+            credentials: "same-origin",
+            headers: { accept: "application/json" },
+          });
+          if (!response.ok) {
+            return;
+          }
+          const payload = await response.json();
+          if (leAutoEnrollProgress && typeof payload.percent === "number") {
+            leAutoEnrollProgress.value = payload.percent;
+          }
+          if (leAutoEnrollStatus && payload.message) {
+            leAutoEnrollStatus.textContent = payload.message;
+          }
+          if (payload.done) {
+            stopLePoll();
+            if (payload.error) {
+              leAutoEnrollDialog?.close();
+              if (leStartSubmit) {
+                leStartSubmit.disabled = false;
+              }
+              window.alert(payload.error);
+              return;
+            }
+            if (leAutoEnrollProgress) {
+              leAutoEnrollProgress.value = 100;
+            }
+            window.location.reload();
+          }
+        } catch (_err) {
+          stopLePoll();
+          leAutoEnrollDialog?.close();
+          if (leStartSubmit) {
+            leStartSubmit.disabled = false;
+          }
+        }
+      }
+
+      leStartForm?.addEventListener("submit", async (event) => {
+        const challengeType = leChallengeSelect?.value;
+        const zoneId = leStartForm.querySelector('[name="zone_id"]')?.value?.trim();
+        if (challengeType !== "dns-01" || !zoneId) {
+          return;
+        }
+        event.preventDefault();
+        stopLePoll();
+        resetLeDialog();
+        if (leStartSubmit) {
+          leStartSubmit.disabled = true;
+        }
+        leAutoEnrollDialog?.showModal();
+        try {
+          const response = await fetch("/settings/system/ssl-letsencrypt/start-async", {
+            method: "POST",
+            body: new FormData(leStartForm),
+            credentials: "same-origin",
+            headers: { accept: "application/json" },
+          });
+          if (!response.ok) {
+            const detail = await response.json().catch(() => ({}));
+            leAutoEnrollDialog?.close();
+            if (leStartSubmit) {
+              leStartSubmit.disabled = false;
+            }
+            window.alert(detail.detail || "Failed to start Let's Encrypt enrollment.");
+            return;
+          }
+          await pollLeProgress();
+          lePollTimer = window.setInterval(pollLeProgress, 1000);
+        } catch (_err) {
+          leAutoEnrollDialog?.close();
+          if (leStartSubmit) {
+            leStartSubmit.disabled = false;
+          }
+          window.alert("Failed to start Let's Encrypt enrollment.");
+        }
+      });
+      leAutoEnrollDialog?.addEventListener("cancel", (event) => {
+        event.preventDefault();
+      });
+
+      const smtpAnonymous = document.getElementById("smtp-anonymous");
+      const smtpUsername = document.getElementById("smtp-username");
+      const smtpPassword = document.getElementById("smtp-password");
+      function syncSmtpAnonymous() {
+        if (!smtpAnonymous) {
+          return;
+        }
+        const anonymous = smtpAnonymous.checked;
+        if (smtpUsername) {
+          smtpUsername.disabled = anonymous;
+        }
+        if (smtpPassword) {
+          smtpPassword.disabled = anonymous;
+        }
+      }
+      smtpAnonymous?.addEventListener("change", syncSmtpAnonymous);
+      syncSmtpAnonymous();
     </script>
   </div>
 </body>

@@ -1,8 +1,9 @@
 from typing import Dict, List, Optional
 
-from ..models import DnsRecordRequest
+from ..models import DnsRecordInfo, DnsRecordRequest
 
-from .base import DnsProviderPlugin, PluginField
+from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
+from .utils import lookup_record_types_to_query
 
 
 class AzureDnsClient:
@@ -49,8 +50,8 @@ class AzureDnsClient:
         if dns_server:
             raise ValueError("Azure DNS ignores per-server host settings; use Azure fields on the zone configuration.")
 
-        if not payload.zone_name:
-            raise ValueError("zone_name is required for Azure DNS.")
+        if not dns_zone:
+            raise ValueError("DNS zone (domain) is required in the zone configuration.")
 
         client = self.DnsManagementClient(self.credential, self.subscription_id)
         record_set_name = payload.record_name.strip(".") or "@"
@@ -61,7 +62,7 @@ class AzureDnsClient:
             existing = self._get_existing_record_set(
                 client,
                 self.resource_group,
-                payload.zone_name,
+                dns_zone,
                 record_set_name,
                 inner,
             )
@@ -70,7 +71,7 @@ class AzureDnsClient:
             try:
                 client.record_sets.delete(
                     self.resource_group,
-                    payload.zone_name,
+                    dns_zone,
                     record_set_name,
                     inner,
                 )
@@ -81,7 +82,7 @@ class AzureDnsClient:
         existing = self._get_existing_record_set(
             client,
             self.resource_group,
-            payload.zone_name,
+            dns_zone,
             record_set_name,
             record_type,
         )
@@ -89,13 +90,67 @@ class AzureDnsClient:
 
         client.record_sets.create_or_update(
             self.resource_group,
-            payload.zone_name,
+            dns_zone,
             record_set_name,
             record_type,
             record_set,
         )
 
         return existing is not None
+
+    def get_record(
+        self,
+        *,
+        record_name: str,
+        record_type: Optional[str] = None,
+        dns_server: Optional[str] = None,
+        dns_zone: Optional[str] = None,
+    ) -> List[DnsRecordInfo]:
+        if dns_server:
+            raise ValueError("Azure DNS ignores per-server host settings; use Azure fields on the zone configuration.")
+        if not dns_zone:
+            raise ValueError("DNS zone (domain) is required in the zone configuration.")
+
+        record_set_name = record_name.strip(".") or "@"
+        display_name = record_set_name
+        client = self.DnsManagementClient(self.credential, self.subscription_id)
+        types_to_query = lookup_record_types_to_query(record_type)
+        results: List[DnsRecordInfo] = []
+        for rt in types_to_query:
+            existing = self._get_existing_record_set(
+                client,
+                self.resource_group,
+                dns_zone,
+                record_set_name,
+                rt,
+            )
+            if existing is not None:
+                results.append(self._record_set_to_info(existing, display_name, rt))
+        return results
+
+    def _record_set_to_info(self, record_set, display_name: str, record_type: str) -> DnsRecordInfo:
+        ttl = int(record_set.ttl or 300)
+        rt = record_type.upper()
+        values: List[str] = []
+        if rt == "A":
+            values = [r.ipv4_address for r in (record_set.a_records or [])]
+        elif rt == "AAAA":
+            values = [r.ipv6_address for r in (record_set.aaaa_records or [])]
+        elif rt == "CNAME":
+            cname = record_set.cname_record
+            if cname and cname.cname:
+                values = [cname.cname.rstrip(".")]
+        elif rt == "TXT":
+            for txt in record_set.txt_records or []:
+                if txt.value:
+                    for part in txt.value:
+                        values.append(part)
+        return DnsRecordInfo(
+            record_name=display_name,
+            record_type=rt,
+            ttl=ttl,
+            values=values,
+        )
 
     def _get_existing_record_set(
         self,
@@ -138,6 +193,7 @@ PLUGIN = DnsProviderPlugin(
     heading="Azure DNS",
     help_text="Use an Azure service principal with permission to manage records in the zone. Target DNS Server and TSIG settings are not used for Azure DNS.",
     fields=[
+        DNS_ZONE_DOMAIN_FIELD,
         PluginField("azure_tenant_id", "Azure tenant ID", autocomplete="off"),
         PluginField("azure_client_id", "Azure client ID (application ID)", autocomplete="off"),
         PluginField(

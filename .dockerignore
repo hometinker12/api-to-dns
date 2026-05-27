@@ -2,6 +2,12 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
 .env
 .env.*
 .git
+.cursor/
+data/
+tests/
+debug-*.log
+*.db

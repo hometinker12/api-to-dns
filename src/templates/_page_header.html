@@ -1,0 +1,195 @@
+{% set _show_dashboard = show_dashboard_link|default(true) %}
+{% set _nav = page_nav(user, _show_dashboard) if user is defined else {} %}
+{% set restart_required = restart_required|default(_nav.restart_required|default(false)) %}
+{% set can_system_update = can_system_update|default(_nav.can_system_update|default(false)) %}
+{% set restart_reason = restart_reason|default(_nav.restart_reason|default("")) %}
+{% set restart_preview = restart_preview|default(_nav.restart_preview|default({})) %}
+<header class="page-header">
+  <div>
+    <h1>{{ page_title }}</h1>
+    {% if page_help %}<p class="help">{{ page_help }}</p>{% endif %}
+  </div>
+  <nav class="nav-links">
+    {% if restart_required and can_system_update %}
+      <button
+        type="button"
+        class="warning"
+        id="restart-app-btn"
+        data-after-url="{{ restart_preview.after_restart_url }}"
+        data-reason="{{ restart_reason }}"
+      >Restart Application</button>
+    {% endif %}
+    {% for link in page_links or [] %}
+      <a class="button{% if link.class %} {{ link.class }}{% endif %}" href="{{ link.href }}">{{ link.label }}</a>
+    {% endfor %}
+    {% if _show_dashboard %}
+      <a class="button" href="/admin">Dashboard</a>
+    {% endif %}
+    <a class="button danger" href="/logout">Logout</a>
+  </nav>
+</header>
+
+{% if restart_required and can_system_update %}
+  <dialog id="restart-app-dialog">
+    <div class="dialog-content">
+      <div class="dialog-header">
+        <h2>Restart Application</h2>
+        <button type="button" class="danger" id="restart-app-close">Close</button>
+      </div>
+      <p class="alert warning">{{ restart_reason }}</p>
+      <p class="help">After restart, you may need to use a different URL (for example when enabling HTTPS or changing the port).</p>
+      <dl class="form-meta">
+        <dt>Access URL after restart</dt>
+        <dd><code id="restart-after-url">{{ restart_preview.after_restart_url }}</code></dd>
+      </dl>
+      <form id="restart-app-form" action="/system/restart" method="post">
+        <div class="dialog-actions">
+          <button type="button" class="secondary" id="restart-app-cancel">Cancel</button>
+          <button type="submit" class="warning" id="restart-app-submit">Restart now</button>
+        </div>
+      </form>
+    </div>
+  </dialog>
+  <dialog
+    id="restart-wait-dialog"
+    data-after-restart-url="{{ restart_preview.after_restart_url }}"
+  >
+    <div class="dialog-content le-auto-enroll-dialog">
+      <p id="restart-wait-status">Restarting application. Please wait…</p>
+      <progress id="restart-wait-progress" class="le-auto-enroll-progress" max="100" value="0"></progress>
+      <p class="help">You will be redirected to the new access URL: <code id="restart-wait-target"></code></p>
+    </div>
+  </dialog>
+  <script>
+    (() => {
+      const RESTART_WAIT_MS = 20000;
+      const RESTART_TICK_MS = 200;
+
+      const confirmDialog = document.getElementById("restart-app-dialog");
+      const waitDialog = document.getElementById("restart-wait-dialog");
+      const restartForm = document.getElementById("restart-app-form");
+      const restartSubmit = document.getElementById("restart-app-submit");
+      const afterUrlEl = document.getElementById("restart-after-url");
+      const restartBtn = document.getElementById("restart-app-btn");
+      const waitStatus = document.getElementById("restart-wait-status");
+      const waitProgress = document.getElementById("restart-wait-progress");
+      const waitTarget = document.getElementById("restart-wait-target");
+
+      let restartTimer = null;
+      let restartRedirecting = false;
+
+      function resolveAfterRestartUrl() {
+        const fromPreview = afterUrlEl?.textContent?.trim();
+        if (fromPreview) {
+          return fromPreview;
+        }
+        const fromButton = restartBtn?.dataset.afterUrl?.trim();
+        if (fromButton) {
+          return fromButton;
+        }
+        return waitDialog?.dataset.afterRestartUrl?.trim() || "";
+      }
+
+      function isAbsoluteAccessUrl(url) {
+        return /^https?:\/\//i.test(url);
+      }
+
+      function stopRestartTimer() {
+        if (restartTimer !== null) {
+          window.clearInterval(restartTimer);
+          restartTimer = null;
+        }
+      }
+
+      function beginRestartWait(initialAfterRestartUrl) {
+        if (!isAbsoluteAccessUrl(initialAfterRestartUrl) || restartRedirecting) {
+          return;
+        }
+        restartRedirecting = true;
+        stopRestartTimer();
+        confirmDialog?.close();
+        if (restartSubmit) {
+          restartSubmit.disabled = true;
+        }
+        if (waitProgress) {
+          waitProgress.value = 0;
+        }
+
+        // Post-restart access URL (e.g. https://host/login after enabling SSL), not the current page URL.
+        let afterRestartUrl = initialAfterRestartUrl;
+        const updateAfterRestartUrl = (url) => {
+          if (!isAbsoluteAccessUrl(url)) {
+            return;
+          }
+          afterRestartUrl = url;
+          if (waitTarget) {
+            waitTarget.textContent = afterRestartUrl;
+          }
+          if (waitDialog) {
+            waitDialog.dataset.afterRestartUrl = afterRestartUrl;
+          }
+        };
+        updateAfterRestartUrl(afterRestartUrl);
+
+        if (waitStatus) {
+          waitStatus.textContent = "Restarting application. Please wait…";
+        }
+        waitDialog?.showModal();
+
+        const startedAt = Date.now();
+
+        fetch("/system/restart", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { accept: "application/json" },
+        })
+          .then((response) => (response.ok ? response.json() : null))
+          .then((payload) => {
+            if (payload?.after_restart_url) {
+              updateAfterRestartUrl(payload.after_restart_url);
+            }
+          })
+          .catch(() => {});
+
+        restartTimer = window.setInterval(() => {
+          const elapsed = Date.now() - startedAt;
+          const percent = Math.min(100, Math.round((elapsed / RESTART_WAIT_MS) * 100));
+          if (waitProgress) {
+            waitProgress.value = percent;
+          }
+          const remainingSec = Math.max(0, Math.ceil((RESTART_WAIT_MS - elapsed) / 1000));
+          if (waitStatus) {
+            waitStatus.textContent = `Restarting application… (${remainingSec}s remaining)`;
+          }
+          if (elapsed >= RESTART_WAIT_MS) {
+            stopRestartTimer();
+            if (waitProgress) {
+              waitProgress.value = 100;
+            }
+            window.location.replace(afterRestartUrl);
+          }
+        }, RESTART_TICK_MS);
+      }
+
+      restartBtn?.addEventListener("click", () => confirmDialog?.showModal());
+      document.getElementById("restart-app-close")?.addEventListener("click", () => confirmDialog?.close());
+      document.getElementById("restart-app-cancel")?.addEventListener("click", () => confirmDialog?.close());
+
+      restartForm?.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const afterRestartUrl = resolveAfterRestartUrl();
+        if (!isAbsoluteAccessUrl(afterRestartUrl)) {
+          window.alert("The new access URL after restart is not available.");
+          return;
+        }
+        beginRestartWait(afterRestartUrl);
+      });
+
+      waitDialog?.addEventListener("cancel", (event) => {
+        if (restartRedirecting) {
+          event.preventDefault();
+        }
+      });
+    })();
+  </script>
+{% endif %}

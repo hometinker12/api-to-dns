@@ -1,4 +1,5 @@
-# Smoke tests: push to **release** (no inputs; remote lab zones are fixed below).
+# Smoke tests: push to **develop** (no inputs; remote lab zones are fixed below).
+# - **pytest**: unit tests on ubuntu (`python -m pytest`).
 # - **bind-smoke-linux**: checkout on ubuntu, `docker build`, BIND + API in Docker (bash), same idea as release CI.
 # - **microsoft-dns-smoke-windows**: install DNS Server on windows-2025, run the API natively with Python/uvicorn,
 #   then inline PowerShell (Invoke-WebRequest / Invoke-RestMethod) exercises local + optional remote Microsoft DNS.
@@ -10,18 +11,38 @@
 #
 # Optional remote lab secrets: MICROSOFT_DNS_WINRM_HOST, USER, PASSWORD, SSL, QUERY_HOST
 
-name: Docker image + Bind + Microsoft DNS smoke test ( release)
+name: Docker image + Bind + Microsoft DNS smoke test (develop)
 
 on:
   push:
     branches:
+      - develop
       - release
 
 jobs:
+  pytest:
+    name: pytest (ubuntu)
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run pytest
+        run: python -m pytest
+
   bind-smoke-linux:
     name: BIND and Docker image smoke (ubuntu + Docker)
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/release'
+    if: github.ref == 'refs/heads/develop'
     steps:
       - uses: actions/checkout@v6
 
@@ -202,17 +223,68 @@ jobs:
           echo "[bind] Verify admin page"
           curl --fail --silent -b /tmp/cookies http://localhost:8000/admin | python3 -c "import sys; assert 'api-to-dns App Dashboard' in sys.stdin.read()"
 
+          #region agent log
+          cat > /tmp/agent-debug-bind-zone.py <<'PY'
+          import json
+          import sys
+          import time
+          from pathlib import Path
+
+          zone, status, path = sys.argv[1:]
+          html = Path(path).read_text(encoding="utf-8", errors="replace")
+          payload = {
+              "sessionId": "5623d1",
+              "runId": "ci-smoke-pre-fix",
+              "hypothesisId": "H1,H2,H3",
+              "location": ".github/workflows/microsoft-dns-smoke.yml:bind-zone-create",
+              "message": "bind zone create response diagnostics",
+              "data": {
+                  "zone": zone,
+                  "status": status,
+                  "hasExactSuccess": f"Zone '{zone}' added" in html,
+                  "hasEscapedSuccess": f"Zone &#39;{zone}&#39; added" in html,
+                  "hasErrorAlert": 'class="alert error"' in html,
+                  "hasLoginForm": 'name="username"' in html and 'name="password"' in html,
+                  "snippet": html[:500],
+              },
+              "timestamp": int(time.time() * 1000),
+          }
+          line = json.dumps(payload, ensure_ascii=True)
+          with open("debug-5623d1.log", "a", encoding="utf-8") as f:
+              f.write(line + "\n")
+          print("[agent-debug] " + line)
+          PY
+          #endregion agent log
+
+          cat > /tmp/agent-print-excerpt.py <<'PY'
+          import sys
+          from pathlib import Path
+
+          print(Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")[:1200])
+          PY
+
           for zone in smoke.test denied.test; do
             echo "[bind] Configure zone ${zone}"
-            curl --fail --silent -b /tmp/cookies -X POST http://localhost:8000/zones \
+            zone_body="/tmp/zone-create-${zone}.html"
+            zone_status="$(curl --silent --show-error -b /tmp/cookies -X POST http://localhost:8000/zones \
+              -w "%{http_code}" \
               -H "Content-Type: application/x-www-form-urlencoded" \
               --data-urlencode "zone_name=${zone}" \
+              --data-urlencode "dns_zone=${zone}" \
               --data-urlencode "dns_provider_type=bind" \
               --data-urlencode "dns_server=bind-test" \
               --data-urlencode "dns_username=${TSIG_NAME}" \
               --data-urlencode "dns_password=${TSIG_SECRET}" \
               --data-urlencode "dns_tsig_algorithm=hmac-sha256" \
-              -o /dev/null
+              -o "${zone_body}")"
+            #region agent log
+            python3 /tmp/agent-debug-bind-zone.py "${zone}" "${zone_status}" "${zone_body}"
+            #endregion agent log
+            if [ "${zone_status}" != "200" ] || ! { grep -q "Zone '${zone}' added" "${zone_body}" || grep -q "Zone &#39;${zone}&#39; added" "${zone_body}"; }; then
+              echo "[bind] Zone create assertion failed for ${zone}; response excerpt:"
+              python3 /tmp/agent-print-excerpt.py "${zone_body}"
+              exit 1
+            fi
           done
 
           echo "[bind] Fetch API key management page"
@@ -235,19 +307,26 @@ jobs:
             | python3 -c "import json, sys; assert json.load(sys.stdin)['status'] == 'success'"
 
           call_dns_api() {
-            local expected_status="$1"
-            local expected_action="$2"
-            local body="$3"
+            local method="$1"
+            local expected_status="$2"
+            local expected_action="$3"
+            local request_uri="$4"
+            local body="$5"
             local output="/tmp/dns-response-${expected_action}.json"
             local status
 
-            status="$(curl --silent --show-error -o "${output}" -w "%{http_code}" \
-              -X POST http://localhost:8000/dns-record \
-              -H "Content-Type: application/json" \
-              -H "X-API-Key: ${API_KEY}" \
-              -d "${body}")"
+            local curl_args=(
+              --silent --show-error -o "${output}" -w "%{http_code}"
+              -X "${method}"
+              "${request_uri}"
+              -H "X-API-Key: ${API_KEY}"
+            )
+            if [ -n "${body}" ]; then
+              curl_args+=( -H "Content-Type: application/json" -d "${body}" )
+            fi
+            status="$(curl "${curl_args[@]}")"
 
-            echo "[bind] ${expected_action}: HTTP ${status}"
+            echo "[bind] ${method} ${expected_action}: HTTP ${status}"
             cat "${output}"
             echo
 
@@ -288,21 +367,30 @@ jobs:
             exit 1
           }
 
-          call_dns_api 200 created '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.10"]}'
+          DNS_RECORD_URL='http://localhost:8000/dns-record'
+          DELETE_SMOKE_URL='http://localhost:8000/dns-record?zone_name=smoke.test&record_name=www&record_type=A'
+
+          call_dns_api POST 200 created "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.10"]}'
           wait_for_record_value www.smoke.test 192.0.2.10
-          call_dns_api 200 updated '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.20"]}'
+          call_dns_api PATCH 200 updated "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":450}'
+          wait_for_record_value www.smoke.test 192.0.2.10
+          call_dns_api POST 409 record_already_exists "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.10"]}'
+          call_dns_api PUT 200 updated "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.20"]}'
           wait_for_record_value www.smoke.test 192.0.2.20
-          call_dns_api 200 deleted '{"zone_name":"smoke.test","record_type":"DELETE","record_name":"www","values":["A"]}'
+          call_dns_api PATCH 200 updated "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","values":["192.0.2.30"]}'
+          wait_for_record_value www.smoke.test 192.0.2.30
+          call_dns_api DELETE 200 deleted "${DELETE_SMOKE_URL}" ''
           wait_for_record_absent www.smoke.test
-          call_dns_api 404 not_found '{"zone_name":"smoke.test","record_type":"DELETE","record_name":"www","values":["A"]}'
-          call_dns_api 403 access_denied '{"zone_name":"denied.test","record_type":"A","record_name":"blocked","ttl":300,"values":["192.0.2.55"]}'
+          call_dns_api DELETE 404 not_found "${DELETE_SMOKE_URL}" ''
+          call_dns_api PUT 404 not_found "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.40"]}'
+          call_dns_api POST 403 access_denied "${DNS_RECORD_URL}" '{"zone_name":"denied.test","record_type":"A","record_name":"blocked","ttl":300,"values":["192.0.2.55"]}'
 
           echo "BIND smoke on Linux completed successfully."
 
   microsoft-dns-smoke-windows:
     name: Local Microsoft DNS WinRM smoke (windows, native API + PowerShell)
     runs-on: windows-2025
-    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/release'
+    if: github.ref == 'refs/heads/develop'
 
     steps:
       - uses: actions/checkout@v6
@@ -479,18 +567,65 @@ jobs:
             return $m.Groups[1].Value
           }
 
+          function Write-AgentDebugLog {
+            param(
+              [Parameter(Mandatory)] [string] $HypothesisId,
+              [Parameter(Mandatory)] [string] $Location,
+              [Parameter(Mandatory)] [string] $Message,
+              [Parameter(Mandatory)] [hashtable] $Data
+            )
+            #region agent log
+            $payload = [ordered]@{
+              sessionId    = '5623d1'
+              runId        = 'ci-smoke-pre-fix'
+              hypothesisId = $HypothesisId
+              location     = $Location
+              message      = $Message
+              data         = $Data
+              timestamp    = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            }
+            $line = $payload | ConvertTo-Json -Compress -Depth 8
+            Add-Content -Path 'debug-5623d1.log' -Value $line -Encoding UTF8
+            Write-Host "[agent-debug] $line"
+            #endregion agent log
+          }
+
           function Invoke-DnsRecord {
             param(
               [string] $ApiKey,
               [int] $ExpectedStatus,
-              [hashtable] $JsonBody
+              [string] $Method = 'POST',
+              [hashtable] $JsonBody,
+              [hashtable] $Query
             )
-            $json = $JsonBody | ConvertTo-Json -Compress -Depth 6
-            Write-Host "[microsoft] POST /dns-record $($JsonBody.zone_name) $($JsonBody.record_type) $($JsonBody.record_name) expecting HTTP $ExpectedStatus"
-            $resp = Invoke-WebRequest -Uri "$base/dns-record" -Method Post `
-              -Headers @{ 'X-API-Key' = $ApiKey } -Body $json -ContentType 'application/json' `
-              -UseBasicParsing -SkipHttpErrorCheck
-            Write-Host "[microsoft] POST /dns-record returned HTTP $($resp.StatusCode)"
+            $url = "$base/dns-record"
+            if ($Query) {
+              $pairs = $Query.GetEnumerator() | ForEach-Object {
+                '{0}={1}' -f $_.Key, [uri]::EscapeDataString([string]$_.Value)
+              }
+              $url = "$url`?" + ($pairs -join '&')
+            }
+            $args = @{
+              Uri               = $url
+              Method            = $Method
+              Headers           = @{ 'X-API-Key' = $ApiKey }
+              UseBasicParsing   = $true
+              SkipHttpErrorCheck = $true
+            }
+            if ($JsonBody) {
+              $args.Body = ($JsonBody | ConvertTo-Json -Compress -Depth 6)
+              $args.ContentType = 'application/json'
+            }
+            $label = "$Method /dns-record"
+            if ($JsonBody) {
+              $label = "$label $($JsonBody.zone_name) $($JsonBody.record_type) $($JsonBody.record_name)"
+            }
+            elseif ($Query) {
+              $label = "$label $($Query.zone_name) $($Query.record_type) $($Query.record_name)"
+            }
+            Write-Host "[microsoft] $label expecting HTTP $ExpectedStatus"
+            $resp = Invoke-WebRequest @args
+            Write-Host "[microsoft] $label returned HTTP $($resp.StatusCode)"
             if ([int]$resp.StatusCode -ne $ExpectedStatus) {
               throw "dns-record expected HTTP $ExpectedStatus got $($resp.StatusCode): $($resp.Content)"
             }
@@ -609,12 +744,30 @@ jobs:
 
             foreach ($z in @($la, $ld)) {
               Write-Host "[microsoft-local] Configure zone $z"
-              $null = Invoke-FormPost -Uri "$base/zones" -WebSession $WebSession -Form @{
+              $zoneResp = Invoke-FormPost -Uri "$base/zones" -WebSession $WebSession -Form @{
                 zone_name           = $z
+                dns_zone            = $z
                 dns_provider_type   = 'microsoft'
                 dns_server          = $localDnsServer
                 dns_username        = $localUser
                 dns_password        = $localPass
+              }
+              Write-AgentDebugLog -HypothesisId 'H1,H2,H3,H5' -Location '.github/workflows/microsoft-dns-smoke.yml:microsoft-local-zone-create' -Message 'microsoft local zone create response diagnostics' -Data @{
+                zone              = $z
+                status            = [int]$zoneResp.StatusCode
+                hasExactSuccess   = $zoneResp.Content -match "Zone '$([regex]::Escape($z))' added"
+                hasEscapedSuccess = $zoneResp.Content -match "Zone &#39;$([regex]::Escape($z))&#39; added"
+                hasErrorAlert     = $zoneResp.Content -match 'class="alert error"'
+                hasLoginForm      = ($zoneResp.Content -match 'name="username"' -and $zoneResp.Content -match 'name="password"')
+                snippet           = $zoneResp.Content.Substring(0, [Math]::Min(500, $zoneResp.Content.Length))
+              }
+              if ($zoneResp.StatusCode -ne 200 -or (
+                $zoneResp.Content -notmatch "Zone '$([regex]::Escape($z))' added" -and
+                $zoneResp.Content -notmatch "Zone &#39;$([regex]::Escape($z))&#39; added"
+              )) {
+                Write-Host "[microsoft-local] Zone create response excerpt:"
+                Write-Host $zoneResp.Content.Substring(0, [Math]::Min(1200, $zoneResp.Content.Length))
+                throw "Zone create failed for ${z}: HTTP $($zoneResp.StatusCode)"
               }
             }
 
@@ -634,27 +787,43 @@ jobs:
             if ($kc.status -ne 'success') { throw 'keycheck failed' }
 
             $www = "www.$la"
-            $jCreate = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.10') }
-            $jUpdate = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.20') }
-            $jDelete = @{ zone_name = $la; record_type = 'DELETE'; record_name = 'www'; values = @('A') }
-            $jDenied = @{ zone_name = $ld; record_type = 'A'; record_name = 'blocked'; ttl = 300; values = @('192.0.2.55') }
+            $jCreate  = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.10') }
+            $jReplace = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.20') }
+            $jPatchTtl = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; ttl = 450 }
+            $jPatch   = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; values = @('192.0.2.30') }
+            $qDelete  = @{ zone_name = $la; record_name = 'www'; record_type = 'A' }
+            $jDenied  = @{ zone_name = $ld; record_type = 'A'; record_name = 'blocked'; ttl = 300; values = @('192.0.2.55') }
 
-            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -JsonBody $jCreate
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -Method POST -JsonBody $jCreate
             Assert-DnsRecordAction -Json $x -ExpectedAction 'created'
             Wait-LocalA -Fqdn $www -ExpectedIp '192.0.2.10'
 
-            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -JsonBody $jUpdate
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -Method PATCH -JsonBody $jPatchTtl
+            Assert-DnsRecordAction -Json $x -ExpectedAction 'updated'
+            Wait-LocalA -Fqdn $www -ExpectedIp '192.0.2.10'
+
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 409 -Method POST -JsonBody $jCreate
+            Assert-DnsRecordAction -Json $x -ExpectedAction 'record_already_exists'
+
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -Method PUT -JsonBody $jReplace
             Assert-DnsRecordAction -Json $x -ExpectedAction 'updated'
             Wait-LocalA -Fqdn $www -ExpectedIp '192.0.2.20'
 
-            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -JsonBody $jDelete
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -Method PATCH -JsonBody $jPatch
+            Assert-DnsRecordAction -Json $x -ExpectedAction 'updated'
+            Wait-LocalA -Fqdn $www -ExpectedIp '192.0.2.30'
+
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -Method DELETE -Query $qDelete
             Assert-DnsRecordAction -Json $x -ExpectedAction 'deleted'
             Wait-LocalAbsent -Fqdn $www
 
-            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 404 -JsonBody $jDelete
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 404 -Method DELETE -Query $qDelete
             Assert-DnsRecordAction -Json $x -ExpectedAction 'not_found'
 
-            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 403 -JsonBody $jDenied
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 404 -Method PUT -JsonBody $jReplace
+            Assert-DnsRecordAction -Json $x -ExpectedAction 'not_found'
+
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 403 -Method POST -JsonBody $jDenied
             Assert-DnsRecordAction -Json $x -ExpectedAction 'access_denied'
 
             if ($env:REMOTE_WINRM_HOST -and $env:REMOTE_WINRM_USER -and $env:REMOTE_WINRM_PASSWORD) {
@@ -668,6 +837,7 @@ jobs:
                 Write-Host "[microsoft-remote] Configure zone $z"
                 $form = @{
                   zone_name           = $z
+                  dns_zone            = $z
                   dns_provider_type   = 'microsoft'
                   dns_server          = $env:REMOTE_WINRM_HOST
                   dns_username        = $env:REMOTE_WINRM_USER
@@ -676,7 +846,24 @@ jobs:
                 if ($env:REMOTE_WINRM_SSL -in @('true', 'True', '1')) {
                   $form['dns_winrm_ssl'] = 'true'
                 }
-                $null = Invoke-FormPost -Uri "$base/zones" -WebSession $WebSession -Form $form
+                $zoneResp = Invoke-FormPost -Uri "$base/zones" -WebSession $WebSession -Form $form
+                Write-AgentDebugLog -HypothesisId 'H1,H2,H3,H5' -Location '.github/workflows/microsoft-dns-smoke.yml:microsoft-remote-zone-create' -Message 'microsoft remote zone create response diagnostics' -Data @{
+                  zone              = $z
+                  status            = [int]$zoneResp.StatusCode
+                  hasExactSuccess   = $zoneResp.Content -match "Zone '$([regex]::Escape($z))' added"
+                  hasEscapedSuccess = $zoneResp.Content -match "Zone &#39;$([regex]::Escape($z))&#39; added"
+                  hasErrorAlert     = $zoneResp.Content -match 'class="alert error"'
+                  hasLoginForm      = ($zoneResp.Content -match 'name="username"' -and $zoneResp.Content -match 'name="password"')
+                  snippet           = $zoneResp.Content.Substring(0, [Math]::Min(500, $zoneResp.Content.Length))
+                }
+                if ($zoneResp.StatusCode -ne 200 -or (
+                  $zoneResp.Content -notmatch "Zone '$([regex]::Escape($z))' added" -and
+                  $zoneResp.Content -notmatch "Zone &#39;$([regex]::Escape($z))&#39; added"
+                )) {
+                  Write-Host "[microsoft-remote] Zone create response excerpt:"
+                  Write-Host $zoneResp.Content.Substring(0, [Math]::Min(1200, $zoneResp.Content.Length))
+                  throw "Remote zone create failed for ${z}: HTTP $($zoneResp.StatusCode)"
+                }
               }
 
               Write-Host '[microsoft-remote] GET /api-keys'
@@ -689,25 +876,25 @@ jobs:
               $rWww = "www.$ra"
               $rjC = @{ zone_name = $ra; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.10') }
               $rjU = @{ zone_name = $ra; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.20') }
-              $rjD = @{ zone_name = $ra; record_type = 'DELETE'; record_name = 'www'; values = @('A') }
+              $rqD = @{ zone_name = $ra; record_name = 'www'; record_type = 'A' }
               $rjX = @{ zone_name = $rd; record_type = 'A'; record_name = 'blocked'; ttl = 300; values = @('192.0.2.55') }
 
-              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 200 -JsonBody $rjC
+              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 200 -Method POST -JsonBody $rjC
               Assert-DnsRecordAction -Json $x -ExpectedAction 'created'
               Wait-RemoteA -Fqdn $rWww -ExpectedIp '192.0.2.10' -Server $remoteDig
 
-              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 200 -JsonBody $rjU
+              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 200 -Method PUT -JsonBody $rjU
               Assert-DnsRecordAction -Json $x -ExpectedAction 'updated'
               Wait-RemoteA -Fqdn $rWww -ExpectedIp '192.0.2.20' -Server $remoteDig
 
-              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 200 -JsonBody $rjD
+              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 200 -Method DELETE -Query $rqD
               Assert-DnsRecordAction -Json $x -ExpectedAction 'deleted'
               Wait-RemoteAbsent -Fqdn $rWww -Server $remoteDig
 
-              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 404 -JsonBody $rjD
+              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 404 -Method DELETE -Query $rqD
               Assert-DnsRecordAction -Json $x -ExpectedAction 'not_found'
 
-              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 403 -JsonBody $rjX
+              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 403 -Method POST -JsonBody $rjX
               Assert-DnsRecordAction -Json $x -ExpectedAction 'access_denied'
             }
             else {
