@@ -1,3 +1,5 @@
+import json
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -5,7 +7,18 @@ from fastapi.testclient import TestClient
 from itsdangerous import SignatureExpired
 from sqlmodel import select
 
+import src.activity_logging as activity_logging
 import src.auth as auth_module
+from src.activity_logging import (
+    emit_activity_event,
+    infer_event_category,
+    query_activity_logs,
+    render_alert_template,
+    run_retention_cleanup,
+    set_log_level,
+    set_retention_days,
+    set_smtp_config,
+)
 from src.app import (
     ALL_ROLES,
     ROLE_GLOBAL_ADMIN,
@@ -29,61 +42,23 @@ from src.app import (
 from src.auth import SESSION_IDLE_TIMEOUT_SECONDS, create_session_cookie
 from src.db import SessionLocal, init_db
 from src.dns_client import create_dns_client, discover_plugins, dns_provider_display_name
-from src.models import ApiKey, ApiKeyAllowedZone, DnsZoneConfig, User
+from src.zone_service import provider_dns_zone
+from src.models import (
+    LOG_CATEGORY_SECURITY,
+    LOG_LEVEL_ERROR,
+    LOG_LEVEL_INFORMATIONAL,
+    LOG_LEVEL_VERBOSE,
+    LOG_LEVEL_WARNING,
+    ActivityLog,
+    AlertRule,
+    ApiKey,
+    ApiKeyAllowedZone,
+    DnsZoneConfig,
+    User,
+)
 from src.plugins.bind import BindTsigDnsClient
 from src.security import hash_password
-
-
-@pytest.fixture
-def api_key_value() -> str:
-    return "test-api-key-for-dns-endpoint"
-
-
-def _seed_example_zone_and_permission(db, api_key_value: str) -> None:
-    if not db.exec(select(ApiKey).where(ApiKey.key == api_key_value)).first():
-        db.add(ApiKey(label="pytest", key=api_key_value, active=True))
-        db.commit()
-    key = db.exec(select(ApiKey).where(ApiKey.key == api_key_value)).first()
-    zname = normalize_zone_name("example.com")
-    zone = db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == zname)).first()
-    if not zone:
-        cfg = {
-            "dns_provider_type": "azure",
-            "dns_server": "",
-            "dns_username": "",
-            "dns_password": "",
-            "dns_tsig_algorithm": "",
-            "dns_winrm_ssl": "",
-            "azure_tenant_id": "",
-            "azure_client_id": "",
-            "azure_client_secret": "",
-            "azure_subscription_id": "00000000-0000-0000-0000-000000000001",
-            "azure_resource_group": "rg-test",
-        }
-        zone = DnsZoneConfig(zone_name=zname, encrypted_config=encode_zone_config_dict(cfg))
-        db.add(zone)
-        db.commit()
-        db.refresh(zone)
-    if not db.exec(
-        select(ApiKeyAllowedZone).where(
-            ApiKeyAllowedZone.api_key_id == key.id,
-            ApiKeyAllowedZone.dns_zone_config_id == zone.id,
-        )
-    ).first():
-        db.add(ApiKeyAllowedZone(api_key_id=key.id, dns_zone_config_id=zone.id))
-        db.commit()
-
-
-@pytest.fixture
-def client(api_key_value: str) -> TestClient:
-    init_db()
-    with SessionLocal() as db:
-        set_disabled_dns_plugins(db, set())
-        _seed_example_zone_and_permission(db, api_key_value)
-        if not db.exec(select(User).where(User.username == "admin")).first():
-            db.add(User(username="admin", password_hash=hash_password("x"), roles=_serialize_roles(ALL_ROLES)))
-            db.commit()
-    return TestClient(app)
+from src.time_utils import utc_now
 
 
 def test_root_redirects_to_login_without_session(client: TestClient) -> None:
@@ -98,7 +73,7 @@ def test_admin_redirects_to_login_without_session(client: TestClient) -> None:
     assert response.headers["location"] == "/login"
 
 
-def test_login_sets_five_minute_session_cookie(client: TestClient) -> None:
+def test_login_sets_fifteen_minute_session_cookie(client: TestClient) -> None:
     with SessionLocal() as db:
         _delete_users(db)
         _create_user(db, "admin", "x", ALL_ROLES)
@@ -241,10 +216,27 @@ def test_zones_page_displays_zone_provider_metadata(client: TestClient) -> None:
     assert "&mdash;" in response.text
 
 
+def test_zones_page_has_delete_confirmation_dialog(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/zones")
+    assert response.status_code == 200
+    assert 'id="delete-zone-dialog"' in response.text
+    assert "data-open-delete-zone" in response.text
+
+
+def test_api_keys_page_has_revoke_confirmation_dialog(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/api-keys")
+    assert response.status_code == 200
+    assert 'id="revoke-api-key-dialog"' in response.text
+    assert "data-open-revoke-key" in response.text
+
+
 def test_builtin_dns_plugins_are_discovered() -> None:
     plugins = discover_plugins()
-    assert set(plugins) >= {"azure", "bind", "microsoft"}
+    assert set(plugins) >= {"azure", "bind", "cloudflare", "microsoft"}
     assert plugins["azure"].label == "Azure DNS (REST API)"
+    assert plugins["cloudflare"].label == "Cloudflare DNS (REST API)"
     assert dns_provider_display_name("microsoft") == "Microsoft DNS (WinRM)"
 
 
@@ -267,20 +259,126 @@ def test_zone_form_renders_plugins_from_metadata(client: TestClient) -> None:
     assert '<option value="azure" selected>Azure DNS (REST API)</option>' in response.text
     assert '<option value="microsoft" >Microsoft DNS (WinRM)</option>' in response.text
     assert '<option value="bind" >BIND / RFC 2136 (TSIG)</option>' in response.text
+    assert '<option value="cloudflare" >Cloudflare DNS (REST API)</option>' in response.text
     assert 'data-provider-panel="azure"' in response.text
+    assert 'data-provider-panel="cloudflare"' in response.text
+    assert 'name="dns_zone"' in response.text
     assert 'name="azure_tenant_id"' in response.text
+    assert 'name="cloudflare_api_token"' in response.text
+    assert 'name="cloudflare_proxied"' in response.text
     assert 'name="dns_winrm_ssl"' in response.text
     assert 'name="dns_tsig_algorithm"' in response.text
+    assert 'id="zone-test-btn"' in response.text
+    assert 'id="test-record-type"' in response.text
+
+
+def test_zone_test_requires_auth(client: TestClient) -> None:
+    response = client.post(
+        "/zones/test",
+        data={
+            "zone_name": "example.com",
+            "test_record_name": "@",
+            "dns_provider_type": "azure",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
+
+
+def test_zone_test_success(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    from src.models import DnsRecordInfo
+
+    monkeypatch.setattr(
+        "src.app.test_zone_record_lookup",
+        lambda _cfg, **kwargs: [
+            DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])
+        ],
+    )
+    response = client.post(
+        "/zones/test",
+        data={
+            "zone_name": "example.com",
+            "test_record_name": "www",
+            "test_record_type": "A",
+            "dns_provider_type": "azure",
+            "dns_zone": "example.com",
+            "azure_tenant_id": "tenant",
+            "azure_client_id": "client",
+            "azure_client_secret": "secret",
+            "azure_subscription_id": "sub",
+            "azure_resource_group": "rg",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["records"] == [
+        {"record_name": "www", "record_type": "A", "ttl": 300, "values": ["192.0.2.1"]}
+    ]
+    assert set(body["records"][0]) == {"record_name", "record_type", "ttl", "values"}
+
+
+def test_zone_test_not_found(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    monkeypatch.setattr("src.app.test_zone_record_lookup", lambda _cfg, **kwargs: [])
+    response = client.post(
+        "/zones/test",
+        data={
+            "zone_name": "example.com",
+            "test_record_name": "missing",
+            "dns_provider_type": "azure",
+            "dns_zone": "example.com",
+            "azure_tenant_id": "tenant",
+            "azure_client_id": "client",
+            "azure_client_secret": "secret",
+            "azure_subscription_id": "sub",
+            "azure_resource_group": "rg",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "not_found"
+    assert body["records"] == []
+
+
+def test_zone_test_invalid_record_type(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post(
+        "/zones/test",
+        data={
+            "zone_name": "example.com",
+            "test_record_name": "www",
+            "test_record_type": "MX",
+            "dns_provider_type": "azure",
+            "dns_zone": "example.com",
+            "azure_tenant_id": "tenant",
+            "azure_client_id": "client",
+            "azure_client_secret": "secret",
+            "azure_subscription_id": "sub",
+            "azure_resource_group": "rg",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["status"] == "error"
 
 
 def test_zones_json_request_returns_zone_ids(client: TestClient) -> None:
+    from src.zone_service import api_key_last_used_at, get_api_key
+
     response = client.get("/zones", headers={"Accept": "application/json", "X-API-Key": "test-api-key-for-dns-endpoint"})
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/json")
     zones = response.json()
     example = next(zone for zone in zones if zone["zone_name"] == "example.com")
     assert isinstance(example["id"], int)
-    assert set(zones[0]) == {"id", "zone_name"}
+    assert example["dns_zone"] == "example.com"
+    assert set(zones[0]) == {"id", "zone_name", "dns_zone"}
+    with SessionLocal() as db:
+        key = get_api_key(db, "test-api-key-for-dns-endpoint")
+        assert key is not None
+        assert api_key_last_used_at(db, int(key.id)) is not None
 
 
 def test_zones_json_request_without_api_key_returns_access_denied(client: TestClient) -> None:
@@ -297,6 +395,88 @@ def test_zones_json_schema_is_documented(client: TestClient) -> None:
     zones_response = schema["paths"]["/zones"]["get"]["responses"]["200"]
     assert zones_response["content"]["application/json"]["schema"]["items"]["$ref"].endswith("/DnsZoneSummary")
     assert "DnsZoneSummary" in schema["components"]["schemas"]
+    assert "dns_zone" in schema["components"]["schemas"]["DnsZoneSummary"]["required"]
+
+
+def test_provider_dns_zone_requires_config_field() -> None:
+    with pytest.raises(ValueError, match="DNS zone \\(domain\\) is required"):
+        provider_dns_zone({"dns_provider_type": "azure"})
+
+
+def test_two_zone_configs_can_share_dns_domain(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    domain = "shared.example"
+    config_names = ("shared-azure-cfg", "shared-cf-cfg")
+    for config_name, provider in zip(config_names, ("azure", "cloudflare"), strict=True):
+        response = client.post(
+            "/zones",
+            data={
+                "zone_name": config_name,
+                "dns_provider_type": provider,
+                "dns_zone": domain,
+                "azure_tenant_id": "t",
+                "azure_client_id": "c",
+                "azure_client_secret": "s",
+                "azure_subscription_id": "sub",
+                "azure_resource_group": "rg",
+                "cloudflare_api_token": "token",
+            },
+        )
+        assert response.status_code == 200, response.text[:500]
+
+    with SessionLocal() as db:
+        rows = [
+            db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == name)).first()
+            for name in config_names
+        ]
+        assert all(row is not None for row in rows)
+
+
+def test_zone_delete_detaches_letsencrypt_config(client: TestClient) -> None:
+    from src import letsencrypt
+
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        row = DnsZoneConfig(
+            zone_name="le-zone-delete-integration",
+            encrypted_config=encode_zone_config_dict(
+                {
+                    "dns_provider_type": "azure",
+                    "dns_zone": "example.com",
+                    "azure_tenant_id": "t",
+                    "azure_client_id": "c",
+                    "azure_client_secret": "s",
+                    "azure_subscription_id": "sub",
+                    "azure_resource_group": "rg",
+                }
+            ),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        zone_id = int(row.id)
+        letsencrypt.save_config(
+            db,
+            email="admin@example.com",
+            root_dns_domain="example.com",
+            common_name="api.example.com",
+            subject_alt_names="",
+            challenge_type=letsencrypt.CHALLENGE_DNS,
+            zone_id=zone_id,
+            staging=True,
+            auto_renew_enabled=True,
+        )
+
+    response = client.post(f"/zones/{zone_id}/delete")
+    assert response.status_code == 200
+    assert "Zone removed." in response.text
+
+    with SessionLocal() as db:
+        config = letsencrypt.get_config(db)
+        assert config is not None
+        assert config["zone_id"] is None
+        assert config["auto_renew_enabled"] is False
+        assert db.get(DnsZoneConfig, zone_id) is None
 
 
 def test_legacy_zone_page_routes_are_not_redirects(client: TestClient) -> None:
@@ -378,11 +558,19 @@ def test_session_backed_pages_are_not_in_openapi(client: TestClient) -> None:
         "/settings/account/password",
         "/settings/plugins/{plugin_key}/disable",
         "/settings/plugins/{plugin_key}/enable",
+        "/settings/system/log-level",
+        "/settings/system/retention",
+        "/settings/system/smtp",
+        "/settings/system/log-rotation",
+        "/settings/alerts",
+        "/settings/alerts/{rule_id}",
+        "/settings/alerts/{rule_id}/delete",
     }
     for path in hidden_paths:
         assert path not in schema["paths"]
     assert set(schema["paths"]) == {"/keycheck", "/zones", "/dns-record"}
     assert set(schema["paths"]["/zones"]) == {"get"}
+    assert set(schema["paths"]["/dns-record"]) == {"get", "post", "put", "patch", "delete"}
 
 
 def test_keycheck_unauthorized_response_is_documented(client: TestClient) -> None:
@@ -403,6 +591,115 @@ def test_keycheck_success_response_is_documented(client: TestClient) -> None:
     assert content["schema"]["required"] == ["status"]
 
 
+def test_dns_record_get_schema_is_documented(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    get_op = schema["paths"]["/dns-record"]["get"]
+    param_names = {param["name"] for param in get_op["parameters"]}
+    assert {"zone_name", "record_name", "record_type", "X-API-Key", "Authorization"} <= param_names
+    response_schema = get_op["responses"]["200"]["content"]["application/json"]["schema"]
+    assert response_schema["$ref"].endswith("/DnsRecordGetResponse")
+    assert "DnsRecordGetResponse" in schema["components"]["schemas"]
+    assert "DnsRecordInfo" in schema["components"]["schemas"]
+    assert "dns_zone" in schema["components"]["schemas"]["DnsRecordGetResponse"]["required"]
+    records_items = schema["components"]["schemas"]["DnsRecordGetResponse"]["properties"]["records"]["items"]
+    assert records_items["$ref"].endswith("/DnsRecordInfo")
+
+
+def test_dns_record_get_requires_api_key(client: TestClient) -> None:
+    response = client.get(
+        "/dns-record",
+        params={
+            "zone_name": "example.com",
+            "record_name": "www",
+        },
+    )
+    assert response.status_code == 401
+
+
+def test_dns_record_get_with_mock_client(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.models import DnsRecordInfo
+
+    monkeypatch.setattr(
+        "src.app.test_zone_record_lookup",
+        lambda _settings, **kwargs: [
+            DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])
+        ],
+    )
+    response = client.get(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        params={
+            "zone_name": "example.com",
+            "record_name": "www",
+            "record_type": "A",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["zone_name"] == "example.com"
+    assert body["dns_zone"] == "example.com"
+    assert body["record_name"] == "www"
+    assert body["records"] == [
+        {"record_name": "www", "record_type": "A", "ttl": 300, "values": ["192.0.2.1"]}
+    ]
+
+
+def test_dns_record_get_untyped_multi_type(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.models import DnsRecordInfo
+
+    monkeypatch.setattr(
+        "src.app.test_zone_record_lookup",
+        lambda _settings, **kwargs: [
+            DnsRecordInfo(record_name="@", record_type="A", ttl=500, values=["10.0.0.1"]),
+            DnsRecordInfo(record_name="@", record_type="CNAME", ttl=1000, values=["target.example.com"]),
+        ],
+    )
+    response = client.get(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        params={"zone_name": "example.com", "record_name": "@"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["dns_zone"] == "example.com"
+    assert len(body["records"]) == 2
+    assert body["records"][0]["ttl"] == 500
+    assert body["records"][1]["ttl"] == 1000
+
+
+def test_dns_record_get_not_found(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.app.test_zone_record_lookup", lambda _settings, **kwargs: [])
+    response = client.get(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        params={
+            "zone_name": "example.com",
+            "record_name": "missing",
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "not_found"
+    assert body["dns_zone"] == "example.com"
+    assert body["records"] == []
+
+
+def test_dns_record_get_invalid_record_type(client: TestClient, api_key_value: str) -> None:
+    response = client.get(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        params={
+            "zone_name": "example.com",
+            "record_name": "www",
+            "record_type": "MX",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "invalid_request"
+
+
 def test_dns_record_requires_api_key(client: TestClient) -> None:
     response = client.post(
         "/dns-record",
@@ -419,6 +716,7 @@ def test_dns_record_requires_api_key(client: TestClient) -> None:
 
 def test_dns_record_with_mock_client(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = MagicMock()
+    fake.get_record.return_value = []
     fake.create_or_update_record.return_value = False
     monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
 
@@ -437,11 +735,58 @@ def test_dns_record_with_mock_client(client: TestClient, api_key_value: str, mon
     body = response.json()
     assert body["status"] == "success"
     assert body["action"] == "created"
+    assert body["dns_zone"] == "example.com"
+    fake.get_record.assert_called_once()
     fake.create_or_update_record.assert_called_once()
+    with SessionLocal() as db:
+        event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "dns.record_created")).first()
+        assert event is not None
+        assert event.category == "dns"
 
 
-def test_dns_record_delete_with_mock_client(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dns_record_audit_message_uses_provider_dns_zone(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_name = "audit-config-label"
+    provider_domain = "audit-provider.example"
+    with SessionLocal() as db:
+        key = db.exec(select(ApiKey).where(ApiKey.key == api_key_value)).first()
+        assert key is not None
+        row = db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == config_name)).first()
+        if row is None:
+            row = DnsZoneConfig(
+                zone_name=config_name,
+                encrypted_config=encode_zone_config_dict(
+                    {
+                        "dns_provider_type": "azure",
+                        "dns_zone": provider_domain,
+                        "dns_server": "",
+                        "dns_username": "",
+                        "dns_password": "",
+                        "dns_tsig_algorithm": "",
+                        "dns_winrm_ssl": "",
+                        "azure_tenant_id": "",
+                        "azure_client_id": "",
+                        "azure_client_secret": "",
+                        "azure_subscription_id": "00000000-0000-0000-0000-000000000001",
+                        "azure_resource_group": "rg-test",
+                    }
+                ),
+            )
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+        if not db.exec(
+            select(ApiKeyAllowedZone).where(
+                ApiKeyAllowedZone.api_key_id == key.id,
+                ApiKeyAllowedZone.dns_zone_config_id == row.id,
+            )
+        ).first():
+            db.add(ApiKeyAllowedZone(api_key_id=key.id, dns_zone_config_id=row.id))
+            db.commit()
+
     fake = MagicMock()
+    fake.get_record.return_value = []
     fake.create_or_update_record.return_value = True
     monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
 
@@ -449,24 +794,35 @@ def test_dns_record_delete_with_mock_client(client: TestClient, api_key_value: s
         "/dns-record",
         headers={"X-API-Key": api_key_value},
         json={
-            "zone_name": "example.com",
-            "record_type": "DELETE",
+            "zone_name": config_name,
+            "record_type": "A",
             "record_name": "www",
-            "values": ["A"],
+            "ttl": 300,
+            "values": ["192.0.2.10"],
         },
     )
     assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "success"
-    assert body["action"] == "deleted"
-    fake.create_or_update_record.assert_called_once()
+    assert response.json()["dns_zone"] == provider_domain
+    with SessionLocal() as db:
+        event = db.exec(
+            select(ActivityLog).where(
+                ActivityLog.event_type == "dns.record_created",
+                ActivityLog.zone_name == config_name,
+                ActivityLog.record_name == "www",
+            )
+        ).first()
+        assert event is not None
+        assert event.zone_name == config_name
+        assert event.message == f"DNS record www.{provider_domain} created"
 
 
-def test_dns_record_delete_not_found_returns_404(
+def test_dns_record_post_conflict_returns_409(
     client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from src.models import DnsRecordInfo
+
     fake = MagicMock()
-    fake.create_or_update_record.return_value = False
+    fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A")]
     monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
 
     response = client.post(
@@ -474,21 +830,295 @@ def test_dns_record_delete_not_found_returns_404(
         headers={"X-API-Key": api_key_value},
         json={
             "zone_name": "example.com",
-            "record_type": "DELETE",
+            "record_type": "A",
+            "record_name": "www",
+            "ttl": 300,
+            "values": ["192.0.2.1"],
+        },
+    )
+    assert response.status_code == 409
+    body = response.json()
+    assert body["status"] == "error"
+    assert body["action"] == "record_already_exists"
+    assert body["record_type"] == "A"
+    fake.get_record.assert_called_once()
+    fake.create_or_update_record.assert_not_called()
+    with SessionLocal() as db:
+        event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "dns.record_already_exists")).first()
+        assert event is not None
+        assert event.category == "dns"
+
+
+def test_dns_record_put_replaces_existing_record(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.models import DnsRecordInfo
+
+    fake = MagicMock()
+    fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A")]
+    fake.create_or_update_record.return_value = True
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+
+    response = client.put(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "www",
+            "ttl": 600,
+            "values": ["192.0.2.2"],
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["action"] == "updated"
+    fake.get_record.assert_called_once()
+    fake.create_or_update_record.assert_called_once()
+
+
+def test_dns_record_put_missing_returns_404(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = MagicMock()
+    fake.get_record.return_value = []
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+
+    response = client.put(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
             "record_name": "missing",
-            "values": ["A"],
+            "ttl": 300,
+            "values": ["192.0.2.1"],
         },
     )
     assert response.status_code == 404
     body = response.json()
     assert body["status"] == "error"
     assert body["action"] == "not_found"
+    fake.create_or_update_record.assert_not_called()
+
+
+def test_dns_record_put_requires_ttl(client: TestClient, api_key_value: str) -> None:
+    response = client.put(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "www",
+            "values": ["192.0.2.1"],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_dns_record_patch_updates_values(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.models import DnsRecordInfo
+
+    fake = MagicMock()
+    fake.get_record.return_value = [
+        DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])
+    ]
+    fake.create_or_update_record.return_value = True
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+
+    response = client.patch(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "www",
+            "values": ["192.0.2.99"],
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["action"] == "updated"
+    assert body["values"] == ["192.0.2.99"]
+    fake.get_record.assert_called_once()
+    fake.create_or_update_record.assert_called_once()
+    internal = fake.create_or_update_record.call_args.args[0]
+    assert internal.ttl == 300
+
+
+def test_dns_record_patch_ttl_only(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.models import DnsRecordInfo
+
+    fake = MagicMock()
+    fake.get_record.return_value = [
+        DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])
+    ]
+    fake.create_or_update_record.return_value = True
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+
+    response = client.patch(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "www",
+            "ttl": 600,
+        },
+    )
+    assert response.status_code == 200
+    internal = fake.create_or_update_record.call_args.args[0]
+    assert internal.ttl == 600
+    assert internal.values == ["192.0.2.1"]
+
+
+def test_dns_record_patch_both_fields(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.models import DnsRecordInfo
+
+    fake = MagicMock()
+    fake.get_record.return_value = [
+        DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])
+    ]
+    fake.create_or_update_record.return_value = True
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+
+    response = client.patch(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "www",
+            "ttl": 900,
+            "values": ["192.0.2.99"],
+        },
+    )
+    assert response.status_code == 200
+    internal = fake.create_or_update_record.call_args.args[0]
+    assert internal.ttl == 900
+    assert internal.values == ["192.0.2.99"]
+
+
+def test_dns_record_patch_neither_field_returns_422(client: TestClient, api_key_value: str) -> None:
+    response = client.patch(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "www",
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_dns_record_patch_empty_values_returns_422(client: TestClient, api_key_value: str) -> None:
+    response = client.patch(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "www",
+            "values": [],
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_dns_record_patch_missing_returns_404(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = MagicMock()
+    fake.get_record.return_value = []
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+
+    response = client.patch(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "missing",
+            "values": ["192.0.2.99"],
+        },
+    )
+    assert response.status_code == 404
+    body = response.json()
+    assert body["status"] == "error"
+    assert body["action"] == "not_found"
+    fake.create_or_update_record.assert_not_called()
+
+
+def test_dns_record_delete_with_mock_client(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.models import DnsRecordInfo
+
+    fake = MagicMock()
+    fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A")]
+    fake.create_or_update_record.return_value = True
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+
+    response = client.delete(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        params={"zone_name": "example.com", "record_name": "www", "record_type": "A"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "success"
+    assert body["action"] == "deleted"
+    assert body["record_type"] == "A"
+    fake.get_record.assert_called_once()
+    fake.create_or_update_record.assert_called_once()
+    internal_payload = fake.create_or_update_record.call_args.args[0]
+    assert internal_payload.record_type == "DELETE"
+    assert internal_payload.values == ["A"]
+
+
+def test_dns_record_delete_not_found_returns_404(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = MagicMock()
+    fake.get_record.return_value = []
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+
+    response = client.delete(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        params={"zone_name": "example.com", "record_name": "missing", "record_type": "A"},
+    )
+    assert response.status_code == 404
+    body = response.json()
+    assert body["status"] == "error"
+    assert body["action"] == "not_found"
+    fake.create_or_update_record.assert_not_called()
+
+
+def test_dns_record_delete_rejects_unknown_record_type(
+    client: TestClient, api_key_value: str
+) -> None:
+    response = client.delete(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        params={"zone_name": "example.com", "record_name": "www", "record_type": "MX"},
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "invalid_request"
 
 
 def test_dns_record_provider_runtime_error_returns_502(
     client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake = MagicMock()
+    fake.get_record.return_value = []
     fake.create_or_update_record.side_effect = RuntimeError("WinRM/PowerShell failed (1): example")
     monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
 
@@ -511,9 +1141,24 @@ def test_dns_record_provider_runtime_error_returns_502(
 
 def test_dns_record_schema_excludes_azure_zone_settings(client: TestClient) -> None:
     schema = client.get("/openapi.json").json()
-    request_schema = schema["components"]["schemas"]["DnsRecordRequest"]
-    assert "subscription_id" not in request_schema["properties"]
-    assert "resource_group" not in request_schema["properties"]
+    components = schema["components"]["schemas"]
+    for model_name in ("DnsRecordCreateRequest", "DnsRecordReplaceRequest", "DnsRecordPatchRequest"):
+        assert model_name in components
+        request_schema = components[model_name]
+        assert "subscription_id" not in request_schema["properties"]
+        assert "resource_group" not in request_schema["properties"]
+    assert "DnsRecordRequest" not in components
+
+
+def test_dns_record_openapi_documents_all_methods(client: TestClient) -> None:
+    schema = client.get("/openapi.json").json()
+    path = schema["paths"]["/dns-record"]
+    assert set(path) == {"get", "post", "put", "patch", "delete"}
+    assert "409" in path["post"]["responses"]
+    for method in ("put", "patch", "delete"):
+        assert "404" in path[method]["responses"]
+    delete_param_names = {p["name"] for p in path["delete"]["parameters"]}
+    assert {"zone_name", "record_name", "record_type"} <= delete_param_names
 
 
 def test_dns_record_access_denied_unknown_zone(client: TestClient, api_key_value: str) -> None:
@@ -538,6 +1183,7 @@ def test_dns_record_access_denied_zone_not_allowed(client: TestClient, api_key_v
         if not db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == other)).first():
             cfg = {
                 "dns_provider_type": "azure",
+                "dns_zone": "other.example",
                 "dns_server": "",
                 "dns_username": "",
                 "dns_password": "",
@@ -622,7 +1268,9 @@ def test_no_role_user_can_change_own_password_only(client: TestClient) -> None:
     assert "Create user" not in response.text
     assert "Edit roles" not in response.text
     assert "Plugin Management" not in response.text
-    assert "Activity Logging" not in response.text
+    assert "System Settings" not in response.text
+    assert "View Logs" not in response.text
+    assert "Email Alerting" not in response.text
     assert "System Backup" not in response.text
 
     response = client.post(
@@ -720,7 +1368,9 @@ def test_settings_renders_for_authenticated_session(client: TestClient) -> None:
     assert 'classList.toggle("role-forced", forced)' in response.text
     assert "Authentication" in response.text
     assert "Plugin Management" in response.text
-    assert "Activity Logging" in response.text
+    assert "System Settings" in response.text
+    assert "View Logs" in response.text
+    assert "Email Alerting" in response.text
     assert "System Backup" in response.text
 
 
@@ -735,6 +1385,7 @@ def test_admin_page_links_to_settings(client: TestClient) -> None:
     response = client.get("/admin")
     assert response.status_code == 200
     assert 'href="/settings"' in response.text
+    assert '<code>example.com</code> <span class="help">(example.com)</span>' in response.text
 
 
 def test_dashboard_disables_zone_and_api_key_buttons_without_roles(client: TestClient) -> None:
@@ -1520,7 +2171,9 @@ def test_global_read_can_view_read_only_pages(client: TestClient) -> None:
     for path, expected_text in (
         ("/settings?area=authentication", "Authentication"),
         ("/settings?area=plugins", "Plugin Management"),
-        ("/settings?area=logging", "Activity Logging"),
+        ("/settings?area=logging", "View Logs"),
+        ("/settings?area=system_settings", "System Settings"),
+        ("/settings?area=email_alerting", "Email Alerting"),
         ("/settings?area=backup", "System Backup"),
         ("/zones", "Configured zones"),
         ("/api-keys", "Existing API keys"),
@@ -1552,7 +2205,7 @@ def test_system_update_can_view_system_placeholders_without_global_read(client: 
 
     response = client.get("/settings?area=logging")
     assert response.status_code == 200
-    assert "Activity Logging" in response.text
+    assert "View Logs" in response.text
     assert "System Backup" in response.text
     assert "Authentication" in response.text
     assert "Plugin Management" not in response.text
@@ -1597,6 +2250,7 @@ def test_disabling_last_enabled_plugin_is_blocked(client: TestClient) -> None:
 
     assert client.post("/settings/plugins/bind/disable").status_code == 200
     assert client.post("/settings/plugins/microsoft/disable").status_code == 200
+    assert client.post("/settings/plugins/cloudflare/disable").status_code == 200
     response = client.post("/settings/plugins/azure/disable")
     assert response.status_code == 200
     assert "At least one DNS provider plugin must remain enabled." in response.text
@@ -1623,6 +2277,7 @@ def test_manual_zone_create_with_disabled_provider_is_rejected(client: TestClien
         data={
             "zone_name": "disabled-provider.example",
             "dns_provider_type": "bind",
+            "dns_zone": "example.com",
             "dns_server": "127.0.0.1",
             "dns_username": "api-to-dns.",
             "dns_password": "secret",
@@ -1638,12 +2293,533 @@ def test_manual_zone_create_with_disabled_provider_is_rejected(client: TestClien
         )
 
 
-def test_settings_logging_area_renders_placeholder(client: TestClient) -> None:
+def test_settings_activity_logging_sections_render(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
-    response = client.get("/settings?area=logging")
+    response = client.get("/settings?area=system_settings")
     assert response.status_code == 200
-    assert "Activity Logging" in response.text
-    assert "not implemented yet" in response.text
+    assert "System Settings" in response.text
+    assert 'class="settings-submenu"' in response.text
+    assert "Logging Level" in response.text
+    assert "SMTP Delivery" in response.text
+    assert "App DNS Name" in response.text
+    assert "SSL Certificate" in response.text
+    assert 'name="log_level"' not in response.text
+    submenu = response.text.split('class="settings-submenu"')[1].split("</nav>")[0]
+    assert submenu.index("App DNS Name") < submenu.index("SSL Certificate")
+
+    response = client.get("/settings?area=log_viewing")
+    assert response.status_code == 200
+    assert "View Logs" in response.text
+    assert "Advanced Search" in response.text
+    assert "Category" in response.text
+
+    response = client.get("/settings?area=email_alerting")
+    assert response.status_code == 200
+    assert "Email Alerting" in response.text
+    assert "Template Variables" in response.text
+
+
+def test_settings_system_section_shows_single_panel(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/settings?area=system_settings&section=smtp_delivery")
+    assert response.status_code == 200
+    assert 'name="smtp_servers"' in response.text
+    assert 'name="log_level"' not in response.text
+    assert 'settings-submenu-item selected' in response.text or "settings-submenu-item selected" in response.text
+    assert "section=smtp_delivery" in response.text
+
+    response = client.get("/settings?area=system_settings&section=logging_configuration")
+    assert response.status_code == 200
+    assert 'name="log_level"' in response.text
+    assert 'name="smtp_servers"' not in response.text
+
+
+def test_settings_plugins_area_has_no_system_submenu(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/settings?area=plugins")
+    assert response.status_code == 200
+    assert "Plugin Management" in response.text
+    assert 'class="settings-submenu"' not in response.text
+
+
+def test_settings_log_level_post_redirects_to_section(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post(
+        "/settings/system/log-level",
+        data={
+            "log_level": "informational",
+            "redirect_area": "system_settings",
+            "redirect_section": "logging_configuration",
+        },
+    )
+    assert response.status_code == 200
+    assert "Activity log level set to INFORMATIONAL" in response.text
+    assert 'name="log_level"' in response.text
+    assert 'name="smtp_servers"' not in response.text
+
+
+def test_settings_app_dns_name_section_is_editable(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/settings?area=system_settings&section=system_identity")
+    assert response.status_code == 200
+    assert "App DNS Name" in response.text
+    assert 'name="app_dns_name"' in response.text
+    assert 'action="/settings/system/app-dns-name"' in response.text
+
+
+def test_settings_app_dns_name_post_persists(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post(
+        "/settings/system/app-dns-name",
+        data={"app_dns_name": "my-dns.example", "redirect_section": "system_identity"},
+    )
+    assert response.status_code == 200
+    assert "App DNS name saved as my-dns.example" in response.text
+    with SessionLocal() as db:
+        from src.activity_logging import get_app_dns_name
+
+        assert get_app_dns_name(db) == "my-dns.example"
+
+
+def test_default_app_dns_name_uses_docker_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(activity_logging, "is_running_in_docker", lambda: True)
+    assert activity_logging.default_app_dns_name() == "apitodns.local"
+
+
+def test_default_app_dns_name_uses_hostname_off_docker(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(activity_logging, "is_running_in_docker", lambda: False)
+    monkeypatch.setattr(activity_logging, "_host_system_dns_name", lambda: "host.example")
+    assert activity_logging.default_app_dns_name() == "host.example"
+
+
+def test_settings_operational_log_rotation_docker_shows_message_only(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src import settings_context
+
+    monkeypatch.setattr(activity_logging, "is_running_in_docker", lambda: True)
+    monkeypatch.setattr(settings_context, "is_running_in_docker", lambda: True)
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/settings?area=system_settings&section=operational_log_rotation")
+    assert response.status_code == 200
+    assert "Docker stdout/stderr logs are rotated by Docker." in response.text
+    assert 'action="/settings/system/log-rotation"' not in response.text
+    assert 'name="log_file"' not in response.text
+
+
+def test_settings_operational_log_rotation_non_docker_shows_form(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src import settings_context
+
+    monkeypatch.setattr(activity_logging, "is_running_in_docker", lambda: False)
+    monkeypatch.setattr(settings_context, "is_running_in_docker", lambda: False)
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/settings?area=system_settings&section=operational_log_rotation")
+    assert response.status_code == 200
+    assert 'action="/settings/system/log-rotation"' in response.text
+    assert 'name="log_file"' in response.text
+
+
+def _generate_test_pem_pair(common_name: str = "ssl-test.example") -> tuple[bytes, bytes]:
+    """Generate an unencrypted PKCS8 PEM key and a matching self-signed cert."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(timezone.utc) - timedelta(minutes=5))
+        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=30))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName(common_name), x509.DNSName("localhost")]),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    key_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+    return key_pem, cert_pem
+
+
+def _clear_ssl_state() -> None:
+    """Remove any installed SSL files and reset the ssl_enabled DB toggle."""
+    from src import ssl_certs as _ssl
+
+    key_path, cert_path = _ssl.cert_paths()
+    for p in (key_path, cert_path, _ssl.cert_dir() / _ssl.SOURCE_FILENAME):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+    with SessionLocal() as db:
+        _ssl.set_ssl_enabled(db, False)
+
+
+def test_settings_ssl_section_renders_without_cert(client: TestClient) -> None:
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/settings?area=system_settings&section=ssl_certificate")
+    assert response.status_code == 200
+    assert "SSL Certificate" in response.text
+    assert "Upload Certificate" in response.text
+    assert "Enable HTTPS" in response.text
+    assert "Create self-signed certificate" in response.text
+    assert 'name="ssl_enabled"' in response.text
+    assert "Install a certificate below before enabling SSL." in response.text
+
+
+def _le_config_post_data(**overrides) -> dict:
+    data = {
+        "email": "admin@example.com",
+        "root_dns_domain": "example.com",
+        "common_name": "api.example.com",
+        "subject_alt_names": "api.example.com",
+        "challenge_type": "dns-01",
+        "renew_before_expiry_days": "30",
+        "scheduled_restart_time": "03:00",
+    }
+    data.update(overrides)
+    return data
+
+
+def test_letsencrypt_config_auto_renew_on_rejected_for_manual_dns(client: TestClient) -> None:
+    from src import letsencrypt, ssl_certs
+
+    _clear_ssl_state()
+    with SessionLocal() as db:
+        letsencrypt.save_config(
+            db,
+            email="admin@example.com",
+            root_dns_domain="example.com",
+            common_name="api.example.com",
+            subject_alt_names="api.example.com",
+            challenge_type=letsencrypt.CHALLENGE_DNS,
+            zone_id=None,
+            staging=True,
+            auto_renew_enabled=False,
+        )
+    ssl_certs._write_source(ssl_certs.SOURCE_LETSENCRYPT)
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post(
+        "/settings/system/ssl-letsencrypt/config",
+        data=_le_config_post_data(
+            challenge_type="dns-01",
+            config_notice="auto_renew_on",
+            auto_renew_enabled="on",
+        ),
+    )
+    assert response.status_code == 200
+    assert "not Manual DNS instructions" in response.text
+    with SessionLocal() as db:
+        config = letsencrypt.get_config(db)
+        assert config is not None
+        assert config["auto_renew_enabled"] is False
+
+
+def test_letsencrypt_http_start_shows_awaiting_validation_banner(client: TestClient, monkeypatch) -> None:
+    from src import letsencrypt
+
+    monkeypatch.setattr(
+        letsencrypt,
+        "_acme_prepare_order",
+        lambda _config: {
+            "challenges": [
+                {
+                    "domain": "api.example.com",
+                    "token": "banner-tok",
+                    "key_authorization": "banner-tok.auth",
+                    "response": "banner-tok.auth",
+                }
+            ],
+            "challenge": {
+                "token": "banner-tok",
+                "key_authorization": "banner-tok.auth",
+                "response": "banner-tok.auth",
+            },
+        },
+    )
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post(
+        "/settings/system/ssl-letsencrypt/start",
+        data={
+            "email": "admin@example.com",
+            "root_dns_domain": "example.com",
+            "common_name": "api.example.com",
+            "subject_alt_names": "api.example.com",
+            "challenge_type": "http-01",
+            "staging": "on",
+        },
+    )
+    assert response.status_code == 200
+    assert "Enrollment is waiting for validation" in response.text
+    assert "/.well-known/acme-challenge/" in response.text
+    assert "banner-tok.auth" in response.text
+
+
+def test_letsencrypt_config_notice_auto_renew_on_and_off(client: TestClient) -> None:
+    from src import letsencrypt, ssl_certs
+
+    _clear_ssl_state()
+    with SessionLocal() as db:
+        letsencrypt.save_config(
+            db,
+            email="admin@example.com",
+            root_dns_domain="example.com",
+            common_name="api.example.com",
+            subject_alt_names="api.example.com",
+            challenge_type=letsencrypt.CHALLENGE_HTTP,
+            zone_id=None,
+            staging=True,
+            auto_renew_enabled=False,
+        )
+    ssl_certs._write_source(ssl_certs.SOURCE_LETSENCRYPT)
+    client.cookies.set("session", create_session_cookie("admin"))
+
+    on_response = client.post(
+        "/settings/system/ssl-letsencrypt/config",
+        data=_le_config_post_data(
+            challenge_type="http-01",
+            config_notice="auto_renew_on",
+            auto_renew_enabled="on",
+        ),
+    )
+    assert on_response.status_code == 200
+    assert "Automatic certificate renewal was turned on." in on_response.text
+
+    off_response = client.post(
+        "/settings/system/ssl-letsencrypt/config",
+        data=_le_config_post_data(challenge_type="http-01", config_notice="auto_renew_off"),
+    )
+    assert off_response.status_code == 200
+    assert "Automatic certificate renewal was turned off." in off_response.text
+
+    with SessionLocal() as db:
+        config = letsencrypt.get_config(db)
+        assert config is not None
+        assert config["auto_renew_enabled"] is False
+        assert config["challenge_type"] == letsencrypt.CHALLENGE_HTTP
+
+
+def test_settings_ssl_legacy_section_key_still_redirects(client: TestClient) -> None:
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/settings?area=system_settings&section=ssl_planned")
+    assert response.status_code == 200
+    # ssl_planned is aliased to ssl_certificate in rbac.normalize_system_settings_section.
+    assert "SSL Certificate" in response.text
+
+
+def test_settings_ssl_post_enable_without_cert_is_rejected(client: TestClient) -> None:
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post(
+        "/settings/system/ssl",
+        data={"ssl_enabled": "on", "redirect_section": "ssl_certificate"},
+    )
+    assert response.status_code == 200
+    assert "no certificate is installed" in response.text.lower()
+    with SessionLocal() as db:
+        from src.ssl_certs import is_ssl_enabled
+
+        assert is_ssl_enabled(db) is False
+
+
+def test_settings_ssl_upload_installs_and_unlocks_enable(client: TestClient) -> None:
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    key_pem, cert_pem = _generate_test_pem_pair("upload-section.example")
+    response = client.post(
+        "/settings/system/ssl-upload",
+        data={"redirect_section": "ssl_certificate"},
+        files={
+            "ssl_key": ("server.key", key_pem, "application/x-pem-file"),
+            "ssl_cert": ("server.crt", cert_pem, "application/x-pem-file"),
+        },
+    )
+    assert response.status_code == 200
+    assert "SSL certificate uploaded" in response.text
+    from src import ssl_certs as _ssl
+
+    assert _ssl.cert_exists()
+
+    response = client.get("/settings?area=system_settings&section=ssl_certificate")
+    assert "upload-section.example" in response.text
+    assert "Installed certificate" in response.text
+    # With a cert installed, the Enable SSL checkbox is no longer disabled.
+    assert 'name="ssl_enabled"' in response.text
+    assert "before enabling SSL" not in response.text
+
+
+def test_settings_ssl_upload_rejects_mismatched_key(client: TestClient) -> None:
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    _, cert_pem = _generate_test_pem_pair("leaf.example")
+    other_key_pem, _ = _generate_test_pem_pair("other.example")
+    response = client.post(
+        "/settings/system/ssl-upload",
+        data={"redirect_section": "ssl_certificate"},
+        files={
+            "ssl_key": ("server.key", other_key_pem, "application/x-pem-file"),
+            "ssl_cert": ("server.crt", cert_pem, "application/x-pem-file"),
+        },
+    )
+    assert response.status_code == 200
+    assert "does not match" in response.text.lower()
+    from src import ssl_certs as _ssl
+
+    assert not _ssl.cert_exists()
+
+
+def test_settings_ssl_enable_persists_after_cert_installed(client: TestClient) -> None:
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    key_pem, cert_pem = _generate_test_pem_pair("enable.example")
+    client.post(
+        "/settings/system/ssl-upload",
+        data={"redirect_section": "ssl_certificate"},
+        files={
+            "ssl_key": ("server.key", key_pem, "application/x-pem-file"),
+            "ssl_cert": ("server.crt", cert_pem, "application/x-pem-file"),
+        },
+    )
+
+    response = client.post(
+        "/settings/system/ssl",
+        data={"ssl_enabled": "on", "redirect_section": "ssl_certificate"},
+    )
+    assert response.status_code == 200
+    assert "SSL setting saved" in response.text
+    with SessionLocal() as db:
+        from src.ssl_certs import is_ssl_enabled
+
+        assert is_ssl_enabled(db) is True
+
+    # Disable path: no certificate check, always allowed.
+    response = client.post(
+        "/settings/system/ssl",
+        data={"redirect_section": "ssl_certificate"},
+    )
+    assert response.status_code == 200
+    assert "SSL setting saved" in response.text
+    with SessionLocal() as db:
+        from src.ssl_certs import is_ssl_enabled
+
+        assert is_ssl_enabled(db) is False
+
+
+def test_settings_ssl_regenerate_without_openssl_returns_error(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _clear_ssl_state()
+    from src import ssl_certs as _ssl
+
+    monkeypatch.setattr(_ssl, "_openssl_executable", lambda: None)
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post(
+        "/settings/system/ssl-regenerate",
+        data={"redirect_section": "ssl_certificate"},
+    )
+    assert response.status_code == 200
+    assert "openssl" in response.text.lower()
+    with SessionLocal() as db:
+        event = db.exec(
+            select(ActivityLog).where(ActivityLog.event_type == "system.ssl_regenerate_failed")
+        ).first()
+        assert event is not None
+        assert event.level == LOG_LEVEL_WARNING
+        assert event.category == LOG_CATEGORY_SECURITY
+
+
+def _latest_ssl_audit(db, event_type: str) -> ActivityLog | None:
+    return db.exec(
+        select(ActivityLog)
+        .where(ActivityLog.event_type == event_type)
+        .order_by(ActivityLog.id.desc())
+    ).first()
+
+
+def test_ssl_audit_toggle_rejected_without_cert(client: TestClient) -> None:
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    client.post(
+        "/settings/system/ssl",
+        data={"ssl_enabled": "on", "redirect_section": "ssl_certificate"},
+    )
+    with SessionLocal() as db:
+        event = _latest_ssl_audit(db, "system.ssl_toggled")
+        assert event is not None
+        assert event.level == LOG_LEVEL_WARNING
+        assert event.category == LOG_CATEGORY_SECURITY
+        assert event.status == "error"
+
+
+def test_ssl_audit_upload_success(client: TestClient) -> None:
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    key_pem, cert_pem = _generate_test_pem_pair("audit-upload.example")
+    client.post(
+        "/settings/system/ssl-upload",
+        data={"redirect_section": "ssl_certificate"},
+        files={
+            "ssl_key": ("server.key", key_pem, "application/x-pem-file"),
+            "ssl_cert": ("server.crt", cert_pem, "application/x-pem-file"),
+        },
+    )
+    with SessionLocal() as db:
+        event = _latest_ssl_audit(db, "system.ssl_uploaded")
+        assert event is not None
+        assert event.level == LOG_LEVEL_WARNING
+        assert event.category == LOG_CATEGORY_SECURITY
+
+
+def test_ssl_audit_letsencrypt_cancel_and_config(client: TestClient) -> None:
+    from src import letsencrypt
+
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        letsencrypt.save_config(
+            db,
+            email="admin@example.com",
+            root_dns_domain="example.com",
+            common_name="api.example.com",
+            subject_alt_names="",
+            challenge_type=letsencrypt.CHALLENGE_HTTP,
+            zone_id=None,
+            staging=True,
+        )
+    client.post("/settings/system/ssl-letsencrypt/cancel")
+    client.post(
+        "/settings/system/ssl-letsencrypt/config",
+        data={
+            "email": "admin@example.com",
+            "root_dns_domain": "example.com",
+            "common_name": "api.example.com",
+            "config_notice": "auto_renew_on",
+        },
+    )
+    with SessionLocal() as db:
+        cancel = _latest_ssl_audit(db, "system.ssl_letsencrypt_cancel")
+        assert cancel is not None
+        assert cancel.level == LOG_LEVEL_WARNING
+        assert cancel.category == LOG_CATEGORY_SECURITY
+        config_event = _latest_ssl_audit(db, "system.ssl_letsencrypt_config")
+        assert config_event is not None
+        assert config_event.level == LOG_LEVEL_WARNING
+        assert config_event.category == LOG_CATEGORY_SECURITY
 
 
 def test_settings_backup_area_renders_placeholder(client: TestClient) -> None:
@@ -1749,6 +2925,7 @@ def test_api_key_post_to_dns_record_unaffected_by_session_roles(
         _delete_users(db)
 
     fake = MagicMock()
+    fake.get_record.return_value = []
     fake.create_or_update_record.return_value = False
     monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
 
@@ -1764,3 +2941,364 @@ def test_api_key_post_to_dns_record_unaffected_by_session_roles(
         },
     )
     assert response.status_code == 200
+
+
+def _delete_activity_logs(db) -> None:
+    for row in db.exec(select(ActivityLog)).all():
+        db.delete(row)
+    for rule in db.exec(select(AlertRule)).all():
+        db.delete(rule)
+    db.commit()
+    activity_logging._retention_state.clear()
+
+
+def test_activity_events_written_for_api_key_creation_and_revocation(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_log_level(db, LOG_LEVEL_INFORMATIONAL)
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+
+    response = client.post("/api-keys", data={"label": "audit-key", "zone_ids": str(zone.id)})
+    assert response.status_code == 200
+    with SessionLocal() as db:
+        created = db.exec(select(ApiKey).where(ApiKey.label == "audit-key")).first()
+        assert created is not None
+        create_event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "api_key.created")).first()
+        assert create_event is not None
+        assert create_event.actor_label == "admin"
+        assert "audit-key" in (create_event.message or "")
+
+    response = client.post("/api-keys/revoke", data={"key_id": str(created.id)})
+    assert response.status_code == 200
+    with SessionLocal() as db:
+        revoke_event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "api_key.revoked")).first()
+        assert revoke_event is not None
+        assert revoke_event.level == LOG_LEVEL_WARNING
+        assert "audit-key" in (revoke_event.message or "")
+
+
+def test_dns_provider_failure_writes_error_activity_log(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_log_level(db, LOG_LEVEL_INFORMATIONAL)
+
+    fake = MagicMock()
+    fake.get_record.return_value = []
+    fake.create_or_update_record.side_effect = RuntimeError("WinRM failed with password=supersecret")
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+
+    response = client.post(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "broken",
+            "ttl": 300,
+            "values": ["192.0.2.1"],
+        },
+    )
+    assert response.status_code == 502
+    with SessionLocal() as db:
+        event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "dns.provider_failed")).first()
+        assert event is not None
+        assert event.level == LOG_LEVEL_ERROR
+        assert event.zone_name == "example.com"
+        assert event.record_name == "broken"
+        assert event.details_json is not None
+        assert "supersecret" not in event.details_json
+
+
+def test_infer_event_category_uses_prefix_except_security() -> None:
+    assert infer_event_category("http.request") == "http"
+    assert infer_event_category("plugin.disabled") == "plugin"
+    assert infer_event_category("plugin.enabled") == "plugin"
+    assert infer_event_category("dns_zone.created") == "dns_zone"
+    assert infer_event_category("system.smtp_updated") == "system"
+    assert infer_event_category("alert.email_sent") == "alert"
+    assert infer_event_category("alert_rule.created") == "alert_rule"
+    assert infer_event_category("dns.provider_failed") == "dns"
+    assert infer_event_category("auth.login_failed") == "security"
+    assert infer_event_category("api_key.created") == "security"
+    assert infer_event_category("user.roles_updated") == "security"
+    assert infer_event_category("dns.record_created") == "dns"
+    assert infer_event_category("dns.record_updated") == "dns"
+
+
+def test_request_activity_respects_configured_log_level(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_log_level(db, LOG_LEVEL_VERBOSE)
+
+    response = client.get("/admin")
+    assert response.status_code == 200
+    with SessionLocal() as db:
+        verbose_event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "http.request")).first()
+        assert verbose_event is not None
+        assert verbose_event.level == LOG_LEVEL_VERBOSE
+        assert verbose_event.category == "http"
+        assert verbose_event.request_path == "/admin"
+        _delete_activity_logs(db)
+        set_log_level(db, LOG_LEVEL_INFORMATIONAL)
+
+    response = client.get("/admin")
+    assert response.status_code == 200
+    with SessionLocal() as db:
+        suppressed = db.exec(select(ActivityLog).where(ActivityLog.event_type == "http.request")).first()
+        assert suppressed is None
+        set_log_level(db, LOG_LEVEL_INFORMATIONAL)
+
+
+def test_invalid_api_key_activity_log_uses_fingerprint_not_secret(client: TestClient) -> None:
+    bad_key = "invalid-api-key-secret-value"
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_log_level(db, LOG_LEVEL_INFORMATIONAL)
+
+    response = client.post(
+        "/dns-record",
+        headers={"X-API-Key": bad_key},
+        json={
+            "zone_name": "example.com",
+            "record_type": "A",
+            "record_name": "www",
+            "ttl": 300,
+            "values": ["192.0.2.1"],
+        },
+    )
+    assert response.status_code == 401
+    with SessionLocal() as db:
+        event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "dns.access_denied")).first()
+        assert event is not None
+        assert event.details_json is not None
+        assert bad_key not in event.details_json
+        assert "sha256:" in event.details_json
+
+
+def test_activity_log_filtering_by_event_type_and_level(client: TestClient) -> None:
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_log_level(db, LOG_LEVEL_INFORMATIONAL)
+        emit_activity_event(
+            db,
+            event_type="pytest.filter.info",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            message="filter me",
+        )
+        emit_activity_event(
+            db,
+            event_type="pytest.filter.error",
+            level=LOG_LEVEL_ERROR,
+            category="alert",
+            status="error",
+            message="other row",
+        )
+
+        rows, total = query_activity_logs(db, event_type="pytest.filter.error", level=LOG_LEVEL_ERROR, category="alert")
+
+    assert total == 1
+    assert len(rows) == 1
+    assert rows[0].event_type == "pytest.filter.error"
+    assert rows[0].category == "alert"
+
+
+def test_security_category_events_are_always_logged(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_log_level(db, LOG_LEVEL_ERROR)
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+
+    response = client.post("/api-keys", data={"label": "security-key", "zone_ids": str(zone.id)})
+    assert response.status_code == 200
+
+    with SessionLocal() as db:
+        api_key_event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "api_key.created")).first()
+        emit_activity_event(
+            db,
+            event_type="user.roles_updated",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label="admin",
+            message="User roles changed",
+        )
+        user_event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "user.roles_updated")).first()
+        assert api_key_event is not None
+        assert api_key_event.category == "security"
+        assert user_event is not None
+        assert user_event.category == "security"
+        assert user_event.level == LOG_LEVEL_INFORMATIONAL
+        set_log_level(db, LOG_LEVEL_INFORMATIONAL)
+
+
+def test_alert_rules_trigger_render_templates_and_respect_cooldown(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent_messages = []
+
+    def fake_send_alert_email(db, *, recipients, subject, body):
+        sent_messages.append({"recipients": recipients, "subject": subject, "body": body})
+        return True, []
+
+    monkeypatch.setattr(activity_logging, "send_alert_email", fake_send_alert_email)
+    monkeypatch.setattr(
+        activity_logging,
+        "system_identity",
+        lambda db: {"system_dns_name": "dns-host.example", "system_ip_address": "192.0.2.44"},
+    )
+
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_log_level(db, LOG_LEVEL_INFORMATIONAL)
+        rule = AlertRule(
+            enabled=True,
+            name="provider failures",
+            event_type="pytest.alert",
+            minimum_level=LOG_LEVEL_WARNING,
+            message_contains="Provider",
+            email_recipients="first@example.com, second@example.com",
+            email_subject_template="Alert {level} {event_type} {missing}",
+            email_body_template="System {system_dns_name} {system_ip_address} {zone_name} {record_name}",
+            cooldown_minutes=60,
+        )
+        db.add(rule)
+        db.commit()
+        emit_activity_event(
+            db,
+            event_type="pytest.alert",
+            level=LOG_LEVEL_ERROR,
+            status="error",
+            zone_name="example.com",
+            record_name="www",
+            message="Provider failed",
+        )
+        emit_activity_event(
+            db,
+            event_type="pytest.alert",
+            level=LOG_LEVEL_ERROR,
+            status="error",
+            zone_name="example.com",
+            record_name="www",
+            message="Provider failed again",
+        )
+
+    assert len(sent_messages) == 1
+    assert sent_messages[0]["recipients"] == ["first@example.com", "second@example.com"]
+    assert sent_messages[0]["subject"] == "Alert ERROR pytest.alert "
+    assert "dns-host.example 192.0.2.44 example.com www" in sent_messages[0]["body"]
+    assert render_alert_template("Missing {not_present}", {}) == "Missing "
+    with SessionLocal() as db:
+        sent_event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "alert.email_sent")).first()
+        assert sent_event is not None
+        assert sent_event.level == LOG_LEVEL_INFORMATIONAL
+        assert sent_event.category == "alert"
+
+
+def test_smtp_alert_delivery_tries_csv_servers_in_order(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    attempts = []
+    sent_subjects = []
+
+    class FakeSmtp:
+        def ehlo(self):
+            return None
+
+        def send_message(self, message):
+            sent_subjects.append(message["Subject"])
+
+        def quit(self):
+            return None
+
+    def fake_build_smtp_client(server: str, port: int, security: str, timeout: int):
+        attempts.append((server, port, security, timeout))
+        if server == "smtp-fail.example":
+            raise OSError("connection refused")
+        return FakeSmtp()
+
+    monkeypatch.setattr(activity_logging, "_build_smtp_client", fake_build_smtp_client)
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_smtp_config(
+            db,
+            servers="smtp-fail.example, smtp-ok.example",
+            port=2525,
+            anonymous=True,
+            username="",
+            password="",
+            from_address="api-to-dns@example.com",
+            security="none",
+            timeout=7,
+        )
+        sent, failures = activity_logging.send_alert_email(
+            db,
+            recipients=["ops@example.com"],
+            subject="test subject",
+            body="test body",
+        )
+
+    assert sent is True
+    assert [attempt[0] for attempt in attempts] == ["smtp-fail.example", "smtp-ok.example"]
+    assert failures == [{"server": "smtp-fail.example", "error": "connection refused"}]
+    assert sent_subjects == ["test subject"]
+
+
+def test_smtp_failures_are_reported_without_exception(client: TestClient) -> None:
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_smtp_config(
+            db,
+            servers="",
+            port=25,
+            anonymous=True,
+            username="",
+            password="",
+            from_address="api-to-dns@example.com",
+            security="none",
+            timeout=5,
+        )
+        sent, failures = activity_logging.send_alert_email(
+            db,
+            recipients=["ops@example.com"],
+            subject="test",
+            body="body",
+        )
+
+    assert sent is False
+    assert failures[0]["error"] == "No SMTP servers configured"
+
+
+def test_retention_cleanup_deletes_only_rows_older_than_retention(client: TestClient) -> None:
+    with SessionLocal() as db:
+        _delete_activity_logs(db)
+        set_log_level(db, LOG_LEVEL_INFORMATIONAL)
+        set_retention_days(db, 30)
+        old_row = ActivityLog(
+            timestamp=utc_now() - timedelta(days=31),
+            level=LOG_LEVEL_INFORMATIONAL,
+            event_type="pytest.retention.old",
+        )
+        boundary_row = ActivityLog(
+            timestamp=utc_now() - timedelta(days=30) + timedelta(seconds=5),
+            level=LOG_LEVEL_INFORMATIONAL,
+            event_type="pytest.retention.boundary",
+        )
+        db.add(old_row)
+        db.add(boundary_row)
+        db.commit()
+        db.refresh(old_row)
+        db.refresh(boundary_row)
+        old_id = old_row.id
+        boundary_id = boundary_row.id
+
+        removed = run_retention_cleanup(db, force=True)
+
+        assert removed == 1
+        assert db.get(ActivityLog, old_id) is None
+        assert db.get(ActivityLog, boundary_id) is not None

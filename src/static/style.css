@@ -88,6 +88,15 @@ button.danger:hover,
 .button.danger:hover {
   background: #fecaca;
 }
+button.warning,
+.button.warning {
+  background: #f59e0b;
+  color: #111827;
+}
+button.warning:hover,
+.button.warning:hover {
+  background: #d97706;
+}
 button:disabled,
 input[type="submit"]:disabled,
 .button.disabled {
@@ -148,6 +157,7 @@ input[type="text"],
 input[type="password"],
 input[type="url"],
 input[type="email"],
+input[type="time"],
 textarea,
 select {
   width: 100%;
@@ -157,6 +167,15 @@ select {
   border-radius: 8px;
   border: 1px solid #cbd5e1;
   background: white;
+}
+input[type="text"].input-readonly,
+input[type="text"][readonly],
+input[type="email"][readonly],
+input.input-readonly {
+  background: #e8ecf1;
+  color: #64748b;
+  border-color: #cbd5e1;
+  cursor: not-allowed;
 }
 input[type="checkbox"] {
   margin-right: 0.5rem;
@@ -171,6 +190,14 @@ h2 {
   color: #475569;
   margin: 0 0 1rem;
   line-height: 1.45;
+}
+.help-inline {
+  display: inline;
+  margin: 0 0 0 0;
+  font-weight: normal;
+}
+#le-zone-field > label {
+  margin-bottom: 0.4rem;
 }
 .help code {
   font-size: 0.85em;
@@ -249,6 +276,27 @@ td, th {
   background: #fee2e2;
   color: #991b1b;
 }
+.cert-source-badge {
+  display: inline-block;
+  padding: 0.2rem 0.65rem;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  background: #e2e8f0;
+  color: #334155;
+}
+.cert-source-badge.warning {
+  background: #fde68a;
+  color: #92400e;
+}
+.cert-source-badge.success {
+  background: #d1fae5;
+  color: #065f46;
+}
+.le-auto-renew-enable,
+.le-auto-renew-disable {
+  margin-bottom: 0.75rem;
+}
 dialog {
   width: min(640px, calc(100% - 2rem));
   max-height: calc(100vh - 4rem);
@@ -284,6 +332,38 @@ dialog::backdrop {
   justify-content: flex-end;
   flex-wrap: wrap;
   gap: 0.75rem;
+}
+.le-auto-enroll-dialog {
+  text-align: center;
+  padding: 2rem 1.5rem;
+}
+.le-auto-enroll-dialog p {
+  margin: 0 0 1.25rem;
+  font-size: 1.05rem;
+  color: #0f172a;
+}
+.le-auto-enroll-progress {
+  width: 100%;
+  height: 0.5rem;
+  border: 0;
+  border-radius: 999px;
+  overflow: hidden;
+  appearance: none;
+  background: #e2e8f0;
+}
+.le-auto-enroll-progress::-webkit-progress-bar {
+  background: #e2e8f0;
+  border-radius: 999px;
+}
+.le-auto-enroll-progress::-webkit-progress-value {
+  background: #2563eb;
+  border-radius: 999px;
+  transition: width 0.25s ease;
+}
+.le-auto-enroll-progress::-moz-progress-bar {
+  background: #2563eb;
+  border-radius: 999px;
+  transition: width 0.25s ease;
 }
 .page.page-wide {
   width: min(1100px, calc(100% - 32px));
@@ -330,6 +410,34 @@ dialog::backdrop {
   background: #e2e8f0;
 }
 .settings-menu-item.selected {
+  background: #ffffff;
+  border-left-color: #2563eb;
+  color: #1d4ed8;
+}
+.settings-menu-item.has-submenu.selected {
+  border-left-color: #2563eb;
+}
+.settings-submenu {
+  display: flex;
+  flex-direction: column;
+  padding: 0.15rem 0 0.5rem 0;
+  border-left: 3px solid #cbd5e1;
+  margin-left: 1rem;
+}
+.settings-submenu-item {
+  display: block;
+  padding: 0.55rem 0.85rem 0.55rem 1rem;
+  text-decoration: none;
+  color: #475569;
+  font-size: 0.9rem;
+  font-weight: 500;
+  border-left: 3px solid transparent;
+}
+.settings-submenu-item:hover {
+  background: #e2e8f0;
+  color: #1f2937;
+}
+.settings-submenu-item.selected {
   background: #ffffff;
   border-left-color: #2563eb;
   color: #1d4ed8;
@@ -388,6 +496,32 @@ dialog::backdrop {
 .plugin-fields summary {
   cursor: pointer;
   font-weight: 700;
+}
+.advanced-search {
+  margin: 0.75rem 0 1rem;
+}
+.advanced-search summary {
+  cursor: pointer;
+  font-weight: 700;
+  margin-bottom: 0.75rem;
+}
+.activity-log-table,
+.compact-table {
+  font-size: 0.6rem;
+}
+.activity-log-table td,
+.activity-log-table th,
+.compact-table td,
+.compact-table th {
+  padding: 0.45rem;
+}
+.pagination-nav {
+  margin: 0.75rem 0 1rem;
+}
+.pagination-nav form {
+  display: flex;
+  gap: 0.5rem;
+  margin: 0;
 }
 .placeholder-panel {
   border: 1px dashed #cbd5e1;

@@ -235,19 +235,26 @@ jobs:
             | python3 -c "import json, sys; assert json.load(sys.stdin)['status'] == 'success'"
 
           call_dns_api() {
-            local expected_status="$1"
-            local expected_action="$2"
-            local body="$3"
+            local method="$1"
+            local expected_status="$2"
+            local expected_action="$3"
+            local request_uri="$4"
+            local body="$5"
             local output="/tmp/dns-response-${expected_action}.json"
             local status
 
-            status="$(curl --silent --show-error -o "${output}" -w "%{http_code}" \
-              -X POST http://localhost:8000/dns-record \
-              -H "Content-Type: application/json" \
-              -H "X-API-Key: ${API_KEY}" \
-              -d "${body}")"
+            local curl_args=(
+              --silent --show-error -o "${output}" -w "%{http_code}"
+              -X "${method}"
+              "${request_uri}"
+              -H "X-API-Key: ${API_KEY}"
+            )
+            if [ -n "${body}" ]; then
+              curl_args+=( -H "Content-Type: application/json" -d "${body}" )
+            fi
+            status="$(curl "${curl_args[@]}")"
 
-            echo "[bind] ${expected_action}: HTTP ${status}"
+            echo "[bind] ${method} ${expected_action}: HTTP ${status}"
             cat "${output}"
             echo
 
@@ -288,14 +295,23 @@ jobs:
             exit 1
           }
 
-          call_dns_api 200 created '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.10"]}'
+          DNS_RECORD_URL='http://localhost:8000/dns-record'
+          DELETE_SMOKE_URL='http://localhost:8000/dns-record?zone_name=smoke.test&record_name=www&record_type=A'
+
+          call_dns_api POST 200 created "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.10"]}'
           wait_for_record_value www.smoke.test 192.0.2.10
-          call_dns_api 200 updated '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.20"]}'
+          call_dns_api PATCH 200 updated "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":450}'
+          wait_for_record_value www.smoke.test 192.0.2.10
+          call_dns_api POST 409 record_already_exists "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.10"]}'
+          call_dns_api PUT 200 updated "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.20"]}'
           wait_for_record_value www.smoke.test 192.0.2.20
-          call_dns_api 200 deleted '{"zone_name":"smoke.test","record_type":"DELETE","record_name":"www","values":["A"]}'
+          call_dns_api PATCH 200 updated "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","values":["192.0.2.30"]}'
+          wait_for_record_value www.smoke.test 192.0.2.30
+          call_dns_api DELETE 200 deleted "${DELETE_SMOKE_URL}" ''
           wait_for_record_absent www.smoke.test
-          call_dns_api 404 not_found '{"zone_name":"smoke.test","record_type":"DELETE","record_name":"www","values":["A"]}'
-          call_dns_api 403 access_denied '{"zone_name":"denied.test","record_type":"A","record_name":"blocked","ttl":300,"values":["192.0.2.55"]}'
+          call_dns_api DELETE 404 not_found "${DELETE_SMOKE_URL}" ''
+          call_dns_api PUT 404 not_found "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.40"]}'
+          call_dns_api POST 403 access_denied "${DNS_RECORD_URL}" '{"zone_name":"denied.test","record_type":"A","record_name":"blocked","ttl":300,"values":["192.0.2.55"]}'
 
           echo "BIND smoke on Linux completed successfully."
 
@@ -483,14 +499,38 @@ jobs:
             param(
               [string] $ApiKey,
               [int] $ExpectedStatus,
-              [hashtable] $JsonBody
+              [string] $Method = 'POST',
+              [hashtable] $JsonBody,
+              [hashtable] $Query
             )
-            $json = $JsonBody | ConvertTo-Json -Compress -Depth 6
-            Write-Host "[microsoft] POST /dns-record $($JsonBody.zone_name) $($JsonBody.record_type) $($JsonBody.record_name) expecting HTTP $ExpectedStatus"
-            $resp = Invoke-WebRequest -Uri "$base/dns-record" -Method Post `
-              -Headers @{ 'X-API-Key' = $ApiKey } -Body $json -ContentType 'application/json' `
-              -UseBasicParsing -SkipHttpErrorCheck
-            Write-Host "[microsoft] POST /dns-record returned HTTP $($resp.StatusCode)"
+            $url = "$base/dns-record"
+            if ($Query) {
+              $pairs = $Query.GetEnumerator() | ForEach-Object {
+                '{0}={1}' -f $_.Key, [uri]::EscapeDataString([string]$_.Value)
+              }
+              $url = "$url`?" + ($pairs -join '&')
+            }
+            $args = @{
+              Uri               = $url
+              Method            = $Method
+              Headers           = @{ 'X-API-Key' = $ApiKey }
+              UseBasicParsing   = $true
+              SkipHttpErrorCheck = $true
+            }
+            if ($JsonBody) {
+              $args.Body = ($JsonBody | ConvertTo-Json -Compress -Depth 6)
+              $args.ContentType = 'application/json'
+            }
+            $label = "$Method /dns-record"
+            if ($JsonBody) {
+              $label = "$label $($JsonBody.zone_name) $($JsonBody.record_type) $($JsonBody.record_name)"
+            }
+            elseif ($Query) {
+              $label = "$label $($Query.zone_name) $($Query.record_type) $($Query.record_name)"
+            }
+            Write-Host "[microsoft] $label expecting HTTP $ExpectedStatus"
+            $resp = Invoke-WebRequest @args
+            Write-Host "[microsoft] $label returned HTTP $($resp.StatusCode)"
             if ([int]$resp.StatusCode -ne $ExpectedStatus) {
               throw "dns-record expected HTTP $ExpectedStatus got $($resp.StatusCode): $($resp.Content)"
             }
@@ -634,27 +674,43 @@ jobs:
             if ($kc.status -ne 'success') { throw 'keycheck failed' }
 
             $www = "www.$la"
-            $jCreate = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.10') }
-            $jUpdate = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.20') }
-            $jDelete = @{ zone_name = $la; record_type = 'DELETE'; record_name = 'www'; values = @('A') }
-            $jDenied = @{ zone_name = $ld; record_type = 'A'; record_name = 'blocked'; ttl = 300; values = @('192.0.2.55') }
+            $jCreate  = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.10') }
+            $jReplace = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.20') }
+            $jPatchTtl = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; ttl = 450 }
+            $jPatch   = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; values = @('192.0.2.30') }
+            $qDelete  = @{ zone_name = $la; record_name = 'www'; record_type = 'A' }
+            $jDenied  = @{ zone_name = $ld; record_type = 'A'; record_name = 'blocked'; ttl = 300; values = @('192.0.2.55') }
 
-            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -JsonBody $jCreate
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -Method POST -JsonBody $jCreate
             Assert-DnsRecordAction -Json $x -ExpectedAction 'created'
             Wait-LocalA -Fqdn $www -ExpectedIp '192.0.2.10'
 
-            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -JsonBody $jUpdate
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -Method PATCH -JsonBody $jPatchTtl
+            Assert-DnsRecordAction -Json $x -ExpectedAction 'updated'
+            Wait-LocalA -Fqdn $www -ExpectedIp '192.0.2.10'
+
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 409 -Method POST -JsonBody $jCreate
+            Assert-DnsRecordAction -Json $x -ExpectedAction 'record_already_exists'
+
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -Method PUT -JsonBody $jReplace
             Assert-DnsRecordAction -Json $x -ExpectedAction 'updated'
             Wait-LocalA -Fqdn $www -ExpectedIp '192.0.2.20'
 
-            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -JsonBody $jDelete
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -Method PATCH -JsonBody $jPatch
+            Assert-DnsRecordAction -Json $x -ExpectedAction 'updated'
+            Wait-LocalA -Fqdn $www -ExpectedIp '192.0.2.30'
+
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -Method DELETE -Query $qDelete
             Assert-DnsRecordAction -Json $x -ExpectedAction 'deleted'
             Wait-LocalAbsent -Fqdn $www
 
-            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 404 -JsonBody $jDelete
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 404 -Method DELETE -Query $qDelete
             Assert-DnsRecordAction -Json $x -ExpectedAction 'not_found'
 
-            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 403 -JsonBody $jDenied
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 404 -Method PUT -JsonBody $jReplace
+            Assert-DnsRecordAction -Json $x -ExpectedAction 'not_found'
+
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 403 -Method POST -JsonBody $jDenied
             Assert-DnsRecordAction -Json $x -ExpectedAction 'access_denied'
 
             if ($env:REMOTE_WINRM_HOST -and $env:REMOTE_WINRM_USER -and $env:REMOTE_WINRM_PASSWORD) {
@@ -689,25 +745,25 @@ jobs:
               $rWww = "www.$ra"
               $rjC = @{ zone_name = $ra; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.10') }
               $rjU = @{ zone_name = $ra; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.20') }
-              $rjD = @{ zone_name = $ra; record_type = 'DELETE'; record_name = 'www'; values = @('A') }
+              $rqD = @{ zone_name = $ra; record_name = 'www'; record_type = 'A' }
               $rjX = @{ zone_name = $rd; record_type = 'A'; record_name = 'blocked'; ttl = 300; values = @('192.0.2.55') }
 
-              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 200 -JsonBody $rjC
+              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 200 -Method POST -JsonBody $rjC
               Assert-DnsRecordAction -Json $x -ExpectedAction 'created'
               Wait-RemoteA -Fqdn $rWww -ExpectedIp '192.0.2.10' -Server $remoteDig
 
-              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 200 -JsonBody $rjU
+              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 200 -Method PUT -JsonBody $rjU
               Assert-DnsRecordAction -Json $x -ExpectedAction 'updated'
               Wait-RemoteA -Fqdn $rWww -ExpectedIp '192.0.2.20' -Server $remoteDig
 
-              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 200 -JsonBody $rjD
+              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 200 -Method DELETE -Query $rqD
               Assert-DnsRecordAction -Json $x -ExpectedAction 'deleted'
               Wait-RemoteAbsent -Fqdn $rWww -Server $remoteDig
 
-              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 404 -JsonBody $rjD
+              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 404 -Method DELETE -Query $rqD
               Assert-DnsRecordAction -Json $x -ExpectedAction 'not_found'
 
-              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 403 -JsonBody $rjX
+              $x = Invoke-DnsRecord -ApiKey $msRemoteKey -ExpectedStatus 403 -Method POST -JsonBody $rjX
               Assert-DnsRecordAction -Json $x -ExpectedAction 'access_denied'
             }
             else {

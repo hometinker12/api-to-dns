@@ -7,16 +7,11 @@
 </head>
 <body>
   <div class="page">
-    <header class="page-header">
-      <div>
-        <h1>api-to-dns App Dashboard</h1>
-        <p class="help">Signed in as {{ user }}</p>
-      </div>
-      <nav class="nav-links">
-        <a class="button" href="/settings">Settings</a>
-        <a class="button danger" href="/logout">Logout</a>
-      </nav>
-    </header>
+    {% set page_title = "api-to-dns App Dashboard" %}
+    {% set page_help = "Signed in as " ~ user %}
+    {% set page_links = [{"href": "/settings", "label": "Settings"}] %}
+    {% set show_dashboard_link = false %}
+    {% include "_page_header.html" %}
     <nav class="nav-links">
       {% if can_view_zones %}
         <a class="button" href="/zones">DNS Zones</a>
@@ -36,7 +31,7 @@
         <ul class="summary-list">
           {% for z in zones %}
             <li>
-              <code>{{ z.zone_name }}</code>
+              <code>{{ z.zone_name }}</code> <span class="help">({{ z.dns_zone }})</span>
             </li>
           {% endfor %}
         </ul>

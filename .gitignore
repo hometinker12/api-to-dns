@@ -1,6 +1,18 @@
 .env
+data/
+data/ssl/
 .cursor/
+
+# Pytest cache and artifacts
+.pytest_cache/
+.testmondata
+pytestdebug.log
 __pycache__/
 *.py[cod]
 *$py.class
-.pytest_cache/
+
+# Test coverage reports
+.coverage
+htmlcov/
+coverage.xml
+*.lcov

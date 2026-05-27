@@ -7,30 +7,29 @@
 </head>
 <body>
   <div class="page">
-    <header class="page-header">
-      <h1>api-to-dns Add DNS Zone</h1>
-      <nav class="nav-links">
-        <a class="button" href="/zones">All zones</a>
-        <a class="button" href="/admin">Dashboard</a>
-        <a class="button danger" href="/logout">Logout</a>
-      </nav>
-    </header>
+    {% set page_title = "api-to-dns Add DNS Zone" %}
+    {% set page_help = "" %}
+    {% set page_links = [{"href": "/zones", "label": "All zones"}] %}
+    {% include "_page_header.html" %}
 
     {% if message %}
       <div class="alert success">{{ message }}</div>
     {% endif %}
 
-    <form action="{% if zone %}/zones/{{ zone.id }}{% else %}/zones{% endif %}" method="post">
+    <form id="zone-form" action="{% if zone %}/zones/{{ zone.id }}{% else %}/zones{% endif %}" method="post">
       {% set provider = settings.dns_provider_type or 'azure' %}
       {% if not zone %}
         <section class="form-card">
-          <label>DNS zone name (unique key)
-            <input type="text" name="zone_name" required value="" placeholder="example.com" />
+          <label>Zone configuration name (unique)
+            <p class="help">Unique name for this configuration and for API <code>zone_name</code> requests. Not necessarily the DNS domain.</p>
+            <input type="text" name="zone_name" required value="" placeholder="example-azure" />
           </label>
         </section>
       {% else %}
         <section class="form-card">
-          <p><strong>Zone:</strong> <code>{{ zone.zone_name }}</code></p>
+          <p><strong>Configuration name:</strong> <code>{{ zone.zone_name }}</code></p>
+          <input type="hidden" name="zone_id" value="{{ zone.id }}" />
+          <input type="hidden" name="zone_name" value="{{ zone.zone_name }}" />
         </section>
       {% endif %}
 
@@ -74,7 +73,26 @@
         </section>
       {% endfor %}
 
+      <section class="form-card" id="zone-test-section">
+        <h2>Test lookup</h2>
+        <p class="help">Verify credentials by looking up an existing record in this zone.</p>
+        <label>Record name
+          <input type="text" id="test-record-name" name="test_record_name" value="@" placeholder="@ or www" />
+        </label>
+        <label>Record type (optional)
+          <select id="test-record-type" name="test_record_type">
+            <option value="">All types</option>
+            <option value="A">A</option>
+            <option value="AAAA">AAAA</option>
+            <option value="CNAME">CNAME</option>
+            <option value="TXT">TXT</option>
+          </select>
+        </label>
+        <div id="zone-test-result" class="alert" hidden></div>
+      </section>
+
       <div class="action-cell">
+        <button type="button" class="secondary" id="zone-test-btn">Test Configuration</button>
         <button type="submit">{% if zone %}Save zone{% else %}Create zone{% endif %}</button>
       </div>
     </form>
@@ -82,6 +100,9 @@
     <script>
       const providerSelect = document.getElementById("dns-provider-type");
       const providerPanels = Array.from(document.querySelectorAll("[data-provider-panel]"));
+      const zoneForm = document.getElementById("zone-form");
+      const zoneTestBtn = document.getElementById("zone-test-btn");
+      const zoneTestResult = document.getElementById("zone-test-result");
 
       function syncProviderPanels() {
         const selectedProvider = providerSelect.value;
@@ -93,6 +114,51 @@
           });
         });
       }
+
+      function showZoneTestResult(kind, message) {
+        if (!zoneTestResult) return;
+        zoneTestResult.hidden = false;
+        zoneTestResult.className = "alert";
+        if (kind === "success") {
+          zoneTestResult.classList.add("success");
+        } else if (kind === "error") {
+          zoneTestResult.classList.add("error");
+        }
+        zoneTestResult.textContent = message;
+      }
+
+      zoneTestBtn?.addEventListener("click", async () => {
+        if (!zoneForm) return;
+        const originalLabel = zoneTestBtn.textContent;
+        zoneTestBtn.disabled = true;
+        zoneTestBtn.textContent = "Testing Authentication…";
+        if (zoneTestResult) {
+          zoneTestResult.hidden = true;
+        }
+
+        try {
+          const formData = new FormData(zoneForm);
+          const response = await fetch("/zones/test", {
+            method: "POST",
+            headers: { Accept: "application/json" },
+            body: formData,
+            credentials: "same-origin",
+          });
+          const payload = await response.json();
+          if (payload.status === "success") {
+            showZoneTestResult("success", "Authentication test successful. Found matching records.");
+          } else if (payload.status === "not_found") {
+            showZoneTestResult("success", payload.message || "Authentication test successful. No matching records found.");
+          } else {
+            showZoneTestResult("error", payload.message || "DNS test failed.");
+          }
+        } catch (error) {
+          showZoneTestResult("error", "DNS test failed.");
+        } finally {
+          zoneTestBtn.disabled = false;
+          zoneTestBtn.textContent = originalLabel;
+        }
+      });
 
       providerSelect?.addEventListener("change", syncProviderPanels);
       syncProviderPanels();

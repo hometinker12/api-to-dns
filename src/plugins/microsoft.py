@@ -1,10 +1,11 @@
+import json
 import time
 from typing import Any, Dict, List, Optional
 
-from ..models import DnsRecordRequest
+from ..models import DnsRecordInfo, DnsRecordRequest
 
-from .base import DnsProviderPlugin, PluginField
-from .utils import dns_relative_name, ps_single_quoted, winrm_rr_type
+from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
+from .utils import dns_relative_name, lookup_record_types_to_query, ps_single_quoted, winrm_rr_type
 
 
 class MicrosoftWinRmDnsClient:
@@ -96,9 +97,9 @@ class MicrosoftWinRmDnsClient:
     ) -> bool:
         if not dns_server:
             raise ValueError("DNS server host is required for Microsoft DNS (set Target DNS Server to the DNS/DC WinRM endpoint).")
-        zone = (dns_zone or payload.zone_name or "").strip()
+        zone = (dns_zone or "").strip()
         if not zone:
-            raise ValueError("Zone name is required (set Target DNS Zone in settings or zone_name on the request).")
+            raise ValueError("DNS zone (domain) is required in the zone configuration.")
 
         record_type = payload.record_type.upper()
         ttl = int(payload.ttl or 300)
@@ -199,6 +200,76 @@ class MicrosoftWinRmDnsClient:
 
         return existed
 
+    def get_record(
+        self,
+        *,
+        record_name: str,
+        record_type: Optional[str] = None,
+        dns_server: Optional[str] = None,
+        dns_zone: Optional[str] = None,
+    ) -> List[DnsRecordInfo]:
+        if not dns_server:
+            raise ValueError("DNS server host is required for Microsoft DNS (set Target DNS Server to the DNS/DC WinRM endpoint).")
+        zone = (dns_zone or "").strip()
+        if not zone:
+            raise ValueError("DNS zone (domain) is required in the zone configuration.")
+
+        name = dns_relative_name(zone, record_name)
+        name_at = "@" if name == "@" else name
+
+        types_to_query = lookup_record_types_to_query(record_type)
+        results: List[DnsRecordInfo] = []
+        for rt in types_to_query:
+            info = self._get_record_details(dns_server, zone, name_at, rt)
+            if info is not None:
+                results.append(info)
+        return results
+
+    def _get_record_details(
+        self,
+        computer: str,
+        zone: str,
+        name: str,
+        api_rr_type: str,
+    ) -> Optional[DnsRecordInfo]:
+        ps_rr = winrm_rr_type(api_rr_type)
+        ps = (
+            "Import-Module DnsServer -ErrorAction SilentlyContinue\n"
+            f"$records = @(Get-DnsServerResourceRecord -ComputerName {ps_single_quoted(computer)} "
+            f"-ZoneName {ps_single_quoted(zone)} -Name {ps_single_quoted(name)} "
+            f"-RRType {ps_single_quoted(ps_rr)} -ErrorAction SilentlyContinue)\n"
+            "if ($records.Count -eq 0) { exit 0 }\n"
+            "$ttl = [int]$records[0].TimeToLive.TotalSeconds\n"
+            "$values = @()\n"
+            f"switch ('{api_rr_type}') {{\n"
+            "  'A' { $values = @($records | ForEach-Object { $_.RecordData.IPv4Address.IPAddressToString }) }\n"
+            "  'AAAA' { $values = @($records | ForEach-Object { $_.RecordData.IPv6Address.IPAddressToString }) }\n"
+            "  'CNAME' { $values = @([string]$records[0].RecordData.HostNameAlias) }\n"
+            "  'TXT' {\n"
+            "    foreach ($rec in $records) {\n"
+            "      $text = $rec.RecordData.DescriptiveText\n"
+            "      if ($text -is [System.Array]) { $values += [string]::Join('', $text) }\n"
+            "      else { $values += [string]$text }\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+            "@{ ttl = $ttl; values = @($values) } | ConvertTo-Json -Compress\n"
+        )
+        result = self._run_ps_with_retry(computer, ps)
+        out = (result.std_out or b"").decode(errors="replace").strip()
+        if not out:
+            return None
+        data = json.loads(out)
+        values = data.get("values") or []
+        if isinstance(values, str):
+            values = [values]
+        return DnsRecordInfo(
+            record_name=name,
+            record_type=api_rr_type,
+            ttl=int(data["ttl"]),
+            values=[str(v) for v in values],
+        )
+
     def _record_exists(self, computer: str, zone: str, name: str, rr_type: str) -> bool:
         ps = (
             "Import-Module DnsServer -ErrorAction SilentlyContinue; "
@@ -227,6 +298,7 @@ PLUGIN = DnsProviderPlugin(
     heading="Microsoft DNS (WinRM)",
     help_text="Use a DNS server or domain controller that accepts WinRM connections. The account must have rights to manage records in the zone.",
     fields=[
+        DNS_ZONE_DOMAIN_FIELD,
         PluginField("dns_server", "Target DNS Server", placeholder="dc01.corp.local or 192.0.2.10"),
         PluginField("dns_username", "Username", autocomplete="off", placeholder="DOMAIN\\dns-admin"),
         PluginField(

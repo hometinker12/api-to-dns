@@ -1,125 +1,434 @@
-import html
-import json
+import asyncio
 import os
-import traceback
-from typing import Any, Dict, List, Optional, Set
+import signal
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import Depends, FastAPI, Form, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from sqlmodel import select
-from starlette.status import HTTP_303_SEE_OTHER, HTTP_404_NOT_FOUND
+from starlette.status import HTTP_202_ACCEPTED, HTTP_303_SEE_OTHER, HTTP_404_NOT_FOUND, HTTP_409_CONFLICT
 
+from . import activity_logging
+from .activity_logging import (
+    LOGGER,
+    configure_operational_logging,
+    emit_activity_event,
+    get_log_level,
+    get_retention_days,
+    get_smtp_config,
+    is_running_in_docker,
+    run_retention_cleanup,
+    set_app_dns_name,
+    set_log_level,
+    set_retention_days,
+    set_smtp_config,
+)
 from .auth import create_session_cookie, get_current_user, session_cookie_settings
 from .db import SessionLocal, init_db
+from .http_utils import api_key_fingerprint, api_key_from_headers, http_exception_from_dns_error, wants_json_response
 from .models import (
+    LOG_CATEGORY_SECURITY,
+    LOG_LEVEL_ERROR,
+    LOG_LEVEL_INFORMATIONAL,
+    LOG_LEVEL_VERBOSE,
+    LOG_LEVEL_WARNING,
+    AlertRule,
     ApiKey,
     ApiKeyAllowedZone,
+    DnsRecordCreateRequest,
+    DnsRecordGetResponse,
+    DnsRecordInfo,
+    DnsRecordPatchRequest,
+    DnsRecordReplaceRequest,
     DnsRecordRequest,
     DnsRecordResponse,
     DnsZoneConfig,
     DnsZoneSummary,
-    Setting,
     User,
 )
-from .security import decrypt_value, encrypt_value, generate_api_key, hash_password, verify_password
+from .plugins.utils import normalize_lookup_record_type
+from .paths import STATIC_DIR
+from .rbac import (
+    ALL_ROLES,
+    LEGACY_SETTINGS_AREA_ALIASES,
+    ROLE_ACCOUNT_RESET_PASSWORD,
+    ROLE_ACCOUNT_UPDATE,
+    ROLE_API_KEYS_READ,
+    ROLE_API_KEYS_UPDATE,
+    ROLE_DNS_ZONES_READ,
+    ROLE_DNS_ZONES_UPDATE,
+    ROLE_FORBIDDEN_DETAIL,
+    ROLE_GLOBAL_ADMIN,
+    ROLE_GLOBAL_READ,
+    ROLE_PLUGIN_UPDATE,
+    ROLE_SYSTEM_UPDATE,
+    get_user_roles,
+    global_admin_guard_message,
+    normalize_selected_roles,
+    require_role,
+    serialize_roles,
+    user_has_role,
+    user_is_global_admin,
+    user_public_dict,
+)
+from .security import generate_api_key, hash_password, verify_password
+from .settings_context import render_settings
+from .settings_store import get_setting, set_setting
+from . import ssl_certs
+from . import letsencrypt
+from .letsencrypt import LetsEncryptError
+from .restart import (
+    clear_le_renewal_pending_restart,
+    clear_restart_required,
+    is_le_renewal_pending_restart,
+    is_restart_required,
+    mark_le_renewal_pending_restart,
+    mark_restart_required,
+    perform_application_restart,
+    scheduled_restart_due,
+)
+from .ssl_certs import (
+    CertificateInstallError,
+    OpenSSLUnavailableError,
+    cert_exists,
+    create_self_signed_cert,
+    install_uploaded_cert,
+    is_ssl_enabled,
+    regenerate_self_signed_cert,
+    set_ssl_enabled,
+)
+from .web import client_ip, nav_context, record_activity, render_access_denied_response, render_error_response, templates
+from .zone_service import (
+    api_key_admin_dict,
+    api_key_allowed_zone_names,
+    api_key_public_dict,
+    build_zone_config_from_form,
+    create_dns_client_from_settings,
+    decode_zone_config,
+    dns_provider_display_name,
+    dns_provider_options_with_state,
+    dns_zone_admin_dict,
+    dns_zone_public_dict,
+    dns_zone_summary_dict,
+    enabled_dns_provider_options,
+    encode_zone_config_dict,
+    get_api_key,
+    get_disabled_dns_plugins,
+    get_dns_provider_options,
+    get_known_dns_provider_keys,
+    list_dns_zones,
+    migrate_legacy_dns_settings_if_needed,
+    normalize_zone_name,
+    provider_dns_zone,
+    set_disabled_dns_plugins,
+    test_zone_record_lookup,
+    zones_using_dns_provider,
+)
+
+
+def _zones_html_context(db, *, message: Optional[str] = None) -> Dict[str, Any]:
+    zones = list_dns_zones(db)
+    return {
+        "zones": [dns_zone_admin_dict(db, z) for z in zones],
+        "message": message,
+    }
+
+
+def _api_keys_html_context(db, *, message: Optional[str] = None, **extra: Any) -> Dict[str, Any]:
+    api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda key: key.created_at, reverse=True)
+    key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
+    all_zones = list_dns_zones(db)
+    return {
+        "api_keys": [api_key_admin_dict(db, k) for k in api_keys],
+        "key_zones": key_zones,
+        "all_zones": [dns_zone_public_dict(z) for z in all_zones],
+        "message": message,
+        **extra,
+    }
+
+
+def _resolve_dns_api_zone(
+    db,
+    *,
+    api_key: str,
+    zone_name: str,
+    record_name: str,
+    endpoint: str,
+) -> tuple[ApiKey, DnsZoneConfig, Dict[str, Any], Optional[str], str, str]:
+    key = db.exec(select(ApiKey).where(ApiKey.key == api_key, ApiKey.active == True)).first()
+    if key is None:
+        emit_activity_event(
+            db,
+            event_type="dns.access_denied",
+            level=LOG_LEVEL_WARNING,
+            status="error",
+            actor_type="api_key",
+            actor_label="invalid",
+            message=f"Invalid or revoked API key used on {endpoint}",
+            details={"key_fingerprint": api_key_fingerprint(api_key)},
+        )
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    actor_id = str(key.id) if key.id is not None else None
+    actor_label = key.label
+
+    if not zone_name or not str(zone_name).strip():
+        emit_activity_event(
+            db,
+            event_type="dns.invalid_request",
+            level=LOG_LEVEL_WARNING,
+            status="error",
+            actor_type="api_key",
+            actor_id=actor_id,
+            actor_label=actor_label,
+            record_name=record_name,
+            message=f"zone_name is required on {endpoint}",
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_request", "message": "zone_name is required on every request."},
+        )
+
+    canonical = normalize_zone_name(zone_name)
+    zone_row = db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == canonical)).first()
+    if zone_row is None:
+        emit_activity_event(
+            db,
+            event_type="dns.access_denied",
+            level=LOG_LEVEL_WARNING,
+            status="error",
+            actor_type="api_key",
+            actor_id=actor_id,
+            actor_label=actor_label,
+            zone_name=canonical,
+            record_name=record_name,
+            message=f"Unknown DNS zone {canonical!r}",
+        )
+        raise HTTPException(status_code=403, detail=ACCESS_DENIED_DETAIL)
+
+    perm = db.exec(
+        select(ApiKeyAllowedZone).where(
+            ApiKeyAllowedZone.api_key_id == key.id,
+            ApiKeyAllowedZone.dns_zone_config_id == zone_row.id,
+        )
+    ).first()
+    if perm is None:
+        emit_activity_event(
+            db,
+            event_type="dns.access_denied",
+            level=LOG_LEVEL_WARNING,
+            status="error",
+            actor_type="api_key",
+            actor_id=actor_id,
+            actor_label=actor_label,
+            zone_name=canonical,
+            record_name=record_name,
+            message=f"API key {actor_label!r} not allowed for zone {canonical!r}",
+        )
+        raise HTTPException(status_code=403, detail=ACCESS_DENIED_DETAIL)
+
+    settings = decode_zone_config(zone_row)
+    provider = (settings.get("dns_provider_type") or "azure").strip().lower()
+    if provider == "azure":
+        if not settings.get("azure_subscription_id"):
+            emit_activity_event(
+                db,
+                event_type="dns.invalid_request",
+                level=LOG_LEVEL_WARNING,
+                status="error",
+                actor_type="api_key",
+                actor_id=actor_id,
+                actor_label=actor_label,
+                zone_name=canonical,
+                record_name=record_name,
+                message="Azure subscription ID is required on the zone configuration.",
+            )
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "invalid_request",
+                    "message": "Azure subscription ID is required on the zone configuration.",
+                },
+            )
+        if not settings.get("azure_resource_group"):
+            emit_activity_event(
+                db,
+                event_type="dns.invalid_request",
+                level=LOG_LEVEL_WARNING,
+                status="error",
+                actor_type="api_key",
+                actor_id=actor_id,
+                actor_label=actor_label,
+                zone_name=canonical,
+                record_name=record_name,
+                message="Azure resource group is required on the zone configuration.",
+            )
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "invalid_request",
+                    "message": "Azure resource group is required on the zone configuration.",
+                },
+            )
+
+    return key, zone_row, settings, actor_id, actor_label, provider
 
 ACCESS_DENIED_DETAIL: Dict[str, str] = {
     "error": "access_denied",
     "message": "You do not have access or an invalid key was provided.",
 }
 
-ROLE_GLOBAL_ADMIN = "global.admin"
-ROLE_GLOBAL_READ = "global.read"
-ROLE_ACCOUNT_UPDATE = "account.update"
-ROLE_ACCOUNT_RESET_PASSWORD = "account.reset_password"
-ROLE_API_KEYS_READ = "api_keys.read"
-ROLE_API_KEYS_UPDATE = "api_keys.update"
-ROLE_DNS_ZONES_READ = "dns_zones.read"
-ROLE_DNS_ZONES_UPDATE = "dns_zones.update"
-ROLE_PLUGIN_UPDATE = "plugin.update"
-ROLE_SYSTEM_UPDATE = "system.update"
+AUTH_REDIRECT_DETAILS = {"Authentication required", "Invalid or expired session"}
+WEB_AUTH_PATH_PREFIXES = (
+    "/admin",
+    "/zones",
+    "/api-keys",
+    "/settings",
+)
+_REQUEST_LOG_IGNORE_PREFIXES = ("/static",)
 
-ROLE_DEPENDENCIES: Dict[str, str] = {
-    ROLE_API_KEYS_UPDATE: ROLE_API_KEYS_READ,
-    ROLE_DNS_ZONES_UPDATE: ROLE_DNS_ZONES_READ,
-}
-MANDATORY_ROLES: Set[str] = {ROLE_DNS_ZONES_READ}
+_shutting_down = False
 
-ALL_ROLES: List[str] = [
-    ROLE_GLOBAL_ADMIN,
-    ROLE_GLOBAL_READ,
-    ROLE_ACCOUNT_UPDATE,
-    ROLE_ACCOUNT_RESET_PASSWORD,
-    ROLE_API_KEYS_READ,
-    ROLE_API_KEYS_UPDATE,
-    ROLE_DNS_ZONES_READ,
-    ROLE_DNS_ZONES_UPDATE,
-    ROLE_PLUGIN_UPDATE,
-    ROLE_SYSTEM_UPDATE,
-]
-LEGACY_DEFAULT_ROLES: Set[str] = set(ALL_ROLES) - {ROLE_GLOBAL_ADMIN}
 
-ROLE_LABELS: List[Dict[str, str]] = [
-    {"key": ROLE_GLOBAL_ADMIN, "label": "Global: admin"},
-    {"key": ROLE_GLOBAL_READ, "label": "Global: read-only"},
-    {"key": ROLE_ACCOUNT_UPDATE, "label": "Account: update"},
-    {"key": ROLE_ACCOUNT_RESET_PASSWORD, "label": "Account: reset password"},
-    {"key": ROLE_API_KEYS_READ, "label": "API keys: read"},
-    {"key": ROLE_API_KEYS_UPDATE, "label": "API keys: update", "requires_role": ROLE_API_KEYS_READ},
-    {"key": ROLE_DNS_ZONES_READ, "label": "DNS zones: read", "mandatory": True},
-    {"key": ROLE_DNS_ZONES_UPDATE, "label": "DNS zones: update", "requires_role": ROLE_DNS_ZONES_READ},
-    {"key": ROLE_PLUGIN_UPDATE, "label": "Plugin management"},
-    {"key": ROLE_SYSTEM_UPDATE, "label": "System: update"},
-]
+def _make_shutdown_handler(previous_handler):
+    def handler(signum: int, frame) -> None:
+        global _shutting_down
+        _shutting_down = True
+        if previous_handler not in (signal.SIG_DFL, signal.SIG_IGN) and callable(previous_handler):
+            previous_handler(signum, frame)
 
-SETTINGS_AREAS: List[Dict[str, str]] = [
-    {
-        "key": "authentication",
-        "label": "Authentication",
-        "required_roles": [ROLE_GLOBAL_READ, ROLE_ACCOUNT_UPDATE, ROLE_ACCOUNT_RESET_PASSWORD],
-    },
-    {
-        "key": "plugins",
-        "label": "Plugin Management",
-        "required_roles": [ROLE_GLOBAL_READ, ROLE_PLUGIN_UPDATE],
-    },
-    {
-        "key": "logging",
-        "label": "Activity Logging",
-        "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
-    },
-    {
-        "key": "backup",
-        "label": "System Backup",
-        "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
-    },
-]
+    return handler
 
-ROLE_FORBIDDEN_DETAIL = "You do not have permission to access this resource."
-DISABLED_DNS_PLUGINS_SETTING = "disabled_dns_plugins"
 
-LEGACY_DNS_SETTING_NAMES = [
-    "dns_provider_type",
-    "dns_server",
-    "dns_zone",
-    "dns_username",
-    "dns_password",
-    "dns_tsig_algorithm",
-    "dns_winrm_ssl",
-    "azure_tenant_id",
-    "azure_client_id",
-    "azure_client_secret",
-    "azure_subscription_id",
-    "azure_resource_group",
-]
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    with SessionLocal() as db:
+        migrate_legacy_dns_settings_if_needed(db)
+        configure_operational_logging(level=get_log_level(db))
+        clear_restart_required(db)
+        clear_le_renewal_pending_restart(db)
+        letsencrypt.clear_enrollment_progress(db)
+        try:
+            run_retention_cleanup(db, force=True)
+        except Exception:
+            LOGGER.exception("startup activity retention cleanup failed")
+    admin_user = os.getenv("ADMIN_USER")
+    admin_password = os.getenv("ADMIN_PASSWORD")
+    if admin_user and admin_password:
+        with SessionLocal() as db:
+            if not db.exec(select(User).where(User.username == admin_user)).first():
+                db.add(
+                    User(
+                        username=admin_user,
+                        password_hash=hash_password(admin_password),
+                        roles=serialize_roles([*ALL_ROLES, ROLE_GLOBAL_ADMIN]),
+                    )
+                )
+                db.commit()
+    renewal_task = asyncio.create_task(_letsencrypt_renewal_loop())
+    restart_task = asyncio.create_task(_scheduled_restart_loop())
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGTERM, _make_shutdown_handler(previous_sigterm))
+    signal.signal(signal.SIGINT, _make_shutdown_handler(previous_sigint))
+    try:
+        yield
+    finally:
+        global _shutting_down
+        _shutting_down = True
+        for task in (renewal_task, restart_task):
+            task.cancel()
+        await asyncio.gather(renewal_task, restart_task, return_exceptions=True)
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        signal.signal(signal.SIGINT, previous_sigint)
+
+
+async def _letsencrypt_renewal_loop() -> None:
+    while True:
+        await asyncio.sleep(12 * 60 * 60)
+        try:
+            with SessionLocal() as db:
+                result = letsencrypt.maybe_renew_certificate(db)
+                if result:
+                    _apply_le_renewal_restart_policy(db, result.get("config") or {})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("Let's Encrypt renewal loop failed")
+
+
+def _apply_le_renewal_restart_policy(db, config: Dict[str, Any]) -> None:
+    if config.get("scheduled_restart_enabled") and config.get("scheduled_restart_time"):
+        mark_le_renewal_pending_restart(db)
+    else:
+        mark_restart_required(db, reason="Let's Encrypt certificate renewed.")
+
+
+def _maybe_scheduled_le_restart(db, *, now: Optional[datetime] = None) -> bool:
+    config = letsencrypt.get_config(db)
+    if not config or not config.get("scheduled_restart_enabled") or not config.get("scheduled_restart_time"):
+        return False
+    if ssl_certs._read_source() != ssl_certs.SOURCE_LETSENCRYPT:  # type: ignore[attr-defined]
+        return False
+    if not is_le_renewal_pending_restart(db):
+        return False
+    if not scheduled_restart_due(db, configured_time=str(config["scheduled_restart_time"]), now=now):
+        return False
+    clear_le_renewal_pending_restart(db)
+    perform_application_restart(scheduled=True)
+    return True
+
+
+async def _scheduled_restart_loop() -> None:
+    while True:
+        await asyncio.sleep(60)
+        try:
+            with SessionLocal() as db:
+                _maybe_scheduled_le_restart(db)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("Scheduled restart loop failed")
+
+
+def startup_event() -> None:
+    """Run startup initialization (used by tests; production uses ``lifespan``)."""
+    init_db()
+    with SessionLocal() as db:
+        migrate_legacy_dns_settings_if_needed(db)
+        configure_operational_logging(level=get_log_level(db))
+        clear_restart_required(db)
+        clear_le_renewal_pending_restart(db)
+        letsencrypt.clear_enrollment_progress(db)
+        try:
+            run_retention_cleanup(db, force=True)
+        except Exception:
+            LOGGER.exception("startup activity retention cleanup failed")
+    admin_user = os.getenv("ADMIN_USER")
+    admin_password = os.getenv("ADMIN_PASSWORD")
+    if admin_user and admin_password:
+        with SessionLocal() as db:
+            if not db.exec(select(User).where(User.username == admin_user)).first():
+                db.add(
+                    User(
+                        username=admin_user,
+                        password_hash=hash_password(admin_password),
+                        roles=serialize_roles([*ALL_ROLES, ROLE_GLOBAL_ADMIN]),
+                    )
+                )
+                db.commit()
+
 
 app = FastAPI(
     title="api-to-dns Service",
     description="Create or update DNS records via REST and manage API keys through a protected web UI.",
     version="0.3.4",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -129,17 +438,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/static", StaticFiles(directory="src/static"), name="static")
-templates = Jinja2Templates(directory="src/templates")
-
-AUTH_REDIRECT_DETAILS = {"Authentication required", "Invalid or expired session"}
-WEB_AUTH_PATH_PREFIXES = (
-    "/admin",
-    "/zones",
-    "/api-keys",
-    "/settings",
-)
-
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 @app.middleware("http")
 async def refresh_session_cookie(request: Request, call_next):
@@ -148,6 +447,40 @@ async def refresh_session_cookie(request: Request, call_next):
     if session_user and request.url.path != "/logout" and response.status_code < 400:
         response.set_cookie("session", create_session_cookie(session_user), **session_cookie_settings())
     return response
+
+
+@app.middleware("http")
+async def record_request_activity(request: Request, call_next):
+    response = await call_next(request)
+    try:
+        path = request.url.path
+        if path.startswith(_REQUEST_LOG_IGNORE_PREFIXES):
+            return response
+        with SessionLocal() as db:
+            session_user = getattr(request.state, "session_user", None)
+            emit_activity_event(
+                db,
+                event_type="http.request",
+                level=LOG_LEVEL_VERBOSE,
+                status="success" if response.status_code < 400 else "error",
+                actor_type="user" if session_user else "anonymous",
+                actor_label=session_user,
+                request_method=request.method,
+                request_path=path,
+                request_status_code=response.status_code,
+                request_ip=client_ip(request),
+                evaluate_alerts=False,
+            )
+    except Exception:  # pragma: no cover - logging must never break a request
+        LOGGER.exception("request activity logging failed")
+    return response
+
+
+@app.middleware("http")
+async def reject_requests_during_shutdown(request: Request, call_next):
+    if _shutting_down:
+        return PlainTextResponse("Shutting down", status_code=503)
+    return await call_next(request)
 
 
 @app.exception_handler(HTTPException)
@@ -165,415 +498,16 @@ def http_exception_handler(request: Request, exc: HTTPException):
         and request.url.path.startswith(WEB_AUTH_PATH_PREFIXES)
         and "application/json" not in request.headers.get("accept", "").lower()
     ):
-        return _render_access_denied_response()
+        return render_access_denied_response()
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
-def _render_access_denied_response() -> HTMLResponse:
-    return HTMLResponse(
-        content=(
-            "<!DOCTYPE html><html><head><title>Access denied</title>"
-            "<link rel=\"stylesheet\" href=\"/static/style.css\" /></head>"
-            "<body><div class=\"page\">"
-            "<h1>Access denied</h1>"
-            f"<div class=\"alert error\">{html.escape(ROLE_FORBIDDEN_DETAIL)}</div>"
-            "<p><a class=\"button\" href=\"/admin\">Back to dashboard</a></p>"
-            "</div></body></html>"
-        ),
-        status_code=403,
-    )
 
+# Backwards-compatible re-exports for tests and external callers.
+from .rbac import parse_roles as _parse_roles, serialize_roles as _serialize_roles
 
-def _render_error_response(request: Request, error: Exception, status_code: int = 500):
-    traceback_text = traceback.format_exc()
-    print("Application error:", error)
-    print(traceback_text)
-    content = (
-        "<html><body><h1>Application error</h1>"
-        f"<p>{html.escape(str(error))}</p>"
-        "<pre>"
-        f"{html.escape(traceback_text)}"
-        "</pre></body></html>"
-    )
-    return HTMLResponse(content=content, status_code=status_code)
-
-
-def get_dns_client_from_settings(settings: dict):
-    """Build a DNS provider client from decrypted zone configuration."""
-    from .dns_client import create_dns_client
-
-    return create_dns_client(settings)
-
-
-def get_dns_provider_options() -> List[dict]:
-    from .dns_client import provider_options_for_template
-
-    return provider_options_for_template()
-
-
-def get_known_dns_provider_keys() -> Set[str]:
-    return {plugin["key"] for plugin in get_dns_provider_options()}
-
-
-def get_dns_provider_label(provider_key: str) -> str:
-    from .dns_client import dns_provider_display_name
-
-    return dns_provider_display_name(provider_key)
-
-
-def wants_json_response(request: Request) -> bool:
-    return "application/json" in request.headers.get("accept", "").lower() or "application/json" in request.headers.get(
-        "content-type", ""
-    ).lower()
-
-
-def api_key_from_headers(x_api_key: Optional[str], authorization: Optional[str]) -> Optional[str]:
-    api_key = x_api_key
-    if not api_key and authorization:
-        prefix = "Bearer "
-        if authorization.startswith(prefix):
-            api_key = authorization[len(prefix) :].strip()
-    return api_key
-
-
-def _http_exception_from_dns_error(exc: Exception) -> HTTPException:
-    """Map provider/configuration errors to HTTP errors with structured detail."""
-    if isinstance(exc, HTTPException):
-        return exc
-    if isinstance(exc, ValueError):
-        return HTTPException(
-            status_code=400,
-            detail={"error": "invalid_request", "message": str(exc) or "invalid request"},
-        )
-    if isinstance(exc, RuntimeError):
-        return HTTPException(
-            status_code=502,
-            detail={"error": "dns_provider_failed", "message": str(exc)},
-        )
-    if isinstance(exc, ImportError):
-        return HTTPException(
-            status_code=503,
-            detail={"error": "dependency_unavailable", "message": str(exc)},
-        )
-    return HTTPException(
-        status_code=500,
-        detail={"error": "unexpected", "message": str(exc)},
-    )
-
-
-def get_db():
-    with SessionLocal() as db:
-        yield db
-
-
-def _parse_roles(raw: Optional[str]) -> Set[str]:
-    if not raw:
-        return set()
-    return {part.strip() for part in raw.split(",") if part.strip()}
-
-
-def _serialize_roles(roles) -> str:
-    cleaned = {r for r in roles if r in ALL_ROLES}
-    if ROLE_GLOBAL_ADMIN in cleaned:
-        cleaned = set(ALL_ROLES)
-    cleaned.update(MANDATORY_ROLES)
-    return ",".join(sorted(cleaned))
-
-
-def normalize_selected_roles(roles) -> List[str]:
-    selected = {r for r in roles if r in ALL_ROLES}
-    if ROLE_GLOBAL_ADMIN in selected:
-        return sorted(ALL_ROLES)
-    selected.update(MANDATORY_ROLES)
-    for role, required_role in ROLE_DEPENDENCIES.items():
-        if role in selected:
-            selected.add(required_role)
-    return sorted(selected)
-
-
-def effective_roles(stored_roles: Set[str]) -> Set[str]:
-    if ROLE_GLOBAL_ADMIN in stored_roles:
-        return set(ALL_ROLES)
-    return stored_roles | MANDATORY_ROLES
-
-
-def get_user_roles(db, username: str) -> Set[str]:
-    """Return the role set for `username`."""
-    user_row = db.exec(select(User).where(User.username == username)).first()
-    if user_row is None:
-        return set()
-    return effective_roles(_parse_roles(user_row.roles))
-
-
-def user_has_role(db, username: str, role: str) -> bool:
-    roles = get_user_roles(db, username)
-    return ROLE_GLOBAL_ADMIN in roles or role in roles or (
-        ROLE_GLOBAL_READ in roles and role in {ROLE_API_KEYS_READ, ROLE_DNS_ZONES_READ}
-    )
-
-
-def user_has_any_role(db, username: str, roles) -> bool:
-    return any(user_has_role(db, username, role) for role in roles)
-
-
-def user_is_global_admin(db, username: str) -> bool:
-    return ROLE_GLOBAL_ADMIN in get_user_roles(db, username)
-
-
-def target_is_global_admin(target: User) -> bool:
-    return ROLE_GLOBAL_ADMIN in effective_roles(_parse_roles(target.roles))
-
-
-def global_admin_guard_message(db, actor: str, target: User) -> Optional[str]:
-    if target_is_global_admin(target) and not user_is_global_admin(db, actor):
-        return "Only a global admin can manage another global admin account."
-    return None
-
-
-def require_role(role: str):
-    """FastAPI dependency factory that returns the username when the user has `role`."""
-
-    def _dependency(user: str = Depends(get_current_user)) -> str:
-        with SessionLocal() as db:
-            if not user_has_role(db, user, role):
-                raise HTTPException(status_code=403, detail=ROLE_FORBIDDEN_DETAIL)
-        return user
-
-    return _dependency
-
-
-def user_public_dict(u: User) -> Dict[str, Any]:
-    stored_roles = _parse_roles(u.roles)
-    display_roles = stored_roles or LEGACY_DEFAULT_ROLES
-    effective_display_roles = effective_roles(display_roles)
-    return {
-        "id": u.id,
-        "username": u.username,
-        "disabled": u.disabled,
-        "roles": sorted(effective_display_roles),
-        "stored_roles": sorted(display_roles | MANDATORY_ROLES),
-        "is_global_admin": ROLE_GLOBAL_ADMIN in effective_display_roles,
-        "has_default_roles": not stored_roles,
-    }
-
-
-def accessible_settings_areas(user_roles: Set[str]) -> List[Dict[str, str]]:
-    return [
-        area
-        for area in SETTINGS_AREAS
-        if area["key"] == "authentication" or any(role in user_roles for role in area["required_roles"])
-    ]
-
-
-def normalize_zone_name(zone: str) -> str:
-    return zone.strip().rstrip(".").lower()
-
-
-def get_setting(db, name: str) -> Optional[str]:
-    record = db.exec(select(Setting).where(Setting.name == name)).first()
-    return decrypt_value(record.value) if record else None
-
-
-def set_setting(db, name: str, value: str) -> None:
-    encrypted = encrypt_value(value)
-    record = db.exec(select(Setting).where(Setting.name == name)).first()
-    if record:
-        record.value = encrypted
-    else:
-        db.add(Setting(name=name, value=encrypted))
-    db.commit()
-
-
-def delete_setting(db, name: str) -> None:
-    record = db.exec(select(Setting).where(Setting.name == name)).first()
-    if record:
-        db.delete(record)
-    db.commit()
-
-
-def get_disabled_dns_plugins(db) -> Set[str]:
-    raw = get_setting(db, DISABLED_DNS_PLUGINS_SETTING)
-    if not raw:
-        return set()
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return set()
-    if not isinstance(parsed, list):
-        return set()
-    known_keys = get_known_dns_provider_keys()
-    return {str(key).strip().lower() for key in parsed if str(key).strip().lower() in known_keys}
-
-
-def set_disabled_dns_plugins(db, plugin_keys) -> None:
-    known_keys = get_known_dns_provider_keys()
-    cleaned = sorted({str(key).strip().lower() for key in plugin_keys if str(key).strip().lower() in known_keys})
-    if cleaned:
-        set_setting(db, DISABLED_DNS_PLUGINS_SETTING, json.dumps(cleaned))
-    else:
-        delete_setting(db, DISABLED_DNS_PLUGINS_SETTING)
-
-
-def dns_provider_options_with_state(db) -> List[dict]:
-    disabled = get_disabled_dns_plugins(db)
-    options: List[dict] = []
-    for plugin in get_dns_provider_options():
-        row = dict(plugin)
-        row["enabled"] = row["key"] not in disabled
-        row["disabled"] = not row["enabled"]
-        options.append(row)
-    return options
-
-
-def enabled_dns_provider_options(db) -> List[dict]:
-    return [plugin for plugin in dns_provider_options_with_state(db) if plugin["enabled"]]
-
-
-def zones_using_dns_provider(db, provider_key: str) -> List[str]:
-    matches: List[str] = []
-    for zone in list_dns_zones(db):
-        settings = decode_zone_config(zone)
-        provider = (settings.get("dns_provider_type") or "azure").strip().lower()
-        if provider == provider_key:
-            matches.append(zone.zone_name)
-    return matches
-
-
-def decode_zone_config(row: DnsZoneConfig) -> Dict[str, Any]:
-    raw = decrypt_value(row.encrypted_config)
-    return json.loads(raw)
-
-
-def encode_zone_config_dict(cfg: Dict[str, Any]) -> str:
-    return encrypt_value(json.dumps(cfg))
-
-
-def migrate_legacy_dns_settings_if_needed(db) -> None:
-    if db.exec(select(DnsZoneConfig)).first():
-        return
-    zone_raw = get_setting(db, "dns_zone")
-    if not zone_raw or not str(zone_raw).strip():
-        return
-    canonical = normalize_zone_name(zone_raw)
-    cfg = {
-        "dns_provider_type": get_setting(db, "dns_provider_type") or "azure",
-        "dns_server": get_setting(db, "dns_server") or "",
-        "dns_username": get_setting(db, "dns_username") or "",
-        "dns_password": get_setting(db, "dns_password") or "",
-        "dns_tsig_algorithm": get_setting(db, "dns_tsig_algorithm") or "",
-        "dns_winrm_ssl": get_setting(db, "dns_winrm_ssl") or "",
-        "azure_tenant_id": get_setting(db, "azure_tenant_id") or "",
-        "azure_client_id": get_setting(db, "azure_client_id") or "",
-        "azure_client_secret": get_setting(db, "azure_client_secret") or "",
-        "azure_subscription_id": get_setting(db, "azure_subscription_id") or "",
-        "azure_resource_group": get_setting(db, "azure_resource_group") or "",
-    }
-    row = DnsZoneConfig(zone_name=canonical, encrypted_config=encode_zone_config_dict(cfg))
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    for key in db.exec(select(ApiKey).where(ApiKey.active == True)).all():
-        db.add(ApiKeyAllowedZone(api_key_id=key.id, dns_zone_config_id=row.id))
-    db.commit()
-    for name in LEGACY_DNS_SETTING_NAMES:
-        delete_setting(db, name)
-
-
-def list_dns_zones(db) -> List[DnsZoneConfig]:
-    return sorted(db.exec(select(DnsZoneConfig)).all(), key=lambda z: z.zone_name)
-
-
-def api_key_allowed_zone_names(db, api_key_id: int) -> List[str]:
-    links = db.exec(select(ApiKeyAllowedZone).where(ApiKeyAllowedZone.api_key_id == api_key_id)).all()
-    names: List[str] = []
-    for link in links:
-        z = db.get(DnsZoneConfig, link.dns_zone_config_id)
-        if z:
-            names.append(z.zone_name)
-    return sorted(names)
-
-
-def dns_zone_public_dict(z: DnsZoneConfig) -> Dict[str, Any]:
-    """Safe to use after the Session closes (plain dict)."""
-    cfg = decode_zone_config(z)
-    provider_key = cfg.get("dns_provider_type", "") or "azure"
-    return {
-        "id": z.id,
-        "zone_name": z.zone_name,
-        "dns_provider_type": provider_key,
-        "dns_provider_label": get_dns_provider_label(provider_key),
-        "dns_server": cfg.get("dns_server", "") or "",
-    }
-
-
-def dns_zone_summary_dict(z: DnsZoneConfig) -> Dict[str, Any]:
-    return {"id": z.id, "zone_name": z.zone_name}
-
-
-def api_key_public_dict(k: ApiKey) -> Dict[str, Any]:
-    """Safe to use after the Session closes (plain dict)."""
-    return {"id": k.id, "label": k.label, "key": k.key, "active": k.active}
-
-
-def get_api_key(db, api_key: str):
-    return db.exec(select(ApiKey).where(ApiKey.key == api_key, ApiKey.active == True)).first()
-
-
-def _blank_preserve_secret(new_val: str, old_val: str) -> str:
-    return old_val if not (new_val or "").strip() else new_val
-
-
-def build_zone_config_from_form(
-    form,
-    existing: Optional[Dict[str, Any]] = None,
-    provider_plugins: Optional[List[dict]] = None,
-) -> Dict[str, Any]:
-    ex = existing or {}
-    provider = (form.get("dns_provider_type") or ex.get("dns_provider_type") or "azure").strip().lower()
-    plugins = provider_plugins if provider_plugins is not None else get_dns_provider_options()
-    plugin = next((p for p in plugins if p["key"] == provider), None)
-    if plugin is None:
-        if provider in get_known_dns_provider_keys():
-            raise ValueError(
-                f"{get_dns_provider_label(provider)} is disabled. Enable it in Settings before using it for a DNS zone."
-            )
-        available = ", ".join(p["key"] for p in plugins) or "none"
-        raise ValueError(f"Unknown DNS provider type: {provider}. Available providers: {available}.")
-
-    cfg: Dict[str, Any] = {"dns_provider_type": provider}
-    for field in plugin["fields"]:
-        name = field["name"]
-        if field["type"] == "checkbox":
-            value = "true" if name in form else ""
-        else:
-            value = (form.get(name) or "").strip()
-        if field["preserve_on_blank"]:
-            value = _blank_preserve_secret(value, ex.get(name, ""))
-        elif not value and field["default"] and not ex.get(name):
-            value = field["default"]
-        cfg[name] = value
-    return cfg
-
-
-@app.on_event("startup")
-def startup_event():
-    init_db()
-    with SessionLocal() as db:
-        migrate_legacy_dns_settings_if_needed(db)
-    admin_user = os.getenv("ADMIN_USER")
-    admin_password = os.getenv("ADMIN_PASSWORD")
-    if admin_user and admin_password:
-        with SessionLocal() as db:
-            if not db.exec(select(User).where(User.username == admin_user)).first():
-                db.add(
-                    User(
-                        username=admin_user,
-                        password_hash=hash_password(admin_password),
-                        roles=_serialize_roles([*ALL_ROLES, ROLE_GLOBAL_ADMIN]),
-                    )
-                )
-                db.commit()
-
+get_dns_client_from_settings = create_dns_client_from_settings
+get_dns_provider_label = dns_provider_display_name
 
 @app.get("/", response_class=RedirectResponse, include_in_schema=False)
 def root(request: Request) -> RedirectResponse:
@@ -641,26 +575,73 @@ def login_form(request: Request):
             context={"error": None},
         )
     except Exception as exc:
-        return _render_error_response(request, exc)
+        return render_error_response(request, exc)
 
 
 @app.post("/login", response_class=HTMLResponse, include_in_schema=False)
 def login(request: Request, username: str = Form(...), password: str = Form(...)):
+    ip = client_ip(request)
     with SessionLocal() as db:
         user = db.exec(select(User).where(User.username == username)).first()
         if not user or user.disabled or not verify_password(password, user.password_hash):
+            try:
+                emit_activity_event(
+                    db,
+                    event_type="auth.login_failed",
+                    level=LOG_LEVEL_WARNING,
+                    status="error",
+                    actor_type="user",
+                    actor_label=username,
+                    message=f"Failed login for {username!r}",
+                    details={"reason": "disabled" if user and user.disabled else "invalid_credentials"},
+                    request_ip=ip,
+                )
+            except Exception:  # pragma: no cover
+                LOGGER.exception("could not record auth.login_failed")
             return templates.TemplateResponse(
                 request=request,
                 name="login.html",
                 context={"error": "Invalid credentials."},
             )
+        try:
+            emit_activity_event(
+                db,
+                event_type="auth.login_succeeded",
+                level=LOG_LEVEL_INFORMATIONAL,
+                status="success",
+                actor_type="user",
+                actor_label=username,
+                message=f"Successful login for {username!r}",
+                request_ip=ip,
+            )
+        except Exception:  # pragma: no cover
+            LOGGER.exception("could not record auth.login_succeeded")
     response = RedirectResponse(url="/admin", status_code=HTTP_303_SEE_OTHER)
     response.set_cookie("session", create_session_cookie(username), **session_cookie_settings())
     return response
 
 
 @app.get("/logout", include_in_schema=False)
-def logout() -> RedirectResponse:
+def logout(request: Request) -> RedirectResponse:
+    session_token = request.cookies.get("session")
+    actor: Optional[str] = None
+    if session_token:
+        try:
+            from .auth import verify_session_cookie
+
+            actor = verify_session_cookie(session_token)
+        except Exception:  # pragma: no cover - invalid sessions still log out
+            actor = None
+    if actor:
+        record_activity(
+            event_type="auth.logout",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=actor,
+            message=f"Logout for {actor!r}",
+            request_ip=client_ip(request),
+        )
     response = RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
     response.delete_cookie("session")
     return response
@@ -691,7 +672,7 @@ def admin(request: Request, user: str = Depends(get_current_user)):
             },
         )
     except Exception as exc:
-        return _render_error_response(request, exc)
+        return render_error_response(request, exc)
 
 
 @app.get(
@@ -715,26 +696,55 @@ def zones_page(
         if wants_json_response(request):
             api_key = api_key_from_headers(x_api_key, authorization)
             if not api_key:
+                record_activity(
+                    event_type="dns.access_denied",
+                    level=LOG_LEVEL_WARNING,
+                    status="error",
+                    actor_type="api_key",
+                    actor_label="missing",
+                    message="API key missing on GET /zones",
+                )
                 raise HTTPException(status_code=403, detail=ACCESS_DENIED_DETAIL)
             key = get_api_key(db, api_key)
             if key is None:
+                emit_activity_event(
+                    db,
+                    event_type="dns.access_denied",
+                    level=LOG_LEVEL_WARNING,
+                    status="error",
+                    actor_type="api_key",
+                    actor_label="invalid",
+                    message="Invalid or revoked API key used on GET /zones",
+                    details={"key_fingerprint": api_key_fingerprint(api_key)},
+                )
                 raise HTTPException(status_code=403, detail=ACCESS_DENIED_DETAIL)
             zone_ids = [
                 link.dns_zone_config_id
                 for link in db.exec(select(ApiKeyAllowedZone).where(ApiKeyAllowedZone.api_key_id == key.id)).all()
             ]
             zones = [zone for zone_id in zone_ids if (zone := db.get(DnsZoneConfig, zone_id)) is not None]
+            actor_id = str(key.id) if key.id is not None else None
+            emit_activity_event(
+                db,
+                event_type="dns.zones_list",
+                level=LOG_LEVEL_INFORMATIONAL,
+                status="success",
+                actor_type="api_key",
+                actor_id=actor_id,
+                actor_label=key.label,
+                message=f"Listed {len(zones)} allowed DNS zone(s)",
+                details={"zone_count": len(zones)},
+            )
             return [DnsZoneSummary(**dns_zone_summary_dict(z)) for z in zones]
 
         user = get_current_user(request)
         if not user_has_role(db, user, ROLE_DNS_ZONES_READ):
             raise HTTPException(status_code=403, detail=ROLE_FORBIDDEN_DETAIL)
-        zones = list_dns_zones(db)
-        zones_view = [dns_zone_public_dict(z) for z in zones]
+        ctx = _zones_html_context(db)
     return templates.TemplateResponse(
         request=request,
         name="zones.html",
-        context={"request": request, "zones": zones_view, "message": None},
+        context={"request": request, **ctx},
     )
 
 
@@ -763,22 +773,20 @@ async def zone_create(request: Request, user: str = Depends(require_role(ROLE_DN
     canonical = normalize_zone_name(zone_name)
     if not canonical:
         with SessionLocal() as db:
-            zones = list_dns_zones(db)
-            zones_view = [dns_zone_public_dict(z) for z in zones]
+            ctx = _zones_html_context(db, message="Zone name is required.")
         return templates.TemplateResponse(
             request=request,
             name="zones.html",
-            context={"request": request, "zones": zones_view, "message": "Zone name is required."},
+            context={"request": request, **ctx},
         )
     with SessionLocal() as db:
         provider_plugins = enabled_dns_provider_options(db)
         if db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == canonical)).first():
-            zones = list_dns_zones(db)
-            zones_view = [dns_zone_public_dict(z) for z in zones]
+            ctx = _zones_html_context(db, message=f"A zone named {canonical!r} already exists.")
             return templates.TemplateResponse(
                 request=request,
                 name="zones.html",
-                context={"request": request, "zones": zones_view, "message": f"A zone named {canonical!r} already exists."},
+                context={"request": request, **ctx},
             )
         try:
             cfg = build_zone_config_from_form(form, provider_plugins=provider_plugins)
@@ -798,12 +806,153 @@ async def zone_create(request: Request, user: str = Depends(require_role(ROLE_DN
         row = DnsZoneConfig(zone_name=canonical, encrypted_config=encode_zone_config_dict(cfg))
         db.add(row)
         db.commit()
-        zones = list_dns_zones(db)
-        zones_view = [dns_zone_public_dict(z) for z in zones]
+        emit_activity_event(
+            db,
+            event_type="dns_zone.created",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            zone_name=canonical,
+            message=f"Zone {canonical!r} added",
+            details={"dns_provider_type": cfg.get("dns_provider_type")},
+        )
+        ctx = _zones_html_context(db, message=f"Zone {canonical!r} added.")
     return templates.TemplateResponse(
         request=request,
         name="zones.html",
-        context={"request": request, "zones": zones_view, "message": f"Zone {canonical!r} added."},
+        context={"request": request, **ctx},
+    )
+
+
+@app.post("/zones/test", include_in_schema=False)
+async def zone_test(request: Request, user: str = Depends(require_role(ROLE_DNS_ZONES_UPDATE))):
+    form = await request.form()
+    zone_name_raw = str(form.get("zone_name") or "")
+    test_record_name = str(form.get("test_record_name") or "").strip()
+    test_record_type_raw = str(form.get("test_record_type") or "").strip()
+    zone_id_raw = form.get("zone_id")
+
+    existing: Optional[Dict[str, Any]] = None
+    canonical = normalize_zone_name(zone_name_raw)
+
+    with SessionLocal() as db:
+        provider_plugins = enabled_dns_provider_options(db)
+        if zone_id_raw:
+            try:
+                zone_id = int(zone_id_raw)
+            except (TypeError, ValueError):
+                zone_id = None
+            if zone_id is not None:
+                row = db.get(DnsZoneConfig, zone_id)
+                if row:
+                    existing = decode_zone_config(row)
+                    if not canonical:
+                        canonical = row.zone_name
+
+        if not canonical:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": "Zone name is required.",
+                    "records": [],
+                },
+            )
+        if not test_record_name:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": "Test record name is required.",
+                    "records": [],
+                },
+            )
+
+        try:
+            test_record_type = normalize_lookup_record_type(test_record_type_raw or None)
+            cfg = build_zone_config_from_form(form, existing=existing, provider_plugins=provider_plugins)
+            records = test_zone_record_lookup(
+                cfg,
+                record_name=test_record_name,
+                record_type=test_record_type,
+            )
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": str(exc),
+                    "records": [],
+                },
+            )
+        except Exception as exc:
+            mapped = http_exception_from_dns_error(exc)
+            detail = mapped.detail if isinstance(mapped.detail, dict) else {"message": str(mapped.detail)}
+            emit_activity_event(
+                db,
+                event_type="dns_zone.test",
+                level=LOG_LEVEL_ERROR,
+                status="error",
+                actor_type="user",
+                actor_label=user,
+                zone_name=canonical,
+                record_name=test_record_name,
+                message=str(detail.get("message", "DNS test failed")),
+                details={
+                    "dns_provider_type": (cfg.get("dns_provider_type") if "cfg" in locals() else None),
+                    "test_record_type": test_record_type_raw or None,
+                },
+            )
+            return JSONResponse(
+                status_code=mapped.status_code,
+                content={
+                    "status": "error",
+                    "message": detail.get("message", "DNS test failed"),
+                    "records": [],
+                },
+            )
+
+        record_payload = [record.model_dump() for record in records]
+        if records:
+            message = f"Found {len(records)} record(s) at {test_record_name!r} in zone {canonical!r}."
+            status = "success"
+            event_level = LOG_LEVEL_INFORMATIONAL
+            event_status = "success"
+        else:
+            if test_record_type:
+                message = f"Authentication successful. No {test_record_type} record found for {test_record_name!r} in zone {canonical!r}."
+            else:
+                message = (
+                    f"Authentication successful. No records found at {test_record_name!r} in zone {canonical!r}."
+                )
+            status = "not_found"
+            event_level = LOG_LEVEL_INFORMATIONAL
+            event_status = "not_found"
+
+        emit_activity_event(
+            db,
+            event_type="dns_zone.test",
+            level=event_level,
+            status=event_status,
+            actor_type="user",
+            actor_label=user,
+            zone_name=canonical,
+            record_name=test_record_name,
+            message=message,
+            details={
+                "dns_provider_type": cfg.get("dns_provider_type"),
+                "test_record_type": test_record_type_raw or None,
+                "records_found": len(records),
+            },
+        )
+
+    return JSONResponse(
+        content={
+            "status": status,
+            "message": message,
+            "records": record_payload,
+        },
     )
 
 
@@ -862,6 +1011,17 @@ async def zone_update(request: Request, zone_id: int, user: str = Depends(requir
         settings = decode_zone_config(row)
         zone_view = dns_zone_public_dict(row)
         title_zone = row.zone_name
+        emit_activity_event(
+            db,
+            event_type="dns_zone.updated",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            zone_name=row.zone_name,
+            message=f"Zone {row.zone_name!r} updated",
+            details={"dns_provider_type": cfg.get("dns_provider_type")},
+        )
     return templates.TemplateResponse(
         request=request,
         name="zone_form.html",
@@ -880,17 +1040,30 @@ async def zone_update(request: Request, zone_id: int, user: str = Depends(requir
 def zone_delete(request: Request, zone_id: int, user: str = Depends(require_role(ROLE_DNS_ZONES_UPDATE))):
     with SessionLocal() as db:
         row = db.get(DnsZoneConfig, zone_id)
+        removed_zone_name = None
         if row:
+            removed_zone_name = row.zone_name
+            letsencrypt.detach_dns_zone_from_letsencrypt(db, zone_id)
             for link in db.exec(select(ApiKeyAllowedZone).where(ApiKeyAllowedZone.dns_zone_config_id == zone_id)).all():
                 db.delete(link)
             db.delete(row)
             db.commit()
-        zones = list_dns_zones(db)
-        zones_view = [dns_zone_public_dict(z) for z in zones]
+        if removed_zone_name:
+            emit_activity_event(
+                db,
+                event_type="dns_zone.deleted",
+                level=LOG_LEVEL_WARNING,
+                status="success",
+                actor_type="user",
+                actor_label=user,
+                zone_name=removed_zone_name,
+                message=f"Zone {removed_zone_name!r} deleted",
+            )
+        ctx = _zones_html_context(db, message="Zone removed.")
     return templates.TemplateResponse(
         request=request,
         name="zones.html",
-        context={"request": request, "zones": zones_view, "message": "Zone removed."},
+        context={"request": request, **ctx},
     )
 
 
@@ -898,24 +1071,14 @@ def zone_delete(request: Request, zone_id: int, user: str = Depends(require_role
 def api_keys_page(request: Request, user: str = Depends(require_role(ROLE_API_KEYS_READ))):
     try:
         with SessionLocal() as db:
-            api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda key: key.created_at, reverse=True)
-            key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
-            all_zones = list_dns_zones(db)
-            api_keys_view = [api_key_public_dict(k) for k in api_keys]
-            all_zones_view = [dns_zone_public_dict(z) for z in all_zones]
+            ctx = _api_keys_html_context(db)
         return templates.TemplateResponse(
             request=request,
             name="api_keys.html",
-            context={
-                "request": request,
-                "api_keys": api_keys_view,
-                "key_zones": key_zones,
-                "all_zones": all_zones_view,
-                "message": None,
-            },
+            context={"request": request, **ctx},
         )
     except Exception as exc:
-        return _render_error_response(request, exc)
+        return render_error_response(request, exc)
 
 
 @app.post("/api-keys/revoke", response_class=HTMLResponse, include_in_schema=False)
@@ -927,25 +1090,25 @@ def revoke_api_key(request: Request, key_id: int = Form(...), user: str = Depend
                 api_key.active = False
                 db.add(api_key)
                 db.commit()
-            api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda k: k.created_at, reverse=True)
-            key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
-            all_zones = list_dns_zones(db)
-            api_keys_view = [api_key_public_dict(k) for k in api_keys]
-            all_zones_view = [dns_zone_public_dict(z) for z in all_zones]
+                emit_activity_event(
+                    db,
+                    event_type="api_key.revoked",
+                    level=LOG_LEVEL_WARNING,
+                    status="success",
+                    actor_type="user",
+                    actor_label=user,
+                    message=f"API key {api_key.label!r} revoked",
+                    details={"api_key_id": api_key.id, "api_key_label": api_key.label},
+                )
+            ctx = _api_keys_html_context(db, message="API key revoked.")
 
         return templates.TemplateResponse(
             request=request,
             name="api_keys.html",
-            context={
-                "request": request,
-                "api_keys": api_keys_view,
-                "key_zones": key_zones,
-                "all_zones": all_zones_view,
-                "message": "API key revoked.",
-            },
+            context={"request": request, **ctx},
         )
     except Exception as exc:
-        return _render_error_response(request, exc)
+        return render_error_response(request, exc)
 
 
 @app.post("/api-keys", response_class=HTMLResponse, include_in_schema=False)
@@ -963,25 +1126,17 @@ def create_api_key_route(
                 if not row:
                     return RedirectResponse(url="/api-keys", status_code=HTTP_303_SEE_OTHER)
                 if not zone_ids:
-                    api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda k: k.created_at, reverse=True)
-                    key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
-                    all_zones = list_dns_zones(db)
-                    api_keys_view = [api_key_public_dict(k) for k in api_keys]
-                    all_zones_view = [dns_zone_public_dict(z) for z in all_zones]
+                    ctx = _api_keys_html_context(
+                        db,
+                        edit_key_error_id=key_id,
+                        edit_key_error="Select at least one DNS zone.",
+                        edit_key_label=label,
+                        edit_key_selected_zone_ids=zone_ids,
+                    )
                     return templates.TemplateResponse(
                         request=request,
                         name="api_keys.html",
-                        context={
-                            "request": request,
-                            "api_keys": api_keys_view,
-                            "key_zones": key_zones,
-                            "all_zones": all_zones_view,
-                            "message": None,
-                            "edit_key_error_id": key_id,
-                            "edit_key_error": "Select at least one DNS zone.",
-                            "edit_key_label": label,
-                            "edit_key_selected_zone_ids": zone_ids,
-                        },
+                        context={"request": request, **ctx},
                     )
                 row.label = label
                 db.add(row)
@@ -992,41 +1147,33 @@ def create_api_key_route(
                     if db.get(DnsZoneConfig, zid):
                         db.add(ApiKeyAllowedZone(api_key_id=key_id, dns_zone_config_id=zid))
                 db.commit()
-                api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda k: k.created_at, reverse=True)
-                key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
-                all_zones = list_dns_zones(db)
-                api_keys_view = [api_key_public_dict(k) for k in api_keys]
-                all_zones_view = [dns_zone_public_dict(z) for z in all_zones]
+                emit_activity_event(
+                    db,
+                    event_type="api_key.updated",
+                    level=LOG_LEVEL_INFORMATIONAL,
+                    status="success",
+                    actor_type="user",
+                    actor_label=user,
+                    message=f"API key {label!r} updated",
+                    details={"api_key_id": key_id, "api_key_label": label, "allowed_zone_ids": list(zone_ids)},
+                )
+                ctx = _api_keys_html_context(db, message="API key updated.")
             return templates.TemplateResponse(
                 request=request,
                 name="api_keys.html",
-                context={
-                    "request": request,
-                    "api_keys": api_keys_view,
-                    "key_zones": key_zones,
-                    "all_zones": all_zones_view,
-                    "message": "API key updated.",
-                },
+                context={"request": request, **ctx},
             )
         if not zone_ids:
             with SessionLocal() as db:
-                api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda k: k.created_at, reverse=True)
-                key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
-                all_zones = list_dns_zones(db)
-                api_keys_view = [api_key_public_dict(k) for k in api_keys]
-                all_zones_view = [dns_zone_public_dict(z) for z in all_zones]
+                ctx = _api_keys_html_context(
+                    db,
+                    create_key_error="Select at least one DNS zone for this API key.",
+                    create_key_label=label,
+                )
             return templates.TemplateResponse(
                 request=request,
                 name="api_keys.html",
-                context={
-                    "request": request,
-                    "api_keys": api_keys_view,
-                    "key_zones": key_zones,
-                    "all_zones": all_zones_view,
-                    "message": None,
-                    "create_key_error": "Select at least one DNS zone for this API key.",
-                    "create_key_label": label,
-                },
+                context={"request": request, **ctx},
             )
         new_key = generate_api_key()
         with SessionLocal() as db:
@@ -1038,25 +1185,29 @@ def create_api_key_route(
                 if db.get(DnsZoneConfig, zid):
                     db.add(ApiKeyAllowedZone(api_key_id=api_key.id, dns_zone_config_id=zid))
             db.commit()
-            api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda k: k.created_at, reverse=True)
-            key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
-            all_zones = list_dns_zones(db)
-            api_keys_view = [api_key_public_dict(k) for k in api_keys]
-            all_zones_view = [dns_zone_public_dict(z) for z in all_zones]
+            emit_activity_event(
+                db,
+                event_type="api_key.created",
+                level=LOG_LEVEL_INFORMATIONAL,
+                status="success",
+                actor_type="user",
+                actor_label=user,
+                message=f"API key {label!r} created",
+                details={
+                    "api_key_id": api_key.id,
+                    "api_key_label": api_key.label,
+                    "allowed_zone_ids": list(zone_ids),
+                },
+            )
+            ctx = _api_keys_html_context(db, message=f"API key created: {new_key}")
 
         return templates.TemplateResponse(
             request=request,
             name="api_keys.html",
-            context={
-                "request": request,
-                "api_keys": api_keys_view,
-                "key_zones": key_zones,
-                "all_zones": all_zones_view,
-                "message": f"API key created: {new_key}",
-            },
+            context={"request": request, **ctx},
         )
     except Exception as exc:
-        return _render_error_response(request, exc)
+        return render_error_response(request, exc)
 
 
 @app.get("/api-keys/{key_id}/edit", response_class=HTMLResponse, include_in_schema=False)
@@ -1123,6 +1274,16 @@ def api_key_update(
             if db.get(DnsZoneConfig, zid):
                 db.add(ApiKeyAllowedZone(api_key_id=key_id, dns_zone_config_id=zid))
         db.commit()
+        emit_activity_event(
+            db,
+            event_type="api_key.updated",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"API key {label!r} updated",
+            details={"api_key_id": key_id, "api_key_label": label, "allowed_zone_ids": list(zone_ids)},
+        )
         all_zones = list_dns_zones(db)
         allowed_ids = {
             link.dns_zone_config_id
@@ -1146,80 +1307,52 @@ def api_key_update(
     )
 
 
-def _settings_context(
-    request: Request,
-    user: str,
-    area: Optional[str],
-    message: Optional[str] = None,
-    message_kind: str = "success",
-    auth_form_error: Optional[str] = None,
-    auth_form_username: Optional[str] = None,
-    auth_form_selected_roles: Optional[List[str]] = None,
-) -> Dict[str, Any]:
-    with SessionLocal() as db:
-        user_roles = get_user_roles(db, user)
-        can_view_accounts = bool(
-            {ROLE_GLOBAL_READ, ROLE_ACCOUNT_UPDATE, ROLE_ACCOUNT_RESET_PASSWORD}.intersection(user_roles)
-        )
-        users_view = (
-            [user_public_dict(u) for u in sorted(db.exec(select(User)).all(), key=lambda u: u.username.lower())]
-            if can_view_accounts
-            else []
-        )
-        plugin_options = (
-            dns_provider_options_with_state(db)
-            if ROLE_GLOBAL_READ in user_roles or ROLE_PLUGIN_UPDATE in user_roles
-            else []
-        )
-
-    accessible = accessible_settings_areas(user_roles)
-    accessible_keys = {a["key"] for a in accessible}
-    requested_area = (area or "").strip().lower() or (accessible[0]["key"] if accessible else "")
-    if requested_area not in accessible_keys:
-        requested_area = accessible[0]["key"] if accessible else ""
-
-    return {
-        "request": request,
-        "user": user,
-        "user_roles": sorted(user_roles),
-        "accessible_areas": accessible,
-        "selected_area": requested_area,
-        "users": users_view,
-        "role_catalog": ROLE_LABELS,
-        "plugins": plugin_options,
-        "message": message,
-        "message_kind": message_kind,
-        "auth_form_error": auth_form_error,
-        "auth_form_username": auth_form_username or "",
-        "auth_form_selected_roles": [] if auth_form_selected_roles is None else auth_form_selected_roles,
-        "can_view_accounts": can_view_accounts,
-        "can_account_update": ROLE_ACCOUNT_UPDATE in user_roles,
-        "can_account_reset_password": ROLE_ACCOUNT_RESET_PASSWORD in user_roles,
-        "can_global_admin": ROLE_GLOBAL_ADMIN in user_roles,
-        "can_plugin_update": ROLE_PLUGIN_UPDATE in user_roles,
-    }
-
-
-def _render_settings(
-    request: Request,
-    user: str,
-    area: Optional[str],
-    **kwargs: Any,
-):
-    return templates.TemplateResponse(
-        request=request,
-        name="settings.html",
-        context=_settings_context(request, user, area, **kwargs),
-    )
-
-
 @app.get("/settings", response_class=HTMLResponse, include_in_schema=False)
 def settings_page(
     request: Request,
     area: Optional[str] = None,
+    section: Optional[str] = None,
+    event_type: Optional[str] = None,
+    level: Optional[str] = None,
+    category: Optional[str] = None,
+    log_status: Optional[str] = None,
+    zone_name: Optional[str] = None,
+    actor: Optional[str] = None,
+    text_query: Optional[str] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    offset: int = 0,
     user: str = Depends(get_current_user),
 ):
-    return _render_settings(request, user, area)
+    normalized_area = (area or "").strip().lower()
+    if normalized_area in LEGACY_SETTINGS_AREA_ALIASES:
+        normalized_area = LEGACY_SETTINGS_AREA_ALIASES[normalized_area]
+    log_search_params: Optional[Dict[str, Any]] = None
+    if normalized_area == "log_viewing":
+        log_search_params = {
+            "event_type": (event_type or "").strip() or None,
+            "level": (level or "").strip() or None,
+            "category": (category or "").strip() or None,
+            "status": (log_status or "").strip() or None,
+            "zone_name": (zone_name or "").strip() or None,
+            "actor": (actor or "").strip() or None,
+            "text_query": (text_query or "").strip() or None,
+            "start": _parse_iso_datetime(start),
+            "end": _parse_iso_datetime(end),
+            "offset": offset,
+        }
+    return render_settings(
+        request, user, normalized_area, log_search_params=log_search_params, section=section
+    )
+
+
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 @app.post("/settings/account/password", response_class=HTMLResponse, include_in_schema=False)
@@ -1231,7 +1364,7 @@ def settings_self_password_change(
     user: str = Depends(get_current_user),
 ):
     if not new_password:
-        return _render_settings(
+        return render_settings(
             request,
             user,
             "authentication",
@@ -1239,7 +1372,7 @@ def settings_self_password_change(
             message_kind="error",
         )
     if new_password != confirm_password:
-        return _render_settings(
+        return render_settings(
             request,
             user,
             "authentication",
@@ -1249,7 +1382,7 @@ def settings_self_password_change(
     with SessionLocal() as db:
         target = db.exec(select(User).where(User.username == user)).first()
         if target is None or not verify_password(current_password, target.password_hash):
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1259,7 +1392,17 @@ def settings_self_password_change(
         target.password_hash = hash_password(new_password)
         db.add(target)
         db.commit()
-    return _render_settings(request, user, "authentication", message="Password changed.")
+        emit_activity_event(
+            db,
+            event_type="user.password_changed",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"User {user!r} changed their own password",
+            details={"target_username": user},
+        )
+    return render_settings(request, user, "authentication", message="Password changed.")
 
 
 @app.post("/settings/users", response_class=HTMLResponse, include_in_schema=False)
@@ -1273,7 +1416,7 @@ def settings_user_create(
     normalized = username.strip()
     selected_roles = normalize_selected_roles(roles)
     if not normalized:
-        return _render_settings(
+        return render_settings(
             request,
             user,
             "authentication",
@@ -1282,7 +1425,7 @@ def settings_user_create(
             auth_form_selected_roles=selected_roles,
         )
     if not password:
-        return _render_settings(
+        return render_settings(
             request,
             user,
             "authentication",
@@ -1292,7 +1435,7 @@ def settings_user_create(
         )
     with SessionLocal() as db:
         if ROLE_GLOBAL_ADMIN in selected_roles and not user_is_global_admin(db, user):
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1301,7 +1444,7 @@ def settings_user_create(
                 auth_form_selected_roles=[r for r in selected_roles if r != ROLE_GLOBAL_ADMIN],
             )
         if db.exec(select(User).where(User.username == normalized)).first():
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1313,11 +1456,21 @@ def settings_user_create(
             User(
                 username=normalized,
                 password_hash=hash_password(password),
-                roles=_serialize_roles(selected_roles),
+                roles=serialize_roles(selected_roles),
             )
         )
         db.commit()
-    return _render_settings(
+        emit_activity_event(
+            db,
+            event_type="user.created",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"User {normalized!r} created",
+            details={"target_username": normalized, "roles": selected_roles},
+        )
+    return render_settings(
         request,
         user,
         "authentication",
@@ -1334,7 +1487,7 @@ def settings_user_disable(
     with SessionLocal() as db:
         target = db.get(User, user_id)
         if not target:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1342,7 +1495,7 @@ def settings_user_disable(
                 message_kind="error",
             )
         if guard_message := global_admin_guard_message(db, user, target):
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1350,7 +1503,7 @@ def settings_user_disable(
                 message_kind="error",
             )
         if target.disabled:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1359,7 +1512,7 @@ def settings_user_disable(
             )
         enabled_users = db.exec(select(User).where(User.disabled == False)).all()  # noqa: E712
         if len(enabled_users) <= 1:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1367,7 +1520,7 @@ def settings_user_disable(
                 message_kind="error",
             )
         if target.username == user:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1378,7 +1531,17 @@ def settings_user_disable(
         db.add(target)
         db.commit()
         username = target.username
-    return _render_settings(
+        emit_activity_event(
+            db,
+            event_type="user.disabled",
+            level=LOG_LEVEL_WARNING,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"User {username!r} disabled",
+            details={"target_username": username, "target_user_id": user_id},
+        )
+    return render_settings(
         request,
         user,
         "authentication",
@@ -1395,7 +1558,7 @@ def settings_user_enable(
     with SessionLocal() as db:
         target = db.get(User, user_id)
         if not target:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1403,7 +1566,7 @@ def settings_user_enable(
                 message_kind="error",
             )
         if guard_message := global_admin_guard_message(db, user, target):
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1411,7 +1574,7 @@ def settings_user_enable(
                 message_kind="error",
             )
         if not target.disabled:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1422,7 +1585,17 @@ def settings_user_enable(
         db.add(target)
         db.commit()
         username = target.username
-    return _render_settings(
+        emit_activity_event(
+            db,
+            event_type="user.enabled",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"User {username!r} enabled",
+            details={"target_username": username, "target_user_id": user_id},
+        )
+    return render_settings(
         request,
         user,
         "authentication",
@@ -1439,7 +1612,7 @@ def settings_user_delete(
     with SessionLocal() as db:
         target = db.get(User, user_id)
         if not target:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1447,7 +1620,7 @@ def settings_user_delete(
                 message_kind="error",
             )
         if guard_message := global_admin_guard_message(db, user, target):
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1456,7 +1629,7 @@ def settings_user_delete(
             )
         remaining = db.exec(select(User)).all()
         if len(remaining) <= 1:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1464,7 +1637,7 @@ def settings_user_delete(
                 message_kind="error",
             )
         if target.username == user:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1472,7 +1645,7 @@ def settings_user_delete(
                 message_kind="error",
             )
         if not target.disabled:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1482,7 +1655,17 @@ def settings_user_delete(
         username = target.username
         db.delete(target)
         db.commit()
-    return _render_settings(
+        emit_activity_event(
+            db,
+            event_type="user.deleted",
+            level=LOG_LEVEL_WARNING,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"User {username!r} deleted",
+            details={"target_username": username, "target_user_id": user_id},
+        )
+    return render_settings(
         request,
         user,
         "authentication",
@@ -1499,7 +1682,7 @@ def settings_user_reset_password(
     user: str = Depends(require_role(ROLE_ACCOUNT_RESET_PASSWORD)),
 ):
     if not password or not confirm_password:
-        return _render_settings(
+        return render_settings(
             request,
             user,
             "authentication",
@@ -1507,7 +1690,7 @@ def settings_user_reset_password(
             message_kind="error",
         )
     if password != confirm_password:
-        return _render_settings(
+        return render_settings(
             request,
             user,
             "authentication",
@@ -1517,7 +1700,7 @@ def settings_user_reset_password(
     with SessionLocal() as db:
         target = db.get(User, user_id)
         if not target:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1525,7 +1708,7 @@ def settings_user_reset_password(
                 message_kind="error",
             )
         if guard_message := global_admin_guard_message(db, user, target):
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1533,7 +1716,7 @@ def settings_user_reset_password(
                 message_kind="error",
             )
         if target.disabled:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1544,7 +1727,17 @@ def settings_user_reset_password(
         db.add(target)
         db.commit()
         username = target.username
-    return _render_settings(
+        emit_activity_event(
+            db,
+            event_type="user.password_reset",
+            level=LOG_LEVEL_WARNING,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"Password reset for {username!r}",
+            details={"target_username": username, "target_user_id": user_id},
+        )
+    return render_settings(
         request,
         user,
         "authentication",
@@ -1563,7 +1756,7 @@ def settings_user_update_roles(
     with SessionLocal() as db:
         target = db.get(User, user_id)
         if not target:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1571,7 +1764,7 @@ def settings_user_update_roles(
                 message_kind="error",
             )
         if guard_message := global_admin_guard_message(db, user, target):
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1579,7 +1772,7 @@ def settings_user_update_roles(
                 message_kind="error",
             )
         if target.username == user:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1591,7 +1784,7 @@ def settings_user_update_roles(
             (ROLE_GLOBAL_ADMIN in selected or ROLE_GLOBAL_ADMIN in target_stored_roles)
             and not user_is_global_admin(db, user)
         ):
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
@@ -1599,18 +1792,28 @@ def settings_user_update_roles(
                 message_kind="error",
             )
         if target.disabled:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "authentication",
                 message="Enable the user account before editing its roles.",
                 message_kind="error",
             )
-        target.roles = _serialize_roles(selected)
+        target.roles = serialize_roles(selected)
         db.add(target)
         db.commit()
         username = target.username
-    return _render_settings(
+        emit_activity_event(
+            db,
+            event_type="user.roles_updated",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"Roles updated for {username!r}",
+            details={"target_username": username, "roles": selected},
+        )
+    return render_settings(
         request,
         user,
         "authentication",
@@ -1627,7 +1830,7 @@ def settings_plugin_disable(
     normalized_key = plugin_key.strip().lower()
     known_keys = get_known_dns_provider_keys()
     if normalized_key not in known_keys:
-        return _render_settings(
+        return render_settings(
             request,
             user,
             "plugins",
@@ -1638,10 +1841,10 @@ def settings_plugin_disable(
     with SessionLocal() as db:
         disabled = get_disabled_dns_plugins(db)
         if normalized_key in disabled:
-            return _render_settings(request, user, "plugins", message=f"{get_dns_provider_label(normalized_key)} is already disabled.")
+            return render_settings(request, user, "plugins", message=f"{dns_provider_display_name(normalized_key)} is already disabled.")
         enabled_count = len([plugin for plugin in get_dns_provider_options() if plugin["key"] not in disabled])
         if enabled_count <= 1:
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "plugins",
@@ -1652,22 +1855,32 @@ def settings_plugin_disable(
         if zone_names:
             zones_text = ", ".join(zone_names)
             first_zone = zone_names[0]
-            return _render_settings(
+            return render_settings(
                 request,
                 user,
                 "plugins",
                 message=(
-                    f"Cannot disable {get_dns_provider_label(normalized_key)}. "
+                    f"Cannot disable {dns_provider_display_name(normalized_key)}. "
                     f"Delete DNS zone {first_zone} first."
                     if len(zone_names) == 1
-                    else f"Cannot disable {get_dns_provider_label(normalized_key)}. Delete DNS zones {zones_text} first."
+                    else f"Cannot disable {dns_provider_display_name(normalized_key)}. Delete DNS zones {zones_text} first."
                 ),
                 message_kind="error",
             )
         disabled.add(normalized_key)
         set_disabled_dns_plugins(db, disabled)
+        emit_activity_event(
+            db,
+            event_type="plugin.disabled",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"Plugin {normalized_key!r} disabled",
+            details={"plugin_key": normalized_key},
+        )
 
-    return _render_settings(request, user, "plugins", message=f"{get_dns_provider_label(normalized_key)} disabled.")
+    return render_settings(request, user, "plugins", message=f"{dns_provider_display_name(normalized_key)} disabled.")
 
 
 @app.post("/settings/plugins/{plugin_key}/enable", response_class=HTMLResponse, include_in_schema=False)
@@ -1679,7 +1892,7 @@ def settings_plugin_enable(
     normalized_key = plugin_key.strip().lower()
     known_keys = get_known_dns_provider_keys()
     if normalized_key not in known_keys:
-        return _render_settings(
+        return render_settings(
             request,
             user,
             "plugins",
@@ -1689,107 +1902,1572 @@ def settings_plugin_enable(
 
     with SessionLocal() as db:
         disabled = get_disabled_dns_plugins(db)
+        was_disabled = normalized_key in disabled
         disabled.discard(normalized_key)
         set_disabled_dns_plugins(db, disabled)
+        if was_disabled:
+            emit_activity_event(
+                db,
+                event_type="plugin.enabled",
+                level=LOG_LEVEL_INFORMATIONAL,
+                status="success",
+                actor_type="user",
+                actor_label=user,
+                message=f"Plugin {normalized_key!r} enabled",
+                details={"plugin_key": normalized_key},
+            )
 
-    return _render_settings(request, user, "plugins", message=f"{get_dns_provider_label(normalized_key)} enabled.")
+    return render_settings(request, user, "plugins", message=f"{dns_provider_display_name(normalized_key)} enabled.")
 
 
-@app.post(
-    "/dns-record",
-    response_model=DnsRecordResponse,
-    responses={
-        HTTP_404_NOT_FOUND: {
-            "description": "DELETE: no matching record in the zone.",
-            "model": DnsRecordResponse,
+@app.post("/settings/system/app-dns-name", response_class=HTMLResponse, include_in_schema=False)
+def settings_update_app_dns_name(
+    request: Request,
+    app_dns_name: str = Form(...),
+    redirect_section: str = Form("system_identity"),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    try:
+        with SessionLocal() as db:
+            applied = set_app_dns_name(db, app_dns_name)
+            emit_activity_event(
+                db,
+                event_type="system.app_dns_name_changed",
+                level=LOG_LEVEL_INFORMATIONAL,
+                status="success",
+                actor_type="user",
+                actor_label=user,
+                message=f"App DNS name set to {applied}",
+                details={"app_dns_name": applied},
+            )
+    except ValueError as exc:
+        return render_settings(
+            request,
+            user,
+            "system_settings",
+            message=str(exc),
+            message_kind="error",
+            section=redirect_section,
+        )
+    return render_settings(
+        request,
+        user,
+        "system_settings",
+        message=f"App DNS name saved as {applied}.",
+        section=redirect_section,
+    )
+
+
+@app.post("/settings/system/log-level", response_class=HTMLResponse, include_in_schema=False)
+def settings_update_log_level(
+    request: Request,
+    log_level: str = Form(...),
+    redirect_area: str = Form("system_settings"),
+    redirect_section: str = Form("logging_configuration"),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    target_area = (redirect_area or "system_settings").strip().lower()
+    if target_area not in {"system_settings", "log_viewing"}:
+        target_area = "system_settings"
+    target_section = redirect_section if target_area == "system_settings" else None
+    try:
+        previous = None
+        with SessionLocal() as db:
+            previous = get_log_level(db)
+            applied = set_log_level(db, log_level)
+            configure_operational_logging(level=applied)
+            emit_activity_event(
+                db,
+                event_type="system.log_level_changed",
+                level=LOG_LEVEL_INFORMATIONAL,
+                status="success",
+                actor_type="user",
+                actor_label=user,
+                message=f"Activity log level set to {applied}",
+                details={"previous_level": previous, "new_level": applied},
+            )
+    except ValueError as exc:
+        return render_settings(
+            request, user, target_area, message=str(exc), message_kind="error", section=target_section
+        )
+    return render_settings(
+        request, user, target_area, message=f"Activity log level set to {applied}.", section=target_section
+    )
+
+
+@app.post("/settings/system/retention", response_class=HTMLResponse, include_in_schema=False)
+def settings_update_retention(
+    request: Request,
+    retention_days: int = Form(...),
+    redirect_section: str = Form("audit_log_retention"),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    if retention_days < 1:
+        return render_settings(
+            request,
+            user,
+            "system_settings",
+            message="Retention must be at least 1 day.",
+            message_kind="error",
+            section=redirect_section,
+        )
+    with SessionLocal() as db:
+        applied = set_retention_days(db, retention_days)
+        emit_activity_event(
+            db,
+            event_type="system.retention_changed",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"Activity log retention set to {applied} days",
+            details={"retention_days": applied},
+        )
+    return render_settings(
+        request,
+        user,
+        "system_settings",
+        message=f"Activity log retention set to {applied} days.",
+        section=redirect_section,
+    )
+
+
+@app.post("/settings/system/smtp", response_class=HTMLResponse, include_in_schema=False)
+def settings_update_smtp(
+    request: Request,
+    smtp_servers: str = Form(""),
+    smtp_port: int = Form(activity_logging.DEFAULT_SMTP_PORT),
+    smtp_security: str = Form("none"),
+    smtp_anonymous: Optional[str] = Form(None),
+    smtp_username: str = Form(""),
+    smtp_password: str = Form(""),
+    smtp_from: str = Form(""),
+    smtp_timeout: int = Form(activity_logging.DEFAULT_SMTP_TIMEOUT),
+    redirect_section: str = Form("smtp_delivery"),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    anonymous = smtp_anonymous is not None
+    with SessionLocal() as db:
+        set_smtp_config(
+            db,
+            servers=smtp_servers,
+            port=smtp_port,
+            anonymous=anonymous,
+            username=smtp_username,
+            password=smtp_password,
+            from_address=smtp_from,
+            security=smtp_security,
+            timeout=smtp_timeout,
+        )
+        emit_activity_event(
+            db,
+            event_type="system.smtp_updated",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message="SMTP delivery settings updated",
+            details={
+                "servers_count": len([s for s in (smtp_servers or "").split(",") if s.strip()]),
+                "anonymous": anonymous,
+                "security": smtp_security,
+            },
+        )
+    return render_settings(
+        request, user, "system_settings", message="SMTP delivery settings saved.", section=redirect_section
+    )
+
+
+@app.post("/settings/system/ssl", response_class=HTMLResponse, include_in_schema=False)
+def settings_update_ssl(
+    request: Request,
+    ssl_enabled: Optional[str] = Form(None),
+    redirect_section: str = Form("ssl_certificate"),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    desired = ssl_enabled is not None
+    with SessionLocal() as db:
+        if desired and not cert_exists():
+            _emit_ssl_audit(
+                db,
+                action="toggled",
+                user=user,
+                status="error",
+                message="SSL enable rejected: no certificate installed",
+                details={"ssl_enabled": desired},
+            )
+            return render_settings(
+                request,
+                user,
+                "system_settings",
+                message=(
+                    "Cannot enable SSL: no certificate is installed. Upload a PEM certificate "
+                    "or create a self-signed certificate first."
+                ),
+                message_kind="error",
+                section=redirect_section,
+            )
+        previous = is_ssl_enabled(db)
+        set_ssl_enabled(db, desired)
+        if desired != previous:
+            mark_restart_required(db, reason="SSL listener setting changed.")
+        _emit_ssl_audit(
+            db,
+            action="toggled",
+            user=user,
+            message=f"SSL listener {'enabled' if desired else 'disabled'} (restart required)",
+            details={"ssl_enabled": desired, "previous": previous, "changed": desired != previous},
+        )
+    return render_settings(
+        request,
+        user,
+        "system_settings",
+        message=(
+            "SSL setting saved. Restart the application for the change to take effect."
+        ),
+        message_kind="warning",
+        section=redirect_section,
+    )
+
+
+@app.post("/settings/system/ssl-upload", response_class=HTMLResponse, include_in_schema=False)
+async def settings_upload_ssl(
+    request: Request,
+    ssl_key: UploadFile = File(...),
+    ssl_cert: UploadFile = File(...),
+    redirect_section: str = Form("ssl_certificate"),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    try:
+        key_bytes = await ssl_key.read()
+        cert_bytes = await ssl_cert.read()
+    except Exception as exc:  # noqa: BLE001 — UploadFile.read failures are surfaced verbatim
+        with SessionLocal() as db:
+            _emit_ssl_audit(
+                db,
+                action="upload_failed",
+                user=user,
+                status="error",
+                message=f"SSL certificate upload failed: {exc}",
+                details={"reason": str(exc)},
+            )
+        return render_settings(
+            request,
+            user,
+            "system_settings",
+            message=f"Failed to read upload: {exc}",
+            message_kind="error",
+            section=redirect_section,
+        )
+
+    try:
+        metadata = install_uploaded_cert(key_bytes, cert_bytes)
+    except CertificateInstallError as exc:
+        with SessionLocal() as db:
+            _emit_ssl_audit(
+                db,
+                action="upload_failed",
+                user=user,
+                status="error",
+                message=f"SSL certificate upload rejected: {exc}",
+                details={"reason": str(exc)},
+            )
+        return render_settings(
+            request,
+            user,
+            "system_settings",
+            message=str(exc),
+            message_kind="error",
+            section=redirect_section,
+        )
+
+    with SessionLocal() as db:
+        mark_restart_required(db, reason="SSL certificate uploaded.")
+        _emit_ssl_audit(
+            db,
+            action="uploaded",
+            user=user,
+            message=f"SSL certificate uploaded (CN={metadata.get('common_name') or 'unknown'})",
+            details={
+                "common_name": metadata.get("common_name") or "",
+                "not_after": metadata.get("not_after_iso") or "",
+                "fingerprint": metadata.get("fingerprint") or "",
+            },
+        )
+    return render_settings(
+        request,
+        user,
+        "system_settings",
+        message=(
+            "SSL certificate uploaded. Restart the application for the new certificate to take effect."
+        ),
+        message_kind="warning",
+        section=redirect_section,
+    )
+
+
+@app.post("/settings/system/ssl-regenerate", response_class=HTMLResponse, include_in_schema=False)
+def settings_regenerate_ssl(
+    request: Request,
+    redirect_section: str = Form("ssl_certificate"),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    already_existed = cert_exists()
+    user_message = ""
+    try:
+        with SessionLocal() as db:
+            if already_existed:
+                metadata = regenerate_self_signed_cert(db)
+                action = "regenerated"
+                user_message = "Self-signed certificate regenerated."
+            else:
+                metadata = create_self_signed_cert(db)
+                action = "created"
+                user_message = "Self-signed certificate created."
+            mark_restart_required(db, reason=user_message)
+            _emit_ssl_audit(
+                db,
+                action=action,
+                user=user,
+                message=f"{user_message} (CN={metadata.get('common_name') or 'unknown'})",
+                details={
+                    "common_name": metadata.get("common_name") or "",
+                    "not_after": metadata.get("not_after_iso") or "",
+                    "fingerprint": metadata.get("fingerprint") or "",
+                    "source": metadata.get("source") or "",
+                },
+            )
+    except OpenSSLUnavailableError as exc:
+        with SessionLocal() as db:
+            _emit_ssl_audit(
+                db,
+                action="regenerate_failed",
+                user=user,
+                status="error",
+                message=f"Self-signed certificate generation failed: {exc}",
+                details={"reason": str(exc)},
+            )
+        return render_settings(
+            request,
+            user,
+            "system_settings",
+            message=str(exc),
+            message_kind="error",
+            section=redirect_section,
+        )
+    except RuntimeError as exc:
+        with SessionLocal() as db:
+            _emit_ssl_audit(
+                db,
+                action="regenerate_failed",
+                user=user,
+                status="error",
+                message=f"Self-signed certificate generation failed: {exc}",
+                details={"reason": str(exc)},
+            )
+        return render_settings(
+            request,
+            user,
+            "system_settings",
+            message=f"Failed to generate self-signed certificate: {exc}",
+            message_kind="error",
+            section=redirect_section,
+        )
+
+    return render_settings(
+        request,
+        user,
+        "system_settings",
+        message=(
+            f"{user_message} Restart the application for the new certificate to take effect."
+        ),
+        message_kind="warning",
+        section=redirect_section,
+    )
+
+
+_le_enrollment_in_progress = False
+
+
+def _emit_ssl_audit(
+    db,
+    *,
+    action: str,
+    user: str,
+    message: str,
+    status: str = "success",
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    emit_activity_event(
+        db,
+        event_type=f"system.ssl_{action}",
+        level=LOG_LEVEL_WARNING,
+        category=LOG_CATEGORY_SECURITY,
+        status=status,
+        actor_type="user",
+        actor_label=user,
+        message=message,
+        details=details or {},
+    )
+
+
+def _le_start_form_kwargs(
+    *,
+    email: str,
+    root_dns_domain: str,
+    common_name: str,
+    subject_alt_names: str,
+    challenge_type: str,
+    zone_id: str,
+    staging: Optional[str],
+    renew_before_expiry_days: int,
+    scheduled_restart_enabled: Optional[str],
+    scheduled_restart_time: str,
+) -> Dict[str, Any]:
+    return {
+        "email": email,
+        "root_dns_domain": root_dns_domain,
+        "common_name": common_name,
+        "subject_alt_names": subject_alt_names,
+        "challenge_type": challenge_type,
+        "zone_id": int(zone_id) if str(zone_id).strip() else None,
+        "staging": staging is not None,
+        "renew_before_expiry_days": renew_before_expiry_days,
+        "scheduled_restart_enabled": (
+            True if scheduled_restart_enabled is None else scheduled_restart_enabled is not None
+        ),
+        "scheduled_restart_time": scheduled_restart_time,
+    }
+
+
+def _le_issued_message(db, config: Dict[str, Any]) -> str:
+    message = "Let's Encrypt certificate installed. Restart the application to use it."
+    message += letsencrypt.http_auto_renew_notice(db, config)
+    return message
+
+
+def _apply_le_start_result(db, result: Dict[str, Any], *, user: str) -> tuple[str, str]:
+    if result.get("status") == "issued":
+        mark_restart_required(db, reason="Let's Encrypt certificate installed.")
+        config = result.get("config") or {}
+        return (_le_issued_message(db, config), "warning")
+    return (
+        "Let's Encrypt enrollment started. Complete the challenge, then continue enrollment.",
+        "success",
+    )
+
+
+def _emit_le_started(db, result: Dict[str, Any], *, user: str) -> None:
+    config = result.get("config") or {}
+    _emit_ssl_audit(
+        db,
+        action="letsencrypt_start",
+        user=user,
+        message="Let's Encrypt enrollment started",
+        details={
+            "root_dns_domain": config.get("root_dns_domain", ""),
+            "common_name": config.get("common_name", ""),
+            "subject_alt_names": config.get("subject_alt_names", []),
+            "zone_id": config.get("zone_id"),
+            "challenge_type": config.get("challenge_type", ""),
         },
-        400: {"description": "Invalid request or configuration."},
+    )
+
+
+def _run_le_auto_enrollment_sync(kwargs: Dict[str, Any], *, user: str) -> None:
+    def progress(phase: str, percent: int, message: str) -> None:
+        with SessionLocal() as progress_db:
+            letsencrypt.write_enrollment_progress(
+                progress_db,
+                phase=phase,
+                percent=percent,
+                message=message,
+            )
+
+    try:
+        with SessionLocal() as db:
+            result = letsencrypt.start_enrollment(db, progress_cb=progress, **kwargs)
+            message, _kind = _apply_le_start_result(db, result, user=user)
+            _emit_le_started(db, result, user=user)
+            status = result.get("status") or ""
+        with SessionLocal() as progress_db:
+            letsencrypt.write_enrollment_progress(
+                progress_db,
+                phase="complete",
+                percent=100,
+                message=message,
+                done=True,
+                result_status=status,
+            )
+    except letsencrypt.LetsEncryptError as exc:
+        with SessionLocal() as progress_db:
+            letsencrypt.write_enrollment_progress(
+                progress_db,
+                phase="error",
+                percent=0,
+                message=str(exc),
+                done=True,
+                error=str(exc),
+            )
+    except Exception as exc:
+        LOGGER.exception("Let's Encrypt auto enrollment failed")
+        with SessionLocal() as progress_db:
+            letsencrypt.write_enrollment_progress(
+                progress_db,
+                phase="error",
+                percent=0,
+                message=str(exc),
+                done=True,
+                error=str(exc),
+            )
+
+
+async def _run_le_auto_enrollment(kwargs: Dict[str, Any], *, user: str) -> None:
+    global _le_enrollment_in_progress
+    try:
+        await asyncio.to_thread(_run_le_auto_enrollment_sync, kwargs, user=user)
+    finally:
+        _le_enrollment_in_progress = False
+
+
+@app.get("/settings/system/ssl-letsencrypt/progress", include_in_schema=False)
+def settings_letsencrypt_progress(user: str = Depends(require_role(ROLE_SYSTEM_UPDATE))):
+    with SessionLocal() as db:
+        payload = letsencrypt.get_enrollment_progress(db)
+        if payload.get("done") and not payload.get("error"):
+            payload["restart_required"] = is_restart_required(db)
+        return JSONResponse(payload)
+
+
+@app.post("/settings/system/ssl-letsencrypt/start-async", include_in_schema=False)
+async def settings_letsencrypt_start_async(
+    request: Request,
+    email: str = Form(...),
+    root_dns_domain: str = Form(...),
+    common_name: str = Form(...),
+    subject_alt_names: str = Form(""),
+    challenge_type: str = Form("dns-01"),
+    zone_id: str = Form(""),
+    staging: Optional[str] = Form(None),
+    renew_before_expiry_days: int = Form(letsencrypt.DEFAULT_RENEW_BEFORE_DAYS),
+    scheduled_restart_enabled: Optional[str] = Form(None),
+    scheduled_restart_time: str = Form(letsencrypt.DEFAULT_SCHEDULED_RESTART_TIME),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    global _le_enrollment_in_progress
+    if challenge_type != letsencrypt.CHALLENGE_DNS or not str(zone_id).strip():
+        with SessionLocal() as db:
+            _emit_ssl_audit(
+                db,
+                action="letsencrypt_start_failed",
+                user=user,
+                status="error",
+                message="Let's Encrypt async enrollment rejected: DNS-01 with API zone required",
+                details={"challenge_type": challenge_type, "zone_id": zone_id},
+            )
+        return JSONResponse(
+            {"detail": "Async enrollment requires DNS-01 with an API configured zone."},
+            status_code=400,
+        )
+    if _le_enrollment_in_progress:
+        with SessionLocal() as db:
+            _emit_ssl_audit(
+                db,
+                action="letsencrypt_start_failed",
+                user=user,
+                status="error",
+                message="Let's Encrypt async enrollment rejected: already in progress",
+            )
+        return JSONResponse({"detail": "Let's Encrypt enrollment is already in progress."}, status_code=HTTP_409_CONFLICT)
+    kwargs = _le_start_form_kwargs(
+        email=email,
+        root_dns_domain=root_dns_domain,
+        common_name=common_name,
+        subject_alt_names=subject_alt_names,
+        challenge_type=challenge_type,
+        zone_id=zone_id,
+        staging=staging,
+        renew_before_expiry_days=renew_before_expiry_days,
+        scheduled_restart_enabled=scheduled_restart_enabled,
+        scheduled_restart_time=scheduled_restart_time,
+    )
+    with SessionLocal() as db:
+        letsencrypt.clear_enrollment_progress(db)
+        letsencrypt.write_enrollment_progress(
+            db,
+            phase="starting",
+            percent=0,
+            message="Starting enrollment...",
+        )
+    _le_enrollment_in_progress = True
+    with SessionLocal() as db:
+        _emit_ssl_audit(
+            db,
+            action="letsencrypt_start_async",
+            user=user,
+            message="Let's Encrypt async enrollment started",
+            details={
+                "root_dns_domain": kwargs.get("root_dns_domain", ""),
+                "common_name": kwargs.get("common_name", ""),
+                "zone_id": kwargs.get("zone_id"),
+                "challenge_type": kwargs.get("challenge_type", ""),
+            },
+        )
+    asyncio.create_task(_run_le_auto_enrollment(kwargs, user=user))
+    return JSONResponse({"status": "started"}, status_code=HTTP_202_ACCEPTED)
+
+
+@app.post("/settings/system/ssl-letsencrypt/start", response_class=HTMLResponse, include_in_schema=False)
+def settings_letsencrypt_start(
+    request: Request,
+    email: str = Form(...),
+    root_dns_domain: str = Form(...),
+    common_name: str = Form(...),
+    subject_alt_names: str = Form(""),
+    challenge_type: str = Form("dns-01"),
+    zone_id: str = Form(""),
+    staging: Optional[str] = Form(None),
+    renew_before_expiry_days: int = Form(letsencrypt.DEFAULT_RENEW_BEFORE_DAYS),
+    scheduled_restart_enabled: Optional[str] = Form(None),
+    scheduled_restart_time: str = Form(letsencrypt.DEFAULT_SCHEDULED_RESTART_TIME),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    try:
+        kwargs = _le_start_form_kwargs(
+            email=email,
+            root_dns_domain=root_dns_domain,
+            common_name=common_name,
+            subject_alt_names=subject_alt_names,
+            challenge_type=challenge_type,
+            zone_id=zone_id,
+            staging=staging,
+            renew_before_expiry_days=renew_before_expiry_days,
+            scheduled_restart_enabled=scheduled_restart_enabled,
+            scheduled_restart_time=scheduled_restart_time,
+        )
+        with SessionLocal() as db:
+            result = letsencrypt.start_enrollment(db, **kwargs)
+            message, kind = _apply_le_start_result(db, result, user=user)
+            _emit_le_started(db, result, user=user)
+    except LetsEncryptError as exc:
+        return render_settings(request, user, "system_settings", message=str(exc), message_kind="error", section="ssl_certificate")
+    return render_settings(request, user, "system_settings", message=message, message_kind=kind, section="ssl_certificate")
+
+
+@app.post("/settings/system/ssl-letsencrypt/continue", response_class=HTMLResponse, include_in_schema=False)
+def settings_letsencrypt_continue(request: Request, user: str = Depends(require_role(ROLE_SYSTEM_UPDATE))):
+    try:
+        with SessionLocal() as db:
+            result = letsencrypt.continue_enrollment(db)
+            config = result.get("config") or {}
+            mark_restart_required(db, reason="Let's Encrypt certificate installed.")
+            _emit_ssl_audit(
+                db,
+                action="letsencrypt_continue",
+                user=user,
+                message="Let's Encrypt certificate installed",
+                details={
+                    "root_dns_domain": config.get("root_dns_domain", ""),
+                    "common_name": config.get("common_name", ""),
+                    "subject_alt_names": config.get("subject_alt_names", []),
+                },
+            )
+    except LetsEncryptError as exc:
+        return render_settings(request, user, "system_settings", message=str(exc), message_kind="error", section="ssl_certificate")
+    with SessionLocal() as db:
+        issued_message = _le_issued_message(db, config)
+    return render_settings(
+        request,
+        user,
+        "system_settings",
+        message=issued_message,
+        message_kind="warning",
+        section="ssl_certificate",
+    )
+
+
+@app.post("/settings/system/ssl-letsencrypt/cancel", response_class=HTMLResponse, include_in_schema=False)
+def settings_letsencrypt_cancel(request: Request, user: str = Depends(require_role(ROLE_SYSTEM_UPDATE))):
+    with SessionLocal() as db:
+        letsencrypt.cancel_enrollment(db)
+        _emit_ssl_audit(db, action="letsencrypt_cancel", user=user, message="Let's Encrypt enrollment cancelled")
+    return render_settings(request, user, "system_settings", message="Let's Encrypt enrollment cancelled.", section="ssl_certificate")
+
+
+@app.post("/settings/system/ssl-letsencrypt/config", response_class=HTMLResponse, include_in_schema=False)
+def settings_letsencrypt_config(
+    request: Request,
+    email: str = Form(""),
+    root_dns_domain: str = Form(""),
+    common_name: str = Form(""),
+    subject_alt_names: str = Form(""),
+    challenge_type: str = Form("dns-01"),
+    zone_id: str = Form(""),
+    staging: Optional[str] = Form(None),
+    renew_before_expiry_days: int = Form(letsencrypt.DEFAULT_RENEW_BEFORE_DAYS),
+    scheduled_restart_enabled: Optional[str] = Form(None),
+    scheduled_restart_time: str = Form(letsencrypt.DEFAULT_SCHEDULED_RESTART_TIME),
+    auto_renew_enabled: Optional[str] = Form(None),
+    config_notice: str = Form(""),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    notice = (config_notice or "").strip()
+    try:
+        with SessionLocal() as db:
+            existing = letsencrypt.get_config(db) or {}
+            challenge = challenge_type or existing.get("challenge_type", letsencrypt.CHALLENGE_DNS)
+            zone_id_val = int(zone_id) if str(zone_id).strip() else existing.get("zone_id")
+            if challenge == letsencrypt.CHALLENGE_HTTP:
+                zone_id_val = None
+            if notice == "auto_renew_on" and not letsencrypt.auto_renew_supported(challenge, zone_id_val):
+                raise LetsEncryptError(
+                    "Automatic certificate renewal requires an automated DNS challenge zone "
+                    "(not Manual DNS instructions)."
+                )
+            letsencrypt.save_config(
+                db,
+                email=email or existing.get("email", ""),
+                root_dns_domain=root_dns_domain or existing.get("root_dns_domain", ""),
+                common_name=common_name or existing.get("common_name", ""),
+                subject_alt_names=subject_alt_names or existing.get("subject_alt_names", []),
+                challenge_type=challenge_type or existing.get("challenge_type", "dns-01"),
+                zone_id=int(zone_id) if str(zone_id).strip() else existing.get("zone_id"),
+                staging=staging is not None,
+                renew_before_expiry_days=renew_before_expiry_days,
+                scheduled_restart_enabled=scheduled_restart_enabled is not None,
+                scheduled_restart_time=scheduled_restart_time,
+                auto_renew_enabled=auto_renew_enabled is not None,
+            )
+            _emit_ssl_audit(
+                db,
+                action="letsencrypt_config",
+                user=user,
+                message="Let's Encrypt settings saved",
+                details={"config_notice": notice, "auto_renew_enabled": auto_renew_enabled is not None},
+            )
+    except LetsEncryptError as exc:
+        return render_settings(request, user, "system_settings", message=str(exc), message_kind="error", section="ssl_certificate")
+    if notice == "auto_renew_on":
+        message = "Automatic certificate renewal was turned on."
+    elif notice == "auto_renew_off":
+        message = "Automatic certificate renewal was turned off."
+    else:
+        message = "Let's Encrypt settings saved."
+    return render_settings(request, user, "system_settings", message=message, section="ssl_certificate")
+
+
+@app.get("/.well-known/acme-challenge/{token}", response_class=PlainTextResponse, include_in_schema=False)
+def letsencrypt_http_challenge(token: str):
+    with SessionLocal() as db:
+        response = letsencrypt.http_challenge_response(db, token)
+    if response is None:
+        raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="Challenge token not found")
+    return PlainTextResponse(response)
+
+
+@app.post("/system/restart", include_in_schema=False)
+def system_restart(request: Request, user: str = Depends(require_role(ROLE_SYSTEM_UPDATE))):
+    with SessionLocal() as db:
+        preview = nav_context(db, user).get("restart_preview", {})
+        clear_restart_required(db)
+        emit_activity_event(
+            db,
+            event_type="system.restart_requested",
+            level=LOG_LEVEL_WARNING,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message="Application restart requested",
+            details=preview,
+        )
+    perform_application_restart(scheduled=False)
+    if wants_json_response(request):
+        return JSONResponse({"status": "restarting", **preview})
+    return RedirectResponse(url=request.headers.get("referer") or "/admin", status_code=HTTP_303_SEE_OTHER)
+
+
+@app.post("/settings/system/log-rotation", response_class=HTMLResponse, include_in_schema=False)
+def settings_update_log_rotation(
+    request: Request,
+    log_file: str = Form(""),
+    max_bytes: int = Form(1_048_576),
+    backup_count: int = Form(5),
+    redirect_section: str = Form("operational_log_rotation"),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    if is_running_in_docker():
+        return render_settings(
+            request,
+            user,
+            "system_settings",
+            message="Operational log rotation is managed by Docker in container deployments.",
+            message_kind="error",
+            section=redirect_section,
+        )
+    with SessionLocal() as db:
+        set_setting(db, activity_logging.SETTING_LOG_FILE, log_file or "")
+        set_setting(db, activity_logging.SETTING_LOG_MAX_BYTES, str(max(1024, int(max_bytes))))
+        set_setting(db, activity_logging.SETTING_LOG_BACKUP_COUNT, str(max(0, int(backup_count))))
+        configure_operational_logging(
+            level=get_log_level(db),
+            log_file=log_file or None,
+            max_bytes=max(1024, int(max_bytes)),
+            backup_count=max(0, int(backup_count)),
+        )
+        emit_activity_event(
+            db,
+            event_type="system.log_rotation_updated",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message="Operational log rotation updated",
+            details={
+                "log_file_configured": bool(log_file),
+                "max_bytes": max(1024, int(max_bytes)),
+                "backup_count": max(0, int(backup_count)),
+            },
+        )
+    return render_settings(
+        request,
+        user,
+        "system_settings",
+        message="Operational log rotation saved.",
+        section=redirect_section,
+    )
+
+
+@app.post("/settings/alerts", response_class=HTMLResponse, include_in_schema=False)
+def settings_alerts_create(
+    request: Request,
+    name: str = Form(...),
+    event_type: str = Form(""),
+    category: str = Form(""),
+    minimum_level: str = Form(LOG_LEVEL_WARNING),
+    message_contains: str = Form(""),
+    email_recipients: str = Form(...),
+    email_subject_template: str = Form(""),
+    email_body_template: str = Form(""),
+    cooldown_minutes: int = Form(0),
+    enabled: Optional[str] = Form("on"),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    cleaned_level = (minimum_level or LOG_LEVEL_WARNING).strip().upper()
+    if cleaned_level not in LOG_LEVEL_VALUES:
+        return render_settings(
+            request, user, "email_alerting", message=f"Unsupported level: {minimum_level}", message_kind="error"
+        )
+    cleaned_category = (category or "").strip().lower()
+    if cleaned_category and cleaned_category not in LOG_CATEGORY_VALUES:
+        return render_settings(
+            request, user, "email_alerting", message=f"Unsupported category: {category}", message_kind="error"
+        )
+    if not email_recipients.strip():
+        return render_settings(
+            request, user, "email_alerting", message="At least one email recipient is required.", message_kind="error"
+        )
+    with SessionLocal() as db:
+        rule = AlertRule(
+            enabled=bool(enabled),
+            name=name.strip(),
+            event_type=event_type.strip() or None,
+            category=cleaned_category or None,
+            minimum_level=cleaned_level,
+            message_contains=message_contains.strip() or None,
+            email_recipients=email_recipients.strip(),
+            email_subject_template=email_subject_template,
+            email_body_template=email_body_template,
+            cooldown_minutes=max(0, int(cooldown_minutes)),
+        )
+        db.add(rule)
+        db.commit()
+        db.refresh(rule)
+        emit_activity_event(
+            db,
+            event_type="alert_rule.created",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"Alert rule {name!r} created",
+            details={"rule_id": rule.id, "rule_name": rule.name, "category": cleaned_category, "minimum_level": cleaned_level},
+        )
+    return render_settings(request, user, "email_alerting", message=f"Alert rule {name!r} created.")
+
+
+@app.post("/settings/alerts/{rule_id}", response_class=HTMLResponse, include_in_schema=False)
+def settings_alerts_update(
+    request: Request,
+    rule_id: int,
+    name: str = Form(...),
+    event_type: str = Form(""),
+    category: str = Form(""),
+    minimum_level: str = Form(LOG_LEVEL_WARNING),
+    message_contains: str = Form(""),
+    email_recipients: str = Form(...),
+    email_subject_template: str = Form(""),
+    email_body_template: str = Form(""),
+    cooldown_minutes: int = Form(0),
+    enabled: Optional[str] = Form(None),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    cleaned_level = (minimum_level or LOG_LEVEL_WARNING).strip().upper()
+    if cleaned_level not in LOG_LEVEL_VALUES:
+        return render_settings(
+            request, user, "email_alerting", message=f"Unsupported level: {minimum_level}", message_kind="error"
+        )
+    cleaned_category = (category or "").strip().lower()
+    if cleaned_category and cleaned_category not in LOG_CATEGORY_VALUES:
+        return render_settings(
+            request, user, "email_alerting", message=f"Unsupported category: {category}", message_kind="error"
+        )
+    with SessionLocal() as db:
+        rule = db.get(AlertRule, rule_id)
+        if rule is None:
+            return render_settings(
+                request, user, "email_alerting", message="Alert rule not found.", message_kind="error"
+            )
+        rule.enabled = enabled is not None
+        rule.name = name.strip()
+        rule.event_type = event_type.strip() or None
+        rule.category = cleaned_category or None
+        rule.minimum_level = cleaned_level
+        rule.message_contains = message_contains.strip() or None
+        rule.email_recipients = email_recipients.strip()
+        rule.email_subject_template = email_subject_template
+        rule.email_body_template = email_body_template
+        rule.cooldown_minutes = max(0, int(cooldown_minutes))
+        db.add(rule)
+        db.commit()
+        emit_activity_event(
+            db,
+            event_type="alert_rule.updated",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"Alert rule {name!r} updated",
+            details={"rule_id": rule_id, "rule_name": rule.name, "category": cleaned_category, "minimum_level": cleaned_level},
+        )
+    return render_settings(request, user, "email_alerting", message=f"Alert rule {name!r} updated.")
+
+
+@app.post("/settings/alerts/{rule_id}/delete", response_class=HTMLResponse, include_in_schema=False)
+def settings_alerts_delete(
+    request: Request,
+    rule_id: int,
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    with SessionLocal() as db:
+        rule = db.get(AlertRule, rule_id)
+        if rule is None:
+            return render_settings(
+                request, user, "email_alerting", message="Alert rule not found.", message_kind="error"
+            )
+        rule_name = rule.name
+        db.delete(rule)
+        db.commit()
+        emit_activity_event(
+            db,
+            event_type="alert_rule.deleted",
+            level=LOG_LEVEL_WARNING,
+            status="success",
+            actor_type="user",
+            actor_label=user,
+            message=f"Alert rule {rule_name!r} deleted",
+            details={"rule_id": rule_id, "rule_name": rule_name},
+        )
+    return render_settings(request, user, "email_alerting", message=f"Alert rule {rule_name!r} deleted.")
+
+
+@app.get(
+    "/dns-record",
+    response_model=DnsRecordGetResponse,
+    summary="Look up DNS records",
+    description=(
+        "Return records at a name in a configured zone as a ``records`` array. "
+        "Each found record includes ``record_name``, ``record_type``, ``ttl``, and ``values`` when "
+        "returned by the provider. Optional ``record_type`` filters which types appear in the array. "
+        "Requires a valid API key with access to the zone."
+    ),
+    responses={
+        400: {"description": "Invalid request, record type, or zone configuration."},
+        401: {"description": "API key is missing or invalid."},
         403: {"description": "API key is not allowed to use this zone, or the zone is not configured."},
         502: {"description": "DNS provider reported a failure (e.g. WinRM or dynamic update)."},
         503: {"description": "A required component is not installed or misconfigured."},
     },
 )
-def upsert_dns_record(
-    payload: DnsRecordRequest,
+def get_dns_record(
+    zone_name: str = Query(..., description="DNS zone name. Must match a configured zone allowed for this API key."),
+    record_name: str = Query(..., description="Record name relative to the zone, e.g. www or @"),
+    record_type: Optional[str] = Query(
+        None,
+        description="Optional DNS record type: A, AAAA, CNAME, or TXT. Omit to return all supported types at the name.",
+    ),
     x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
     authorization: Optional[str] = Header(None, alias="Authorization"),
 ):
     api_key = api_key_from_headers(x_api_key, authorization)
 
     if not api_key:
+        record_activity(
+            event_type="dns.access_denied",
+            level=LOG_LEVEL_WARNING,
+            status="error",
+            actor_type="api_key",
+            message="API key missing on GET /dns-record",
+        )
         raise HTTPException(status_code=401, detail="API key is required")
 
     with SessionLocal() as db:
-        key = db.exec(select(ApiKey).where(ApiKey.key == api_key, ApiKey.active == True)).first()
-        if key is None:
-            raise HTTPException(status_code=401, detail="Invalid API key")
+        _key, zone_row, settings, actor_id, actor_label, provider = _resolve_dns_api_zone(
+            db,
+            api_key=api_key,
+            zone_name=zone_name,
+            record_name=record_name,
+            endpoint="GET /dns-record",
+        )
+        provider_domain = provider_dns_zone(settings)
 
-        if not payload.zone_name or not str(payload.zone_name).strip():
+        try:
+            lookup_type = normalize_lookup_record_type(record_type)
+            records = test_zone_record_lookup(
+                settings,
+                record_name=record_name,
+                record_type=lookup_type,
+            )
+        except ValueError as exc:
+            emit_activity_event(
+                db,
+                event_type="dns.invalid_request",
+                level=LOG_LEVEL_WARNING,
+                status="error",
+                actor_type="api_key",
+                actor_id=actor_id,
+                actor_label=actor_label,
+                zone_name=zone_row.zone_name,
+                record_name=record_name,
+                message=str(exc),
+            )
             raise HTTPException(
                 status_code=400,
-                detail={"error": "invalid_request", "message": "zone_name is required on every request."},
+                detail={"error": "invalid_request", "message": str(exc)},
+            ) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            mapped = http_exception_from_dns_error(exc)
+            sanitized_error = (str(exc) or "DNS provider error").splitlines()[0][:512]
+            emit_activity_event(
+                db,
+                event_type="dns.provider_failed",
+                level=LOG_LEVEL_ERROR,
+                status="error",
+                actor_type="api_key",
+                actor_id=actor_id,
+                actor_label=actor_label,
+                zone_name=zone_row.zone_name,
+                record_name=record_name,
+                message=sanitized_error,
+                details={
+                    "provider": provider,
+                    "record_type": record_type,
+                    "exception_type": type(exc).__name__,
+                },
             )
-        canonical = normalize_zone_name(payload.zone_name)
-        zone_row = db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == canonical)).first()
-        if zone_row is None:
-            raise HTTPException(status_code=403, detail=ACCESS_DENIED_DETAIL)
-        perm = db.exec(
-            select(ApiKeyAllowedZone).where(
-                ApiKeyAllowedZone.api_key_id == key.id,
-                ApiKeyAllowedZone.dns_zone_config_id == zone_row.id,
+            raise mapped from exc
+
+        status = "success" if records else "not_found"
+        message = (
+            f"Found {len(records)} record(s) at {record_name!r} in zone {provider_domain!r}."
+            if records
+            else (
+                f"No {lookup_type} record found at {record_name!r} in zone {provider_domain!r}."
+                if lookup_type
+                else f"No A, AAAA, CNAME, or TXT records found at {record_name!r} in zone {provider_domain!r}."
             )
-        ).first()
-        if perm is None:
-            raise HTTPException(status_code=403, detail=ACCESS_DENIED_DETAIL)
+        )
+        emit_activity_event(
+            db,
+            event_type="dns.record_lookup",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status=status,
+            actor_type="api_key",
+            actor_id=actor_id,
+            actor_label=actor_label,
+            zone_name=zone_row.zone_name,
+            record_name=record_name,
+            message=message,
+            details={
+                "provider": provider,
+                "record_type": record_type,
+                "records_found": len(records),
+            },
+        )
+        return DnsRecordGetResponse(
+            status=status,
+            zone_name=zone_row.zone_name,
+            dns_zone=provider_domain,
+            record_name=record_name,
+            records=records,
+        )
 
-        settings = decode_zone_config(zone_row)
-        provider = (settings.get("dns_provider_type") or "azure").strip().lower()
-        if provider == "azure":
-            if not settings.get("azure_subscription_id"):
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "error": "invalid_request",
-                        "message": "Azure subscription ID is required on the zone configuration.",
-                    },
-                )
-            if not settings.get("azure_resource_group"):
-                raise HTTPException(
-                    status_code=400,
-                    detail={
-                        "error": "invalid_request",
-                        "message": "Azure resource group is required on the zone configuration.",
-                    },
-                )
 
-        payload = payload.model_copy(update={"zone_name": zone_row.zone_name})
+_MUTATION_RESPONSES: Dict[int, Dict[str, Any]] = {
+    400: {"description": "Invalid request, record type, or configuration."},
+    401: {"description": "API key is missing or invalid."},
+    403: {"description": "API key is not allowed to use this zone, or the zone is not configured."},
+    502: {"description": "DNS provider reported a failure (e.g. WinRM or dynamic update)."},
+    503: {"description": "A required component is not installed or misconfigured."},
+}
+
+
+def _record_exists_at_type(
+    client,
+    *,
+    settings: Dict[str, Any],
+    record_name: str,
+    record_type: str,
+) -> bool:
+    """Return True if the DNS provider reports any record of *record_type* at *record_name*."""
+
+    records = client.get_record(
+        record_name=record_name,
+        record_type=record_type,
+        dns_server=settings.get("dns_server"),
+        dns_zone=provider_dns_zone(settings),
+    )
+    return bool(records)
+
+
+def _apply_dns_mutation(
+    *,
+    api_key: Optional[str],
+    zone_name: Optional[str],
+    record_name: str,
+    record_type: str,
+    ttl: Optional[int],
+    values: List[str],
+    mode: Literal["create", "replace", "patch", "delete"],
+    endpoint: str,
+    patch_ttl: Optional[int] = None,
+    patch_values: Optional[List[str]] = None,
+):
+    """Shared pre-check + mutation flow for POST/PUT/PATCH/DELETE on ``/dns-record``."""
+
+    if not api_key:
+        record_activity(
+            event_type="dns.access_denied",
+            level=LOG_LEVEL_WARNING,
+            status="error",
+            actor_type="api_key",
+            message=f"API key missing on {endpoint}",
+        )
+        raise HTTPException(status_code=401, detail="API key is required")
+
+    rt_upper = (record_type or "").strip().upper()
+
+    with SessionLocal() as db:
+        _key, zone_row, settings, actor_id, actor_label, provider = _resolve_dns_api_zone(
+            db,
+            api_key=api_key,
+            zone_name=zone_name or "",
+            record_name=record_name,
+            endpoint=endpoint,
+        )
 
         try:
             client = get_dns_client_from_settings(settings)
-            existed = client.create_or_update_record(
-                payload,
-                dns_server=settings.get("dns_server"),
-                dns_zone=zone_row.zone_name,
+            provider_domain = provider_dns_zone(settings)
+
+            if mode == "patch":
+                records = client.get_record(
+                    record_name=record_name,
+                    record_type=rt_upper,
+                    dns_server=settings.get("dns_server"),
+                    dns_zone=provider_domain,
+                )
+                if not records:
+                    body = DnsRecordResponse(
+                        status="error",
+                        action="not_found",
+                        zone_name=zone_row.zone_name,
+                        dns_zone=provider_domain,
+                        record_name=record_name,
+                        record_type=rt_upper,
+                        values=list(patch_values or []),
+                    )
+                    emit_activity_event(
+                        db,
+                        event_type="dns.record_not_found",
+                        level=LOG_LEVEL_WARNING,
+                        status="error",
+                        actor_type="api_key",
+                        actor_id=actor_id,
+                        actor_label=actor_label,
+                        zone_name=zone_row.zone_name,
+                        record_name=record_name,
+                        message=f"DNS record {record_name}.{provider_domain} {rt_upper} not found",
+                        details={"record_type": rt_upper, "provider": provider},
+                    )
+                    return JSONResponse(status_code=HTTP_404_NOT_FOUND, content=body.model_dump())
+
+                existing = records[0]
+                if existing.ttl is None or not existing.values:
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "error": "dns_provider_failed",
+                            "message": "Could not read existing TTL and values for PATCH merge.",
+                        },
+                    )
+                final_ttl = patch_ttl if patch_ttl is not None else existing.ttl
+                final_values = list(patch_values) if patch_values is not None else list(existing.values)
+                internal = DnsRecordRequest(
+                    zone_name=zone_row.zone_name,
+                    record_type=rt_upper,
+                    record_name=record_name,
+                    ttl=final_ttl,
+                    values=final_values,
+                )
+                client.create_or_update_record(
+                    internal,
+                    dns_server=settings.get("dns_server"),
+                    dns_zone=provider_domain,
+                )
+                body = DnsRecordResponse(
+                    status="success",
+                    action="updated",
+                    zone_name=zone_row.zone_name,
+                    dns_zone=provider_domain,
+                    record_name=record_name,
+                    record_type=rt_upper,
+                    values=final_values,
+                )
+                emit_activity_event(
+                    db,
+                    event_type="dns.record_updated",
+                    level=LOG_LEVEL_INFORMATIONAL,
+                    status="success",
+                    actor_type="api_key",
+                    actor_id=actor_id,
+                    actor_label=actor_label,
+                    zone_name=zone_row.zone_name,
+                    record_name=record_name,
+                    message=f"DNS record {record_name}.{provider_domain} updated",
+                    details={
+                        "record_type": rt_upper,
+                        "values_count": len(final_values),
+                        "provider": provider,
+                    },
+                )
+                return body
+
+            exists = _record_exists_at_type(
+                client,
+                settings=settings,
+                record_name=record_name,
+                record_type=rt_upper,
             )
-            op = payload.record_type.strip().upper()
-            if op == "DELETE":
-                action = "deleted" if existed else "not_found"
-                status = "success" if existed else "error"
-            else:
-                action = "updated" if existed else "created"
-                status = "success"
-            body = DnsRecordResponse(
-                status=status,
-                action=action,
-                zone_name=payload.zone_name,
-                record_name=payload.record_name,
-                record_type=payload.record_type,
-                values=payload.values,
-            )
-            if op == "DELETE" and not existed:
+
+            if mode == "create" and exists:
+                body = DnsRecordResponse(
+                    status="error",
+                    action="record_already_exists",
+                    zone_name=zone_row.zone_name,
+                    dns_zone=provider_domain,
+                    record_name=record_name,
+                    record_type=rt_upper,
+                    values=list(values),
+                )
+                emit_activity_event(
+                    db,
+                    event_type="dns.record_already_exists",
+                    level=LOG_LEVEL_WARNING,
+                    status="error",
+                    actor_type="api_key",
+                    actor_id=actor_id,
+                    actor_label=actor_label,
+                    zone_name=zone_row.zone_name,
+                    record_name=record_name,
+                    message=f"DNS record {record_name}.{provider_domain} {rt_upper} already exists",
+                    details={"record_type": rt_upper, "provider": provider},
+                )
+                return JSONResponse(status_code=HTTP_409_CONFLICT, content=body.model_dump())
+
+            if mode in ("replace", "delete") and not exists:
+                body = DnsRecordResponse(
+                    status="error",
+                    action="not_found",
+                    zone_name=zone_row.zone_name,
+                    dns_zone=provider_domain,
+                    record_name=record_name,
+                    record_type=rt_upper,
+                    values=[] if mode == "delete" else list(values),
+                )
+                emit_activity_event(
+                    db,
+                    event_type="dns.record_not_found",
+                    level=LOG_LEVEL_WARNING,
+                    status="error",
+                    actor_type="api_key",
+                    actor_id=actor_id,
+                    actor_label=actor_label,
+                    zone_name=zone_row.zone_name,
+                    record_name=record_name,
+                    message=f"DNS record {record_name}.{provider_domain} {rt_upper} not found",
+                    details={"record_type": rt_upper, "provider": provider},
+                )
                 return JSONResponse(status_code=HTTP_404_NOT_FOUND, content=body.model_dump())
+
+            if mode == "delete":
+                internal = DnsRecordRequest(
+                    zone_name=zone_row.zone_name,
+                    record_type="DELETE",
+                    record_name=record_name,
+                    ttl=ttl or 300,
+                    values=[rt_upper],
+                )
+            else:
+                internal = DnsRecordRequest(
+                    zone_name=zone_row.zone_name,
+                    record_type=rt_upper,
+                    record_name=record_name,
+                    ttl=ttl if ttl is not None else 300,
+                    values=list(values),
+                )
+
+            client.create_or_update_record(
+                internal,
+                dns_server=settings.get("dns_server"),
+                dns_zone=provider_domain,
+            )
+
+            action = {
+                "create": "created",
+                "replace": "updated",
+                "patch": "updated",
+                "delete": "deleted",
+            }[mode]
+            response_values: List[str] = [] if mode == "delete" else list(values)
+            body = DnsRecordResponse(
+                status="success",
+                action=action,
+                zone_name=zone_row.zone_name,
+                dns_zone=provider_domain,
+                record_name=record_name,
+                record_type=rt_upper,
+                values=response_values,
+            )
+            emit_activity_event(
+                db,
+                event_type=f"dns.record_{action}",
+                level=LOG_LEVEL_INFORMATIONAL,
+                status="success",
+                actor_type="api_key",
+                actor_id=actor_id,
+                actor_label=actor_label,
+                zone_name=zone_row.zone_name,
+                record_name=record_name,
+                message=f"DNS record {record_name}.{provider_domain} {action}",
+                details={
+                    "record_type": rt_upper,
+                    "values_count": len(values),
+                    "provider": provider,
+                },
+            )
             return body
         except HTTPException:
             raise
         except Exception as exc:
-            raise _http_exception_from_dns_error(exc) from exc
+            mapped = http_exception_from_dns_error(exc)
+            sanitized_error = (str(exc) or "DNS provider error").splitlines()[0][:512]
+            emit_activity_event(
+                db,
+                event_type="dns.provider_failed",
+                level=LOG_LEVEL_ERROR,
+                status="error",
+                actor_type="api_key",
+                actor_id=actor_id,
+                actor_label=actor_label,
+                zone_name=zone_row.zone_name,
+                record_name=record_name,
+                message=sanitized_error,
+                details={
+                    "provider": provider,
+                    "record_type": rt_upper,
+                    "exception_type": type(exc).__name__,
+                },
+            )
+            raise mapped from exc
+
+
+@app.post(
+    "/dns-record",
+    response_model=DnsRecordResponse,
+    summary="Create a DNS record",
+    description=(
+        "Create a new DNS record of the given type. "
+        "Pre-checks the zone with ``get_record`` and returns **409** "
+        "``record_already_exists`` if a record of that type is already present at the name."
+    ),
+    responses={
+        HTTP_409_CONFLICT: {
+            "description": "A record of this type already exists at this name.",
+            "model": DnsRecordResponse,
+        },
+        **_MUTATION_RESPONSES,
+    },
+)
+def create_dns_record(
+    payload: DnsRecordCreateRequest,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    api_key = api_key_from_headers(x_api_key, authorization)
+    return _apply_dns_mutation(
+        api_key=api_key,
+        zone_name=payload.zone_name,
+        record_name=payload.record_name,
+        record_type=payload.record_type,
+        ttl=payload.ttl,
+        values=payload.values,
+        mode="create",
+        endpoint="POST /dns-record",
+    )
+
+
+@app.put(
+    "/dns-record",
+    response_model=DnsRecordResponse,
+    summary="Replace a DNS record (full update)",
+    description=(
+        "Replace the record's type, TTL, and values. "
+        "Pre-checks with ``get_record`` and returns **404** ``not_found`` if no record "
+        "of the given type exists at the name."
+    ),
+    responses={
+        HTTP_404_NOT_FOUND: {
+            "description": "No matching record exists at this name and type.",
+            "model": DnsRecordResponse,
+        },
+        **_MUTATION_RESPONSES,
+    },
+)
+def replace_dns_record(
+    payload: DnsRecordReplaceRequest,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    api_key = api_key_from_headers(x_api_key, authorization)
+    return _apply_dns_mutation(
+        api_key=api_key,
+        zone_name=payload.zone_name,
+        record_name=payload.record_name,
+        record_type=payload.record_type,
+        ttl=payload.ttl,
+        values=payload.values,
+        mode="replace",
+        endpoint="PUT /dns-record",
+    )
+
+
+@app.patch(
+    "/dns-record",
+    response_model=DnsRecordResponse,
+    summary="Update a DNS record (partial update)",
+    description=(
+        "Update ``ttl`` and/or ``values`` on an existing record. Omitted fields are preserved "
+        "from the live record (via ``get_record``). Returns **404** ``not_found`` if no record "
+        "of the given type exists at the name."
+    ),
+    responses={
+        HTTP_404_NOT_FOUND: {
+            "description": "No matching record exists at this name and type.",
+            "model": DnsRecordResponse,
+        },
+        **_MUTATION_RESPONSES,
+    },
+)
+def patch_dns_record(
+    payload: DnsRecordPatchRequest,
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    api_key = api_key_from_headers(x_api_key, authorization)
+    return _apply_dns_mutation(
+        api_key=api_key,
+        zone_name=payload.zone_name,
+        record_name=payload.record_name,
+        record_type=payload.record_type,
+        ttl=None,
+        values=[],
+        mode="patch",
+        endpoint="PATCH /dns-record",
+        patch_ttl=payload.ttl,
+        patch_values=payload.values,
+    )
+
+
+@app.delete(
+    "/dns-record",
+    response_model=DnsRecordResponse,
+    summary="Delete a DNS record",
+    description=(
+        "Delete the record of the given type at the given name. "
+        "Identity is taken from query parameters (same as ``GET /dns-record``). "
+        "Pre-checks with ``get_record`` and returns **404** ``not_found`` if no record "
+        "of the given type exists at the name."
+    ),
+    responses={
+        HTTP_404_NOT_FOUND: {
+            "description": "No matching record exists at this name and type.",
+            "model": DnsRecordResponse,
+        },
+        **_MUTATION_RESPONSES,
+    },
+)
+def delete_dns_record(
+    zone_name: str = Query(..., description="DNS zone name. Must match a configured zone allowed for this API key."),
+    record_name: str = Query(..., description="Record name relative to the zone, e.g. www or @"),
+    record_type: str = Query(..., description="DNS record type to remove: A, AAAA, CNAME, or TXT."),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+):
+    api_key = api_key_from_headers(x_api_key, authorization)
+    try:
+        from .plugins.utils import normalize_lookup_record_type as _normalize
+
+        normalized_type = _normalize(record_type)
+        if normalized_type is None:
+            raise ValueError("record_type is required.")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_request", "message": str(exc)},
+        ) from exc
+    return _apply_dns_mutation(
+        api_key=api_key,
+        zone_name=zone_name,
+        record_name=record_name,
+        record_type=normalized_type,
+        ttl=None,
+        values=[],
+        mode="delete",
+        endpoint="DELETE /dns-record",
+    )
+
+
+def api_key_fingerprint(api_key: str) -> str:
+    """Return a short, log-safe fingerprint for an API key string.
+
+    Never logs the key itself: the prefix is short and combined with a SHA-256
+    digest so the full key cannot be recovered from logs.
+    """
+    import hashlib
+
+    if not api_key:
+        return ""
+    digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+    return f"sha256:{digest}"

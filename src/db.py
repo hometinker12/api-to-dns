@@ -23,6 +23,9 @@ def init_db() -> None:
     SQLModel.metadata.create_all(engine)
     _migrate_add_user_roles_column()
     _migrate_add_user_disabled_column()
+    _migrate_activity_log_category_column()
+    _migrate_alert_rule_category_column()
+    _migrate_activity_log_indexes()
 
 
 def _migrate_add_user_roles_column() -> None:
@@ -52,3 +55,53 @@ def _migrate_add_user_disabled_column() -> None:
     with engine.begin() as conn:
         default_value = "false" if engine.dialect.name != "sqlite" else "0"
         conn.execute(text(f"ALTER TABLE user ADD COLUMN disabled BOOLEAN DEFAULT {default_value} NOT NULL"))
+
+
+def _migrate_activity_log_indexes() -> None:
+    """Ensure indexes on ``activity_log`` exist for tables created before logging."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if "activity_log" not in inspector.get_table_names():
+        return
+    existing = {idx["name"] for idx in inspector.get_indexes("activity_log")}
+    wanted = {
+        "ix_activity_log_timestamp": "timestamp",
+        "ix_activity_log_event_type": "event_type",
+        "ix_activity_log_level": "level",
+        "ix_activity_log_category": "category",
+        "ix_activity_log_zone_name": "zone_name",
+    }
+    with engine.begin() as conn:
+        for index_name, column_name in wanted.items():
+            if index_name in existing:
+                continue
+            conn.execute(text(f"CREATE INDEX {index_name} ON activity_log ({column_name})"))
+
+
+def _migrate_activity_log_category_column() -> None:
+    """Add the `category` column to existing activity log tables."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if "activity_log" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("activity_log")}
+    if "category" in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE activity_log ADD COLUMN category VARCHAR"))
+
+
+def _migrate_alert_rule_category_column() -> None:
+    """Add the `category` column to existing alert rule tables."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if "alert_rule" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("alert_rule")}
+    if "category" in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE alert_rule ADD COLUMN category VARCHAR"))
