@@ -1,4 +1,4 @@
-# Smoke tests: push to **release** or run manually (no inputs; remote lab zones are fixed below).
+# Smoke tests: push to **develop** (no inputs; remote lab zones are fixed below).
 # - **pytest**: unit tests on ubuntu (`python -m pytest`).
 # - **bind-smoke-linux**: checkout on ubuntu, `docker build`, BIND + API in Docker (bash), same idea as release CI.
 # - **microsoft-dns-smoke-windows**: install DNS Server on windows-2025, run the API natively with Python/uvicorn,
@@ -11,19 +11,19 @@
 #
 # Optional remote lab secrets: MICROSOFT_DNS_WINRM_HOST, USER, PASSWORD, SSL, QUERY_HOST
 
-name: Docker image + Bind + Microsoft DNS smoke test ( release)
+name: Docker image + Bind + Microsoft DNS smoke test (develop)
 
 on:
-  workflow_dispatch:
   push:
     branches:
+      - develop
       - release
 
 jobs:
   pytest:
     name: pytest (ubuntu)
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/release'
+    if: github.ref == 'refs/heads/develop'
     steps:
       - uses: actions/checkout@v6
 
@@ -42,7 +42,7 @@ jobs:
   bind-smoke-linux:
     name: BIND and Docker image smoke (ubuntu + Docker)
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/release'
+    if: github.ref == 'refs/heads/develop'
     steps:
       - uses: actions/checkout@v6
 
@@ -384,7 +384,7 @@ jobs:
   microsoft-dns-smoke-windows:
     name: Local Microsoft DNS WinRM smoke (windows, native API + PowerShell)
     runs-on: windows-2025
-    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/release'
+    if: github.ref == 'refs/heads/develop'
 
     steps:
       - uses: actions/checkout@v6
