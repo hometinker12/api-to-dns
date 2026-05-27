@@ -223,6 +223,46 @@ jobs:
           echo "[bind] Verify admin page"
           curl --fail --silent -b /tmp/cookies http://localhost:8000/admin | python3 -c "import sys; assert 'api-to-dns App Dashboard' in sys.stdin.read()"
 
+          #region agent log
+          cat > /tmp/agent-debug-bind-zone.py <<'PY'
+          import json
+          import sys
+          import time
+          from pathlib import Path
+
+          zone, status, path = sys.argv[1:]
+          html = Path(path).read_text(encoding="utf-8", errors="replace")
+          payload = {
+              "sessionId": "5623d1",
+              "runId": "ci-smoke-pre-fix",
+              "hypothesisId": "H1,H2,H3",
+              "location": ".github/workflows/microsoft-dns-smoke.yml:bind-zone-create",
+              "message": "bind zone create response diagnostics",
+              "data": {
+                  "zone": zone,
+                  "status": status,
+                  "hasExactSuccess": f"Zone '{zone}' added" in html,
+                  "hasEscapedSuccess": f"Zone &#39;{zone}&#39; added" in html,
+                  "hasErrorAlert": 'class="alert error"' in html,
+                  "hasLoginForm": 'name="username"' in html and 'name="password"' in html,
+                  "snippet": html[:500],
+              },
+              "timestamp": int(time.time() * 1000),
+          }
+          line = json.dumps(payload, ensure_ascii=True)
+          with open("debug-5623d1.log", "a", encoding="utf-8") as f:
+              f.write(line + "\n")
+          print("[agent-debug] " + line)
+          PY
+          #endregion agent log
+
+          cat > /tmp/agent-print-excerpt.py <<'PY'
+          import sys
+          from pathlib import Path
+
+          print(Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")[:1200])
+          PY
+
           for zone in smoke.test denied.test; do
             echo "[bind] Configure zone ${zone}"
             zone_body="/tmp/zone-create-${zone}.html"
@@ -238,45 +278,11 @@ jobs:
               --data-urlencode "dns_tsig_algorithm=hmac-sha256" \
               -o "${zone_body}")"
             #region agent log
-            python3 - "${zone}" "${zone_status}" "${zone_body}" <<'PY'
-            import json
-            import sys
-            import time
-            from pathlib import Path
-
-            zone, status, path = sys.argv[1:]
-            html = Path(path).read_text(encoding="utf-8", errors="replace")
-            payload = {
-                "sessionId": "5623d1",
-                "runId": "ci-smoke-pre-fix",
-                "hypothesisId": "H1,H2,H3",
-                "location": ".github/workflows/microsoft-dns-smoke.yml:bind-zone-create",
-                "message": "bind zone create response diagnostics",
-                "data": {
-                    "zone": zone,
-                    "status": status,
-                    "hasExactSuccess": f"Zone '{zone}' added" in html,
-                    "hasEscapedSuccess": f"Zone &#39;{zone}&#39; added" in html,
-                    "hasErrorAlert": 'class="alert error"' in html,
-                    "hasLoginForm": 'name="username"' in html and 'name="password"' in html,
-                    "snippet": html[:500],
-                },
-                "timestamp": int(time.time() * 1000),
-            }
-            line = json.dumps(payload, ensure_ascii=True)
-            with open("debug-5623d1.log", "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-            print("[agent-debug] " + line)
-            PY
+            python3 /tmp/agent-debug-bind-zone.py "${zone}" "${zone_status}" "${zone_body}"
             #endregion agent log
             if [ "${zone_status}" != "200" ] || ! grep -q "Zone '${zone}' added" "${zone_body}"; then
               echo "[bind] Zone create assertion failed for ${zone}; response excerpt:"
-              python3 - "${zone_body}" <<'PY'
-              import sys
-              from pathlib import Path
-
-              print(Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")[:1200])
-              PY
+              python3 /tmp/agent-print-excerpt.py "${zone_body}"
               exit 1
             fi
           done
