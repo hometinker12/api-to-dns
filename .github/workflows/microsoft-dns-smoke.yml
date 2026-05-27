@@ -1,4 +1,4 @@
-# Smoke tests: push to **release** (no inputs; remote lab zones are fixed below).
+# Smoke tests: push to **release** or run manually (no inputs; remote lab zones are fixed below).
 # - **pytest**: unit tests on ubuntu (`python -m pytest`).
 # - **bind-smoke-linux**: checkout on ubuntu, `docker build`, BIND + API in Docker (bash), same idea as release CI.
 # - **microsoft-dns-smoke-windows**: install DNS Server on windows-2025, run the API natively with Python/uvicorn,
@@ -14,6 +14,7 @@
 name: Docker image + Bind + Microsoft DNS smoke test ( release)
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - release
@@ -22,7 +23,7 @@ jobs:
   pytest:
     name: pytest (ubuntu)
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/release'
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/release'
     steps:
       - uses: actions/checkout@v6
 
@@ -41,7 +42,7 @@ jobs:
   bind-smoke-linux:
     name: BIND and Docker image smoke (ubuntu + Docker)
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/release'
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/release'
     steps:
       - uses: actions/checkout@v6
 
@@ -224,7 +225,9 @@ jobs:
 
           for zone in smoke.test denied.test; do
             echo "[bind] Configure zone ${zone}"
-            curl --fail --silent -b /tmp/cookies -X POST http://localhost:8000/zones \
+            zone_body="/tmp/zone-create-${zone}.html"
+            zone_status="$(curl --silent --show-error -b /tmp/cookies -X POST http://localhost:8000/zones \
+              -w "%{http_code}" \
               -H "Content-Type: application/x-www-form-urlencoded" \
               --data-urlencode "zone_name=${zone}" \
               --data-urlencode "dns_zone=${zone}" \
@@ -233,8 +236,49 @@ jobs:
               --data-urlencode "dns_username=${TSIG_NAME}" \
               --data-urlencode "dns_password=${TSIG_SECRET}" \
               --data-urlencode "dns_tsig_algorithm=hmac-sha256" \
-              -o "/tmp/zone-create-${zone}.html"
-            grep -q "Zone '${zone}' added" "/tmp/zone-create-${zone}.html"
+              -o "${zone_body}")"
+            #region agent log
+            python3 - "${zone}" "${zone_status}" "${zone_body}" <<'PY'
+            import json
+            import sys
+            import time
+            from pathlib import Path
+
+            zone, status, path = sys.argv[1:]
+            html = Path(path).read_text(encoding="utf-8", errors="replace")
+            payload = {
+                "sessionId": "5623d1",
+                "runId": "ci-smoke-pre-fix",
+                "hypothesisId": "H1,H2,H3",
+                "location": ".github/workflows/microsoft-dns-smoke.yml:bind-zone-create",
+                "message": "bind zone create response diagnostics",
+                "data": {
+                    "zone": zone,
+                    "status": status,
+                    "hasExactSuccess": f"Zone '{zone}' added" in html,
+                    "hasEscapedSuccess": f"Zone &#39;{zone}&#39; added" in html,
+                    "hasErrorAlert": 'class="alert error"' in html,
+                    "hasLoginForm": 'name="username"' in html and 'name="password"' in html,
+                    "snippet": html[:500],
+                },
+                "timestamp": int(time.time() * 1000),
+            }
+            line = json.dumps(payload, ensure_ascii=True)
+            with open("debug-5623d1.log", "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+            print("[agent-debug] " + line)
+            PY
+            #endregion agent log
+            if [ "${zone_status}" != "200" ] || ! grep -q "Zone '${zone}' added" "${zone_body}"; then
+              echo "[bind] Zone create assertion failed for ${zone}; response excerpt:"
+              python3 - "${zone_body}" <<'PY'
+              import sys
+              from pathlib import Path
+
+              print(Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")[:1200])
+              PY
+              exit 1
+            fi
           done
 
           echo "[bind] Fetch API key management page"
@@ -340,7 +384,7 @@ jobs:
   microsoft-dns-smoke-windows:
     name: Local Microsoft DNS WinRM smoke (windows, native API + PowerShell)
     runs-on: windows-2025
-    if: github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/release'
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/release'
 
     steps:
       - uses: actions/checkout@v6
@@ -517,6 +561,29 @@ jobs:
             return $m.Groups[1].Value
           }
 
+          function Write-AgentDebugLog {
+            param(
+              [Parameter(Mandatory)] [string] $HypothesisId,
+              [Parameter(Mandatory)] [string] $Location,
+              [Parameter(Mandatory)] [string] $Message,
+              [Parameter(Mandatory)] [hashtable] $Data
+            )
+            #region agent log
+            $payload = [ordered]@{
+              sessionId    = '5623d1'
+              runId        = 'ci-smoke-pre-fix'
+              hypothesisId = $HypothesisId
+              location     = $Location
+              message      = $Message
+              data         = $Data
+              timestamp    = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            }
+            $line = $payload | ConvertTo-Json -Compress -Depth 8
+            Add-Content -Path 'debug-5623d1.log' -Value $line -Encoding UTF8
+            Write-Host "[agent-debug] $line"
+            #endregion agent log
+          }
+
           function Invoke-DnsRecord {
             param(
               [string] $ApiKey,
@@ -679,7 +746,18 @@ jobs:
                 dns_username        = $localUser
                 dns_password        = $localPass
               }
+              Write-AgentDebugLog -HypothesisId 'H1,H2,H3,H5' -Location '.github/workflows/microsoft-dns-smoke.yml:microsoft-local-zone-create' -Message 'microsoft local zone create response diagnostics' -Data @{
+                zone              = $z
+                status            = [int]$zoneResp.StatusCode
+                hasExactSuccess   = $zoneResp.Content -match "Zone '$([regex]::Escape($z))' added"
+                hasEscapedSuccess = $zoneResp.Content -match "Zone &#39;$([regex]::Escape($z))&#39; added"
+                hasErrorAlert     = $zoneResp.Content -match 'class="alert error"'
+                hasLoginForm      = ($zoneResp.Content -match 'name="username"' -and $zoneResp.Content -match 'name="password"')
+                snippet           = $zoneResp.Content.Substring(0, [Math]::Min(500, $zoneResp.Content.Length))
+              }
               if ($zoneResp.StatusCode -ne 200 -or $zoneResp.Content -notmatch "Zone '$([regex]::Escape($z))' added") {
+                Write-Host "[microsoft-local] Zone create response excerpt:"
+                Write-Host $zoneResp.Content.Substring(0, [Math]::Min(1200, $zoneResp.Content.Length))
                 throw "Zone create failed for ${z}: HTTP $($zoneResp.StatusCode)"
               }
             }
@@ -760,7 +838,18 @@ jobs:
                   $form['dns_winrm_ssl'] = 'true'
                 }
                 $zoneResp = Invoke-FormPost -Uri "$base/zones" -WebSession $WebSession -Form $form
+                Write-AgentDebugLog -HypothesisId 'H1,H2,H3,H5' -Location '.github/workflows/microsoft-dns-smoke.yml:microsoft-remote-zone-create' -Message 'microsoft remote zone create response diagnostics' -Data @{
+                  zone              = $z
+                  status            = [int]$zoneResp.StatusCode
+                  hasExactSuccess   = $zoneResp.Content -match "Zone '$([regex]::Escape($z))' added"
+                  hasEscapedSuccess = $zoneResp.Content -match "Zone &#39;$([regex]::Escape($z))&#39; added"
+                  hasErrorAlert     = $zoneResp.Content -match 'class="alert error"'
+                  hasLoginForm      = ($zoneResp.Content -match 'name="username"' -and $zoneResp.Content -match 'name="password"')
+                  snippet           = $zoneResp.Content.Substring(0, [Math]::Min(500, $zoneResp.Content.Length))
+                }
                 if ($zoneResp.StatusCode -ne 200 -or $zoneResp.Content -notmatch "Zone '$([regex]::Escape($z))' added") {
+                  Write-Host "[microsoft-remote] Zone create response excerpt:"
+                  Write-Host $zoneResp.Content.Substring(0, [Math]::Min(1200, $zoneResp.Content.Length))
                   throw "Remote zone create failed for ${z}: HTTP $($zoneResp.StatusCode)"
                 }
               }
