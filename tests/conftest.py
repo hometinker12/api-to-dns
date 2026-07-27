@@ -40,10 +40,20 @@ def api_key_value() -> str:
 
 
 def _seed_example_zone_and_permission(db, api_key_value: str) -> None:
-    if not db.exec(select(ApiKey).where(ApiKey.key == api_key_value)).first():
-        db.add(ApiKey(label="pytest", key=api_key_value, active=True))
+    from src.security import api_key_prefix, hash_api_key
+
+    digest = hash_api_key(api_key_value)
+    if not db.exec(select(ApiKey).where(ApiKey.key == digest)).first():
+        db.add(
+            ApiKey(
+                label="pytest",
+                key=digest,
+                key_prefix=api_key_prefix(api_key_value),
+                active=True,
+            )
+        )
         db.commit()
-    key = db.exec(select(ApiKey).where(ApiKey.key == api_key_value)).first()
+    key = db.exec(select(ApiKey).where(ApiKey.key == digest)).first()
     zname = normalize_zone_name("example.com")
     zone = db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == zname)).first()
     if not zone:

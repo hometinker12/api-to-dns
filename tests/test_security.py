@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from cryptography.fernet import Fernet
+from fastapi.testclient import TestClient
 
 
 def test_get_app_version_matches_version_file() -> None:
@@ -79,3 +80,49 @@ def test_api_key_fingerprint_only_defined_in_http_utils() -> None:
     assert callable(http_utils.api_key_fingerprint)
     # Local duplicate at bottom of app.py was removed; attribute should be the import.
     assert app_module.api_key_fingerprint is http_utils.api_key_fingerprint
+
+
+def test_hash_api_key_is_sha256_hex() -> None:
+    from src.security import hash_api_key, is_api_key_hash
+
+    digest = hash_api_key("raw-secret-key")
+    assert is_api_key_hash(digest)
+    assert digest != "raw-secret-key"
+    assert hash_api_key("raw-secret-key") == digest
+
+
+def test_get_api_key_matches_hashed_storage(client: TestClient) -> None:
+    from src.db import SessionLocal
+    from src.models import ApiKey
+    from src.security import hash_api_key
+    from src.zone_service import get_api_key
+    from sqlmodel import select
+
+    raw = "test-api-key-for-dns-endpoint"
+    with SessionLocal() as db:
+        row = db.exec(select(ApiKey).where(ApiKey.key == hash_api_key(raw))).first()
+        assert row is not None
+        assert row.key == hash_api_key(raw)
+        assert row.key_prefix
+        assert get_api_key(db, raw) is not None
+        assert get_api_key(db, "wrong-key") is None
+
+
+def test_migrate_hashes_plaintext_api_keys() -> None:
+    from src.db import SessionLocal, init_db
+    from src.models import ApiKey
+    from src.security import hash_api_key, is_api_key_hash
+    from sqlmodel import select
+
+    init_db()
+    with SessionLocal() as db:
+        db.add(ApiKey(label="legacy", key="plaintext-legacy-key", active=True))
+        db.commit()
+
+    init_db()
+    with SessionLocal() as db:
+        row = db.exec(select(ApiKey).where(ApiKey.label == "legacy")).first()
+        assert row is not None
+        assert is_api_key_hash(row.key)
+        assert row.key == hash_api_key("plaintext-legacy-key")
+        assert row.key_prefix == "plaintext-le"
