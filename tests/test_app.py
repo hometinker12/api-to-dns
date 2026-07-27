@@ -1371,7 +1371,7 @@ def test_settings_renders_for_authenticated_session(client: TestClient) -> None:
     assert "System Settings" in response.text
     assert "View Logs" in response.text
     assert "Email Alerting" in response.text
-    assert "System Backup" in response.text
+    assert "System Backup" not in response.text
 
 
 def test_settings_route_hidden_from_openapi(client: TestClient) -> None:
@@ -2174,7 +2174,6 @@ def test_global_read_can_view_read_only_pages(client: TestClient) -> None:
         ("/settings?area=logging", "View Logs"),
         ("/settings?area=system_settings", "System Settings"),
         ("/settings?area=email_alerting", "Email Alerting"),
-        ("/settings?area=backup", "System Backup"),
         ("/zones", "Configured zones"),
         ("/api-keys", "Existing API keys"),
     ):
@@ -2206,7 +2205,7 @@ def test_system_update_can_view_system_placeholders_without_global_read(client: 
     response = client.get("/settings?area=logging")
     assert response.status_code == 200
     assert "View Logs" in response.text
-    assert "System Backup" in response.text
+    assert "System Backup" not in response.text
     assert "Authentication" in response.text
     assert "Plugin Management" not in response.text
 
@@ -2822,25 +2821,20 @@ def test_ssl_audit_letsencrypt_cancel_and_config(client: TestClient) -> None:
         assert config_event.category == LOG_CATEGORY_SECURITY
 
 
-def test_settings_backup_area_renders_placeholder(client: TestClient) -> None:
+def test_settings_backup_area_removed(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
     response = client.get("/settings?area=backup")
     assert response.status_code == 200
-    assert "System Backup" in response.text
-    assert "not implemented yet" in response.text
-
-
-def test_settings_backup_area_requires_global_read_or_system_update(client: TestClient) -> None:
-    client.cookies.set("session", create_session_cookie("limited"))
-    with SessionLocal() as db:
-        _delete_users(db)
-        _create_user(db, "limited", "x", [ROLE_API_KEYS_READ])
-        _create_user(db, "admin", "x", ALL_ROLES)
-
-    response = client.get("/settings?area=backup")
-    assert response.status_code == 200
     assert "System Backup" not in response.text
-    assert "Authentication" in response.text
+    assert "not implemented yet" not in response.text
+
+
+def test_settings_syslog_section_removed(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/settings?area=system_settings&section=syslog_planned")
+    assert response.status_code == 200
+    assert "Syslog Server" not in response.text
+    assert "not implemented yet" not in response.text
 
 
 def test_dns_zones_read_is_required_on_all_user_accounts(client: TestClient) -> None:
