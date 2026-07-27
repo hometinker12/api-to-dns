@@ -188,6 +188,28 @@ def test_csrf_rejects_cross_origin_post(client: TestClient, monkeypatch: pytest.
     assert response.status_code == 403
 
 
+def test_csrf_allows_same_origin_login_post(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.csrf.allow_insecure_defaults", lambda: False)
+    response = client.post(
+        "/login",
+        data={"username": "admin", "password": "x"},
+        headers={"Origin": "http://testserver", "Host": "testserver", "Referer": "http://testserver/login"},
+        follow_redirects=False,
+    )
+    assert response.status_code in {200, 303}
+
+
+def test_csrf_rejects_login_post_without_origin_in_production(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.csrf.allow_insecure_defaults", lambda: False)
+    response = client.post(
+        "/login",
+        data={"username": "admin", "password": "x"},
+        headers={"Host": "testserver"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 403
+
+
 def test_cors_default_not_star_in_production_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("API_TO_DNS_ALLOW_INSECURE_DEFAULTS", "0")
     monkeypatch.delenv("CORS_ORIGINS", raising=False)
