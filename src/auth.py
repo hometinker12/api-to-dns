@@ -3,16 +3,41 @@ from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from fastapi import HTTPException, Request
 from sqlmodel import select
 
-SECRET_KEY = os.getenv("SECRET_KEY", "please-change-this-secret")
+from .security import allow_insecure_defaults
+
+_INSECURE_SECRET_DEFAULTS = frozenset(
+    {
+        "",
+        "please-change-this-secret",
+        "change-me-before-production",
+    }
+)
+
+
+def _require_secret_key() -> str:
+    raw = os.getenv("SECRET_KEY")
+    candidate = (raw or "").strip()
+    if candidate in _INSECURE_SECRET_DEFAULTS:
+        if allow_insecure_defaults():
+            return "test-secret-key-for-pytest-only"
+        raise RuntimeError(
+            "SECRET_KEY must be set to a non-default random value before starting the application. "
+            "Do not use placeholder values such as 'change-me-before-production'."
+        )
+    return candidate
+
+
+SECRET_KEY = _require_secret_key()
 SESSION_IDLE_TIMEOUT_SECONDS = 900
 serializer = URLSafeTimedSerializer(SECRET_KEY, salt="session-cookie")
 
 
-def session_cookie_settings() -> dict:
+def session_cookie_settings(*, secure: bool = False) -> dict:
     return {
         "httponly": True,
         "max_age": SESSION_IDLE_TIMEOUT_SECONDS,
         "samesite": "lax",
+        "secure": secure,
     }
 
 
