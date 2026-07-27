@@ -75,7 +75,7 @@ from .rbac import (
     user_is_global_admin,
     user_public_dict,
 )
-from .security import generate_api_key, hash_password, verify_password
+from .security import api_key_prefix, generate_api_key, hash_api_key, hash_password, verify_password
 from .settings_context import render_settings
 from .settings_store import get_setting, set_setting
 from . import ssl_certs
@@ -160,7 +160,7 @@ def _resolve_dns_api_zone(
     record_name: str,
     endpoint: str,
 ) -> tuple[ApiKey, DnsZoneConfig, Dict[str, Any], Optional[str], str, str]:
-    key = db.exec(select(ApiKey).where(ApiKey.key == api_key, ApiKey.active == True)).first()
+    key = get_api_key(db, api_key)
     if key is None:
         emit_activity_event(
             db,
@@ -1160,7 +1160,7 @@ def create_api_key_route(
             )
         new_key = generate_api_key()
         with SessionLocal() as db:
-            api_key = ApiKey(label=label, key=new_key)
+            api_key = ApiKey(label=label, key=hash_api_key(new_key), key_prefix=api_key_prefix(new_key))
             db.add(api_key)
             db.commit()
             db.refresh(api_key)
@@ -1180,9 +1180,15 @@ def create_api_key_route(
                     "api_key_id": api_key.id,
                     "api_key_label": api_key.label,
                     "allowed_zone_ids": list(zone_ids),
+                    "key_prefix": api_key.key_prefix,
                 },
             )
-            ctx = _api_keys_html_context(db, message=f"API key created: {new_key}")
+            ctx = _api_keys_html_context(
+                db,
+                message=(
+                    f"API key created. Copy it now — it will not be shown again: {new_key}"
+                ),
+            )
 
         return templates.TemplateResponse(
             request=request,

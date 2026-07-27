@@ -70,6 +70,29 @@ def generate_api_key() -> str:
     return secrets.token_urlsafe(32)
 
 
+def hash_api_key(raw_key: str) -> str:
+    """Return a SHA-256 hex digest for storing API keys at rest."""
+    import hashlib
+
+    return hashlib.sha256((raw_key or "").encode("utf-8")).hexdigest()
+
+
+def api_key_prefix(raw_key: str, length: int = 12) -> str:
+    """Return a short non-secret prefix for admin UI display."""
+    return (raw_key or "")[: max(0, int(length))]
+
+
+def is_api_key_hash(value: str) -> bool:
+    """Return True when ``value`` looks like a stored SHA-256 hex digest."""
+    if not value or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
 def encrypt_value(value: str) -> str:
     return fernet.encrypt(value.encode()).decode()
 
