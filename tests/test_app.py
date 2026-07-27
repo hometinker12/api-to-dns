@@ -2956,6 +2956,15 @@ def test_activity_events_written_for_api_key_creation_and_revocation(client: Tes
 
     response = client.post("/api-keys", data={"label": "audit-key", "zone_ids": str(zone.id)})
     assert response.status_code == 200
+    assert "API key created:" in response.text
+    assert 'data-created-api-key="' in response.text
+    import re
+
+    attr = re.search(r'data-created-api-key="([^"]+)"', response.text)
+    legacy = re.search(r"API key created:\s*([^<\s]+)", response.text)
+    assert attr is not None and legacy is not None
+    assert attr.group(1) == legacy.group(1)
+    assert len(attr.group(1)) >= 20
     with SessionLocal() as db:
         created = db.exec(select(ApiKey).where(ApiKey.label == "audit-key")).first()
         assert created is not None
@@ -2963,6 +2972,8 @@ def test_activity_events_written_for_api_key_creation_and_revocation(client: Tes
         assert create_event is not None
         assert create_event.actor_label == "admin"
         assert "audit-key" in (create_event.message or "")
+        # Raw key must not be persisted.
+        assert created.key != attr.group(1)
 
     response = client.post("/api-keys/revoke", data={"key_id": str(created.id)})
     assert response.status_code == 200

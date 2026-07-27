@@ -949,9 +949,8 @@ def create_api_key_route(
             )
             ctx = _api_keys_html_context(
                 db,
-                message=(
-                    f"API key created. Copy it now — it will not be shown again: {new_key}"
-                ),
+                message=f"API key created: {new_key} (copy now; it will not be shown again)",
+                created_api_key=new_key,
             )
 
         return templates.TemplateResponse(
