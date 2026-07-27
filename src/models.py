@@ -245,7 +245,8 @@ class User(SQLModel, table=True):
 class ApiKey(SQLModel, table=True):
     id: Optional[int] = SQLField(default=None, primary_key=True)
     label: str
-    key: str = SQLField(index=True, unique=True)
+    key: str = SQLField(index=True, unique=True)  # SHA-256 hex digest of the raw key
+    key_prefix: Optional[str] = SQLField(default="")
     active: bool = SQLField(default=True)
     created_at: datetime = SQLField(default_factory=utc_now)
 

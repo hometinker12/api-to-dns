@@ -26,6 +26,48 @@ def init_db() -> None:
     _migrate_activity_log_category_column()
     _migrate_alert_rule_category_column()
     _migrate_activity_log_indexes()
+    _migrate_add_api_key_prefix_column()
+    _migrate_hash_plaintext_api_keys()
+
+
+def _migrate_add_api_key_prefix_column() -> None:
+    """Add ``key_prefix`` for displaying API keys without storing plaintext."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if "apikey" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("apikey")}
+    if "key_prefix" in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE apikey ADD COLUMN key_prefix VARCHAR DEFAULT ''"))
+
+
+def _migrate_hash_plaintext_api_keys() -> None:
+    """Hash any legacy plaintext API keys still stored in ``apikey.key``."""
+    from sqlmodel import select
+
+    from .models import ApiKey
+    from .security import api_key_prefix, hash_api_key, is_api_key_hash
+
+    with Session(engine) as db:
+        changed = False
+        for row in db.exec(select(ApiKey)).all():
+            raw = row.key or ""
+            if is_api_key_hash(raw):
+                if not (row.key_prefix or "").strip():
+                    # Prefix is unrecoverable once hashed; keep a stable marker.
+                    row.key_prefix = "hashed"
+                    db.add(row)
+                    changed = True
+                continue
+            row.key_prefix = api_key_prefix(raw)
+            row.key = hash_api_key(raw)
+            db.add(row)
+            changed = True
+        if changed:
+            db.commit()
 
 
 def _migrate_add_user_roles_column() -> None:

@@ -259,7 +259,9 @@ def dns_zone_summary_dict(z: DnsZoneConfig) -> Dict[str, Any]:
 
 
 def api_key_public_dict(k: ApiKey) -> Dict[str, Any]:
-    return {"id": k.id, "label": k.label, "key": k.key, "active": k.active}
+    # Never expose the stored hash; UI shows the non-secret prefix only.
+    display = (k.key_prefix or "").strip() or "********"
+    return {"id": k.id, "label": k.label, "key": display, "key_prefix": display, "active": k.active}
 
 
 def api_key_admin_dict(db, k: ApiKey) -> Dict[str, Any]:
@@ -274,7 +276,10 @@ def api_key_admin_dict(db, k: ApiKey) -> Dict[str, Any]:
 
 
 def get_api_key(db, api_key: str):
-    return db.exec(select(ApiKey).where(ApiKey.key == api_key, ApiKey.active == True)).first()
+    from .security import hash_api_key
+
+    digest = hash_api_key(api_key)
+    return db.exec(select(ApiKey).where(ApiKey.key == digest, ApiKey.active == True)).first()
 
 
 def _blank_preserve_secret(new_val: str, old_val: str) -> str:
