@@ -3,6 +3,8 @@
 import os
 import tempfile
 
+from cryptography.fernet import Fernet
+
 _db = tempfile.NamedTemporaryFile(prefix="api-to-dns-test-", suffix=".db", delete=False)
 _db.close()
 os.environ["DATABASE_URL"] = "sqlite:///" + os.path.abspath(_db.name).replace("\\", "/")
@@ -14,6 +16,12 @@ os.environ["DATABASE_URL"] = "sqlite:///" + os.path.abspath(_db.name).replace("\
 _ssl_cert_dir = tempfile.mkdtemp(prefix="api-to-dns-test-ssl-")
 os.environ["APP_SSL_DIR"] = _ssl_cert_dir
 os.environ["SSL_ENABLED"] = "0"
+
+# Provide crypto secrets before importing application modules. Production
+# refuses placeholder/missing keys; tests may use dedicated values.
+os.environ.setdefault("API_TO_DNS_ALLOW_INSECURE_DEFAULTS", "1")
+os.environ.setdefault("SECRET_KEY", "test-secret-key-for-pytest-only")
+os.environ.setdefault("ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

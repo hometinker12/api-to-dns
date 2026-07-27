@@ -1,4 +1,4 @@
-# Smoke tests: push to **develop** (no inputs; remote lab zones are fixed below).
+# Tests: pytest on **develop**; BIND and Microsoft DNS smoke tests on **release**.
 # - **pytest**: unit tests on ubuntu (`python -m pytest`).
 # - **bind-smoke-linux**: checkout on ubuntu, `docker build`, BIND + API in Docker (bash), same idea as release CI.
 # - **microsoft-dns-smoke-windows**: install DNS Server on windows-2025, run the API natively with Python/uvicorn,
@@ -11,7 +11,7 @@
 #
 # Optional remote lab secrets: MICROSOFT_DNS_WINRM_HOST, USER, PASSWORD, SSL, QUERY_HOST
 
-name: Docker image + Bind + Microsoft DNS smoke test (develop)
+name: Pytest + Bind + Microsoft DNS smoke
 
 on:
   push:
@@ -42,25 +42,30 @@ jobs:
   bind-smoke-linux:
     name: BIND and Docker image smoke (ubuntu + Docker)
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/develop'
+    if: github.ref == 'refs/heads/release'
     steps:
       - uses: actions/checkout@v6
 
       - name: Copy env example for testing
         run: cp .env.example .env
 
-      - name: Generate encryption key for testing
+      - name: Generate encryption and session secrets for testing
         run: |
           KEY="$(python - <<'PY'
           import base64
           import os
+          import secrets
 
           print(base64.urlsafe_b64encode(os.urandom(32)).decode())
+          print(secrets.token_urlsafe(32))
           PY
           )"
-          sed -i.bak "s|ENCRYPTION_KEY=.*|ENCRYPTION_KEY=${KEY}|" .env
+          ENC_KEY="$(printf '%s\n' "$KEY" | sed -n '1p')"
+          SECRET="$(printf '%s\n' "$KEY" | sed -n '2p')"
+          sed -i.bak "s|ENCRYPTION_KEY=.*|ENCRYPTION_KEY=${ENC_KEY}|" .env
+          sed -i.bak "s|SECRET_KEY=.*|SECRET_KEY=${SECRET}|" .env
           rm -f .env.bak
-          echo 'Generated encryption key for testing'
+          echo 'Generated encryption and session secrets for testing'
 
       - name: Build the Docker image
         run: |
@@ -223,46 +228,6 @@ jobs:
           echo "[bind] Verify admin page"
           curl --fail --silent -b /tmp/cookies http://localhost:8000/admin | python3 -c "import sys; assert 'api-to-dns App Dashboard' in sys.stdin.read()"
 
-          #region agent log
-          cat > /tmp/agent-debug-bind-zone.py <<'PY'
-          import json
-          import sys
-          import time
-          from pathlib import Path
-
-          zone, status, path = sys.argv[1:]
-          html = Path(path).read_text(encoding="utf-8", errors="replace")
-          payload = {
-              "sessionId": "5623d1",
-              "runId": "ci-smoke-pre-fix",
-              "hypothesisId": "H1,H2,H3",
-              "location": ".github/workflows/microsoft-dns-smoke.yml:bind-zone-create",
-              "message": "bind zone create response diagnostics",
-              "data": {
-                  "zone": zone,
-                  "status": status,
-                  "hasExactSuccess": f"Zone '{zone}' added" in html,
-                  "hasEscapedSuccess": f"Zone &#39;{zone}&#39; added" in html,
-                  "hasErrorAlert": 'class="alert error"' in html,
-                  "hasLoginForm": 'name="username"' in html and 'name="password"' in html,
-                  "snippet": html[:500],
-              },
-              "timestamp": int(time.time() * 1000),
-          }
-          line = json.dumps(payload, ensure_ascii=True)
-          with open("debug-5623d1.log", "a", encoding="utf-8") as f:
-              f.write(line + "\n")
-          print("[agent-debug] " + line)
-          PY
-          #endregion agent log
-
-          cat > /tmp/agent-print-excerpt.py <<'PY'
-          import sys
-          from pathlib import Path
-
-          print(Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")[:1200])
-          PY
-
           for zone in smoke.test denied.test; do
             echo "[bind] Configure zone ${zone}"
             zone_body="/tmp/zone-create-${zone}.html"
@@ -277,12 +242,9 @@ jobs:
               --data-urlencode "dns_password=${TSIG_SECRET}" \
               --data-urlencode "dns_tsig_algorithm=hmac-sha256" \
               -o "${zone_body}")"
-            #region agent log
-            python3 /tmp/agent-debug-bind-zone.py "${zone}" "${zone_status}" "${zone_body}"
-            #endregion agent log
             if [ "${zone_status}" != "200" ] || ! { grep -q "Zone '${zone}' added" "${zone_body}" || grep -q "Zone &#39;${zone}&#39; added" "${zone_body}"; }; then
               echo "[bind] Zone create assertion failed for ${zone}; response excerpt:"
-              python3 /tmp/agent-print-excerpt.py "${zone_body}"
+              python3 -c 'import sys; from pathlib import Path; print(Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")[:1200])' "${zone_body}"
               exit 1
             fi
           done
@@ -390,7 +352,7 @@ jobs:
   microsoft-dns-smoke-windows:
     name: Local Microsoft DNS WinRM smoke (windows, native API + PowerShell)
     runs-on: windows-2025
-    if: github.ref == 'refs/heads/develop'
+    if: github.ref == 'refs/heads/release'
 
     steps:
       - uses: actions/checkout@v6
@@ -494,13 +456,15 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "LOCAL_ALLOWED_ZONE=local-smoke.test"
           Add-Content -Path $env:GITHUB_ENV -Value "LOCAL_DENIED_ZONE=local-denied.test"
 
-      - name: Prepare .env with Fernet encryption key
+      - name: Prepare .env with Fernet encryption and session secrets
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           Copy-Item -Force .env.example .env
           $key = (& python -c "import base64,os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())").Trim()
+          $secret = (& python -c "import secrets; print(secrets.token_urlsafe(32))").Trim()
           $text = (Get-Content .env -Raw) -replace 'ENCRYPTION_KEY=.*', "ENCRYPTION_KEY=$key"
+          $text = $text -replace 'SECRET_KEY=.*', "SECRET_KEY=$secret"
           $utf8 = [System.Text.UTF8Encoding]::new($false)
           [System.IO.File]::WriteAllText((Join-Path (Get-Location) '.env'), $text, $utf8)
 
@@ -565,29 +529,6 @@ jobs:
             $m = [regex]::Match($Html, 'API key created:\s*([^<\s]+)')
             if (-not $m.Success) { throw 'Could not extract API key from HTML' }
             return $m.Groups[1].Value
-          }
-
-          function Write-AgentDebugLog {
-            param(
-              [Parameter(Mandatory)] [string] $HypothesisId,
-              [Parameter(Mandatory)] [string] $Location,
-              [Parameter(Mandatory)] [string] $Message,
-              [Parameter(Mandatory)] [hashtable] $Data
-            )
-            #region agent log
-            $payload = [ordered]@{
-              sessionId    = '5623d1'
-              runId        = 'ci-smoke-pre-fix'
-              hypothesisId = $HypothesisId
-              location     = $Location
-              message      = $Message
-              data         = $Data
-              timestamp    = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-            }
-            $line = $payload | ConvertTo-Json -Compress -Depth 8
-            Add-Content -Path 'debug-5623d1.log' -Value $line -Encoding UTF8
-            Write-Host "[agent-debug] $line"
-            #endregion agent log
           }
 
           function Invoke-DnsRecord {
@@ -752,15 +693,6 @@ jobs:
                 dns_username        = $localUser
                 dns_password        = $localPass
               }
-              Write-AgentDebugLog -HypothesisId 'H1,H2,H3,H5' -Location '.github/workflows/microsoft-dns-smoke.yml:microsoft-local-zone-create' -Message 'microsoft local zone create response diagnostics' -Data @{
-                zone              = $z
-                status            = [int]$zoneResp.StatusCode
-                hasExactSuccess   = $zoneResp.Content -match "Zone '$([regex]::Escape($z))' added"
-                hasEscapedSuccess = $zoneResp.Content -match "Zone &#39;$([regex]::Escape($z))&#39; added"
-                hasErrorAlert     = $zoneResp.Content -match 'class="alert error"'
-                hasLoginForm      = ($zoneResp.Content -match 'name="username"' -and $zoneResp.Content -match 'name="password"')
-                snippet           = $zoneResp.Content.Substring(0, [Math]::Min(500, $zoneResp.Content.Length))
-              }
               if ($zoneResp.StatusCode -ne 200 -or (
                 $zoneResp.Content -notmatch "Zone '$([regex]::Escape($z))' added" -and
                 $zoneResp.Content -notmatch "Zone &#39;$([regex]::Escape($z))&#39; added"
@@ -847,15 +779,6 @@ jobs:
                   $form['dns_winrm_ssl'] = 'true'
                 }
                 $zoneResp = Invoke-FormPost -Uri "$base/zones" -WebSession $WebSession -Form $form
-                Write-AgentDebugLog -HypothesisId 'H1,H2,H3,H5' -Location '.github/workflows/microsoft-dns-smoke.yml:microsoft-remote-zone-create' -Message 'microsoft remote zone create response diagnostics' -Data @{
-                  zone              = $z
-                  status            = [int]$zoneResp.StatusCode
-                  hasExactSuccess   = $zoneResp.Content -match "Zone '$([regex]::Escape($z))' added"
-                  hasEscapedSuccess = $zoneResp.Content -match "Zone &#39;$([regex]::Escape($z))&#39; added"
-                  hasErrorAlert     = $zoneResp.Content -match 'class="alert error"'
-                  hasLoginForm      = ($zoneResp.Content -match 'name="username"' -and $zoneResp.Content -match 'name="password"')
-                  snippet           = $zoneResp.Content.Substring(0, [Math]::Min(500, $zoneResp.Content.Length))
-                }
                 if ($zoneResp.StatusCode -ne 200 -or (
                   $zoneResp.Content -notmatch "Zone '$([regex]::Escape($z))' added" -and
                   $zoneResp.Content -notmatch "Zone &#39;$([regex]::Escape($z))&#39; added"
