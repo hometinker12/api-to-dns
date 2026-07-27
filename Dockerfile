@@ -17,7 +17,7 @@
 
 FROM python:3.12-slim
 
-ARG VERSION=0.5.0
+ARG VERSION=0.6.0
 
 LABEL org.opencontainers.image.title="api-to-dns" \
       org.opencontainers.image.description="DNS REST API and admin UI (Azure, Cloudflare, Microsoft DNS, BIND/TSIG)" \

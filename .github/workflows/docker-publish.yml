@@ -92,6 +92,7 @@ jobs:
   publish:
     name: Build and publish
     needs: container-smoke
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
