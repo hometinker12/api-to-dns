@@ -223,6 +223,8 @@ jobs:
           echo "[bind] Login as admin"
           curl --fail --silent -c /tmp/cookies -X POST http://localhost:8000/login \
             -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "Origin: http://localhost:8000" \
+            -H "Referer: http://localhost:8000/login" \
             -d "username=admin&password=your-admin-password" \
             -o /dev/null
           echo "[bind] Verify admin page"
@@ -234,6 +236,8 @@ jobs:
             zone_status="$(curl --silent --show-error -b /tmp/cookies -X POST http://localhost:8000/zones \
               -w "%{http_code}" \
               -H "Content-Type: application/x-www-form-urlencoded" \
+              -H "Origin: http://localhost:8000" \
+              -H "Referer: http://localhost:8000/zones" \
               --data-urlencode "zone_name=${zone}" \
               --data-urlencode "dns_zone=${zone}" \
               --data-urlencode "dns_provider_type=bind" \
@@ -257,6 +261,8 @@ jobs:
           echo "[bind] Create API key for smoke.test"
           curl --fail --silent -L -b /tmp/cookies -X POST http://localhost:8000/api-keys \
             -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "Origin: http://localhost:8000" \
+            -H "Referer: http://localhost:8000/api-keys" \
             --data-urlencode "label=bind-smoke-test" \
             --data-urlencode "zone_ids=${SMOKE_ZONE_ID}" \
             -o /tmp/api-key-create.html
@@ -512,8 +518,12 @@ jobs:
               '{0}={1}' -f $_.Key, [uri]::EscapeDataString([string]$_.Value)
             }
             $body = $pairs -join '&'
+            # Same-origin CSRF checks require Origin/Referer to match Host.
+            $uriObj = [uri]$Uri
+            $origin = '{0}://{1}' -f $uriObj.Scheme, $uriObj.Authority
             return Invoke-WebRequest -Uri $Uri -WebSession $WebSession -Method Post -Body $body `
-              -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing -MaximumRedirection $MaximumRedirection -SkipHttpErrorCheck
+              -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing -MaximumRedirection $MaximumRedirection -SkipHttpErrorCheck `
+              -Headers @{ Origin = $origin; Referer = $Uri }
           }
 
           function Get-ZoneIdFromApiKeysHtml {
