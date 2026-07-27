@@ -27,9 +27,16 @@ from .activity_logging import (
     set_retention_days,
     set_smtp_config,
 )
-from .auth import create_session_cookie, get_current_user, session_cookie_settings
+from .auth import create_session_cookie, get_current_user, session_cookie_secure, session_cookie_settings
+from .dns_api_service import ACCESS_DENIED_DETAIL
 from .db import SessionLocal, init_db
-from .http_utils import api_key_fingerprint, api_key_from_headers, http_exception_from_dns_error, wants_json_response
+from .http_utils import (
+    api_key_fingerprint,
+    api_key_from_headers,
+    http_exception_from_dns_error,
+    sanitize_client_error_message,
+    wants_json_response,
+)
 from .models import (
     LOG_CATEGORY_SECURITY,
     LOG_LEVEL_ERROR,
@@ -39,13 +46,7 @@ from .models import (
     AlertRule,
     ApiKey,
     ApiKeyAllowedZone,
-    DnsRecordCreateRequest,
-    DnsRecordGetResponse,
     DnsRecordInfo,
-    DnsRecordPatchRequest,
-    DnsRecordReplaceRequest,
-    DnsRecordRequest,
-    DnsRecordResponse,
     DnsZoneConfig,
     DnsZoneSummary,
     User,
@@ -75,7 +76,9 @@ from .rbac import (
     user_is_global_admin,
     user_public_dict,
 )
-from .security import api_key_prefix, generate_api_key, hash_api_key, hash_password, verify_password
+from .security import allow_insecure_defaults, api_key_prefix, generate_api_key, hash_api_key, hash_password, verify_password
+from .csrf import csrf_origin_allowed, csrf_rejection_response
+from .rate_limit import rate_limit_exceeded, rate_limit_rejection_response
 from .settings_context import render_settings
 from .settings_store import get_setting, set_setting
 from . import ssl_certs
@@ -128,6 +131,7 @@ from .zone_service import (
     set_disabled_dns_plugins,
     test_zone_record_lookup,
     zones_using_dns_provider,
+    DnsProviderDisabledError,
 )
 
 
@@ -151,137 +155,6 @@ def _api_keys_html_context(db, *, message: Optional[str] = None, **extra: Any) -
         **extra,
     }
 
-
-def _resolve_dns_api_zone(
-    db,
-    *,
-    api_key: str,
-    zone_name: str,
-    record_name: str,
-    endpoint: str,
-) -> tuple[ApiKey, DnsZoneConfig, Dict[str, Any], Optional[str], str, str]:
-    key = get_api_key(db, api_key)
-    if key is None:
-        emit_activity_event(
-            db,
-            event_type="dns.access_denied",
-            level=LOG_LEVEL_WARNING,
-            status="error",
-            actor_type="api_key",
-            actor_label="invalid",
-            message=f"Invalid or revoked API key used on {endpoint}",
-            details={"key_fingerprint": api_key_fingerprint(api_key)},
-        )
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
-    actor_id = str(key.id) if key.id is not None else None
-    actor_label = key.label
-
-    if not zone_name or not str(zone_name).strip():
-        emit_activity_event(
-            db,
-            event_type="dns.invalid_request",
-            level=LOG_LEVEL_WARNING,
-            status="error",
-            actor_type="api_key",
-            actor_id=actor_id,
-            actor_label=actor_label,
-            record_name=record_name,
-            message=f"zone_name is required on {endpoint}",
-        )
-        raise HTTPException(
-            status_code=400,
-            detail={"error": "invalid_request", "message": "zone_name is required on every request."},
-        )
-
-    canonical = normalize_zone_name(zone_name)
-    zone_row = db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == canonical)).first()
-    if zone_row is None:
-        emit_activity_event(
-            db,
-            event_type="dns.access_denied",
-            level=LOG_LEVEL_WARNING,
-            status="error",
-            actor_type="api_key",
-            actor_id=actor_id,
-            actor_label=actor_label,
-            zone_name=canonical,
-            record_name=record_name,
-            message=f"Unknown DNS zone {canonical!r}",
-        )
-        raise HTTPException(status_code=403, detail=ACCESS_DENIED_DETAIL)
-
-    perm = db.exec(
-        select(ApiKeyAllowedZone).where(
-            ApiKeyAllowedZone.api_key_id == key.id,
-            ApiKeyAllowedZone.dns_zone_config_id == zone_row.id,
-        )
-    ).first()
-    if perm is None:
-        emit_activity_event(
-            db,
-            event_type="dns.access_denied",
-            level=LOG_LEVEL_WARNING,
-            status="error",
-            actor_type="api_key",
-            actor_id=actor_id,
-            actor_label=actor_label,
-            zone_name=canonical,
-            record_name=record_name,
-            message=f"API key {actor_label!r} not allowed for zone {canonical!r}",
-        )
-        raise HTTPException(status_code=403, detail=ACCESS_DENIED_DETAIL)
-
-    settings = decode_zone_config(zone_row)
-    provider = (settings.get("dns_provider_type") or "azure").strip().lower()
-    if provider == "azure":
-        if not settings.get("azure_subscription_id"):
-            emit_activity_event(
-                db,
-                event_type="dns.invalid_request",
-                level=LOG_LEVEL_WARNING,
-                status="error",
-                actor_type="api_key",
-                actor_id=actor_id,
-                actor_label=actor_label,
-                zone_name=canonical,
-                record_name=record_name,
-                message="Azure subscription ID is required on the zone configuration.",
-            )
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": "invalid_request",
-                    "message": "Azure subscription ID is required on the zone configuration.",
-                },
-            )
-        if not settings.get("azure_resource_group"):
-            emit_activity_event(
-                db,
-                event_type="dns.invalid_request",
-                level=LOG_LEVEL_WARNING,
-                status="error",
-                actor_type="api_key",
-                actor_id=actor_id,
-                actor_label=actor_label,
-                zone_name=canonical,
-                record_name=record_name,
-                message="Azure resource group is required on the zone configuration.",
-            )
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": "invalid_request",
-                    "message": "Azure resource group is required on the zone configuration.",
-                },
-            )
-
-    return key, zone_row, settings, actor_id, actor_label, provider
-
-ACCESS_DENIED_DETAIL: Dict[str, str] = {
-    "error": "access_denied",
-    "message": "You do not have access or an invalid key was provided.",
-}
 
 AUTH_REDIRECT_DETAILS = {"Authentication required", "Invalid or expired session"}
 WEB_AUTH_PATH_PREFIXES = (
@@ -414,21 +287,40 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+_cors_origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "").split(",") if origin.strip()]
+if not _cors_origins and allow_insecure_defaults():
+    # Tests / local insecure mode: keep permissive CORS for convenience.
+    _cors_origins = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+
+@app.middleware("http")
+async def csrf_and_rate_limit_middleware(request: Request, call_next):
+    if rate_limit_exceeded(request):
+        return rate_limit_rejection_response(request)
+    if not csrf_origin_allowed(request):
+        return csrf_rejection_response(request)
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def refresh_session_cookie(request: Request, call_next):
     response = await call_next(request)
     session_user = getattr(request.state, "session_user", None)
     if session_user and request.url.path != "/logout" and response.status_code < 400:
-        response.set_cookie("session", create_session_cookie(session_user), **session_cookie_settings())
+        response.set_cookie(
+            "session",
+            create_session_cookie(session_user),
+            **session_cookie_settings(secure=session_cookie_secure()),
+        )
     return response
 
 
@@ -499,135 +391,6 @@ def root(request: Request) -> RedirectResponse:
     except HTTPException:
         return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
     return RedirectResponse(url="/admin")
-
-
-@app.get(
-    "/keycheck",
-    responses={
-        200: {
-            "description": "API key is valid",
-            "content": {
-                "application/json": {
-                    "example": {"status": "success"},
-                    "schema": {
-                        "type": "object",
-                        "properties": {"status": {"type": "string", "example": "success"}},
-                        "required": ["status"],
-                    },
-                }
-            },
-        },
-        401: {
-            "description": "Unauthorized",
-            "content": {
-                "application/json": {
-                    "example": {"status": "failure"},
-                    "schema": {
-                        "type": "object",
-                        "properties": {"status": {"type": "string", "example": "failure"}},
-                        "required": ["status"],
-                    },
-                }
-            },
-        }
-    },
-)
-def keycheck(
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
-):
-    api_key = api_key_from_headers(x_api_key, authorization)
-
-    if not api_key:
-        return JSONResponse(status_code=401, content={"status": "failure"})
-
-    with SessionLocal() as db:
-        key = get_api_key(db, api_key)
-        if key is None:
-            return JSONResponse(status_code=401, content={"status": "failure"})
-
-    return {"status": "success"}
-
-
-@app.get("/login", response_class=HTMLResponse, include_in_schema=False)
-def login_form(request: Request):
-    try:
-        return templates.TemplateResponse(
-            request=request,
-            name="login.html",
-            context={"error": None},
-        )
-    except Exception as exc:
-        return render_error_response(request, exc)
-
-
-@app.post("/login", response_class=HTMLResponse, include_in_schema=False)
-def login(request: Request, username: str = Form(...), password: str = Form(...)):
-    ip = client_ip(request)
-    with SessionLocal() as db:
-        user = db.exec(select(User).where(User.username == username)).first()
-        if not user or user.disabled or not verify_password(password, user.password_hash):
-            try:
-                emit_activity_event(
-                    db,
-                    event_type="auth.login_failed",
-                    level=LOG_LEVEL_WARNING,
-                    status="error",
-                    actor_type="user",
-                    actor_label=username,
-                    message=f"Failed login for {username!r}",
-                    details={"reason": "disabled" if user and user.disabled else "invalid_credentials"},
-                    request_ip=ip,
-                )
-            except Exception:  # pragma: no cover
-                LOGGER.exception("could not record auth.login_failed")
-            return templates.TemplateResponse(
-                request=request,
-                name="login.html",
-                context={"error": "Invalid credentials."},
-            )
-        try:
-            emit_activity_event(
-                db,
-                event_type="auth.login_succeeded",
-                level=LOG_LEVEL_INFORMATIONAL,
-                status="success",
-                actor_type="user",
-                actor_label=username,
-                message=f"Successful login for {username!r}",
-                request_ip=ip,
-            )
-        except Exception:  # pragma: no cover
-            LOGGER.exception("could not record auth.login_succeeded")
-    response = RedirectResponse(url="/admin", status_code=HTTP_303_SEE_OTHER)
-    response.set_cookie("session", create_session_cookie(username), **session_cookie_settings())
-    return response
-
-
-@app.get("/logout", include_in_schema=False)
-def logout(request: Request) -> RedirectResponse:
-    session_token = request.cookies.get("session")
-    actor: Optional[str] = None
-    if session_token:
-        try:
-            from .auth import verify_session_cookie
-
-            actor = verify_session_cookie(session_token)
-        except Exception:  # pragma: no cover - invalid sessions still log out
-            actor = None
-    if actor:
-        record_activity(
-            event_type="auth.logout",
-            level=LOG_LEVEL_INFORMATIONAL,
-            status="success",
-            actor_type="user",
-            actor_label=actor,
-            message=f"Logout for {actor!r}",
-            request_ip=client_ip(request),
-        )
-    response = RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
-    response.delete_cookie("session")
-    return response
 
 
 @app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
@@ -859,6 +622,7 @@ async def zone_test(request: Request, user: str = Depends(require_role(ROLE_DNS_
                 cfg,
                 record_name=test_record_name,
                 record_type=test_record_type,
+                db=db,
             )
         except ValueError as exc:
             return JSONResponse(
@@ -2869,581 +2633,7 @@ def settings_alerts_delete(
     return render_settings(request, user, "email_alerting", message=f"Alert rule {rule_name!r} deleted.")
 
 
-@app.get(
-    "/dns-record",
-    response_model=DnsRecordGetResponse,
-    summary="Look up DNS records",
-    description=(
-        "Return records at a name in a configured zone as a ``records`` array. "
-        "Each found record includes ``record_name``, ``record_type``, ``ttl``, and ``values`` when "
-        "returned by the provider. Optional ``record_type`` filters which types appear in the array. "
-        "Requires a valid API key with access to the zone."
-    ),
-    responses={
-        400: {"description": "Invalid request, record type, or zone configuration."},
-        401: {"description": "API key is missing or invalid."},
-        403: {"description": "API key is not allowed to use this zone, or the zone is not configured."},
-        502: {"description": "DNS provider reported a failure (e.g. WinRM or dynamic update)."},
-        503: {"description": "A required component is not installed or misconfigured."},
-    },
-)
-def get_dns_record(
-    zone_name: str = Query(..., description="DNS zone name. Must match a configured zone allowed for this API key."),
-    record_name: str = Query(..., description="Record name relative to the zone, e.g. www or @"),
-    record_type: Optional[str] = Query(
-        None,
-        description="Optional DNS record type: A, AAAA, CNAME, or TXT. Omit to return all supported types at the name.",
-    ),
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
-):
-    api_key = api_key_from_headers(x_api_key, authorization)
 
-    if not api_key:
-        record_activity(
-            event_type="dns.access_denied",
-            level=LOG_LEVEL_WARNING,
-            status="error",
-            actor_type="api_key",
-            message="API key missing on GET /dns-record",
-        )
-        raise HTTPException(status_code=401, detail="API key is required")
+from .routes import include_routers
 
-    with SessionLocal() as db:
-        _key, zone_row, settings, actor_id, actor_label, provider = _resolve_dns_api_zone(
-            db,
-            api_key=api_key,
-            zone_name=zone_name,
-            record_name=record_name,
-            endpoint="GET /dns-record",
-        )
-        provider_domain = provider_dns_zone(settings)
-
-        try:
-            lookup_type = normalize_lookup_record_type(record_type)
-            records = test_zone_record_lookup(
-                settings,
-                record_name=record_name,
-                record_type=lookup_type,
-            )
-        except ValueError as exc:
-            emit_activity_event(
-                db,
-                event_type="dns.invalid_request",
-                level=LOG_LEVEL_WARNING,
-                status="error",
-                actor_type="api_key",
-                actor_id=actor_id,
-                actor_label=actor_label,
-                zone_name=zone_row.zone_name,
-                record_name=record_name,
-                message=str(exc),
-            )
-            raise HTTPException(
-                status_code=400,
-                detail={"error": "invalid_request", "message": str(exc)},
-            ) from exc
-        except HTTPException:
-            raise
-        except Exception as exc:
-            mapped = http_exception_from_dns_error(exc)
-            sanitized_error = (str(exc) or "DNS provider error").splitlines()[0][:512]
-            emit_activity_event(
-                db,
-                event_type="dns.provider_failed",
-                level=LOG_LEVEL_ERROR,
-                status="error",
-                actor_type="api_key",
-                actor_id=actor_id,
-                actor_label=actor_label,
-                zone_name=zone_row.zone_name,
-                record_name=record_name,
-                message=sanitized_error,
-                details={
-                    "provider": provider,
-                    "record_type": record_type,
-                    "exception_type": type(exc).__name__,
-                },
-            )
-            raise mapped from exc
-
-        status = "success" if records else "not_found"
-        message = (
-            f"Found {len(records)} record(s) at {record_name!r} in zone {provider_domain!r}."
-            if records
-            else (
-                f"No {lookup_type} record found at {record_name!r} in zone {provider_domain!r}."
-                if lookup_type
-                else f"No A, AAAA, CNAME, or TXT records found at {record_name!r} in zone {provider_domain!r}."
-            )
-        )
-        emit_activity_event(
-            db,
-            event_type="dns.record_lookup",
-            level=LOG_LEVEL_INFORMATIONAL,
-            status=status,
-            actor_type="api_key",
-            actor_id=actor_id,
-            actor_label=actor_label,
-            zone_name=zone_row.zone_name,
-            record_name=record_name,
-            message=message,
-            details={
-                "provider": provider,
-                "record_type": record_type,
-                "records_found": len(records),
-            },
-        )
-        return DnsRecordGetResponse(
-            status=status,
-            zone_name=zone_row.zone_name,
-            dns_zone=provider_domain,
-            record_name=record_name,
-            records=records,
-        )
-
-
-_MUTATION_RESPONSES: Dict[int, Dict[str, Any]] = {
-    400: {"description": "Invalid request, record type, or configuration."},
-    401: {"description": "API key is missing or invalid."},
-    403: {"description": "API key is not allowed to use this zone, or the zone is not configured."},
-    502: {"description": "DNS provider reported a failure (e.g. WinRM or dynamic update)."},
-    503: {"description": "A required component is not installed or misconfigured."},
-}
-
-
-def _record_exists_at_type(
-    client,
-    *,
-    settings: Dict[str, Any],
-    record_name: str,
-    record_type: str,
-) -> bool:
-    """Return True if the DNS provider reports any record of *record_type* at *record_name*."""
-
-    records = client.get_record(
-        record_name=record_name,
-        record_type=record_type,
-        dns_server=settings.get("dns_server"),
-        dns_zone=provider_dns_zone(settings),
-    )
-    return bool(records)
-
-
-def _apply_dns_mutation(
-    *,
-    api_key: Optional[str],
-    zone_name: Optional[str],
-    record_name: str,
-    record_type: str,
-    ttl: Optional[int],
-    values: List[str],
-    mode: Literal["create", "replace", "patch", "delete"],
-    endpoint: str,
-    patch_ttl: Optional[int] = None,
-    patch_values: Optional[List[str]] = None,
-):
-    """Shared pre-check + mutation flow for POST/PUT/PATCH/DELETE on ``/dns-record``."""
-
-    if not api_key:
-        record_activity(
-            event_type="dns.access_denied",
-            level=LOG_LEVEL_WARNING,
-            status="error",
-            actor_type="api_key",
-            message=f"API key missing on {endpoint}",
-        )
-        raise HTTPException(status_code=401, detail="API key is required")
-
-    rt_upper = (record_type or "").strip().upper()
-
-    with SessionLocal() as db:
-        _key, zone_row, settings, actor_id, actor_label, provider = _resolve_dns_api_zone(
-            db,
-            api_key=api_key,
-            zone_name=zone_name or "",
-            record_name=record_name,
-            endpoint=endpoint,
-        )
-
-        try:
-            client = get_dns_client_from_settings(settings)
-            provider_domain = provider_dns_zone(settings)
-
-            if mode == "patch":
-                records = client.get_record(
-                    record_name=record_name,
-                    record_type=rt_upper,
-                    dns_server=settings.get("dns_server"),
-                    dns_zone=provider_domain,
-                )
-                if not records:
-                    body = DnsRecordResponse(
-                        status="error",
-                        action="not_found",
-                        zone_name=zone_row.zone_name,
-                        dns_zone=provider_domain,
-                        record_name=record_name,
-                        record_type=rt_upper,
-                        values=list(patch_values or []),
-                    )
-                    emit_activity_event(
-                        db,
-                        event_type="dns.record_not_found",
-                        level=LOG_LEVEL_WARNING,
-                        status="error",
-                        actor_type="api_key",
-                        actor_id=actor_id,
-                        actor_label=actor_label,
-                        zone_name=zone_row.zone_name,
-                        record_name=record_name,
-                        message=f"DNS record {record_name}.{provider_domain} {rt_upper} not found",
-                        details={"record_type": rt_upper, "provider": provider},
-                    )
-                    return JSONResponse(status_code=HTTP_404_NOT_FOUND, content=body.model_dump())
-
-                existing = records[0]
-                if existing.ttl is None or not existing.values:
-                    raise HTTPException(
-                        status_code=502,
-                        detail={
-                            "error": "dns_provider_failed",
-                            "message": "Could not read existing TTL and values for PATCH merge.",
-                        },
-                    )
-                final_ttl = patch_ttl if patch_ttl is not None else existing.ttl
-                final_values = list(patch_values) if patch_values is not None else list(existing.values)
-                internal = DnsRecordRequest(
-                    zone_name=zone_row.zone_name,
-                    record_type=rt_upper,
-                    record_name=record_name,
-                    ttl=final_ttl,
-                    values=final_values,
-                )
-                client.create_or_update_record(
-                    internal,
-                    dns_server=settings.get("dns_server"),
-                    dns_zone=provider_domain,
-                )
-                body = DnsRecordResponse(
-                    status="success",
-                    action="updated",
-                    zone_name=zone_row.zone_name,
-                    dns_zone=provider_domain,
-                    record_name=record_name,
-                    record_type=rt_upper,
-                    values=final_values,
-                )
-                emit_activity_event(
-                    db,
-                    event_type="dns.record_updated",
-                    level=LOG_LEVEL_INFORMATIONAL,
-                    status="success",
-                    actor_type="api_key",
-                    actor_id=actor_id,
-                    actor_label=actor_label,
-                    zone_name=zone_row.zone_name,
-                    record_name=record_name,
-                    message=f"DNS record {record_name}.{provider_domain} updated",
-                    details={
-                        "record_type": rt_upper,
-                        "values_count": len(final_values),
-                        "provider": provider,
-                    },
-                )
-                return body
-
-            exists = _record_exists_at_type(
-                client,
-                settings=settings,
-                record_name=record_name,
-                record_type=rt_upper,
-            )
-
-            if mode == "create" and exists:
-                body = DnsRecordResponse(
-                    status="error",
-                    action="record_already_exists",
-                    zone_name=zone_row.zone_name,
-                    dns_zone=provider_domain,
-                    record_name=record_name,
-                    record_type=rt_upper,
-                    values=list(values),
-                )
-                emit_activity_event(
-                    db,
-                    event_type="dns.record_already_exists",
-                    level=LOG_LEVEL_WARNING,
-                    status="error",
-                    actor_type="api_key",
-                    actor_id=actor_id,
-                    actor_label=actor_label,
-                    zone_name=zone_row.zone_name,
-                    record_name=record_name,
-                    message=f"DNS record {record_name}.{provider_domain} {rt_upper} already exists",
-                    details={"record_type": rt_upper, "provider": provider},
-                )
-                return JSONResponse(status_code=HTTP_409_CONFLICT, content=body.model_dump())
-
-            if mode in ("replace", "delete") and not exists:
-                body = DnsRecordResponse(
-                    status="error",
-                    action="not_found",
-                    zone_name=zone_row.zone_name,
-                    dns_zone=provider_domain,
-                    record_name=record_name,
-                    record_type=rt_upper,
-                    values=[] if mode == "delete" else list(values),
-                )
-                emit_activity_event(
-                    db,
-                    event_type="dns.record_not_found",
-                    level=LOG_LEVEL_WARNING,
-                    status="error",
-                    actor_type="api_key",
-                    actor_id=actor_id,
-                    actor_label=actor_label,
-                    zone_name=zone_row.zone_name,
-                    record_name=record_name,
-                    message=f"DNS record {record_name}.{provider_domain} {rt_upper} not found",
-                    details={"record_type": rt_upper, "provider": provider},
-                )
-                return JSONResponse(status_code=HTTP_404_NOT_FOUND, content=body.model_dump())
-
-            if mode == "delete":
-                internal = DnsRecordRequest(
-                    zone_name=zone_row.zone_name,
-                    record_type="DELETE",
-                    record_name=record_name,
-                    ttl=ttl or 300,
-                    values=[rt_upper],
-                )
-            else:
-                internal = DnsRecordRequest(
-                    zone_name=zone_row.zone_name,
-                    record_type=rt_upper,
-                    record_name=record_name,
-                    ttl=ttl if ttl is not None else 300,
-                    values=list(values),
-                )
-
-            client.create_or_update_record(
-                internal,
-                dns_server=settings.get("dns_server"),
-                dns_zone=provider_domain,
-            )
-
-            action = {
-                "create": "created",
-                "replace": "updated",
-                "patch": "updated",
-                "delete": "deleted",
-            }[mode]
-            response_values: List[str] = [] if mode == "delete" else list(values)
-            body = DnsRecordResponse(
-                status="success",
-                action=action,
-                zone_name=zone_row.zone_name,
-                dns_zone=provider_domain,
-                record_name=record_name,
-                record_type=rt_upper,
-                values=response_values,
-            )
-            emit_activity_event(
-                db,
-                event_type=f"dns.record_{action}",
-                level=LOG_LEVEL_INFORMATIONAL,
-                status="success",
-                actor_type="api_key",
-                actor_id=actor_id,
-                actor_label=actor_label,
-                zone_name=zone_row.zone_name,
-                record_name=record_name,
-                message=f"DNS record {record_name}.{provider_domain} {action}",
-                details={
-                    "record_type": rt_upper,
-                    "values_count": len(values),
-                    "provider": provider,
-                },
-            )
-            return body
-        except HTTPException:
-            raise
-        except Exception as exc:
-            mapped = http_exception_from_dns_error(exc)
-            sanitized_error = (str(exc) or "DNS provider error").splitlines()[0][:512]
-            emit_activity_event(
-                db,
-                event_type="dns.provider_failed",
-                level=LOG_LEVEL_ERROR,
-                status="error",
-                actor_type="api_key",
-                actor_id=actor_id,
-                actor_label=actor_label,
-                zone_name=zone_row.zone_name,
-                record_name=record_name,
-                message=sanitized_error,
-                details={
-                    "provider": provider,
-                    "record_type": rt_upper,
-                    "exception_type": type(exc).__name__,
-                },
-            )
-            raise mapped from exc
-
-
-@app.post(
-    "/dns-record",
-    response_model=DnsRecordResponse,
-    summary="Create a DNS record",
-    description=(
-        "Create a new DNS record of the given type. "
-        "Pre-checks the zone with ``get_record`` and returns **409** "
-        "``record_already_exists`` if a record of that type is already present at the name."
-    ),
-    responses={
-        HTTP_409_CONFLICT: {
-            "description": "A record of this type already exists at this name.",
-            "model": DnsRecordResponse,
-        },
-        **_MUTATION_RESPONSES,
-    },
-)
-def create_dns_record(
-    payload: DnsRecordCreateRequest,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
-):
-    api_key = api_key_from_headers(x_api_key, authorization)
-    return _apply_dns_mutation(
-        api_key=api_key,
-        zone_name=payload.zone_name,
-        record_name=payload.record_name,
-        record_type=payload.record_type,
-        ttl=payload.ttl,
-        values=payload.values,
-        mode="create",
-        endpoint="POST /dns-record",
-    )
-
-
-@app.put(
-    "/dns-record",
-    response_model=DnsRecordResponse,
-    summary="Replace a DNS record (full update)",
-    description=(
-        "Replace the record's type, TTL, and values. "
-        "Pre-checks with ``get_record`` and returns **404** ``not_found`` if no record "
-        "of the given type exists at the name."
-    ),
-    responses={
-        HTTP_404_NOT_FOUND: {
-            "description": "No matching record exists at this name and type.",
-            "model": DnsRecordResponse,
-        },
-        **_MUTATION_RESPONSES,
-    },
-)
-def replace_dns_record(
-    payload: DnsRecordReplaceRequest,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
-):
-    api_key = api_key_from_headers(x_api_key, authorization)
-    return _apply_dns_mutation(
-        api_key=api_key,
-        zone_name=payload.zone_name,
-        record_name=payload.record_name,
-        record_type=payload.record_type,
-        ttl=payload.ttl,
-        values=payload.values,
-        mode="replace",
-        endpoint="PUT /dns-record",
-    )
-
-
-@app.patch(
-    "/dns-record",
-    response_model=DnsRecordResponse,
-    summary="Update a DNS record (partial update)",
-    description=(
-        "Update ``ttl`` and/or ``values`` on an existing record. Omitted fields are preserved "
-        "from the live record (via ``get_record``). Returns **404** ``not_found`` if no record "
-        "of the given type exists at the name."
-    ),
-    responses={
-        HTTP_404_NOT_FOUND: {
-            "description": "No matching record exists at this name and type.",
-            "model": DnsRecordResponse,
-        },
-        **_MUTATION_RESPONSES,
-    },
-)
-def patch_dns_record(
-    payload: DnsRecordPatchRequest,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
-):
-    api_key = api_key_from_headers(x_api_key, authorization)
-    return _apply_dns_mutation(
-        api_key=api_key,
-        zone_name=payload.zone_name,
-        record_name=payload.record_name,
-        record_type=payload.record_type,
-        ttl=None,
-        values=[],
-        mode="patch",
-        endpoint="PATCH /dns-record",
-        patch_ttl=payload.ttl,
-        patch_values=payload.values,
-    )
-
-
-@app.delete(
-    "/dns-record",
-    response_model=DnsRecordResponse,
-    summary="Delete a DNS record",
-    description=(
-        "Delete the record of the given type at the given name. "
-        "Identity is taken from query parameters (same as ``GET /dns-record``). "
-        "Pre-checks with ``get_record`` and returns **404** ``not_found`` if no record "
-        "of the given type exists at the name."
-    ),
-    responses={
-        HTTP_404_NOT_FOUND: {
-            "description": "No matching record exists at this name and type.",
-            "model": DnsRecordResponse,
-        },
-        **_MUTATION_RESPONSES,
-    },
-)
-def delete_dns_record(
-    zone_name: str = Query(..., description="DNS zone name. Must match a configured zone allowed for this API key."),
-    record_name: str = Query(..., description="Record name relative to the zone, e.g. www or @"),
-    record_type: str = Query(..., description="DNS record type to remove: A, AAAA, CNAME, or TXT."),
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
-):
-    api_key = api_key_from_headers(x_api_key, authorization)
-    try:
-        from .plugins.utils import normalize_lookup_record_type as _normalize
-
-        normalized_type = _normalize(record_type)
-        if normalized_type is None:
-            raise ValueError("record_type is required.")
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={"error": "invalid_request", "message": str(exc)},
-        ) from exc
-    return _apply_dns_mutation(
-        api_key=api_key,
-        zone_name=zone_name,
-        record_name=record_name,
-        record_type=normalized_type,
-        ttl=None,
-        values=[],
-        mode="delete",
-        endpoint="DELETE /dns-record",
-    )
-
+include_routers(app)
