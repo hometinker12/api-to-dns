@@ -2,6 +2,7 @@
 data/
 data/ssl/
 .cursor/
+docker-compose.override.yml
 
 # Pytest cache and artifacts
 .pytest_cache/
