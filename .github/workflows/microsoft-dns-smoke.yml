@@ -261,7 +261,7 @@ jobs:
             --data-urlencode "zone_ids=${SMOKE_ZONE_ID}" \
             -o /tmp/api-key-create.html
 
-          API_KEY="$(python3 -c 'import re; html=open("/tmp/api-key-create.html", encoding="utf-8").read(); match=re.search(r"API key created:\s*([^<\s]+)", html); assert match, "Could not extract API key"; print(match.group(1))')"
+          API_KEY="$(python3 -c 'import re; html=open("/tmp/api-key-create.html", encoding="utf-8").read(); match=re.search(r"data-created-api-key=\"([^\"]+)\"", html) or re.search(r"API key created:\s*([^<\s]+)", html); assert match, "Could not extract API key"; print(match.group(1))')"
           : "${API_KEY:?Could not extract API key}"
 
           echo "[bind] Validate API key with /keycheck"
@@ -526,7 +526,10 @@ jobs:
 
           function Get-ApiKeyFromCreateHtml {
             param([string] $Html)
-            $m = [regex]::Match($Html, 'API key created:\s*([^<\s]+)')
+            $m = [regex]::Match($Html, 'data-created-api-key="([^"]+)"')
+            if (-not $m.Success) {
+              $m = [regex]::Match($Html, 'API key created:\s*([^<\s]+)')
+            }
             if (-not $m.Success) { throw 'Could not extract API key from HTML' }
             return $m.Groups[1].Value
           }

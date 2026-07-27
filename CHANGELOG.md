@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+### Added
+
+- Fail-fast startup when `ENCRYPTION_KEY` / `SECRET_KEY` are missing or placeholder values (tests may set `API_TO_DNS_ALLOW_INSECURE_DEFAULTS=1`).
+- API keys stored as SHA-256 digests with a short display prefix; raw key shown once at creation.
+- Shared Let's Encrypt challenge provisioning so auto-renew publishes DNS/HTTP challenges before ACME finalize.
+- Same-origin CSRF checks for browser POSTs; configurable `CORS_ORIGINS`; Secure session cookies when SSL is enabled; rate limits for `/login`, `/keycheck`, and `/dns-record`.
+- `GET /health` and `GET /ready`; Docker healthcheck probes `/health`.
+- DNS API routes extracted to `src/routes/` (and helpers to `src/dns_api_service.py`).
+
+### Changed
+
+- Application version metadata aligned to **0.5.0** (`VERSION`, OpenAPI, `pyproject.toml`, Docker label).
+- Provider error messages sanitized for API clients; disabled DNS plugins blocked on the DNS API (503).
+- Removed unfinished **System Backup** and **Syslog** settings placeholders from the admin nav (tracked for a future release).
+- README documents Let's Encrypt and clarifies `zone_name` (configuration id) vs `dns_zone` (provider domain).
+- Pinned `acme==5.7.0` and `josepy==2.2.0`.
+
 ## [0.5.0] - 2026-05-26
 
 ### Added

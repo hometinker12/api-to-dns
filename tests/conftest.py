@@ -20,6 +20,7 @@ os.environ["SSL_ENABLED"] = "0"
 # Provide crypto secrets before importing application modules. Production
 # refuses placeholder/missing keys; tests may use dedicated values.
 os.environ.setdefault("API_TO_DNS_ALLOW_INSECURE_DEFAULTS", "1")
+os.environ.setdefault("API_TO_DNS_DISABLE_RATE_LIMIT", "1")
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-pytest-only")
 os.environ.setdefault("ENCRYPTION_KEY", Fernet.generate_key().decode())
 
