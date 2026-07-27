@@ -73,11 +73,6 @@ SETTINGS_AREAS: List[Dict[str, Any]] = [
         "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
     },
     {
-        "key": "backup",
-        "label": "System Backup",
-        "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
-    },
-    {
         "key": "system_settings",
         "label": "System Settings",
         "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
@@ -93,7 +88,6 @@ SYSTEM_SETTINGS_SECTIONS: List[Dict[str, str]] = [
     {"key": "system_identity", "label": "App DNS Name"},
     {"key": "ssl_certificate", "label": "SSL Certificate"},
     {"key": "smtp_delivery", "label": "SMTP Delivery"},
-    {"key": "syslog_planned", "label": "Syslog Server (planned)"},
     {"key": "logging_configuration", "label": "Logging Level"},
     {"key": "audit_log_retention", "label": "Audit Log Retention"},
     {"key": "operational_log_rotation", "label": "Operational Log Rotation"},
