@@ -526,7 +526,7 @@ def healthcheck() -> int:
     else:
         port = http_port()
         scheme = "http"
-    url = f"{scheme}://127.0.0.1:{port}/login"
+    url = f"{scheme}://127.0.0.1:{port}/health"
     try:
         if scheme == "https":
             import ssl as _ssl
