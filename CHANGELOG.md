@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-27
+
 ### Added
 
 - Fail-fast startup when `ENCRYPTION_KEY` / `SECRET_KEY` are missing or placeholder values (tests may set `API_TO_DNS_ALLOW_INSECURE_DEFAULTS=1`).
@@ -13,11 +15,13 @@
 
 ### Changed
 
-- Application version metadata aligned to **0.5.0** (`VERSION`, OpenAPI, `pyproject.toml`, Docker label).
+- Application version metadata aligned to **0.6.0** (`VERSION`, OpenAPI, `pyproject.toml`, Docker label).
 - Provider error messages sanitized for API clients; disabled DNS plugins blocked on the DNS API (503).
 - Removed unfinished **System Backup** and **Syslog** settings placeholders from the admin nav (tracked for a future release).
 - README documents Let's Encrypt and clarifies `zone_name` (configuration id) vs `dns_zone` (provider domain).
 - Pinned `acme==5.7.0` and `josepy==2.2.0`.
+- Docker Compose host HTTP mapping changed from `8000:8000` to `8001:8000`; `.env.example` clarifies `SSL_ENABLED`;
+
 
 ## [0.5.0] - 2026-05-26
 
