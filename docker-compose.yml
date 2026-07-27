@@ -20,6 +20,12 @@ services:
       - api-to-dns-ssl:/app/data/ssl
       - api-to-dns-logs:/app/logs
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.ssl_certs", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     logging:
       driver: json-file
       options:
