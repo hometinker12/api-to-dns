@@ -29,7 +29,13 @@ from .activity_logging import (
 )
 from .auth import create_session_cookie, get_current_user, session_cookie_settings
 from .db import SessionLocal, init_db
-from .http_utils import api_key_fingerprint, api_key_from_headers, http_exception_from_dns_error, wants_json_response
+from .http_utils import (
+    api_key_fingerprint,
+    api_key_from_headers,
+    http_exception_from_dns_error,
+    sanitize_client_error_message,
+    wants_json_response,
+)
 from .models import (
     LOG_CATEGORY_SECURITY,
     LOG_LEVEL_ERROR,
@@ -128,6 +134,7 @@ from .zone_service import (
     set_disabled_dns_plugins,
     test_zone_record_lookup,
     zones_using_dns_provider,
+    DnsProviderDisabledError,
 )
 
 
@@ -859,6 +866,7 @@ async def zone_test(request: Request, user: str = Depends(require_role(ROLE_DNS_
                 cfg,
                 record_name=test_record_name,
                 record_type=test_record_type,
+                db=db,
             )
         except ValueError as exc:
             return JSONResponse(
@@ -2925,6 +2933,7 @@ def get_dns_record(
                 settings,
                 record_name=record_name,
                 record_type=lookup_type,
+                db=db,
             )
         except ValueError as exc:
             emit_activity_event(
@@ -2947,7 +2956,7 @@ def get_dns_record(
             raise
         except Exception as exc:
             mapped = http_exception_from_dns_error(exc)
-            sanitized_error = (str(exc) or "DNS provider error").splitlines()[0][:512]
+            sanitized_error = sanitize_client_error_message(exc, fallback="DNS provider error")
             emit_activity_event(
                 db,
                 event_type="dns.provider_failed",
@@ -3067,6 +3076,11 @@ def _apply_dns_mutation(
         )
 
         try:
+            if provider in get_disabled_dns_plugins(db):
+                raise DnsProviderDisabledError(
+                    f"{dns_provider_display_name(provider)} is disabled. "
+                    "Enable it in Settings before using it for DNS operations."
+                )
             client = get_dns_client_from_settings(settings)
             provider_domain = provider_dns_zone(settings)
 
@@ -3271,7 +3285,7 @@ def _apply_dns_mutation(
             raise
         except Exception as exc:
             mapped = http_exception_from_dns_error(exc)
-            sanitized_error = (str(exc) or "DNS provider error").splitlines()[0][:512]
+            sanitized_error = sanitize_client_error_message(exc, fallback="DNS provider error")
             emit_activity_event(
                 db,
                 event_type="dns.provider_failed",

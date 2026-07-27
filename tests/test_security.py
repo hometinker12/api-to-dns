@@ -126,3 +126,45 @@ def test_migrate_hashes_plaintext_api_keys() -> None:
         assert is_api_key_hash(row.key)
         assert row.key == hash_api_key("plaintext-legacy-key")
         assert row.key_prefix == "plaintext-le"
+
+
+def test_sanitize_client_error_message_redacts_secrets() -> None:
+    from src.http_utils import sanitize_client_error_message
+
+    msg = sanitize_client_error_message(
+        RuntimeError("Cloudflare failed: token=supersecret123 and password=abc"),
+        fallback="DNS provider error",
+    )
+    assert "supersecret123" not in msg
+    assert "password=abc" not in msg
+    assert "[redacted]" in msg
+
+
+def test_http_exception_from_dns_error_hides_raw_provider_message() -> None:
+    from src.http_utils import http_exception_from_dns_error
+
+    exc = http_exception_from_dns_error(Exception("unexpected boom with secret=leakme"))
+    assert exc.status_code == 500
+    assert isinstance(exc.detail, dict)
+    assert "leakme" not in str(exc.detail["message"])
+
+
+def test_disabled_plugin_blocks_dns_client_creation(client: TestClient) -> None:
+    from src.db import SessionLocal
+    from src.zone_service import (
+        DnsProviderDisabledError,
+        create_dns_client_from_settings,
+        decode_zone_config,
+        list_dns_zones,
+        set_disabled_dns_plugins,
+    )
+
+    with SessionLocal() as db:
+        zone = list_dns_zones(db)[0]
+        cfg = decode_zone_config(zone)
+        set_disabled_dns_plugins(db, {cfg["dns_provider_type"]})
+        try:
+            with pytest.raises(DnsProviderDisabledError):
+                create_dns_client_from_settings(cfg, db=db)
+        finally:
+            set_disabled_dns_plugins(db, set())
