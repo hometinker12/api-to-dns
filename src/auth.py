@@ -32,6 +32,22 @@ SESSION_IDLE_TIMEOUT_SECONDS = 900
 serializer = URLSafeTimedSerializer(SECRET_KEY, salt="session-cookie")
 
 
+def session_cookie_secure() -> bool:
+    env = os.getenv("SSL_ENABLED", "").strip().lower()
+    if env in {"1", "true", "yes"}:
+        return True
+    if env in {"0", "false", "no"}:
+        return False
+    try:
+        from .db import SessionLocal
+        from .ssl_certs import is_ssl_enabled
+
+        with SessionLocal() as db:
+            return bool(is_ssl_enabled(db))
+    except Exception:
+        return False
+
+
 def session_cookie_settings(*, secure: bool = False) -> dict:
     return {
         "httponly": True,
