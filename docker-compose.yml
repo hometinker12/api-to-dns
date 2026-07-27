@@ -5,7 +5,7 @@ services:
     image: hometinker12/api-to-dns:latest
     build: .
     ports:
-      - "8000:8000"
+      - "8001:8000"
       - "8443:8443"
     env_file:
       - .env
@@ -20,6 +20,12 @@ services:
       - api-to-dns-ssl:/app/data/ssl
       - api-to-dns-logs:/app/logs
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.ssl_certs", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     logging:
       driver: json-file
       options:

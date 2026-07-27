@@ -3,6 +3,8 @@
 import os
 import tempfile
 
+from cryptography.fernet import Fernet
+
 _db = tempfile.NamedTemporaryFile(prefix="api-to-dns-test-", suffix=".db", delete=False)
 _db.close()
 os.environ["DATABASE_URL"] = "sqlite:///" + os.path.abspath(_db.name).replace("\\", "/")
@@ -14,6 +16,13 @@ os.environ["DATABASE_URL"] = "sqlite:///" + os.path.abspath(_db.name).replace("\
 _ssl_cert_dir = tempfile.mkdtemp(prefix="api-to-dns-test-ssl-")
 os.environ["APP_SSL_DIR"] = _ssl_cert_dir
 os.environ["SSL_ENABLED"] = "0"
+
+# Provide crypto secrets before importing application modules. Production
+# refuses placeholder/missing keys; tests may use dedicated values.
+os.environ.setdefault("API_TO_DNS_ALLOW_INSECURE_DEFAULTS", "1")
+os.environ.setdefault("API_TO_DNS_DISABLE_RATE_LIMIT", "1")
+os.environ.setdefault("SECRET_KEY", "test-secret-key-for-pytest-only")
+os.environ.setdefault("ENCRYPTION_KEY", Fernet.generate_key().decode())
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -32,10 +41,20 @@ def api_key_value() -> str:
 
 
 def _seed_example_zone_and_permission(db, api_key_value: str) -> None:
-    if not db.exec(select(ApiKey).where(ApiKey.key == api_key_value)).first():
-        db.add(ApiKey(label="pytest", key=api_key_value, active=True))
+    from src.security import api_key_prefix, hash_api_key
+
+    digest = hash_api_key(api_key_value)
+    if not db.exec(select(ApiKey).where(ApiKey.key == digest)).first():
+        db.add(
+            ApiKey(
+                label="pytest",
+                key=digest,
+                key_prefix=api_key_prefix(api_key_value),
+                active=True,
+            )
+        )
         db.commit()
-    key = db.exec(select(ApiKey).where(ApiKey.key == api_key_value)).first()
+    key = db.exec(select(ApiKey).where(ApiKey.key == digest)).first()
     zname = normalize_zone_name("example.com")
     zone = db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == zname)).first()
     if not zone:

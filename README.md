@@ -1,6 +1,6 @@
 # DNS REST Service
 
-[![License: MIT + Commons Clause](https://img.shields.io/badge/License-MIT%20+%20Commons%20Clause-orange)](LICENSE.md) [![Release](https://img.shields.io/badge/release-0.5.0-blue)](VERSION) [![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/) [![Python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/) [![AI Assisted](https://img.shields.io/badge/AI%20Assisted-yes-blue)](https://cursor.com)
+[![License: MIT + Commons Clause](https://img.shields.io/badge/License-MIT%20+%20Commons%20Clause-orange)](LICENSE.md) [![Release](https://img.shields.io/badge/release-0.6.0-blue)](VERSION) [![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/) [![Python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/) [![AI Assisted](https://img.shields.io/badge/AI%20Assisted-yes-blue)](https://cursor.com)
 
 
 A Dockerized FastAPI service to manage DNS records through a protected admin web UI and secure API key authentication.
@@ -126,7 +126,7 @@ $rng.Dispose()
 $key = [Convert]::ToBase64String($bytes).Replace('+', '-').Replace('/', '_')
 Write-Output "ENCRYPTION_KEY=$key"
 ```
-**Important:** Never use the placeholder value `change-me-before-production` in production. Always generate a unique key for each deployment. If you change `ENCRYPTION_KEY` after data is stored, existing encrypted credentials in the database cannot be decrypted.
+**Important:** Never use the placeholder value `change-me-before-production` in production. The application **refuses to start** when `ENCRYPTION_KEY` or `SECRET_KEY` is missing or set to a known placeholder (unless `API_TO_DNS_ALLOW_INSECURE_DEFAULTS=1` for local tests). Always generate a unique key for each deployment. If you change `ENCRYPTION_KEY` after data is stored, existing encrypted credentials in the database cannot be decrypted.
 
 ## Admin UI
 
@@ -165,20 +165,17 @@ Alert rules match stored activity events by event type, category, minimum level,
 
 SMTP delivery settings live under **System Settings**. The SMTP server field accepts an ordered CSV list such as `smtp1.example.com,192.0.2.25,smtp-backup.example.com`; delivery tries each server in order until one succeeds. Anonymous SMTP skips authentication. Successful delivery writes an informational `alert.email_sent` event. If delivery fails for every server, the app writes an `alert.email_failed` activity event without blocking the original action.
 
-### Planned Infrastructure Settings
-
-**System Settings** still includes a placeholder for syslog forwarding (host, port, protocol, facility, and minimum level are planned but not implemented yet).
-
-### Optional: HTTPS with self-signed or uploaded certificates
+### Optional: HTTPS with self-signed, uploaded, or Let's Encrypt certificates
 
 SSL is off by default. A fresh install serves HTTP on port `HTTP_PORT` (default `8000`) and does not create any cert files under `APP_SSL_DIR` until an admin opts in. Only one listener runs at a time — toggling SSL in the UI updates the database immediately but requires a restart of the application (container or `uvicorn` process) to swap listeners.
 
 To enable HTTPS:
 
 1. Sign in as an admin and open **Settings → System Settings → SSL Certificate**.
-2. Either:
+2. Choose one of:
    - **Upload Certificate** — provide an unencrypted PEM private key and a matching PEM certificate (concatenate any chain intermediates after the leaf certificate in the same file). The app validates the key/cert pair, rejects mismatched or expired material, and writes `server.key` / `server.crt` atomically into `APP_SSL_DIR`.
    - **Create self-signed certificate** — generate an RSA-2048 self-signed certificate (valid 825 days) using the configured App DNS Name as the Common Name and as a DNS SAN, plus `localhost`. Requires the `openssl` command on PATH (installed in the provided Dockerfile; install separately for local dev).
+   - **Let's Encrypt** — enroll via **DNS-01** (automated TXT records through a configured DNS zone plugin, or manual TXT) or **HTTP-01** (serve tokens at `/.well-known/acme-challenge/`). Staging mode is available for dry runs. Auto-renew can be enabled for automated DNS-01 (and optionally HTTP-01 when the host is internet-reachable); renewal may schedule an application restart so the new certificate is loaded.
 3. Tick **Enable HTTPS** and **Save**.
 4. Restart the application:
    - Docker: `docker compose restart` (or `up -d` after rebuild).
@@ -187,6 +184,8 @@ To enable HTTPS:
 Once restarted the app listens on `https://<app_dns_name>:TLS_PORT` (default `8443`). Self-signed certificates trigger browser warnings until the certificate is trusted on each client device. Disabling SSL does not delete the cert files on disk; the next enable + restart reuses them.
 
 The Docker compose file ships a dedicated `api-to-dns-ssl` named volume mounted at `/app/data/ssl` so cert/key material is isolated from the SQLite data volume and can be backed up independently.
+
+Liveness/readiness: `GET /health` and `GET /ready` (DB). The container healthcheck uses `/health`.
 
 ### Local development (HTTP or HTTPS)
 
@@ -202,7 +201,7 @@ Generating a self-signed certificate from the UI requires the `openssl` binary o
 
 ### Logging Security
 
-The app redacts secret-looking detail fields before storing activity logs or sending alert emails. It logs API key IDs, labels, and short SHA-256 fingerprints rather than full API key values. Request bodies are not stored by default, and DNS provider credentials remain encrypted at rest in configuration rows.
+The app redacts secret-looking detail fields before storing activity logs or sending alert emails. It logs API key IDs, labels, and short SHA-256 fingerprints rather than full API key values. **API keys themselves are stored as SHA-256 digests** (the raw key is shown only once at creation). Request bodies are not stored by default, and DNS provider credentials remain encrypted at rest in configuration rows.
 
 ## API Usage
 
@@ -224,18 +223,18 @@ All examples target `http://localhost:8000/dns-record` with `Content-Type: appli
 
 `record_type` accepts `**A`**, `**AAAA**`, `**CNAME**`, or `**TXT**`. The legacy `POST` upsert and `record_type: "DELETE"` pseudo-payload have been removed.
 
-**`zone_name` is required** on every request and must match a **configuration name** you set under **DNS zones** (not the provider DNS domain). The API key must include that configuration in its **allowed zones** list (see **API Keys** in the admin UI). If the zone is missing or the key is not allowed, the response is **403** with `{"detail":{"error":"access_denied","message":"..."}}`.
+**`zone_name` is required** on every request and must match a **zone configuration name** from **DNS zones** (for example `prod-azure`), **not** the provider DNS domain. Responses also include **`dns_zone`**, the provider domain (for example `example.com`). The API key must include that configuration in its **allowed zones** list (see **API Keys** in the admin UI). If the zone is missing or the key is not allowed, the response is **403** with `{"detail":{"error":"access_denied","message":"..."}}`.
 
 ### Create a new A record (`POST`)
 
-Save the Azure **subscription ID** and **resource group** on the zone configuration when using Azure. Requests only include the DNS operation fields. The same body shape works for Azure, Microsoft (WinRM), and BIND/TSIG.
+Save the Azure **subscription ID** and **resource group** on the zone configuration when using Azure. Requests only include the DNS operation fields. The same body shape works for Azure, Microsoft (WinRM), Cloudflare, and BIND/TSIG.
 
 ```bash
 curl -sS -X POST "http://localhost:8000/dns-record" \
   -H "Content-Type: application/json" \
   -H "X-API-Key: YOUR_API_KEY" \
   -d '{
-    "zone_name": "example.com",
+    "zone_name": "prod-azure",
     "record_type": "A",
     "record_name": "www",
     "ttl": 300,
@@ -247,7 +246,7 @@ PowerShell:
 
 ```powershell
 $body = @{
-  zone_name   = "example.com"
+  zone_name   = "prod-azure"
   record_type = "A"
   record_name = "www"
   ttl         = 300
@@ -264,7 +263,7 @@ Invoke-RestMethod -Method POST `
 If a record of that type already exists at the name, the response is **409**:
 
 ```json
-{"status":"error","action":"record_already_exists","zone_name":"example.com","record_name":"www","record_type":"A","values":["192.0.2.10"]}
+{"status":"error","action":"record_already_exists","zone_name":"prod-azure","record_name":"www","record_type":"A","values":["192.0.2.10"]}
 ```
 
 ### Replace an existing record (`PUT`)
@@ -276,7 +275,7 @@ curl -sS -X PUT "http://localhost:8000/dns-record" \
   -H "Content-Type: application/json" \
   -H "X-API-Key: YOUR_API_KEY" \
   -d '{
-    "zone_name": "example.com",
+    "zone_name": "prod-azure",
     "record_type": "A",
     "record_name": "www",
     "ttl": 600,
@@ -288,7 +287,7 @@ PowerShell:
 
 ```powershell
 $body = @{
-  zone_name   = "example.com"
+  zone_name   = "prod-azure"
   record_type = "A"
   record_name = "www"
   ttl         = 600
@@ -305,7 +304,7 @@ Invoke-RestMethod -Method PUT `
 If no record of that type exists at the name, the response is **404**:
 
 ```json
-{"status":"error","action":"not_found","zone_name":"example.com","record_name":"www","record_type":"A","values":["192.0.2.20"]}
+{"status":"error","action":"not_found","zone_name":"prod-azure","record_name":"www","record_type":"A","values":["192.0.2.20"]}
 ```
 
 ### Partial update (`PATCH`)
@@ -319,7 +318,7 @@ curl -sS -X PATCH "http://localhost:8000/dns-record" \
   -H "Content-Type: application/json" \
   -H "X-API-Key: YOUR_API_KEY" \
   -d '{
-    "zone_name": "example.com",
+    "zone_name": "prod-azure",
     "record_type": "A",
     "record_name": "www",
     "values": ["192.0.2.30"]
@@ -330,7 +329,7 @@ PowerShell:
 
 ```powershell
 $body = @{
-  zone_name   = "example.com"
+  zone_name   = "prod-azure"
   record_type = "A"
   record_name = "www"
   values      = @("192.0.2.30")
@@ -350,7 +349,7 @@ curl -sS -X PATCH "http://localhost:8000/dns-record" \
   -H "Content-Type: application/json" \
   -H "X-API-Key: YOUR_API_KEY" \
   -d '{
-    "zone_name": "example.com",
+    "zone_name": "prod-azure",
     "record_type": "A",
     "record_name": "www",
     "ttl": 600
@@ -361,7 +360,7 @@ PowerShell:
 
 ```powershell
 $body = @{
-  zone_name   = "example.com"
+  zone_name   = "prod-azure"
   record_type = "A"
   record_name = "www"
   ttl         = 600
@@ -382,7 +381,7 @@ Invoke-RestMethod -Method PATCH `
 
 ```bash
 curl -sS -X DELETE \
-  "http://localhost:8000/dns-record?zone_name=example.com&record_name=www&record_type=A" \
+  "http://localhost:8000/dns-record?zone_name=prod-azure&record_name=www&record_type=A" \
   -H "X-API-Key: YOUR_API_KEY"
 ```
 
@@ -390,7 +389,7 @@ PowerShell:
 
 ```powershell
 Invoke-RestMethod -Method DELETE `
-  "http://localhost:8000/dns-record?zone_name=example.com&record_name=www&record_type=A" `
+  "http://localhost:8000/dns-record?zone_name=prod-azure&record_name=www&record_type=A" `
   -Headers @{ "X-API-Key" = $apiKey }
 ```
 
@@ -407,7 +406,7 @@ Example response when `@` has both `A` and `CNAME` records:
 ```json
 {
   "status": "success",
-  "zone_name": "example.com",
+  "zone_name": "prod-azure",
   "record_name": "@",
   "records": [
     {"record_name": "@", "record_type": "A", "ttl": 500, "values": ["10.0.0.1"]},
@@ -418,7 +417,7 @@ Example response when `@` has both `A` and `CNAME` records:
 
 ```bash
 curl -sS \
-  "http://localhost:8000/dns-record?zone_name=example.com&record_name=www&record_type=A" \
+  "http://localhost:8000/dns-record?zone_name=prod-azure&record_name=www&record_type=A" \
   -H "X-API-Key: YOUR_API_KEY"
 ```
 
@@ -426,7 +425,7 @@ PowerShell:
 
 ```powershell
 Invoke-RestMethod -Method GET `
-  "http://localhost:8000/dns-record?zone_name=example.com&record_name=www&record_type=A" `
+  "http://localhost:8000/dns-record?zone_name=prod-azure&record_name=www&record_type=A" `
   -Headers @{ "X-API-Key" = $apiKey }
 ```
 

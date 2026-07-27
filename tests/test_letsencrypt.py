@@ -560,6 +560,96 @@ def test_self_signed_cert_never_renews(client: TestClient, monkeypatch) -> None:
     assert called is False
 
 
+def test_maybe_renew_certificate_publishes_dns_challenges_before_finalize(monkeypatch) -> None:
+    calls: list[str] = []
+
+    monkeypatch.setattr(letsencrypt, "_read_source", lambda: ssl_certs.SOURCE_LETSENCRYPT)
+    monkeypatch.setattr(
+        letsencrypt,
+        "cert_metadata",
+        lambda: {
+            "source": ssl_certs.SOURCE_LETSENCRYPT,
+            "not_after": datetime.now(timezone.utc) + timedelta(days=10),
+        },
+    )
+    monkeypatch.setattr(
+        letsencrypt,
+        "_acme_prepare_order",
+        lambda _config: {
+            "order_resource": {"stub": True},
+            "private_key_pem": "key",
+            "challenges": [
+                {
+                    "domain": "api.example.com",
+                    "dns_value": "renew-txt",
+                    "name": "_acme-challenge.api.example.com",
+                    "uri": "https://acme.example/chal/1",
+                }
+            ],
+            "challenge": {
+                "domain": "api.example.com",
+                "dns_value": "renew-txt",
+                "uri": "https://acme.example/chal/1",
+            },
+        },
+    )
+
+    def fake_create(db, *, zone_id, domain, value, ttl=1):
+        calls.append(f"create:{domain}:{value}")
+        return {"name": f"_acme-challenge.{domain}", "value": value}
+
+    def fake_verify(db, *, zone_id, domain, expected_value, progress_cb=None, attempt_offset=0, attempt_total=1):
+        calls.append(f"verify:{domain}:{expected_value}")
+
+    def fake_finalize(enrollment):
+        calls.append("finalize")
+        assert enrollment.get("status") == "ready"
+        assert enrollment.get("dns_records")
+        return {"key_pem": b"key", "cert_pem": b"cert"}
+
+    monkeypatch.setattr(letsencrypt, "create_dns_txt_challenge", fake_create)
+    monkeypatch.setattr(letsencrypt, "_verify_dns_txt_challenge", fake_verify)
+    monkeypatch.setattr(letsencrypt, "_cleanup_dns_txt_challenges", lambda *a, **k: calls.append("cleanup"))
+    monkeypatch.setattr(letsencrypt, "_acme_finalize_order", fake_finalize)
+    monkeypatch.setattr(
+        letsencrypt,
+        "install_letsencrypt_cert",
+        lambda key_pem, cert_pem: {"source": ssl_certs.SOURCE_LETSENCRYPT, "not_after": datetime.now(timezone.utc)},
+    )
+
+    _ensure_db()
+    with SessionLocal() as db:
+        zone = db.exec(select(DnsZoneConfig)).first()
+        if zone is None:
+            from tests.conftest import _seed_example_zone_and_permission
+
+            _seed_example_zone_and_permission(db, "test-api-key-for-dns-endpoint")
+            zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+        letsencrypt.save_config(
+            db,
+            **_sample_config_kwargs(
+                challenge_type=letsencrypt.CHALLENGE_DNS,
+                zone_id=int(zone.id),
+                root_dns_domain="example.com",
+                common_name="api.example.com",
+                subject_alt_names="",
+            ),
+            auto_renew_enabled=True,
+        )
+        result = letsencrypt.maybe_renew_certificate(db)
+        assert result is not None
+        assert result["status"] == "renewed"
+        assert letsencrypt.get_enrollment(db) is None
+
+    assert calls == [
+        "create:api.example.com:renew-txt",
+        "verify:api.example.com:renew-txt",
+        "finalize",
+        "cleanup",
+    ]
+
+
 def test_http_challenge_state_round_trip(client: TestClient, monkeypatch) -> None:
     monkeypatch.setattr(
         letsencrypt,

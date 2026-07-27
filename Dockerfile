@@ -17,7 +17,7 @@
 
 FROM python:3.12-slim
 
-ARG VERSION=0.3.4
+ARG VERSION=0.6.0
 
 LABEL org.opencontainers.image.title="api-to-dns" \
       org.opencontainers.image.description="DNS REST API and admin UI (Azure, Cloudflare, Microsoft DNS, BIND/TSIG)" \
@@ -44,6 +44,7 @@ RUN mkdir -p /app/data /app/data/ssl /app/logs
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
+COPY VERSION ./VERSION
 COPY src ./src
 COPY scripts ./scripts
 # Strip any CRLF line endings the script may have picked up on a Windows host

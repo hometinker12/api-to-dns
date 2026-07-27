@@ -682,22 +682,26 @@ def save_config(
     return config
 
 
-def start_enrollment(db, *, progress_cb: Optional[ProgressCallback] = None, **kwargs: Any) -> Dict[str, Any]:
+def _attach_challenges_to_enrollment(
+    db,
+    enrollment: Dict[str, Any],
+    *,
+    progress_cb: Optional[ProgressCallback] = None,
+    automated_only: bool = False,
+) -> Dict[str, Any]:
+    """Publish DNS/HTTP challenge material onto ``enrollment`` and set status.
+
+    When ``automated_only`` is True (renewal), manual challenge paths raise
+    instead of waiting for operator action.
+    """
     report = progress_cb or _noop_progress
-    report("save_config", 5, "Saving configuration...")
-    config = save_config(db, **kwargs)
-    report("prepare_order", 15, "Preparing ACME order...")
-    order = _acme_prepare_order(config)
-    enrollment = {
-        "status": "awaiting_validation",
-        "config": config,
-        "order": order,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
+    config = enrollment.get("config") or {}
+    order = enrollment.get("order") or {}
     challenges = order.get("challenges") or ([order.get("challenge")] if order.get("challenge") else [])
     challenge = challenges[0] if challenges else {}
-    primary_name = config["common_name"]
-    if config["challenge_type"] == CHALLENGE_DNS:
+    primary_name = config.get("common_name") or ""
+
+    if config.get("challenge_type") == CHALLENGE_DNS:
         if config.get("zone_id"):
             provisioned_domains: List[str] = []
             try:
@@ -729,8 +733,9 @@ def start_enrollment(db, *, progress_cb: Optional[ProgressCallback] = None, **kw
                 enrollment["status"] = "ready"
             except LetsEncryptError:
                 _cleanup_dns_txt_challenges(db, zone_id=int(config["zone_id"]), domains=provisioned_domains)
-                clear_enrollment(db)
                 raise
+        elif automated_only:
+            raise LetsEncryptError("Automated DNS-01 renewal requires a configured DNS zone for TXT challenges.")
         else:
             enrollment["manual"] = {
                 "type": CHALLENGE_DNS,
@@ -748,25 +753,72 @@ def start_enrollment(db, *, progress_cb: Optional[ProgressCallback] = None, **kw
     else:
         token = challenge.get("token") or ""
         response = challenge.get("key_authorization") or challenge.get("response") or ""
-        enrollment["manual"] = {
-            "type": CHALLENGE_HTTP,
-            "challenges": [
-                {
-                    "url": entry.get("url") or f"http://{entry.get('domain') or primary_name}/.well-known/acme-challenge/{entry.get('token') or ''}",
-                    "response": entry.get("key_authorization") or entry.get("response") or "",
-                }
-                for entry in challenges
-            ],
-            "url": f"http://{primary_name}/.well-known/acme-challenge/{token}",
-            "token": token,
-            "response": response,
-        }
         enrollment["http_challenges"] = [
-            {"token": entry.get("token") or "", "response": entry.get("key_authorization") or entry.get("response") or ""}
+            {
+                "token": entry.get("token") or "",
+                "response": entry.get("key_authorization") or entry.get("response") or "",
+            }
             for entry in challenges
         ]
         enrollment["http_challenge"] = {"token": token, "response": response}
-        enrollment["status"] = "awaiting_manual"
+        if automated_only:
+            # Persist challenge responses so /.well-known/acme-challenge can serve
+            # them while ACME finalization polls over HTTP-01.
+            enrollment["status"] = "ready"
+            enrollment["manual"] = {
+                "type": CHALLENGE_HTTP,
+                "url": f"http://{primary_name}/.well-known/acme-challenge/{token}",
+                "token": token,
+                "response": response,
+            }
+        else:
+            enrollment["manual"] = {
+                "type": CHALLENGE_HTTP,
+                "challenges": [
+                    {
+                        "url": entry.get("url")
+                        or f"http://{entry.get('domain') or primary_name}/.well-known/acme-challenge/{entry.get('token') or ''}",
+                        "response": entry.get("key_authorization") or entry.get("response") or "",
+                    }
+                    for entry in challenges
+                ],
+                "url": f"http://{primary_name}/.well-known/acme-challenge/{token}",
+                "token": token,
+                "response": response,
+            }
+            enrollment["status"] = "awaiting_manual"
+    return enrollment
+
+
+def _cleanup_enrollment_challenges(db, enrollment: Dict[str, Any]) -> None:
+    config = enrollment.get("config") or {}
+    if config.get("zone_id"):
+        domains = [
+            entry.get("domain")
+            for entry in (enrollment.get("order") or {}).get("challenges", [])
+            if entry.get("domain")
+        ]
+        if domains:
+            _cleanup_dns_txt_challenges(db, zone_id=int(config["zone_id"]), domains=domains)
+
+
+def start_enrollment(db, *, progress_cb: Optional[ProgressCallback] = None, **kwargs: Any) -> Dict[str, Any]:
+    report = progress_cb or _noop_progress
+    report("save_config", 5, "Saving configuration...")
+    config = save_config(db, **kwargs)
+    report("prepare_order", 15, "Preparing ACME order...")
+    order = _acme_prepare_order(config)
+    enrollment = {
+        "status": "awaiting_validation",
+        "config": config,
+        "order": order,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        _attach_challenges_to_enrollment(db, enrollment, progress_cb=progress_cb, automated_only=False)
+    except LetsEncryptError:
+        clear_enrollment(db)
+        raise
     _write_json_setting(db, SETTING_ENROLLMENT, enrollment)
     if enrollment["status"] == "ready":
         return continue_enrollment(db, progress_cb=progress_cb)
@@ -875,10 +927,17 @@ def maybe_renew_certificate(db) -> Optional[Dict[str, Any]]:
     if not should_renew_cert(cert_metadata(), renew_days):
         return None
     order = _acme_prepare_order(config)
-    enrollment = {"status": "renewing", "config": config, "order": order}
-    issued = _acme_finalize_order(enrollment)
-    metadata = install_letsencrypt_cert(issued["key_pem"], issued["cert_pem"])
-    return {"status": "renewed", "metadata": metadata, "config": config}
+    enrollment: Dict[str, Any] = {"status": "renewing", "config": config, "order": order}
+    try:
+        _attach_challenges_to_enrollment(db, enrollment, automated_only=True)
+        # Persist so HTTP-01 renewals can serve challenge tokens during finalize.
+        _write_json_setting(db, SETTING_ENROLLMENT, enrollment)
+        issued = _acme_finalize_order(enrollment)
+        metadata = install_letsencrypt_cert(issued["key_pem"], issued["cert_pem"])
+        return {"status": "renewed", "metadata": metadata, "config": config}
+    finally:
+        _cleanup_enrollment_challenges(db, enrollment)
+        clear_enrollment(db)
 
 
 def config_view(db) -> Dict[str, Any]:

@@ -57,7 +57,7 @@ from src.models import (
     User,
 )
 from src.plugins.bind import BindTsigDnsClient
-from src.security import hash_password
+from src.security import hash_api_key, hash_password
 from src.time_utils import utc_now
 
 
@@ -750,7 +750,7 @@ def test_dns_record_audit_message_uses_provider_dns_zone(
     config_name = "audit-config-label"
     provider_domain = "audit-provider.example"
     with SessionLocal() as db:
-        key = db.exec(select(ApiKey).where(ApiKey.key == api_key_value)).first()
+        key = db.exec(select(ApiKey).where(ApiKey.key == hash_api_key(api_key_value))).first()
         assert key is not None
         row = db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == config_name)).first()
         if row is None:
@@ -1371,7 +1371,7 @@ def test_settings_renders_for_authenticated_session(client: TestClient) -> None:
     assert "System Settings" in response.text
     assert "View Logs" in response.text
     assert "Email Alerting" in response.text
-    assert "System Backup" in response.text
+    assert "System Backup" not in response.text
 
 
 def test_settings_route_hidden_from_openapi(client: TestClient) -> None:
@@ -2174,7 +2174,6 @@ def test_global_read_can_view_read_only_pages(client: TestClient) -> None:
         ("/settings?area=logging", "View Logs"),
         ("/settings?area=system_settings", "System Settings"),
         ("/settings?area=email_alerting", "Email Alerting"),
-        ("/settings?area=backup", "System Backup"),
         ("/zones", "Configured zones"),
         ("/api-keys", "Existing API keys"),
     ):
@@ -2206,7 +2205,7 @@ def test_system_update_can_view_system_placeholders_without_global_read(client: 
     response = client.get("/settings?area=logging")
     assert response.status_code == 200
     assert "View Logs" in response.text
-    assert "System Backup" in response.text
+    assert "System Backup" not in response.text
     assert "Authentication" in response.text
     assert "Plugin Management" not in response.text
 
@@ -2822,25 +2821,20 @@ def test_ssl_audit_letsencrypt_cancel_and_config(client: TestClient) -> None:
         assert config_event.category == LOG_CATEGORY_SECURITY
 
 
-def test_settings_backup_area_renders_placeholder(client: TestClient) -> None:
+def test_settings_backup_area_removed(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
     response = client.get("/settings?area=backup")
     assert response.status_code == 200
-    assert "System Backup" in response.text
-    assert "not implemented yet" in response.text
-
-
-def test_settings_backup_area_requires_global_read_or_system_update(client: TestClient) -> None:
-    client.cookies.set("session", create_session_cookie("limited"))
-    with SessionLocal() as db:
-        _delete_users(db)
-        _create_user(db, "limited", "x", [ROLE_API_KEYS_READ])
-        _create_user(db, "admin", "x", ALL_ROLES)
-
-    response = client.get("/settings?area=backup")
-    assert response.status_code == 200
     assert "System Backup" not in response.text
-    assert "Authentication" in response.text
+    assert "not implemented yet" not in response.text
+
+
+def test_settings_syslog_section_removed(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/settings?area=system_settings&section=syslog_planned")
+    assert response.status_code == 200
+    assert "Syslog Server" not in response.text
+    assert "not implemented yet" not in response.text
 
 
 def test_dns_zones_read_is_required_on_all_user_accounts(client: TestClient) -> None:
@@ -2962,6 +2956,15 @@ def test_activity_events_written_for_api_key_creation_and_revocation(client: Tes
 
     response = client.post("/api-keys", data={"label": "audit-key", "zone_ids": str(zone.id)})
     assert response.status_code == 200
+    assert "API key created:" in response.text
+    assert 'data-created-api-key="' in response.text
+    import re
+
+    attr = re.search(r'data-created-api-key="([^"]+)"', response.text)
+    legacy = re.search(r"API key created:\s*([^<\s]+)", response.text)
+    assert attr is not None and legacy is not None
+    assert attr.group(1) == legacy.group(1)
+    assert len(attr.group(1)) >= 20
     with SessionLocal() as db:
         created = db.exec(select(ApiKey).where(ApiKey.label == "audit-key")).first()
         assert created is not None
@@ -2969,6 +2972,8 @@ def test_activity_events_written_for_api_key_creation_and_revocation(client: Tes
         assert create_event is not None
         assert create_event.actor_label == "admin"
         assert "audit-key" in (create_event.message or "")
+        # Raw key must not be persisted.
+        assert created.key != attr.group(1)
 
     response = client.post("/api-keys/revoke", data={"key_id": str(created.id)})
     assert response.status_code == 200

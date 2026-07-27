@@ -13,7 +13,7 @@
     {% include "_page_header.html" %}
 
     {% if message %}
-      <div class="alert success">{{ message }}</div>
+      <div class="alert success"{% if created_api_key %} data-created-api-key="{{ created_api_key }}"{% endif %}>{{ message }}</div>
     {% endif %}
 
     <section>
