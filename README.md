@@ -263,7 +263,7 @@ Invoke-RestMethod -Method POST `
 If a record of that type already exists at the name, the response is **409**:
 
 ```json
-{"status":"error","action":"record_already_exists","zone_name":"example.com","record_name":"www","record_type":"A","values":["192.0.2.10"]}
+{"status":"error","action":"record_already_exists","zone_name":"prod-azure","record_name":"www","record_type":"A","values":["192.0.2.10"]}
 ```
 
 ### Replace an existing record (`PUT`)
@@ -304,7 +304,7 @@ Invoke-RestMethod -Method PUT `
 If no record of that type exists at the name, the response is **404**:
 
 ```json
-{"status":"error","action":"not_found","zone_name":"example.com","record_name":"www","record_type":"A","values":["192.0.2.20"]}
+{"status":"error","action":"not_found","zone_name":"prod-azure","record_name":"www","record_type":"A","values":["192.0.2.20"]}
 ```
 
 ### Partial update (`PATCH`)
@@ -381,7 +381,7 @@ Invoke-RestMethod -Method PATCH `
 
 ```bash
 curl -sS -X DELETE \
-  "http://localhost:8000/dns-record?zone_name=example.com&record_name=www&record_type=A" \
+  "http://localhost:8000/dns-record?zone_name=prod-azure&record_name=www&record_type=A" \
   -H "X-API-Key: YOUR_API_KEY"
 ```
 
@@ -389,7 +389,7 @@ PowerShell:
 
 ```powershell
 Invoke-RestMethod -Method DELETE `
-  "http://localhost:8000/dns-record?zone_name=example.com&record_name=www&record_type=A" `
+  "http://localhost:8000/dns-record?zone_name=prod-azure&record_name=www&record_type=A" `
   -Headers @{ "X-API-Key" = $apiKey }
 ```
 
@@ -417,7 +417,7 @@ Example response when `@` has both `A` and `CNAME` records:
 
 ```bash
 curl -sS \
-  "http://localhost:8000/dns-record?zone_name=example.com&record_name=www&record_type=A" \
+  "http://localhost:8000/dns-record?zone_name=prod-azure&record_name=www&record_type=A" \
   -H "X-API-Key: YOUR_API_KEY"
 ```
 
@@ -425,7 +425,7 @@ PowerShell:
 
 ```powershell
 Invoke-RestMethod -Method GET `
-  "http://localhost:8000/dns-record?zone_name=example.com&record_name=www&record_type=A" `
+  "http://localhost:8000/dns-record?zone_name=prod-azure&record_name=www&record_type=A" `
   -Headers @{ "X-API-Key" = $apiKey }
 ```
 
