@@ -67,11 +67,14 @@ templates.env.globals["page_nav"] = _page_nav
 def render_error_response(request: Request, error: Exception, status_code: int = 500):
     traceback_text = traceback.format_exc()
     LOGGER.exception("Application error: %s", error)
-    content = (
-        "<html><body><h1>Application error</h1>"
-        f"<p>{html.escape(str(error))}</p>"
-        "<pre>"
-        f"{html.escape(traceback_text)}"
-        "</pre></body></html>"
-    )
+    from .security import allow_insecure_defaults
+
+    if allow_insecure_defaults():
+        detail = (
+            f"<p>{html.escape(str(error))}</p>"
+            f"<pre>{html.escape(traceback_text)}</pre>"
+        )
+    else:
+        detail = "<p>An unexpected error occurred. Details are available in the server logs.</p>"
+    content = f"<html><body><h1>Application error</h1>{detail}</body></html>"
     return HTMLResponse(content=content, status_code=status_code)

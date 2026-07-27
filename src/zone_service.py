@@ -8,6 +8,7 @@ from .dns_client import create_dns_client, dns_provider_display_name, provider_o
 
 __all__ = [
     "DISABLED_DNS_PLUGINS_SETTING",
+    "DnsProviderDisabledError",
     "LEGACY_DNS_SETTING_NAMES",
     "api_key_admin_dict",
     "api_key_allowed_zone_names",
@@ -42,6 +43,10 @@ from .security import decrypt_value, encrypt_value
 from .settings_store import delete_setting, get_setting, set_setting
 
 DISABLED_DNS_PLUGINS_SETTING = "disabled_dns_plugins"
+
+
+class DnsProviderDisabledError(RuntimeError):
+    """Raised when a zone's DNS provider plugin has been disabled in Settings."""
 
 LEGACY_DNS_SETTING_NAMES = [
     "dns_provider_type",
@@ -78,7 +83,13 @@ def get_known_dns_provider_keys() -> Set[str]:
     return {plugin["key"] for plugin in get_dns_provider_options()}
 
 
-def create_dns_client_from_settings(settings: dict):
+def create_dns_client_from_settings(settings: dict, db=None):
+    provider = (settings.get("dns_provider_type") or "azure").strip().lower()
+    if db is not None and provider in get_disabled_dns_plugins(db):
+        raise DnsProviderDisabledError(
+            f"{dns_provider_display_name(provider)} is disabled. "
+            "Enable it in Settings before using it for DNS operations."
+        )
     return create_dns_client(settings)
 
 
@@ -323,8 +334,9 @@ def test_zone_record_lookup(
     *,
     record_name: str,
     record_type: Optional[str] = None,
+    db=None,
 ) -> List[DnsRecordInfo]:
-    client = create_dns_client_from_settings(cfg)
+    client = create_dns_client_from_settings(cfg, db=db)
     return client.get_record(
         record_name=record_name,
         record_type=record_type,
