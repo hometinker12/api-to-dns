@@ -126,7 +126,7 @@ $rng.Dispose()
 $key = [Convert]::ToBase64String($bytes).Replace('+', '-').Replace('/', '_')
 Write-Output "ENCRYPTION_KEY=$key"
 ```
-**Important:** Never use the placeholder value `change-me-before-production` in production. Always generate a unique key for each deployment. If you change `ENCRYPTION_KEY` after data is stored, existing encrypted credentials in the database cannot be decrypted.
+**Important:** Never use the placeholder value `change-me-before-production` in production. The application **refuses to start** when `ENCRYPTION_KEY` or `SECRET_KEY` is missing or set to a known placeholder (unless `API_TO_DNS_ALLOW_INSECURE_DEFAULTS=1` for local tests). Always generate a unique key for each deployment. If you change `ENCRYPTION_KEY` after data is stored, existing encrypted credentials in the database cannot be decrypted.
 
 ## Admin UI
 

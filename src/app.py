@@ -101,6 +101,7 @@ from .ssl_certs import (
     regenerate_self_signed_cert,
     set_ssl_enabled,
 )
+from .version import get_app_version
 from .web import client_ip, nav_context, record_activity, render_access_denied_response, render_error_response, templates
 from .zone_service import (
     api_key_admin_dict,
@@ -304,8 +305,8 @@ def _make_shutdown_handler(previous_handler):
     return handler
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+def _startup_init() -> None:
+    """Shared DB/logging/admin bootstrap used by lifespan and tests."""
     init_db()
     with SessionLocal() as db:
         migrate_legacy_dns_settings_if_needed(db)
@@ -330,6 +331,11 @@ async def lifespan(app: FastAPI):
                     )
                 )
                 db.commit()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    _startup_init()
     renewal_task = asyncio.create_task(_letsencrypt_renewal_loop())
     restart_task = asyncio.create_task(_scheduled_restart_loop())
     previous_sigterm = signal.getsignal(signal.SIGTERM)
@@ -398,36 +404,13 @@ async def _scheduled_restart_loop() -> None:
 
 def startup_event() -> None:
     """Run startup initialization (used by tests; production uses ``lifespan``)."""
-    init_db()
-    with SessionLocal() as db:
-        migrate_legacy_dns_settings_if_needed(db)
-        configure_operational_logging(level=get_log_level(db))
-        clear_restart_required(db)
-        clear_le_renewal_pending_restart(db)
-        letsencrypt.clear_enrollment_progress(db)
-        try:
-            run_retention_cleanup(db, force=True)
-        except Exception:
-            LOGGER.exception("startup activity retention cleanup failed")
-    admin_user = os.getenv("ADMIN_USER")
-    admin_password = os.getenv("ADMIN_PASSWORD")
-    if admin_user and admin_password:
-        with SessionLocal() as db:
-            if not db.exec(select(User).where(User.username == admin_user)).first():
-                db.add(
-                    User(
-                        username=admin_user,
-                        password_hash=hash_password(admin_password),
-                        roles=serialize_roles([*ALL_ROLES, ROLE_GLOBAL_ADMIN]),
-                    )
-                )
-                db.commit()
+    _startup_init()
 
 
 app = FastAPI(
     title="api-to-dns Service",
     description="Create or update DNS records via REST and manage API keys through a protected web UI.",
-    version="0.3.4",
+    version=get_app_version(),
     lifespan=lifespan,
 )
 
@@ -3458,16 +3441,3 @@ def delete_dns_record(
         endpoint="DELETE /dns-record",
     )
 
-
-def api_key_fingerprint(api_key: str) -> str:
-    """Return a short, log-safe fingerprint for an API key string.
-
-    Never logs the key itself: the prefix is short and combined with a SHA-256
-    digest so the full key cannot be recovered from logs.
-    """
-    import hashlib
-
-    if not api_key:
-        return ""
-    digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
-    return f"sha256:{digest}"

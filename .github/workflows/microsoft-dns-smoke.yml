@@ -49,18 +49,23 @@ jobs:
       - name: Copy env example for testing
         run: cp .env.example .env
 
-      - name: Generate encryption key for testing
+      - name: Generate encryption and session secrets for testing
         run: |
           KEY="$(python - <<'PY'
           import base64
           import os
+          import secrets
 
           print(base64.urlsafe_b64encode(os.urandom(32)).decode())
+          print(secrets.token_urlsafe(32))
           PY
           )"
-          sed -i.bak "s|ENCRYPTION_KEY=.*|ENCRYPTION_KEY=${KEY}|" .env
+          ENC_KEY="$(printf '%s\n' "$KEY" | sed -n '1p')"
+          SECRET="$(printf '%s\n' "$KEY" | sed -n '2p')"
+          sed -i.bak "s|ENCRYPTION_KEY=.*|ENCRYPTION_KEY=${ENC_KEY}|" .env
+          sed -i.bak "s|SECRET_KEY=.*|SECRET_KEY=${SECRET}|" .env
           rm -f .env.bak
-          echo 'Generated encryption key for testing'
+          echo 'Generated encryption and session secrets for testing'
 
       - name: Build the Docker image
         run: |
@@ -451,13 +456,15 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "LOCAL_ALLOWED_ZONE=local-smoke.test"
           Add-Content -Path $env:GITHUB_ENV -Value "LOCAL_DENIED_ZONE=local-denied.test"
 
-      - name: Prepare .env with Fernet encryption key
+      - name: Prepare .env with Fernet encryption and session secrets
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           Copy-Item -Force .env.example .env
           $key = (& python -c "import base64,os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())").Trim()
+          $secret = (& python -c "import secrets; print(secrets.token_urlsafe(32))").Trim()
           $text = (Get-Content .env -Raw) -replace 'ENCRYPTION_KEY=.*', "ENCRYPTION_KEY=$key"
+          $text = $text -replace 'SECRET_KEY=.*', "SECRET_KEY=$secret"
           $utf8 = [System.Text.UTF8Encoding]::new($false)
           [System.IO.File]::WriteAllText((Join-Path (Get-Location) '.env'), $text, $utf8)
 
