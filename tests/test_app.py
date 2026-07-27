@@ -57,7 +57,7 @@ from src.models import (
     User,
 )
 from src.plugins.bind import BindTsigDnsClient
-from src.security import hash_password
+from src.security import hash_api_key, hash_password
 from src.time_utils import utc_now
 
 
@@ -750,7 +750,7 @@ def test_dns_record_audit_message_uses_provider_dns_zone(
     config_name = "audit-config-label"
     provider_domain = "audit-provider.example"
     with SessionLocal() as db:
-        key = db.exec(select(ApiKey).where(ApiKey.key == api_key_value)).first()
+        key = db.exec(select(ApiKey).where(ApiKey.key == hash_api_key(api_key_value))).first()
         assert key is not None
         row = db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == config_name)).first()
         if row is None:

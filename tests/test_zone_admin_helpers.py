@@ -4,6 +4,7 @@ from sqlmodel import select
 
 from src.db import SessionLocal, init_db
 from src.models import ActivityLog, ApiKey, ApiKeyAllowedZone, DnsZoneConfig
+from src.security import api_key_prefix, hash_api_key
 from src.zone_service import (
     api_key_count_for_zone,
     api_key_last_used_at,
@@ -16,6 +17,19 @@ from src.zone_service import (
 
 def _ensure_db() -> None:
     init_db()
+
+
+def _add_api_key(db, *, label: str, raw_key: str, active: bool = True) -> ApiKey:
+    key = ApiKey(
+        label=label,
+        key=hash_api_key(raw_key),
+        key_prefix=api_key_prefix(raw_key),
+        active=active,
+    )
+    db.add(key)
+    db.commit()
+    db.refresh(key)
+    return key
 
 
 def test_api_key_count_for_zone() -> None:
@@ -33,10 +47,7 @@ def test_api_key_count_for_zone() -> None:
         zone_id = int(zone.id)
         assert api_key_count_for_zone(db, zone_id) == 0
         for label in ("key-one", "key-two"):
-            key = ApiKey(label=label, key=f"secret-{label}", active=True)
-            db.add(key)
-            db.commit()
-            db.refresh(key)
+            key = _add_api_key(db, label=label, raw_key=f"secret-{label}")
             db.add(ApiKeyAllowedZone(api_key_id=int(key.id), dns_zone_config_id=zone_id))
         db.commit()
         assert api_key_count_for_zone(db, zone_id) == 2
@@ -45,10 +56,7 @@ def test_api_key_count_for_zone() -> None:
 def test_api_key_last_used_at_from_activity_log() -> None:
     _ensure_db()
     with SessionLocal() as db:
-        key = ApiKey(label="used-key", key="secret-used-key", active=True)
-        db.add(key)
-        db.commit()
-        db.refresh(key)
+        key = _add_api_key(db, label="used-key", raw_key="secret-used-key")
         key_id = int(key.id)
         assert api_key_last_used_at(db, key_id) is None
         ts = datetime(2026, 5, 20, 12, 0, tzinfo=timezone.utc)
@@ -73,10 +81,7 @@ def test_api_key_last_used_at_from_activity_log() -> None:
 def test_api_key_last_used_at_counts_not_found_lookup() -> None:
     _ensure_db()
     with SessionLocal() as db:
-        key = ApiKey(label="lookup-key", key="secret-lookup-key", active=True)
-        db.add(key)
-        db.commit()
-        db.refresh(key)
+        key = _add_api_key(db, label="lookup-key", raw_key="secret-lookup-key")
         key_id = int(key.id)
         ts = datetime(2026, 5, 21, 9, 30, tzinfo=timezone.utc)
         db.add(
