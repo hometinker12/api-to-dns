@@ -81,7 +81,9 @@ from .rbac import (
     user_is_global_admin,
     user_public_dict,
 )
-from .security import api_key_prefix, generate_api_key, hash_api_key, hash_password, verify_password
+from .security import allow_insecure_defaults, api_key_prefix, generate_api_key, hash_api_key, hash_password, verify_password
+from .csrf import csrf_origin_allowed, csrf_rejection_response
+from .rate_limit import rate_limit_exceeded, rate_limit_rejection_response
 from .settings_context import render_settings
 from .settings_store import get_setting, set_setting
 from . import ssl_certs
@@ -421,21 +423,53 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+_cors_origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "").split(",") if origin.strip()]
+if not _cors_origins and allow_insecure_defaults():
+    # Tests / local insecure mode: keep permissive CORS for convenience.
+    _cors_origins = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+
+def _session_cookie_secure() -> bool:
+    env = os.getenv("SSL_ENABLED", "").strip().lower()
+    if env in {"1", "true", "yes"}:
+        return True
+    if env in {"0", "false", "no"}:
+        return False
+    try:
+        with SessionLocal() as db:
+            return bool(is_ssl_enabled(db))
+    except Exception:
+        return False
+
+
+@app.middleware("http")
+async def csrf_and_rate_limit_middleware(request: Request, call_next):
+    if rate_limit_exceeded(request):
+        return rate_limit_rejection_response(request)
+    if not csrf_origin_allowed(request):
+        return csrf_rejection_response(request)
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def refresh_session_cookie(request: Request, call_next):
     response = await call_next(request)
     session_user = getattr(request.state, "session_user", None)
     if session_user and request.url.path != "/logout" and response.status_code < 400:
-        response.set_cookie("session", create_session_cookie(session_user), **session_cookie_settings())
+        response.set_cookie(
+            "session",
+            create_session_cookie(session_user),
+            **session_cookie_settings(secure=_session_cookie_secure()),
+        )
     return response
 
 
@@ -607,7 +641,11 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
         except Exception:  # pragma: no cover
             LOGGER.exception("could not record auth.login_succeeded")
     response = RedirectResponse(url="/admin", status_code=HTTP_303_SEE_OTHER)
-    response.set_cookie("session", create_session_cookie(username), **session_cookie_settings())
+    response.set_cookie(
+        "session",
+        create_session_cookie(username),
+        **session_cookie_settings(secure=_session_cookie_secure()),
+    )
     return response
 
 

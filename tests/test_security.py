@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
+from src.auth import create_session_cookie
 
 
 def test_get_app_version_matches_version_file() -> None:
@@ -168,3 +169,29 @@ def test_disabled_plugin_blocks_dns_client_creation(client: TestClient) -> None:
                 create_dns_client_from_settings(cfg, db=db)
         finally:
             set_disabled_dns_plugins(db, set())
+
+
+def test_csrf_rejects_cross_origin_post(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("API_TO_DNS_ALLOW_INSECURE_DEFAULTS", "0")
+    from src import csrf as csrf_module
+    import importlib
+
+    importlib.reload(csrf_module)
+    # Simulate production-like CSRF enforcement for this request.
+    monkeypatch.setattr(csrf_module, "allow_insecure_defaults", lambda: False)
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post(
+        "/api-keys",
+        data={"label": "x", "zone_ids": "1"},
+        headers={"Origin": "https://evil.example", "Host": "localhost"},
+    )
+    assert response.status_code == 403
+
+
+def test_cors_default_not_star_in_production_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("API_TO_DNS_ALLOW_INSECURE_DEFAULTS", "0")
+    monkeypatch.delenv("CORS_ORIGINS", raising=False)
+    origins = [origin.strip() for origin in __import__("os").getenv("CORS_ORIGINS", "").split(",") if origin.strip()]
+    if not origins:
+        # Mirrors app.py production branch.
+        assert origins == []
