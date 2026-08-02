@@ -3,23 +3,21 @@ import os
 import signal
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import select
 from starlette.status import HTTP_202_ACCEPTED, HTTP_303_SEE_OTHER, HTTP_404_NOT_FOUND, HTTP_409_CONFLICT
 
-from . import activity_logging
+from . import activity_logging, letsencrypt, ssl_certs
 from .activity_logging import (
     LOGGER,
     configure_operational_logging,
     emit_activity_event,
     get_log_level,
-    get_retention_days,
-    get_smtp_config,
     is_running_in_docker,
     run_retention_cleanup,
     set_app_dns_name,
@@ -27,32 +25,41 @@ from .activity_logging import (
     set_retention_days,
     set_smtp_config,
 )
-from .auth import create_session_cookie, get_current_user, session_cookie_secure, session_cookie_settings
-from .dns_api_service import ACCESS_DENIED_DETAIL
+from .auth import (
+    bump_session_version,
+    create_session_cookie,
+    get_current_user,
+    session_cookie_secure,
+    session_cookie_settings,
+)
+from .csrf import csrf_origin_allowed, csrf_rejection_response
 from .db import SessionLocal, init_db
+from .dns_api_service import ACCESS_DENIED_DETAIL
 from .http_utils import (
     api_key_fingerprint,
     api_key_from_headers,
     http_exception_from_dns_error,
-    sanitize_client_error_message,
     wants_json_response,
 )
+from .letsencrypt import LetsEncryptError
 from .models import (
     LOG_CATEGORY_SECURITY,
+    LOG_CATEGORY_VALUES,
     LOG_LEVEL_ERROR,
     LOG_LEVEL_INFORMATIONAL,
+    LOG_LEVEL_VALUES,
     LOG_LEVEL_VERBOSE,
     LOG_LEVEL_WARNING,
     AlertRule,
     ApiKey,
     ApiKeyAllowedZone,
-    DnsRecordInfo,
     DnsZoneConfig,
     DnsZoneSummary,
     User,
 )
-from .plugins.utils import normalize_lookup_record_type
 from .paths import STATIC_DIR
+from .plugins.utils import normalize_lookup_record_type
+from .rate_limit import rate_limit_exceeded, rate_limit_rejection_response
 from .rbac import (
     ALL_ROLES,
     LEGACY_SETTINGS_AREA_ALIASES,
@@ -64,26 +71,22 @@ from .rbac import (
     ROLE_DNS_ZONES_UPDATE,
     ROLE_FORBIDDEN_DETAIL,
     ROLE_GLOBAL_ADMIN,
-    ROLE_GLOBAL_READ,
     ROLE_PLUGIN_UPDATE,
     ROLE_SYSTEM_UPDATE,
-    get_user_roles,
     global_admin_guard_message,
     normalize_selected_roles,
+    parse_roles,
     require_role,
     serialize_roles,
     user_has_role,
-    user_is_global_admin,
-    user_public_dict,
+    validate_role_assignment,
 )
-from .security import allow_insecure_defaults, api_key_prefix, generate_api_key, hash_api_key, hash_password, verify_password
-from .csrf import csrf_origin_allowed, csrf_rejection_response
-from .rate_limit import rate_limit_exceeded, rate_limit_rejection_response
-from .settings_context import render_settings
-from .settings_store import get_setting, set_setting
-from . import ssl_certs
-from . import letsencrypt
-from .letsencrypt import LetsEncryptError
+from .rbac import (
+    ROLE_GLOBAL_READ as ROLE_GLOBAL_READ,
+)
+from .rbac import (
+    get_user_roles as get_user_roles,
+)
 from .restart import (
     clear_le_renewal_pending_restart,
     clear_restart_required,
@@ -94,18 +97,32 @@ from .restart import (
     perform_application_restart,
     scheduled_restart_due,
 )
+from .routes import include_routers
+from .security import api_key_prefix, generate_api_key, hash_api_key, hash_password, verify_password
+from .settings_context import render_settings
+from .settings_store import set_setting
 from .ssl_certs import (
+    MAX_SSL_CERT_UPLOAD_BYTES,
+    MAX_SSL_KEY_UPLOAD_BYTES,
     CertificateInstallError,
     OpenSSLUnavailableError,
     cert_exists,
     create_self_signed_cert,
     install_uploaded_cert,
     is_ssl_enabled,
+    read_upload_bounded,
     regenerate_self_signed_cert,
     set_ssl_enabled,
 )
 from .version import get_app_version
-from .web import client_ip, nav_context, record_activity, render_access_denied_response, render_error_response, templates
+from .web import (
+    client_ip,
+    nav_context,
+    record_activity,
+    render_access_denied_response,
+    render_error_response,
+    templates,
+)
 from .zone_service import (
     api_key_admin_dict,
     api_key_allowed_zone_names,
@@ -114,7 +131,6 @@ from .zone_service import (
     create_dns_client_from_settings,
     decode_zone_config,
     dns_provider_display_name,
-    dns_provider_options_with_state,
     dns_zone_admin_dict,
     dns_zone_public_dict,
     dns_zone_summary_dict,
@@ -127,15 +143,13 @@ from .zone_service import (
     list_dns_zones,
     migrate_legacy_dns_settings_if_needed,
     normalize_zone_name,
-    provider_dns_zone,
     set_disabled_dns_plugins,
     test_zone_record_lookup,
     zones_using_dns_provider,
-    DnsProviderDisabledError,
 )
 
 
-def _zones_html_context(db, *, message: Optional[str] = None) -> Dict[str, Any]:
+def _zones_html_context(db, *, message: str | None = None) -> dict[str, Any]:
     zones = list_dns_zones(db)
     return {
         "zones": [dns_zone_admin_dict(db, z) for z in zones],
@@ -143,7 +157,7 @@ def _zones_html_context(db, *, message: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
-def _api_keys_html_context(db, *, message: Optional[str] = None, **extra: Any) -> Dict[str, Any]:
+def _api_keys_html_context(db, *, message: str | None = None, **extra: Any) -> dict[str, Any]:
     api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda key: key.created_at, reverse=True)
     key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
     all_zones = list_dns_zones(db)
@@ -241,14 +255,14 @@ async def _letsencrypt_renewal_loop() -> None:
             LOGGER.exception("Let's Encrypt renewal loop failed")
 
 
-def _apply_le_renewal_restart_policy(db, config: Dict[str, Any]) -> None:
+def _apply_le_renewal_restart_policy(db, config: dict[str, Any]) -> None:
     if config.get("scheduled_restart_enabled") and config.get("scheduled_restart_time"):
         mark_le_renewal_pending_restart(db)
     else:
         mark_restart_required(db, reason="Let's Encrypt certificate renewed.")
 
 
-def _maybe_scheduled_le_restart(db, *, now: Optional[datetime] = None) -> bool:
+def _maybe_scheduled_le_restart(db, *, now: datetime | None = None) -> bool:
     config = letsencrypt.get_config(db)
     if not config or not config.get("scheduled_restart_enabled") or not config.get("scheduled_restart_time"):
         return False
@@ -280,17 +294,23 @@ def startup_event() -> None:
     _startup_init()
 
 
+def _openapi_enabled() -> bool:
+    return os.getenv("OPENAPI_ENABLED", "").strip().lower() in {"1", "true", "yes"}
+
+
+_OPENAPI_ON = _openapi_enabled()
 app = FastAPI(
     title="api-to-dns Service",
     description="Create or update DNS records via REST and manage API keys through a protected web UI.",
     version=get_app_version(),
     lifespan=lifespan,
+    docs_url="/docs" if _OPENAPI_ON else None,
+    redoc_url="/redoc" if _OPENAPI_ON else None,
+    openapi_url="/openapi.json" if _OPENAPI_ON else None,
 )
 
+# Explicit CORS only. Never auto-enable "*" from insecure crypto defaults.
 _cors_origins = [origin.strip() for origin in os.getenv("CORS_ORIGINS", "").split(",") if origin.strip()]
-if not _cors_origins and allow_insecure_defaults():
-    # Tests / local insecure mode: keep permissive CORS for convenience.
-    _cors_origins = ["*"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -300,6 +320,39 @@ app.add_middleware(
 )
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "same-origin",
+    "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
+    # Compatible with current inline admin scripts/styles; tighten further when assets are externalized.
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "base-uri 'self'; "
+        "object-src 'none'; "
+        "frame-ancestors 'none'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "font-src 'self'; "
+        "connect-src 'self'"
+    ),
+}
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    for header, value in _SECURITY_HEADERS.items():
+        response.headers.setdefault(header, value)
+    if session_cookie_secure(request):
+        response.headers.setdefault(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+        )
+    return response
 
 
 @app.middleware("http")
@@ -316,10 +369,11 @@ async def refresh_session_cookie(request: Request, call_next):
     response = await call_next(request)
     session_user = getattr(request.state, "session_user", None)
     if session_user and request.url.path != "/logout" and response.status_code < 400:
+        session_version = int(getattr(request.state, "session_version", 0) or 0)
         response.set_cookie(
             "session",
-            create_session_cookie(session_user),
-            **session_cookie_settings(secure=session_cookie_secure()),
+            create_session_cookie(session_user, session_version),
+            **session_cookie_settings(secure=session_cookie_secure(request)),
         )
     return response
 
@@ -377,12 +431,12 @@ def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
-
 # Backwards-compatible re-exports for tests and external callers.
-from .rbac import parse_roles as _parse_roles, serialize_roles as _serialize_roles
-
+_parse_roles = parse_roles
+_serialize_roles = serialize_roles
 get_dns_client_from_settings = create_dns_client_from_settings
 get_dns_provider_label = dns_provider_display_name
+
 
 @app.get("/", response_class=RedirectResponse, include_in_schema=False)
 def root(request: Request) -> RedirectResponse:
@@ -397,11 +451,15 @@ def root(request: Request) -> RedirectResponse:
 def admin(request: Request, user: str = Depends(get_current_user)):
     try:
         with SessionLocal() as db:
-            can_view_zones = user_has_role(db, user, ROLE_DNS_ZONES_READ) or user_has_role(db, user, ROLE_DNS_ZONES_UPDATE)
-            can_view_api_keys = user_has_role(db, user, ROLE_API_KEYS_READ) or user_has_role(db, user, ROLE_API_KEYS_UPDATE)
+            can_view_zones = user_has_role(db, user, ROLE_DNS_ZONES_READ) or user_has_role(
+                db, user, ROLE_DNS_ZONES_UPDATE
+            )
+            can_view_api_keys = user_has_role(db, user, ROLE_API_KEYS_READ) or user_has_role(
+                db, user, ROLE_API_KEYS_UPDATE
+            )
             zones = list_dns_zones(db)
             api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda key: key.created_at, reverse=True)
-            key_zones: Dict[int, List[str]] = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
+            key_zones: dict[int, list[str]] = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
             api_keys_view = [api_key_public_dict(k) for k in api_keys]
             zones_view = [dns_zone_public_dict(z) for z in zones]
         return templates.TemplateResponse(
@@ -423,7 +481,7 @@ def admin(request: Request, user: str = Depends(get_current_user)):
 
 @app.get(
     "/zones",
-    response_model=List[DnsZoneSummary],
+    response_model=list[DnsZoneSummary],
     responses={
         200: {
             "description": "HTML DNS zones page, or JSON zone summaries when requested with application/json.",
@@ -435,8 +493,8 @@ def admin(request: Request, user: str = Depends(get_current_user)):
 )
 def zones_page(
     request: Request,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+    authorization: str | None = Header(None, alias="Authorization"),
 ):
     with SessionLocal() as db:
         if wants_json_response(request):
@@ -506,7 +564,9 @@ def zone_new_form(request: Request, user: str = Depends(require_role(ROLE_DNS_ZO
             "zone": None,
             "settings": {},
             "provider_plugins": provider_plugins,
-            "message": None if provider_plugins else "No DNS provider plugins are enabled. Enable a plugin in Settings first.",
+            "message": None
+            if provider_plugins
+            else "No DNS provider plugins are enabled. Enable a plugin in Settings first.",
             "title": "Add DNS zone",
         },
     )
@@ -579,7 +639,7 @@ async def zone_test(request: Request, user: str = Depends(require_role(ROLE_DNS_
     test_record_type_raw = str(form.get("test_record_type") or "").strip()
     zone_id_raw = form.get("zone_id")
 
-    existing: Optional[Dict[str, Any]] = None
+    existing: dict[str, Any] | None = None
     canonical = normalize_zone_name(zone_name_raw)
 
     with SessionLocal() as db:
@@ -670,9 +730,7 @@ async def zone_test(request: Request, user: str = Depends(require_role(ROLE_DNS_
             if test_record_type:
                 message = f"Authentication successful. No {test_record_type} record found for {test_record_name!r} in zone {canonical!r}."
             else:
-                message = (
-                    f"Authentication successful. No records found at {test_record_name!r} in zone {canonical!r}."
-                )
+                message = f"Authentication successful. No records found at {test_record_name!r} in zone {canonical!r}."
             status = "not_found"
             event_level = LOG_LEVEL_INFORMATIONAL
             event_status = "not_found"
@@ -862,8 +920,8 @@ def revoke_api_key(request: Request, key_id: int = Form(...), user: str = Depend
 def create_api_key_route(
     request: Request,
     label: str = Form(...),
-    zone_ids: List[int] = Form(default_factory=list),
-    key_id: Optional[int] = Form(None),
+    zone_ids: list[int] = Form(default_factory=list),
+    key_id: int | None = Form(None),
     user: str = Depends(require_role(ROLE_API_KEYS_UPDATE)),
 ):
     try:
@@ -993,7 +1051,7 @@ def api_key_update(
     request: Request,
     key_id: int,
     label: str = Form(...),
-    zone_ids: List[int] = Form(default_factory=list),
+    zone_ids: list[int] = Form(default_factory=list),
     user: str = Depends(require_role(ROLE_API_KEYS_UPDATE)),
 ):
     with SessionLocal() as db:
@@ -1062,24 +1120,24 @@ def api_key_update(
 @app.get("/settings", response_class=HTMLResponse, include_in_schema=False)
 def settings_page(
     request: Request,
-    area: Optional[str] = None,
-    section: Optional[str] = None,
-    event_type: Optional[str] = None,
-    level: Optional[str] = None,
-    category: Optional[str] = None,
-    log_status: Optional[str] = None,
-    zone_name: Optional[str] = None,
-    actor: Optional[str] = None,
-    text_query: Optional[str] = None,
-    start: Optional[str] = None,
-    end: Optional[str] = None,
+    area: str | None = None,
+    section: str | None = None,
+    event_type: str | None = None,
+    level: str | None = None,
+    category: str | None = None,
+    log_status: str | None = None,
+    zone_name: str | None = None,
+    actor: str | None = None,
+    text_query: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
     offset: int = 0,
     user: str = Depends(get_current_user),
 ):
     normalized_area = (area or "").strip().lower()
     if normalized_area in LEGACY_SETTINGS_AREA_ALIASES:
         normalized_area = LEGACY_SETTINGS_AREA_ALIASES[normalized_area]
-    log_search_params: Optional[Dict[str, Any]] = None
+    log_search_params: dict[str, Any] | None = None
     if normalized_area == "log_viewing":
         log_search_params = {
             "event_type": (event_type or "").strip() or None,
@@ -1093,12 +1151,10 @@ def settings_page(
             "end": _parse_iso_datetime(end),
             "offset": offset,
         }
-    return render_settings(
-        request, user, normalized_area, log_search_params=log_search_params, section=section
-    )
+    return render_settings(request, user, normalized_area, log_search_params=log_search_params, section=section)
 
 
-def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+def _parse_iso_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
@@ -1142,8 +1198,7 @@ def settings_self_password_change(
                 message_kind="error",
             )
         target.password_hash = hash_password(new_password)
-        db.add(target)
-        db.commit()
+        new_version = bump_session_version(db, target)
         emit_activity_event(
             db,
             event_type="user.password_changed",
@@ -1154,7 +1209,14 @@ def settings_self_password_change(
             message=f"User {user!r} changed their own password",
             details={"target_username": user},
         )
-    return render_settings(request, user, "authentication", message="Password changed.")
+    response = render_settings(request, user, "authentication", message="Password changed.")
+    response.set_cookie(
+        "session",
+        create_session_cookie(user, new_version),
+        **session_cookie_settings(secure=session_cookie_secure(request)),
+    )
+    request.state.session_version = new_version
+    return response
 
 
 @app.post("/settings/users", response_class=HTMLResponse, include_in_schema=False)
@@ -1162,7 +1224,7 @@ def settings_user_create(
     request: Request,
     username: str = Form(...),
     password: str = Form(...),
-    roles: List[str] = Form(default_factory=list),
+    roles: list[str] = Form(default_factory=list),
     user: str = Depends(require_role(ROLE_ACCOUNT_UPDATE)),
 ):
     normalized = username.strip()
@@ -1186,14 +1248,14 @@ def settings_user_create(
             auth_form_selected_roles=selected_roles,
         )
     with SessionLocal() as db:
-        if ROLE_GLOBAL_ADMIN in selected_roles and not user_is_global_admin(db, user):
+        if assignment_error := validate_role_assignment(db, user, selected_roles):
             return render_settings(
                 request,
                 user,
                 "authentication",
-                auth_form_error="Only a global admin can grant global admin.",
+                auth_form_error=assignment_error,
                 auth_form_username=normalized,
-                auth_form_selected_roles=[r for r in selected_roles if r != ROLE_GLOBAL_ADMIN],
+                auth_form_selected_roles=selected_roles,
             )
         if db.exec(select(User).where(User.username == normalized)).first():
             return render_settings(
@@ -1209,6 +1271,7 @@ def settings_user_create(
                 username=normalized,
                 password_hash=hash_password(password),
                 roles=serialize_roles(selected_roles),
+                session_version=0,
             )
         )
         db.commit()
@@ -1280,8 +1343,7 @@ def settings_user_disable(
                 message_kind="error",
             )
         target.disabled = True
-        db.add(target)
-        db.commit()
+        bump_session_version(db, target)
         username = target.username
         emit_activity_event(
             db,
@@ -1476,8 +1538,7 @@ def settings_user_reset_password(
                 message_kind="error",
             )
         target.password_hash = hash_password(password)
-        db.add(target)
-        db.commit()
+        bump_session_version(db, target)
         username = target.username
         emit_activity_event(
             db,
@@ -1501,7 +1562,7 @@ def settings_user_reset_password(
 def settings_user_update_roles(
     request: Request,
     user_id: int,
-    roles: List[str] = Form(default_factory=list),
+    roles: list[str] = Form(default_factory=list),
     user: str = Depends(require_role(ROLE_ACCOUNT_UPDATE)),
 ):
     selected = normalize_selected_roles(roles)
@@ -1532,15 +1593,17 @@ def settings_user_update_roles(
                 message_kind="error",
             )
         target_stored_roles = _parse_roles(target.roles)
-        if (
-            (ROLE_GLOBAL_ADMIN in selected or ROLE_GLOBAL_ADMIN in target_stored_roles)
-            and not user_is_global_admin(db, user)
+        if assignment_error := validate_role_assignment(
+            db,
+            user,
+            selected,
+            previous_roles=target_stored_roles,
         ):
             return render_settings(
                 request,
                 user,
                 "authentication",
-                message="Only a global admin can change global admin role assignments.",
+                message=assignment_error,
                 message_kind="error",
             )
         if target.disabled:
@@ -1552,8 +1615,7 @@ def settings_user_update_roles(
                 message_kind="error",
             )
         target.roles = serialize_roles(selected)
-        db.add(target)
-        db.commit()
+        bump_session_version(db, target)
         username = target.username
         emit_activity_event(
             db,
@@ -1593,7 +1655,9 @@ def settings_plugin_disable(
     with SessionLocal() as db:
         disabled = get_disabled_dns_plugins(db)
         if normalized_key in disabled:
-            return render_settings(request, user, "plugins", message=f"{dns_provider_display_name(normalized_key)} is already disabled.")
+            return render_settings(
+                request, user, "plugins", message=f"{dns_provider_display_name(normalized_key)} is already disabled."
+            )
         enabled_count = len([plugin for plugin in get_dns_provider_options() if plugin["key"] not in disabled])
         if enabled_count <= 1:
             return render_settings(
@@ -1612,8 +1676,7 @@ def settings_plugin_disable(
                 user,
                 "plugins",
                 message=(
-                    f"Cannot disable {dns_provider_display_name(normalized_key)}. "
-                    f"Delete DNS zone {first_zone} first."
+                    f"Cannot disable {dns_provider_display_name(normalized_key)}. Delete DNS zone {first_zone} first."
                     if len(zone_names) == 1
                     else f"Cannot disable {dns_provider_display_name(normalized_key)}. Delete DNS zones {zones_text} first."
                 ),
@@ -1789,41 +1852,55 @@ def settings_update_smtp(
     request: Request,
     smtp_servers: str = Form(""),
     smtp_port: int = Form(activity_logging.DEFAULT_SMTP_PORT),
-    smtp_security: str = Form("none"),
-    smtp_anonymous: Optional[str] = Form(None),
+    smtp_security: str = Form(activity_logging.DEFAULT_SMTP_SECURITY),
+    smtp_anonymous: str | None = Form(None),
     smtp_username: str = Form(""),
     smtp_password: str = Form(""),
     smtp_from: str = Form(""),
     smtp_timeout: int = Form(activity_logging.DEFAULT_SMTP_TIMEOUT),
+    smtp_allow_insecure_auth: str | None = Form(None),
     redirect_section: str = Form("smtp_delivery"),
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
     anonymous = smtp_anonymous is not None
-    with SessionLocal() as db:
-        set_smtp_config(
-            db,
-            servers=smtp_servers,
-            port=smtp_port,
-            anonymous=anonymous,
-            username=smtp_username,
-            password=smtp_password,
-            from_address=smtp_from,
-            security=smtp_security,
-            timeout=smtp_timeout,
-        )
-        emit_activity_event(
-            db,
-            event_type="system.smtp_updated",
-            level=LOG_LEVEL_INFORMATIONAL,
-            status="success",
-            actor_type="user",
-            actor_label=user,
-            message="SMTP delivery settings updated",
-            details={
-                "servers_count": len([s for s in (smtp_servers or "").split(",") if s.strip()]),
-                "anonymous": anonymous,
-                "security": smtp_security,
-            },
+    allow_insecure_auth = smtp_allow_insecure_auth is not None
+    try:
+        with SessionLocal() as db:
+            set_smtp_config(
+                db,
+                servers=smtp_servers,
+                port=smtp_port,
+                anonymous=anonymous,
+                username=smtp_username,
+                password=smtp_password,
+                from_address=smtp_from,
+                security=smtp_security,
+                timeout=smtp_timeout,
+                allow_insecure_auth=allow_insecure_auth,
+            )
+            emit_activity_event(
+                db,
+                event_type="system.smtp_updated",
+                level=LOG_LEVEL_INFORMATIONAL,
+                status="success",
+                actor_type="user",
+                actor_label=user,
+                message="SMTP delivery settings updated",
+                details={
+                    "servers_count": len([s for s in (smtp_servers or "").split(",") if s.strip()]),
+                    "anonymous": anonymous,
+                    "security": smtp_security,
+                    "allow_insecure_auth": allow_insecure_auth,
+                },
+            )
+    except ValueError as exc:
+        return render_settings(
+            request,
+            user,
+            "system_settings",
+            message=str(exc),
+            message_kind="error",
+            section=redirect_section,
         )
     return render_settings(
         request, user, "system_settings", message="SMTP delivery settings saved.", section=redirect_section
@@ -1833,7 +1910,7 @@ def settings_update_smtp(
 @app.post("/settings/system/ssl", response_class=HTMLResponse, include_in_schema=False)
 def settings_update_ssl(
     request: Request,
-    ssl_enabled: Optional[str] = Form(None),
+    ssl_enabled: str | None = Form(None),
     redirect_section: str = Form("ssl_certificate"),
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
@@ -1874,9 +1951,7 @@ def settings_update_ssl(
         request,
         user,
         "system_settings",
-        message=(
-            "SSL setting saved. Restart the application for the change to take effect."
-        ),
+        message=("SSL setting saved. Restart the application for the change to take effect."),
         message_kind="warning",
         section=redirect_section,
     )
@@ -1891,8 +1966,26 @@ async def settings_upload_ssl(
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
     try:
-        key_bytes = await ssl_key.read()
-        cert_bytes = await ssl_cert.read()
+        key_bytes = await read_upload_bounded(ssl_key, MAX_SSL_KEY_UPLOAD_BYTES)
+        cert_bytes = await read_upload_bounded(ssl_cert, MAX_SSL_CERT_UPLOAD_BYTES)
+    except CertificateInstallError as exc:
+        with SessionLocal() as db:
+            _emit_ssl_audit(
+                db,
+                action="upload_failed",
+                user=user,
+                status="error",
+                message=f"SSL certificate upload rejected: {exc}",
+                details={"reason": str(exc)},
+            )
+        return render_settings(
+            request,
+            user,
+            "system_settings",
+            message=str(exc),
+            message_kind="error",
+            section=redirect_section,
+        )
     except Exception as exc:  # noqa: BLE001 — UploadFile.read failures are surfaced verbatim
         with SessionLocal() as db:
             _emit_ssl_audit(
@@ -1950,9 +2043,7 @@ async def settings_upload_ssl(
         request,
         user,
         "system_settings",
-        message=(
-            "SSL certificate uploaded. Restart the application for the new certificate to take effect."
-        ),
+        message=("SSL certificate uploaded. Restart the application for the new certificate to take effect."),
         message_kind="warning",
         section=redirect_section,
     )
@@ -2030,9 +2121,7 @@ def settings_regenerate_ssl(
         request,
         user,
         "system_settings",
-        message=(
-            f"{user_message} Restart the application for the new certificate to take effect."
-        ),
+        message=(f"{user_message} Restart the application for the new certificate to take effect."),
         message_kind="warning",
         section=redirect_section,
     )
@@ -2048,7 +2137,7 @@ def _emit_ssl_audit(
     user: str,
     message: str,
     status: str = "success",
-    details: Optional[Dict[str, Any]] = None,
+    details: dict[str, Any] | None = None,
 ) -> None:
     emit_activity_event(
         db,
@@ -2071,11 +2160,11 @@ def _le_start_form_kwargs(
     subject_alt_names: str,
     challenge_type: str,
     zone_id: str,
-    staging: Optional[str],
+    staging: str | None,
     renew_before_expiry_days: int,
-    scheduled_restart_enabled: Optional[str],
+    scheduled_restart_enabled: str | None,
     scheduled_restart_time: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     return {
         "email": email,
         "root_dns_domain": root_dns_domain,
@@ -2092,13 +2181,13 @@ def _le_start_form_kwargs(
     }
 
 
-def _le_issued_message(db, config: Dict[str, Any]) -> str:
+def _le_issued_message(db, config: dict[str, Any]) -> str:
     message = "Let's Encrypt certificate installed. Restart the application to use it."
     message += letsencrypt.http_auto_renew_notice(db, config)
     return message
 
 
-def _apply_le_start_result(db, result: Dict[str, Any], *, user: str) -> tuple[str, str]:
+def _apply_le_start_result(db, result: dict[str, Any], *, user: str) -> tuple[str, str]:
     if result.get("status") == "issued":
         mark_restart_required(db, reason="Let's Encrypt certificate installed.")
         config = result.get("config") or {}
@@ -2109,7 +2198,7 @@ def _apply_le_start_result(db, result: Dict[str, Any], *, user: str) -> tuple[st
     )
 
 
-def _emit_le_started(db, result: Dict[str, Any], *, user: str) -> None:
+def _emit_le_started(db, result: dict[str, Any], *, user: str) -> None:
     config = result.get("config") or {}
     _emit_ssl_audit(
         db,
@@ -2126,7 +2215,7 @@ def _emit_le_started(db, result: Dict[str, Any], *, user: str) -> None:
     )
 
 
-def _run_le_auto_enrollment_sync(kwargs: Dict[str, Any], *, user: str) -> None:
+def _run_le_auto_enrollment_sync(kwargs: dict[str, Any], *, user: str) -> None:
     def progress(phase: str, percent: int, message: str) -> None:
         with SessionLocal() as progress_db:
             letsencrypt.write_enrollment_progress(
@@ -2174,7 +2263,7 @@ def _run_le_auto_enrollment_sync(kwargs: Dict[str, Any], *, user: str) -> None:
             )
 
 
-async def _run_le_auto_enrollment(kwargs: Dict[str, Any], *, user: str) -> None:
+async def _run_le_auto_enrollment(kwargs: dict[str, Any], *, user: str) -> None:
     global _le_enrollment_in_progress
     try:
         await asyncio.to_thread(_run_le_auto_enrollment_sync, kwargs, user=user)
@@ -2200,9 +2289,9 @@ async def settings_letsencrypt_start_async(
     subject_alt_names: str = Form(""),
     challenge_type: str = Form("dns-01"),
     zone_id: str = Form(""),
-    staging: Optional[str] = Form(None),
+    staging: str | None = Form(None),
     renew_before_expiry_days: int = Form(letsencrypt.DEFAULT_RENEW_BEFORE_DAYS),
-    scheduled_restart_enabled: Optional[str] = Form(None),
+    scheduled_restart_enabled: str | None = Form(None),
     scheduled_restart_time: str = Form(letsencrypt.DEFAULT_SCHEDULED_RESTART_TIME),
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
@@ -2230,7 +2319,9 @@ async def settings_letsencrypt_start_async(
                 status="error",
                 message="Let's Encrypt async enrollment rejected: already in progress",
             )
-        return JSONResponse({"detail": "Let's Encrypt enrollment is already in progress."}, status_code=HTTP_409_CONFLICT)
+        return JSONResponse(
+            {"detail": "Let's Encrypt enrollment is already in progress."}, status_code=HTTP_409_CONFLICT
+        )
     kwargs = _le_start_form_kwargs(
         email=email,
         root_dns_domain=root_dns_domain,
@@ -2278,9 +2369,9 @@ def settings_letsencrypt_start(
     subject_alt_names: str = Form(""),
     challenge_type: str = Form("dns-01"),
     zone_id: str = Form(""),
-    staging: Optional[str] = Form(None),
+    staging: str | None = Form(None),
     renew_before_expiry_days: int = Form(letsencrypt.DEFAULT_RENEW_BEFORE_DAYS),
-    scheduled_restart_enabled: Optional[str] = Form(None),
+    scheduled_restart_enabled: str | None = Form(None),
     scheduled_restart_time: str = Form(letsencrypt.DEFAULT_SCHEDULED_RESTART_TIME),
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
@@ -2302,8 +2393,12 @@ def settings_letsencrypt_start(
             message, kind = _apply_le_start_result(db, result, user=user)
             _emit_le_started(db, result, user=user)
     except LetsEncryptError as exc:
-        return render_settings(request, user, "system_settings", message=str(exc), message_kind="error", section="ssl_certificate")
-    return render_settings(request, user, "system_settings", message=message, message_kind=kind, section="ssl_certificate")
+        return render_settings(
+            request, user, "system_settings", message=str(exc), message_kind="error", section="ssl_certificate"
+        )
+    return render_settings(
+        request, user, "system_settings", message=message, message_kind=kind, section="ssl_certificate"
+    )
 
 
 @app.post("/settings/system/ssl-letsencrypt/continue", response_class=HTMLResponse, include_in_schema=False)
@@ -2325,7 +2420,9 @@ def settings_letsencrypt_continue(request: Request, user: str = Depends(require_
                 },
             )
     except LetsEncryptError as exc:
-        return render_settings(request, user, "system_settings", message=str(exc), message_kind="error", section="ssl_certificate")
+        return render_settings(
+            request, user, "system_settings", message=str(exc), message_kind="error", section="ssl_certificate"
+        )
     with SessionLocal() as db:
         issued_message = _le_issued_message(db, config)
     return render_settings(
@@ -2343,7 +2440,9 @@ def settings_letsencrypt_cancel(request: Request, user: str = Depends(require_ro
     with SessionLocal() as db:
         letsencrypt.cancel_enrollment(db)
         _emit_ssl_audit(db, action="letsencrypt_cancel", user=user, message="Let's Encrypt enrollment cancelled")
-    return render_settings(request, user, "system_settings", message="Let's Encrypt enrollment cancelled.", section="ssl_certificate")
+    return render_settings(
+        request, user, "system_settings", message="Let's Encrypt enrollment cancelled.", section="ssl_certificate"
+    )
 
 
 @app.post("/settings/system/ssl-letsencrypt/config", response_class=HTMLResponse, include_in_schema=False)
@@ -2355,11 +2454,11 @@ def settings_letsencrypt_config(
     subject_alt_names: str = Form(""),
     challenge_type: str = Form("dns-01"),
     zone_id: str = Form(""),
-    staging: Optional[str] = Form(None),
+    staging: str | None = Form(None),
     renew_before_expiry_days: int = Form(letsencrypt.DEFAULT_RENEW_BEFORE_DAYS),
-    scheduled_restart_enabled: Optional[str] = Form(None),
+    scheduled_restart_enabled: str | None = Form(None),
     scheduled_restart_time: str = Form(letsencrypt.DEFAULT_SCHEDULED_RESTART_TIME),
-    auto_renew_enabled: Optional[str] = Form(None),
+    auto_renew_enabled: str | None = Form(None),
     config_notice: str = Form(""),
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
@@ -2398,7 +2497,9 @@ def settings_letsencrypt_config(
                 details={"config_notice": notice, "auto_renew_enabled": auto_renew_enabled is not None},
             )
     except LetsEncryptError as exc:
-        return render_settings(request, user, "system_settings", message=str(exc), message_kind="error", section="ssl_certificate")
+        return render_settings(
+            request, user, "system_settings", message=str(exc), message_kind="error", section="ssl_certificate"
+        )
     if notice == "auto_renew_on":
         message = "Automatic certificate renewal was turned on."
     elif notice == "auto_renew_off":
@@ -2501,7 +2602,7 @@ def settings_alerts_create(
     email_subject_template: str = Form(""),
     email_body_template: str = Form(""),
     cooldown_minutes: int = Form(0),
-    enabled: Optional[str] = Form("on"),
+    enabled: str | None = Form("on"),
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
     cleaned_level = (minimum_level or LOG_LEVEL_WARNING).strip().upper()
@@ -2542,7 +2643,12 @@ def settings_alerts_create(
             actor_type="user",
             actor_label=user,
             message=f"Alert rule {name!r} created",
-            details={"rule_id": rule.id, "rule_name": rule.name, "category": cleaned_category, "minimum_level": cleaned_level},
+            details={
+                "rule_id": rule.id,
+                "rule_name": rule.name,
+                "category": cleaned_category,
+                "minimum_level": cleaned_level,
+            },
         )
     return render_settings(request, user, "email_alerting", message=f"Alert rule {name!r} created.")
 
@@ -2560,7 +2666,7 @@ def settings_alerts_update(
     email_subject_template: str = Form(""),
     email_body_template: str = Form(""),
     cooldown_minutes: int = Form(0),
-    enabled: Optional[str] = Form(None),
+    enabled: str | None = Form(None),
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
     cleaned_level = (minimum_level or LOG_LEVEL_WARNING).strip().upper()
@@ -2599,7 +2705,12 @@ def settings_alerts_update(
             actor_type="user",
             actor_label=user,
             message=f"Alert rule {name!r} updated",
-            details={"rule_id": rule_id, "rule_name": rule.name, "category": cleaned_category, "minimum_level": cleaned_level},
+            details={
+                "rule_id": rule_id,
+                "rule_name": rule.name,
+                "category": cleaned_category,
+                "minimum_level": cleaned_level,
+            },
         )
     return render_settings(request, user, "email_alerting", message=f"Alert rule {name!r} updated.")
 
@@ -2631,8 +2742,5 @@ def settings_alerts_delete(
         )
     return render_settings(request, user, "email_alerting", message=f"Alert rule {rule_name!r} deleted.")
 
-
-
-from .routes import include_routers
 
 include_routers(app)

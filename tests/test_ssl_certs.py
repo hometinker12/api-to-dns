@@ -1,11 +1,11 @@
 """Tests for the SSL certificate management module."""
+
 from __future__ import annotations
 
-import os
+import asyncio
 import shutil
-import sys
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -40,10 +40,10 @@ def _generate_pem_pair(
 ) -> tuple[bytes, bytes, rsa.RSAPrivateKey]:
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     if not_after is None:
-        not_after = datetime.now(timezone.utc) + timedelta(days=30)
+        not_after = datetime.now(UTC) + timedelta(days=30)
     if not_before is None:
         not_before = min(
-            datetime.now(timezone.utc) - timedelta(minutes=5),
+            datetime.now(UTC) - timedelta(minutes=5),
             not_after - timedelta(days=1),
         )
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
@@ -97,9 +97,7 @@ def test_bootstrap_returns_http_when_disabled(ssl_workspace: Path) -> None:
     assert ssl_certs.bootstrap() == "http"
 
 
-def test_bootstrap_exits_when_enabled_without_cert(
-    ssl_workspace: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_bootstrap_exits_when_enabled_without_cert(ssl_workspace: Path, capsys: pytest.CaptureFixture[str]) -> None:
     with SessionLocal() as db:
         ssl_certs.set_ssl_enabled(db, True)
     with pytest.raises(SystemExit) as exc_info:
@@ -118,9 +116,7 @@ def test_bootstrap_returns_https_when_enabled_and_cert_present(ssl_workspace: Pa
     assert ssl_certs.bootstrap() == "https"
 
 
-def test_bootstrap_env_override_forces_http(
-    ssl_workspace: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_bootstrap_env_override_forces_http(ssl_workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     with SessionLocal() as db:
         ssl_certs.set_ssl_enabled(db, True)
     monkeypatch.setenv("SSL_ENABLED", "0")
@@ -156,8 +152,8 @@ def test_install_uploaded_cert_rejects_invalid_pem(ssl_workspace: Path) -> None:
 def test_install_uploaded_cert_rejects_expired(ssl_workspace: Path) -> None:
     key_pem, cert_pem, _ = _generate_pem_pair(
         common_name="old.example",
-        not_before=datetime.now(timezone.utc) - timedelta(days=10),
-        not_after=datetime.now(timezone.utc) - timedelta(days=1),
+        not_before=datetime.now(UTC) - timedelta(days=10),
+        not_after=datetime.now(UTC) - timedelta(days=1),
     )
     with pytest.raises(ssl_certs.CertificateInstallError) as exc:
         ssl_certs.install_uploaded_cert(key_pem, cert_pem)
@@ -180,9 +176,7 @@ def _openssl_supports_addext() -> bool:
     if not exe:
         return False
     try:
-        result = subprocess.run(
-            [exe, "version"], check=False, capture_output=True, text=True, timeout=5
-        )
+        result = subprocess.run([exe, "version"], check=False, capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
         return False
     if result.returncode != 0:
@@ -219,17 +213,83 @@ def test_regenerate_self_signed_cert_overwrites_uploaded(ssl_workspace: Path) ->
     assert ssl_certs.cert_metadata()["source"] == "self_signed"
 
 
-def test_create_self_signed_raises_when_openssl_missing(
-    ssl_workspace: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_create_self_signed_raises_when_openssl_missing(ssl_workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ssl_certs, "_openssl_executable", lambda: None)
     with SessionLocal() as db, pytest.raises(ssl_certs.OpenSSLUnavailableError):
         ssl_certs.create_self_signed_cert(db)
 
 
-def test_cli_bootstrap_prints_mode(
-    ssl_workspace: Path, capsys: pytest.CaptureFixture[str]
+def test_install_uploaded_cert_rejects_oversized(ssl_workspace: Path) -> None:
+    oversized = b"A" * (ssl_certs.MAX_SSL_KEY_UPLOAD_BYTES + 1)
+    with pytest.raises(ssl_certs.CertificateInstallError, match="maximum allowed size"):
+        ssl_certs.install_uploaded_cert(oversized, b"-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----")
+
+
+def test_read_upload_bounded_accepts_within_limit() -> None:
+    class _Upload:
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+            self._offset = 0
+
+        async def read(self, size: int = -1) -> bytes:
+            if self._offset >= len(self._payload):
+                return b""
+            if size < 0:
+                chunk = self._payload[self._offset :]
+                self._offset = len(self._payload)
+                return chunk
+            chunk = self._payload[self._offset : self._offset + size]
+            self._offset += len(chunk)
+            return chunk
+
+    payload = b"A" * 1024
+    assert asyncio.run(ssl_certs.read_upload_bounded(_Upload(payload), 2048)) == payload
+
+
+def test_read_upload_bounded_rejects_oversized_key_and_cert() -> None:
+    class _Upload:
+        def __init__(self, payload: bytes) -> None:
+            self._payload = payload
+            self._offset = 0
+
+        async def read(self, size: int = -1) -> bytes:
+            if self._offset >= len(self._payload):
+                return b""
+            if size < 0:
+                chunk = self._payload[self._offset :]
+                self._offset = len(self._payload)
+                return chunk
+            chunk = self._payload[self._offset : self._offset + size]
+            self._offset += len(chunk)
+            return chunk
+
+    oversized_key = b"K" * (ssl_certs.MAX_SSL_KEY_UPLOAD_BYTES + 1)
+    with pytest.raises(ssl_certs.CertificateInstallError, match="maximum allowed size"):
+        asyncio.run(ssl_certs.read_upload_bounded(_Upload(oversized_key), ssl_certs.MAX_SSL_KEY_UPLOAD_BYTES))
+
+    oversized_cert = b"C" * (ssl_certs.MAX_SSL_CERT_UPLOAD_BYTES + 1)
+    with pytest.raises(ssl_certs.CertificateInstallError, match="maximum allowed size"):
+        asyncio.run(ssl_certs.read_upload_bounded(_Upload(oversized_cert), ssl_certs.MAX_SSL_CERT_UPLOAD_BYTES))
+
+
+def test_create_self_signed_rejects_bad_hostname_without_openssl(
+    ssl_workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    called = {"openssl": False}
+
+    def boom(*_args, **_kwargs):
+        called["openssl"] = True
+        raise AssertionError("openssl must not be invoked for invalid hostnames")
+
+    monkeypatch.setattr(ssl_certs, "_openssl_executable", lambda: "openssl")
+    monkeypatch.setattr(ssl_certs.subprocess, "run", boom)
+    monkeypatch.setattr(ssl_certs, "get_app_dns_name", lambda _db: "bad name;rm -rf /")
+    with SessionLocal() as db, pytest.raises(ValueError, match="Hostname"):
+        ssl_certs.create_self_signed_cert(db)
+    assert called["openssl"] is False
+
+
+def test_cli_bootstrap_prints_mode(ssl_workspace: Path, capsys: pytest.CaptureFixture[str]) -> None:
     with SessionLocal() as db:
         ssl_certs.set_ssl_enabled(db, False)
     rc = ssl_certs._cli(["bootstrap"])  # type: ignore[attr-defined]

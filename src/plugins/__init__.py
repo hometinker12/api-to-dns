@@ -1,14 +1,13 @@
 import importlib
 import pkgutil
 from functools import lru_cache
-from typing import Dict, List
 
 from .base import DnsProviderPlugin, plugin_to_template_dict
 
 
 @lru_cache(maxsize=1)
-def discover_plugins() -> Dict[str, DnsProviderPlugin]:
-    plugins: Dict[str, DnsProviderPlugin] = {}
+def discover_plugins() -> dict[str, DnsProviderPlugin]:
+    plugins: dict[str, DnsProviderPlugin] = {}
     for module_info in pkgutil.iter_modules(__path__):
         if module_info.name in {"base", "utils"} or module_info.name.startswith("_"):
             continue
@@ -33,5 +32,5 @@ def get_plugin(key: str) -> DnsProviderPlugin:
         raise ValueError(f"Unknown DNS provider type: {key}. Available providers: {available}.") from exc
 
 
-def provider_options_for_template() -> List[dict]:
+def provider_options_for_template() -> list[dict]:
     return [plugin_to_template_dict(plugin) for plugin in discover_plugins().values()]

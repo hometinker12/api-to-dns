@@ -180,14 +180,14 @@
                       <label class="inline-check">
                         <input
                           type="checkbox"
-                          {% if role.key != "global.admin" or can_global_admin %}name="roles"{% endif %}
+                          {% if role.grantable %}name="roles"{% endif %}
                           value="{{ role.key }}"
                           {% if role.requires_role %}data-requires-role="{{ role.requires_role }}"{% endif %}
                           {% if role.mandatory %}data-mandatory-role="true"{% endif %}
                           {% if role.key in auth_form_selected_roles or role.mandatory %}checked{% endif %}
-                          {% if role.mandatory or (role.key == "global.admin" and not can_global_admin) %}disabled{% endif %}
+                          {% if role.mandatory or not role.grantable %}disabled{% endif %}
                         />
-                        <code>{{ role.key }}</code> &mdash; {{ role.label }}
+                        <code>{{ role.key }}</code> &mdash; {{ role.label }}{% if role.sensitive and not role.grantable %} (global admin only){% endif %}
                       </label>
                     {% endfor %}
                   </fieldset>
@@ -241,17 +241,20 @@
                         <legend>Roles</legend>
                         <p class="help">Uncheck every role to leave the user with no permissions. Default admin behavior only applies when no roles have ever been assigned.</p>
                         {% for role in role_catalog %}
+                          {% if not role.grantable and (role.key in u.stored_roles or role.mandatory) %}
+                            <input type="hidden" name="roles" value="{{ role.key }}" />
+                          {% endif %}
                           <label class="inline-check">
                             <input
                               type="checkbox"
-                              {% if role.key != "global.admin" or can_global_admin %}name="roles"{% endif %}
+                              {% if role.grantable %}name="roles"{% endif %}
                               value="{{ role.key }}"
                               {% if role.requires_role %}data-requires-role="{{ role.requires_role }}"{% endif %}
                             {% if role.mandatory %}data-mandatory-role="true"{% endif %}
                             {% if role.key in u.stored_roles or role.mandatory %}checked{% endif %}
-                            {% if role.mandatory or (role.key == "global.admin" and not can_global_admin) %}disabled{% endif %}
+                            {% if role.mandatory or not role.grantable %}disabled{% endif %}
                             />
-                            <code>{{ role.key }}</code> &mdash; {{ role.label }}
+                            <code>{{ role.key }}</code> &mdash; {{ role.label }}{% if role.sensitive and not role.grantable %} (global admin only){% endif %}
                           </label>
                         {% endfor %}
                       </fieldset>
@@ -418,7 +421,7 @@
           {% elif selected_system_section == "smtp_delivery" %}
           <section class="form-card">
             <h2>SMTP Delivery</h2>
-            <p class="help">SMTP servers are tried in order. Anonymous mode skips authentication entirely.</p>
+            <p class="help">SMTP servers are tried in order. Default security is STARTTLS. Anonymous mode skips authentication entirely and may use cleartext port 25.</p>
             <form action="/settings/system/smtp" method="post">
               <input type="hidden" name="redirect_section" value="smtp_delivery" />
               <label>SMTP servers (CSV)
@@ -429,7 +432,7 @@
               </label>
               <label>Security
                 <select name="smtp_security" {% if not can_system_update %}disabled{% endif %}>
-                  {% for option in ["none", "starttls", "ssl"] %}
+                  {% for option in ["starttls", "ssl", "none"] %}
                     <option value="{{ option }}" {% if sys.smtp.security == option %}selected{% endif %}>{{ option }}</option>
                   {% endfor %}
                 </select>
@@ -442,8 +445,13 @@
                 <input type="text" name="smtp_username" id="smtp-username" value="{{ sys.smtp.username }}" {% if not can_system_update %}disabled{% endif %} />
               </label>
               <label>Password
-                <input type="password" name="smtp_password" id="smtp-password" placeholder="{% if sys.smtp.password_set %}(unchanged){% else %}(not set){% endif %}" {% if not can_system_update %}disabled{% endif %} />
+                <input type="password" name="smtp_password" id="smtp-password" placeholder="{% if sys.smtp.password_set %}(unchanged){% else %}(not set){% endif %}" autocomplete="new-password" {% if not can_system_update %}disabled{% endif %} />
               </label>
+              <label class="inline-check">
+                <input type="checkbox" name="smtp_allow_insecure_auth" {% if sys.smtp.allow_insecure_auth %}checked{% endif %} {% if not can_system_update %}disabled{% endif %} />
+                Allow insecure cleartext SMTP authentication (not recommended)
+              </label>
+              <p class="help alert warning">WARNING: Cleartext SMTP authentication sends credentials unencrypted. Prefer STARTTLS or SSL. Anonymous delivery without credentials remains allowed.</p>
               <label>From address
                 <input type="email" name="smtp_from" value="{{ sys.smtp.from_address }}" {% if not can_system_update %}disabled{% endif %} />
               </label>
@@ -770,6 +778,7 @@
             </p>
             <form action="/settings/system/ssl-upload" method="post" enctype="multipart/form-data">
               <input type="hidden" name="redirect_section" value="ssl_certificate" />
+              <p class="help">Size limits: private key up to 64 KiB; certificate/bundle up to 256 KiB. Oversized uploads are rejected before parsing.</p>
               <label>Private key (PEM, <code>.key</code> / <code>.pem</code>)<br>
                 <input type="file" name="ssl_key" accept=".key,.pem,application/x-pem-file" required />
               </label>

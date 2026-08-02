@@ -18,6 +18,7 @@ and email alerting. It deliberately keeps a narrow, focused API:
 Operational logging configuration (Python ``logging``) is intentionally kept
 separate from the searchable audit events. See ``configure_operational_logging``.
 """
+
 from __future__ import annotations
 
 import json
@@ -28,26 +29,26 @@ import socket
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from logging.handlers import RotatingFileHandler
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any
 
 from sqlmodel import select
 
-from .settings_store import get_setting, set_setting
-from .time_utils import utc_now
 from .models import (
     LOG_CATEGORY_ALERT,
-    LOG_CATEGORY_VALUES,
     LOG_CATEGORY_SECURITY,
-    SECURITY_EVENT_PREFIXES,
+    LOG_CATEGORY_VALUES,
     LOG_LEVEL_ERROR,
     LOG_LEVEL_INFORMATIONAL,
     LOG_LEVEL_ORDER,
     LOG_LEVEL_VALUES,
     LOG_LEVEL_VERBOSE,
     LOG_LEVEL_WARNING,
+    SECURITY_EVENT_PREFIXES,
     ActivityLog,
     AlertRule,
 )
+from .settings_store import get_setting, set_setting
+from .time_utils import utc_now
 
 LOGGER = logging.getLogger("api_to_dns")
 
@@ -66,6 +67,7 @@ SETTING_SMTP_PASSWORD = "smtp_password"
 SETTING_SMTP_FROM = "smtp_from"
 SETTING_SMTP_SECURITY = "smtp_security"  # one of "none", "starttls", "ssl"
 SETTING_SMTP_TIMEOUT = "smtp_timeout"
+SETTING_SMTP_ALLOW_INSECURE_AUTH = "smtp_allow_insecure_auth"
 
 SETTING_LOG_FILE = "operational_log_file"
 SETTING_LOG_MAX_BYTES = "operational_log_max_bytes"
@@ -76,9 +78,9 @@ DEFAULT_APP_DNS_NAME_DOCKER = "apitodns.local"
 DOCKER_RUNTIME_LABEL = "Detected Docker container runtime."
 DEFAULT_LOG_LEVEL = LOG_LEVEL_INFORMATIONAL
 DEFAULT_RETENTION_DAYS = 90
-DEFAULT_SMTP_PORT = 25
+DEFAULT_SMTP_PORT = 587
 DEFAULT_SMTP_TIMEOUT = 10
-DEFAULT_SMTP_SECURITY = "none"
+DEFAULT_SMTP_SECURITY = "starttls"
 
 DEFAULT_SUBJECT_TEMPLATE = "[api-to-dns] {level}: {event_type}"
 DEFAULT_BODY_TEMPLATE = (
@@ -108,7 +110,7 @@ _SENSITIVE_KEY_FRAGMENTS = (
 
 _REDACTED = "***redacted***"
 
-_retention_state: Dict[str, datetime] = {}
+_retention_state: dict[str, datetime] = {}
 
 
 def get_log_level(db) -> str:
@@ -169,7 +171,7 @@ def redact_details(details: Any) -> Any:
     return details
 
 
-def _details_to_json(details: Optional[Dict[str, Any]]) -> Optional[str]:
+def _details_to_json(details: dict[str, Any] | None) -> str | None:
     if details is None:
         return None
     safe = redact_details(details)
@@ -195,14 +197,14 @@ def _normalize_level(level: str) -> str:
     return cleaned
 
 
-def normalize_category(category: Optional[str]) -> Optional[str]:
+def normalize_category(category: str | None) -> str | None:
     cleaned = (category or "").strip().lower()
     if not cleaned:
         return None
     return cleaned if cleaned in LOG_CATEGORY_VALUES else cleaned
 
 
-def infer_event_category(event_type: str) -> Optional[str]:
+def infer_event_category(event_type: str) -> str | None:
     """Infer category from the event type namespace.
 
     By default the segment before the first dot is the category (``plugin.disabled`` →
@@ -220,7 +222,7 @@ def infer_event_category(event_type: str) -> Optional[str]:
     return normalized
 
 
-def should_store_event(event_level: str, configured_level: str, category: Optional[str] = None) -> bool:
+def should_store_event(event_level: str, configured_level: str, category: str | None = None) -> bool:
     """Return True if an event at ``event_level`` should be persisted given the configured threshold."""
     if normalize_category(category) == LOG_CATEGORY_SECURITY:
         return True
@@ -238,13 +240,13 @@ def is_running_in_docker() -> bool:
     if os.path.exists("/.dockerenv"):
         return True
     try:
-        with open("/proc/1/cgroup", "rt", encoding="utf-8") as handle:
+        with open("/proc/1/cgroup", encoding="utf-8") as handle:
             return any("docker" in line or "kubepods" in line or "containerd" in line for line in handle)
     except OSError:
         return False
 
 
-_host_system_dns_name_cache: Optional[str] = None
+_host_system_dns_name_cache: str | None = None
 
 
 def _host_system_dns_name() -> str:
@@ -283,9 +285,9 @@ def get_app_dns_name(db) -> str:
 
 
 def set_app_dns_name(db, name: str) -> str:
-    cleaned = (name or "").strip()
-    if not cleaned:
-        raise ValueError("App DNS name cannot be empty.")
+    from .hostnames import validate_dns_hostname
+
+    cleaned = validate_dns_hostname(name)
     set_setting(db, SETTING_APP_DNS_NAME, cleaned)
     return cleaned
 
@@ -307,7 +309,7 @@ def detect_system_ip_address() -> str:
         sock.close()
 
 
-def system_identity(db) -> Dict[str, str]:
+def system_identity(db) -> dict[str, str]:
     return {"system_dns_name": get_app_dns_name(db), "system_ip_address": detect_system_ip_address()}
 
 
@@ -321,21 +323,21 @@ def emit_activity_event(
     *,
     event_type: str,
     level: str = LOG_LEVEL_INFORMATIONAL,
-    category: Optional[str] = None,
-    status: Optional[str] = None,
-    actor_type: Optional[str] = None,
-    actor_id: Optional[str] = None,
-    actor_label: Optional[str] = None,
-    zone_name: Optional[str] = None,
-    record_name: Optional[str] = None,
-    message: Optional[str] = None,
-    details: Optional[Dict[str, Any]] = None,
-    request_method: Optional[str] = None,
-    request_path: Optional[str] = None,
-    request_status_code: Optional[int] = None,
-    request_ip: Optional[str] = None,
+    category: str | None = None,
+    status: str | None = None,
+    actor_type: str | None = None,
+    actor_id: str | None = None,
+    actor_label: str | None = None,
+    zone_name: str | None = None,
+    record_name: str | None = None,
+    message: str | None = None,
+    details: dict[str, Any] | None = None,
+    request_method: str | None = None,
+    request_path: str | None = None,
+    request_status_code: int | None = None,
+    request_ip: str | None = None,
     evaluate_alerts: bool = True,
-) -> Optional[ActivityLog]:
+) -> ActivityLog | None:
     """Persist an audit/activity event if the configured threshold allows it."""
     normalized_level = _normalize_level(level)
     normalized_category = normalize_category(category) or infer_event_category(event_type)
@@ -387,18 +389,18 @@ def emit_activity_event(
 def query_activity_logs(
     db,
     *,
-    event_type: Optional[str] = None,
-    level: Optional[str] = None,
-    category: Optional[str] = None,
-    status: Optional[str] = None,
-    zone_name: Optional[str] = None,
-    actor: Optional[str] = None,
-    text_query: Optional[str] = None,
-    start: Optional[datetime] = None,
-    end: Optional[datetime] = None,
+    event_type: str | None = None,
+    level: str | None = None,
+    category: str | None = None,
+    status: str | None = None,
+    zone_name: str | None = None,
+    actor: str | None = None,
+    text_query: str | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
     limit: int = 50,
     offset: int = 0,
-) -> Tuple[List[ActivityLog], int]:
+) -> tuple[list[ActivityLog], int]:
     statement = select(ActivityLog)
     filters = []
     if event_type:
@@ -486,19 +488,47 @@ def run_retention_cleanup(db, *, force: bool = False) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _parse_csv(value: Optional[str]) -> List[str]:
+def _parse_csv(value: str | None) -> list[str]:
     if not value:
         return []
     return [part.strip() for part in value.split(",") if part.strip()]
 
 
-def get_smtp_config(db) -> Dict[str, Any]:
+def _smtp_truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def validate_smtp_transport_security(
+    *,
+    anonymous: bool,
+    username: str,
+    password: str,
+    security: str,
+    allow_insecure_auth: bool,
+) -> str | None:
+    """Return an error message when credentialed cleartext SMTP is not allowed."""
+    cleaned_security = (security or DEFAULT_SMTP_SECURITY).strip().lower()
+    uses_credentials = (not anonymous) and bool((username or "").strip() or (password or "").strip())
+    if not uses_credentials:
+        return None
+    if cleaned_security in {"starttls", "ssl"}:
+        return None
+    if allow_insecure_auth:
+        return None
+    return (
+        "Credentialed SMTP requires STARTTLS or SSL. "
+        "Enable 'Allow insecure cleartext SMTP authentication' only if you accept the risk, "
+        "or use anonymous port-25 delivery without credentials."
+    )
+
+
+def get_smtp_config(db) -> dict[str, Any]:
     servers = _parse_csv(get_setting(db, SETTING_SMTP_SERVERS))
     try:
         port = int(get_setting(db, SETTING_SMTP_PORT) or DEFAULT_SMTP_PORT)
     except ValueError:
         port = DEFAULT_SMTP_PORT
-    anonymous = (get_setting(db, SETTING_SMTP_ANONYMOUS) or "").strip().lower() in {"1", "true", "yes", "on"}
+    anonymous = _smtp_truthy(get_setting(db, SETTING_SMTP_ANONYMOUS))
     security = (get_setting(db, SETTING_SMTP_SECURITY) or DEFAULT_SMTP_SECURITY).strip().lower()
     if security not in {"none", "starttls", "ssl"}:
         security = DEFAULT_SMTP_SECURITY
@@ -515,6 +545,8 @@ def get_smtp_config(db) -> Dict[str, Any]:
         "from_address": get_setting(db, SETTING_SMTP_FROM) or "",
         "security": security,
         "timeout": timeout,
+        "allow_insecure_auth": _smtp_truthy(get_setting(db, SETTING_SMTP_ALLOW_INSECURE_AUTH)),
+        "password_set": bool(get_setting(db, SETTING_SMTP_PASSWORD)),
     }
 
 
@@ -529,8 +561,24 @@ def set_smtp_config(
     from_address: str,
     security: str,
     timeout: int,
+    allow_insecure_auth: bool = False,
     preserve_password_if_blank: bool = True,
 ) -> None:
+    cleaned_security = (security or DEFAULT_SMTP_SECURITY).strip().lower()
+    if cleaned_security not in {"none", "starttls", "ssl"}:
+        cleaned_security = DEFAULT_SMTP_SECURITY
+    existing_password = get_setting(db, SETTING_SMTP_PASSWORD) or ""
+    effective_password = password if (password or not preserve_password_if_blank) else existing_password
+    guard = validate_smtp_transport_security(
+        anonymous=anonymous,
+        username=username,
+        password=effective_password,
+        security=cleaned_security,
+        allow_insecure_auth=allow_insecure_auth,
+    )
+    if guard:
+        raise ValueError(guard)
+
     set_setting(db, SETTING_SMTP_SERVERS, servers or "")
     set_setting(db, SETTING_SMTP_PORT, str(int(port)))
     set_setting(db, SETTING_SMTP_ANONYMOUS, "true" if anonymous else "false")
@@ -538,11 +586,9 @@ def set_smtp_config(
     if password or not preserve_password_if_blank:
         set_setting(db, SETTING_SMTP_PASSWORD, password or "")
     set_setting(db, SETTING_SMTP_FROM, from_address or "")
-    cleaned_security = (security or DEFAULT_SMTP_SECURITY).strip().lower()
-    if cleaned_security not in {"none", "starttls", "ssl"}:
-        cleaned_security = DEFAULT_SMTP_SECURITY
     set_setting(db, SETTING_SMTP_SECURITY, cleaned_security)
     set_setting(db, SETTING_SMTP_TIMEOUT, str(int(timeout)))
+    set_setting(db, SETTING_SMTP_ALLOW_INSECURE_AUTH, "true" if allow_insecure_auth else "false")
 
 
 def _build_smtp_client(server: str, port: int, security: str, timeout: int) -> smtplib.SMTP:
@@ -554,13 +600,13 @@ def _build_smtp_client(server: str, port: int, security: str, timeout: int) -> s
 def send_alert_email(
     db,
     *,
-    recipients: List[str],
+    recipients: list[str],
     subject: str,
     body: str,
-) -> Tuple[bool, List[Dict[str, str]]]:
+) -> tuple[bool, list[dict[str, str]]]:
     """Try the configured SMTP servers in order. Returns (sent, failures)."""
     config = get_smtp_config(db)
-    failures: List[Dict[str, str]] = []
+    failures: list[dict[str, str]] = []
     if not config["servers"]:
         failures.append({"server": "", "error": "No SMTP servers configured"})
         return False, failures
@@ -569,6 +615,16 @@ def send_alert_email(
         return False, failures
     if not recipients:
         failures.append({"server": "", "error": "No recipients on alert rule"})
+        return False, failures
+    guard = validate_smtp_transport_security(
+        anonymous=bool(config["anonymous"]),
+        username=config.get("username") or "",
+        password=config.get("password") or "",
+        security=config.get("security") or DEFAULT_SMTP_SECURITY,
+        allow_insecure_auth=bool(config.get("allow_insecure_auth")),
+    )
+    if guard:
+        failures.append({"server": "", "error": guard})
         return False, failures
 
     message = EmailMessage()
@@ -604,7 +660,7 @@ def send_alert_email(
 # ---------------------------------------------------------------------------
 
 
-def _template_values_for_event(row: ActivityLog) -> Dict[str, str]:
+def _template_values_for_event(row: ActivityLog) -> dict[str, str]:
     details_text = ""
     if row.details_json:
         try:
@@ -633,7 +689,7 @@ class _SafeFormat(dict):
         return ""
 
 
-def render_alert_template(template: str, values: Dict[str, str]) -> str:
+def render_alert_template(template: str, values: dict[str, str]) -> str:
     """Render a template safely.
 
     - Missing placeholders render as the empty string.
@@ -649,7 +705,7 @@ def render_alert_template(template: str, values: Dict[str, str]) -> str:
         return template
 
 
-def evaluate_alert_rules(db, row: ActivityLog) -> List[AlertRule]:
+def evaluate_alert_rules(db, row: ActivityLog) -> list[AlertRule]:
     """Find matching enabled rules, render templates, send, and return triggered rules."""
     rules = list(db.exec(select(AlertRule).where(AlertRule.enabled == True)).all())  # noqa: E712
     if not rules:
@@ -658,7 +714,7 @@ def evaluate_alert_rules(db, row: ActivityLog) -> List[AlertRule]:
     identity = system_identity(db)
     base_values = _template_values_for_event(row)
     base_values.update(identity)
-    triggered: List[AlertRule] = []
+    triggered: list[AlertRule] = []
     event_rank = LOG_LEVEL_ORDER.get(_normalize_level(row.level), LOG_LEVEL_ORDER[LOG_LEVEL_INFORMATIONAL])
 
     for rule in rules:
@@ -666,9 +722,7 @@ def evaluate_alert_rules(db, row: ActivityLog) -> List[AlertRule]:
             continue
         if rule.category and normalize_category(rule.category) != normalize_category(row.category):
             continue
-        rule_threshold = LOG_LEVEL_ORDER.get(
-            _normalize_level(rule.minimum_level), LOG_LEVEL_ORDER[LOG_LEVEL_WARNING]
-        )
+        rule_threshold = LOG_LEVEL_ORDER.get(_normalize_level(rule.minimum_level), LOG_LEVEL_ORDER[LOG_LEVEL_WARNING])
         if event_rank < rule_threshold:
             continue
         if rule.message_contains:
@@ -734,7 +788,7 @@ def evaluate_alert_rules(db, row: ActivityLog) -> List[AlertRule]:
 def configure_operational_logging(
     *,
     level: str = LOG_LEVEL_INFORMATIONAL,
-    log_file: Optional[str] = None,
+    log_file: str | None = None,
     max_bytes: int = 1_048_576,
     backup_count: int = 5,
 ) -> None:

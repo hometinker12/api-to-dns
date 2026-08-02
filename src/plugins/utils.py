@@ -1,6 +1,5 @@
 import ipaddress
 import socket
-from typing import List, Optional, Tuple
 
 import dns.message
 import dns.name
@@ -9,21 +8,19 @@ import dns.rdatatype
 
 from ..models import DnsRecordInfo
 
-LOOKUP_RECORD_TYPES: Tuple[str, ...] = ("A", "AAAA", "CNAME", "TXT")
+LOOKUP_RECORD_TYPES: tuple[str, ...] = ("A", "AAAA", "CNAME", "TXT")
 
 
-def normalize_lookup_record_type(record_type: Optional[str]) -> Optional[str]:
+def normalize_lookup_record_type(record_type: str | None) -> str | None:
     if record_type is None or not str(record_type).strip():
         return None
     rt = str(record_type).strip().upper()
     if rt not in LOOKUP_RECORD_TYPES:
-        raise ValueError(
-            f"Record type must be one of {', '.join(LOOKUP_RECORD_TYPES)}; got {record_type!r}."
-        )
+        raise ValueError(f"Record type must be one of {', '.join(LOOKUP_RECORD_TYPES)}; got {record_type!r}.")
     return rt
 
 
-def lookup_record_types_to_query(record_type: Optional[str]) -> Tuple[str, ...]:
+def lookup_record_types_to_query(record_type: str | None) -> tuple[str, ...]:
     normalized = normalize_lookup_record_type(record_type)
     if normalized:
         return (normalized,)
@@ -115,7 +112,7 @@ def _query_record_details_at_name(
     zone_name: str,
     relative_name: str,
     record_type: str,
-) -> Optional[DnsRecordInfo]:
+) -> DnsRecordInfo | None:
     display_name = relative_name if relative_name not in ("@", "") else "@"
     z = zone_name.strip().rstrip(".")
     if relative_name in ("@", ""):
@@ -131,8 +128,8 @@ def _query_record_details_at_name(
     if not resp.answer:
         return None
 
-    ttl: Optional[int] = None
-    values: List[str] = []
+    ttl: int | None = None
+    values: list[str] = []
     for rrset in resp.answer:
         if rrset.rdtype != rdtype:
             continue
@@ -153,9 +150,9 @@ def query_dns_records_at_name(
     server: str,
     zone_name: str,
     relative_name: str,
-    record_type: Optional[str] = None,
-) -> List[DnsRecordInfo]:
-    results: List[DnsRecordInfo] = []
+    record_type: str | None = None,
+) -> list[DnsRecordInfo]:
+    results: list[DnsRecordInfo] = []
     for rt in lookup_record_types_to_query(record_type):
         info = _query_record_details_at_name(server, zone_name, relative_name, rt)
         if info is not None:

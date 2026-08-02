@@ -1,18 +1,17 @@
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import httpx
-from ..models import DnsRecordInfo, DnsRecordRequest
 
+from ..models import DnsRecordInfo, DnsRecordRequest
 from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
 from .utils import lookup_record_types_to_query
-
 
 CLOUDFLARE_API_BASE_URL = "https://api.cloudflare.com/client/v4"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 SUPPORTED_RECORD_TYPES = ("A", "AAAA", "CNAME", "TXT")
 
 
-def _truthy(value: Optional[str]) -> bool:
+def _truthy(value: str | None) -> bool:
     if value is None:
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
@@ -57,7 +56,7 @@ class CloudflareDnsClient:
     def __init__(
         self,
         api_token: str,
-        zone_id: Optional[str] = None,
+        zone_id: str | None = None,
         proxied: bool = False,
         base_url: str = CLOUDFLARE_API_BASE_URL,
     ):
@@ -71,8 +70,8 @@ class CloudflareDnsClient:
     def create_or_update_record(
         self,
         payload: DnsRecordRequest,
-        dns_server: Optional[str] = None,
-        dns_zone: Optional[str] = None,
+        dns_server: str | None = None,
+        dns_zone: str | None = None,
     ) -> bool:
         if dns_server:
             raise ValueError(
@@ -121,10 +120,10 @@ class CloudflareDnsClient:
         self,
         *,
         record_name: str,
-        record_type: Optional[str] = None,
-        dns_server: Optional[str] = None,
-        dns_zone: Optional[str] = None,
-    ) -> List[DnsRecordInfo]:
+        record_type: str | None = None,
+        dns_server: str | None = None,
+        dns_zone: str | None = None,
+    ) -> list[DnsRecordInfo]:
         if dns_server:
             raise ValueError(
                 "Cloudflare DNS ignores per-server host settings; use the Cloudflare fields on the zone configuration."
@@ -137,7 +136,7 @@ class CloudflareDnsClient:
         display_name = _relative_name(zone_name, fqdn)
         types_to_query = lookup_record_types_to_query(record_type)
 
-        results: List[DnsRecordInfo] = []
+        results: list[DnsRecordInfo] = []
         with self._client() as client:
             zone_id = self._resolve_zone_id(client, zone_name)
             for rt in types_to_query:
@@ -161,9 +160,9 @@ class CloudflareDnsClient:
         method: str,
         path: str,
         *,
-        params: Optional[Dict[str, Any]] = None,
-        json_body: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         try:
             response = client.request(method, path, params=params, json=json_body)
         except httpx.HTTPError as exc:
@@ -172,9 +171,7 @@ class CloudflareDnsClient:
         try:
             body = response.json()
         except ValueError as exc:
-            raise RuntimeError(
-                f"Cloudflare API returned non-JSON response (HTTP {response.status_code})."
-            ) from exc
+            raise RuntimeError(f"Cloudflare API returned non-JSON response (HTTP {response.status_code}).") from exc
 
         if not isinstance(body, dict) or not body.get("success"):
             message = self._first_error_message(body) or f"HTTP {response.status_code}"
@@ -182,7 +179,7 @@ class CloudflareDnsClient:
         return body
 
     @staticmethod
-    def _first_error_message(body: Any) -> Optional[str]:
+    def _first_error_message(body: Any) -> str | None:
         if not isinstance(body, dict):
             return None
         errors = body.get("errors") or []
@@ -210,7 +207,7 @@ class CloudflareDnsClient:
         zone_id: str,
         fqdn: str,
         record_type: str,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         body = self._request(
             client,
             "GET",
@@ -258,9 +255,9 @@ class CloudflareDnsClient:
     def _delete_record(self, client: httpx.Client, zone_id: str, record_id: str) -> None:
         self._request(client, "DELETE", f"/zones/{zone_id}/dns_records/{record_id}")
 
-    def _record_body(self, fqdn: str, record_type: str, content: str, ttl: int) -> Dict[str, Any]:
+    def _record_body(self, fqdn: str, record_type: str, content: str, ttl: int) -> dict[str, Any]:
         api_content = _cloudflare_txt_content(content) if record_type == "TXT" else content
-        body: Dict[str, Any] = {
+        body: dict[str, Any] = {
             "type": record_type,
             "name": fqdn,
             "content": api_content,
@@ -271,7 +268,7 @@ class CloudflareDnsClient:
         return body
 
     @staticmethod
-    def _desired_values(record_type: str, values: List[str]) -> List[str]:
+    def _desired_values(record_type: str, values: list[str]) -> list[str]:
         if record_type == "CNAME":
             if len(values) != 1:
                 raise ValueError("CNAME requires exactly one value.")
@@ -290,8 +287,8 @@ class CloudflareDnsClient:
         fqdn: str,
         record_type: str,
         ttl: int,
-        desired_values: List[str],
-        existing: List[Dict[str, Any]],
+        desired_values: list[str],
+        existing: list[dict[str, Any]],
     ) -> None:
         if record_type == "CNAME":
             content = desired_values[0]
@@ -321,8 +318,8 @@ class CloudflareDnsClient:
             return
 
         desired_set = set(desired_values)
-        existing_by_content: Dict[str, Dict[str, Any]] = {}
-        stale: List[Dict[str, Any]] = []
+        existing_by_content: dict[str, dict[str, Any]] = {}
+        stale: list[dict[str, Any]] = []
         normalize_content = _normalize_txt_value if record_type == "TXT" else str
         for row in existing:
             content = normalize_content(str(row.get("content", "")))
@@ -357,7 +354,7 @@ class CloudflareDnsClient:
                 )
 
     @staticmethod
-    def _rows_to_info(display_name: str, record_type: str, rows: List[Dict[str, Any]]) -> DnsRecordInfo:
+    def _rows_to_info(display_name: str, record_type: str, rows: list[dict[str, Any]]) -> DnsRecordInfo:
         ttls = [int(row["ttl"]) for row in rows if isinstance(row.get("ttl"), (int, float))]
         # Use the minimum TTL when multiple Cloudflare rows back one logical RRset;
         # this matches how recursive resolvers cap the effective TTL.
@@ -375,7 +372,7 @@ class CloudflareDnsClient:
         )
 
 
-def create_client(settings: Dict[str, Optional[str]]) -> CloudflareDnsClient:
+def create_client(settings: dict[str, str | None]) -> CloudflareDnsClient:
     return CloudflareDnsClient(
         api_token=settings.get("cloudflare_api_token") or "",
         zone_id=settings.get("cloudflare_zone_id") or "",

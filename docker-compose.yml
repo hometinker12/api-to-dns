@@ -1,12 +1,18 @@
-version: '3.9'
-
 services:
   dns-api:
-    image: hometinker12/api-to-dns:latest
+    image: hometinker12/api-to-dns:0.6.0
     build: .
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=64M,mode=1777
     ports:
-      - "8001:8000"
-      - "8443:8443"
+      - "127.0.0.1:8001:8000"
+      - "127.0.0.1:8443:8443"
     env_file:
       - .env
     environment:

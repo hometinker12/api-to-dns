@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Security
+
+- Account admins can no longer grant sensitive roles (`global.admin`, `account.*`, `api_keys.update`, `plugin.update`, `system.update`); only `global.admin` may assign those. Account admins may still grant `global.read`, `api_keys.read`, `dns_zones.read`, and `dns_zones.update`.
+- Session cookies now carry a `session_version` that is bumped (and other sessions revoked) on password change/reset, disable, and role changes; self-password-change reissues the active browser cookie.
+- Microsoft WinRM HTTPS validates TLS certificates by default; per-zone `dns_winrm_insecure_tls` opt-out required for lab/self-signed hosts.
+- ACME account key (`acme_account.key`) is Fernet-encrypted at rest; legacy plaintext PEM is migrated atomically and corrupt/wrong-key files fail closed.
+- Logout is POST-only; Secure cookie resolution supports `SESSION_COOKIE_SECURE` and trusted `X-Forwarded-Proto`; OpenAPI/docs default off (`OPENAPI_ENABLED`); security response headers and conditional HSTS added.
+- CSRF and CORS no longer weaken when `API_TO_DNS_ALLOW_INSECURE_DEFAULTS=1`; use explicit `API_TO_DNS_RELAX_CSRF` only in the test harness. Tracebacks require `DEBUG_ERRORS=1`.
+- Rate limits are SQLite-backed (shared across workers) and treat `Authorization: Bearer` like `X-API-Key`.
+- SSL uploads are size-bounded; App DNS names are validated before OpenSSL; SMTP defaults to STARTTLS and blocks credentialed cleartext unless `smtp_allow_insecure_auth` is set; SMTP passwords are not rendered into the settings HTML context.
+- Container runs as non-root uid/gid 10001 with pinned `python:3.12-slim` digest; Compose pins `hometinker12/api-to-dns:0.6.0`, `read_only`, `cap_drop: ALL`, `no-new-privileges`, localhost-bound ports, and `/tmp` tmpfs.
+- Docker publish workflow adds Trivy High/Critical gates, BuildKit SBOM/provenance, and keyless Cosign signing; CI actions pinned to commit SHAs where practical. Pytest moved to `requirements-dev.txt`.
+
 ## [0.6.0] - 2026-07-27
 
 ### Added

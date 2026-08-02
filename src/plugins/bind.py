@@ -1,5 +1,4 @@
 import base64
-from typing import Dict, Optional
 
 import dns.name
 import dns.query
@@ -9,7 +8,6 @@ import dns.tsig
 import dns.update
 
 from ..models import DnsRecordRequest
-
 from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
 from .utils import dns_relative_name, query_dns_records_at_name, record_existed_before_update, tcp_endpoint_host
 
@@ -27,14 +25,14 @@ class BindTsigDnsClient:
         keyname = dns.name.from_text(tsig_key_name if tsig_key_name.endswith(".") else f"{tsig_key_name}.")
         algo = dns.name.from_text(tsig_algorithm if tsig_algorithm.endswith(".") else f"{tsig_algorithm}.")
         self._key = dns.tsig.Key(keyname, secret, algorithm=algo)
-        self._keyring: Dict[dns.name.Name, dns.tsig.Key] = {keyname: self._key}
+        self._keyring: dict[dns.name.Name, dns.tsig.Key] = {keyname: self._key}
         self._keyname = keyname
 
     def create_or_update_record(
         self,
         payload: DnsRecordRequest,
-        dns_server: Optional[str] = None,
-        dns_zone: Optional[str] = None,
+        dns_server: str | None = None,
+        dns_zone: str | None = None,
     ) -> bool:
         if not dns_server:
             raise ValueError("DNS server host is required for BIND (set Target DNS Server in settings).")
@@ -90,9 +88,9 @@ class BindTsigDnsClient:
         self,
         *,
         record_name: str,
-        record_type: Optional[str] = None,
-        dns_server: Optional[str] = None,
-        dns_zone: Optional[str] = None,
+        record_type: str | None = None,
+        dns_server: str | None = None,
+        dns_zone: str | None = None,
     ):
         if not dns_server:
             raise ValueError("DNS server host is required for BIND (set Target DNS Server in settings).")
@@ -103,7 +101,7 @@ class BindTsigDnsClient:
         return query_dns_records_at_name(dns_server, zone_name, relative, record_type)
 
 
-def create_client(settings: Dict[str, Optional[str]]) -> BindTsigDnsClient:
+def create_client(settings: dict[str, str | None]) -> BindTsigDnsClient:
     return BindTsigDnsClient(
         tsig_key_name=settings.get("dns_username") or "",
         tsig_secret_b64=settings.get("dns_password") or "",
