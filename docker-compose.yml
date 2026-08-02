@@ -11,8 +11,8 @@ services:
     tmpfs:
       - /tmp:size=64M,mode=1777
     ports:
-      - "127.0.0.1:8001:8000"
-      - "127.0.0.1:8443:8443"
+      - "8001:8000"
+      - "8443:8443"
     env_file:
       - .env
     environment:
