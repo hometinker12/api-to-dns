@@ -236,7 +236,8 @@ jobs:
           fi
 
           for i in $(seq 1 60); do
-            if curl --fail --silent --max-time 5 http://127.0.0.1:8000/login >/dev/null; then
+            # Probe /health (not /login) so readiness checks do not consume RATE_LIMIT_LOGIN.
+            if curl --fail --silent --max-time 5 http://127.0.0.1:8000/health >/dev/null; then
               break
             fi
             if [ -z "$(docker ps -q -f name=dns-api-test -f status=running)" ]; then
