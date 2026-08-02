@@ -1,6 +1,6 @@
 """DNS public API helpers shared by route handlers and tests."""
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Literal
 
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse
@@ -31,12 +31,12 @@ from .zone_service import (
     provider_dns_zone,
 )
 
-ACCESS_DENIED_DETAIL: Dict[str, str] = {
+ACCESS_DENIED_DETAIL: dict[str, str] = {
     "error": "access_denied",
     "message": "You do not have access or an invalid key was provided.",
 }
 
-_MUTATION_RESPONSES: Dict[int, Dict[str, Any]] = {
+_MUTATION_RESPONSES: dict[int, dict[str, Any]] = {
     400: {"description": "Invalid request, record type, or configuration."},
     401: {"description": "API key is missing or invalid."},
     403: {"description": "API key is not allowed to use this zone, or the zone is not configured."},
@@ -45,7 +45,7 @@ _MUTATION_RESPONSES: Dict[int, Dict[str, Any]] = {
 }
 
 
-def _get_dns_client_from_settings(settings: Dict[str, Any]):
+def _get_dns_client_from_settings(settings: dict[str, Any]):
     """Resolve DNS client factory via ``app`` so tests can monkeypatch ``src.app.get_dns_client_from_settings``."""
     from . import app as app_module
 
@@ -59,7 +59,7 @@ def _resolve_dns_api_zone(
     zone_name: str,
     record_name: str,
     endpoint: str,
-) -> tuple[ApiKey, DnsZoneConfig, Dict[str, Any], Optional[str], str, str]:
+) -> tuple[ApiKey, DnsZoneConfig, dict[str, Any], str | None, str, str]:
     key = get_api_key(db, api_key)
     if key is None:
         emit_activity_event(
@@ -182,7 +182,7 @@ def _resolve_dns_api_zone(
 def _record_exists_at_type(
     client,
     *,
-    settings: Dict[str, Any],
+    settings: dict[str, Any],
     record_name: str,
     record_type: str,
 ) -> bool:
@@ -199,16 +199,16 @@ def _record_exists_at_type(
 
 def _apply_dns_mutation(
     *,
-    api_key: Optional[str],
-    zone_name: Optional[str],
+    api_key: str | None,
+    zone_name: str | None,
     record_name: str,
     record_type: str,
-    ttl: Optional[int],
-    values: List[str],
+    ttl: int | None,
+    values: list[str],
     mode: Literal["create", "replace", "patch", "delete"],
     endpoint: str,
-    patch_ttl: Optional[int] = None,
-    patch_values: Optional[List[str]] = None,
+    patch_ttl: int | None = None,
+    patch_values: list[str] | None = None,
 ):
     """Shared pre-check + mutation flow for POST/PUT/PATCH/DELETE on ``/dns-record``."""
 
@@ -411,7 +411,7 @@ def _apply_dns_mutation(
                 "patch": "updated",
                 "delete": "deleted",
             }[mode]
-            response_values: List[str] = [] if mode == "delete" else list(values)
+            response_values: list[str] = [] if mode == "delete" else list(values)
             body = DnsRecordResponse(
                 status="success",
                 action=action,

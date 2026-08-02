@@ -1,8 +1,9 @@
 import os
 import secrets
 import sys
-from passlib.context import CryptContext
+
 from cryptography.fernet import Fernet
+from passlib.context import CryptContext
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
@@ -64,6 +65,16 @@ def hash_password(password: str) -> str:
 
 def verify_password(password: str, hashed_password: str) -> bool:
     return pwd_context.verify(password, hashed_password)
+
+
+# Precomputed dummy hash so missing/disabled login attempts perform the same
+# PBKDF2 work as a real password check (constant-time login path).
+DUMMY_PASSWORD_HASH = hash_password("api-to-dns-dummy-password-for-timing")
+
+
+def debug_errors_enabled() -> bool:
+    """Return True when HTML error responses may include tracebacks."""
+    return os.getenv("DEBUG_ERRORS", "").strip().lower() in {"1", "true", "yes"}
 
 
 def generate_api_key() -> str:

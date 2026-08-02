@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import src.app as app_module
 from src import letsencrypt
 from src.auth import create_session_cookie
@@ -53,7 +51,9 @@ def test_start_enrollment_reports_progress_via_callback(monkeypatch) -> None:
         letsencrypt,
         "_acme_prepare_order",
         lambda _config: {
-            "challenges": [{"domain": "api.example.com", "dns_value": "txt-value", "name": "_acme-challenge.api.example.com"}],
+            "challenges": [
+                {"domain": "api.example.com", "dns_value": "txt-value", "name": "_acme-challenge.api.example.com"}
+            ],
             "challenge": {"domain": "api.example.com", "dns_value": "txt-value"},
             "order_resource": "{}",
             "private_key_pem": "key",

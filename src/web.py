@@ -1,6 +1,6 @@
 import html
 import traceback
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import Request
 from fastapi.responses import HTMLResponse
@@ -15,7 +15,7 @@ from .restart import is_restart_required, preview_restart_urls, restart_reason
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 
-def client_ip(request: Request) -> Optional[str]:
+def client_ip(request: Request) -> str | None:
     client = getattr(request, "client", None)
     return client.host if client else None
 
@@ -32,11 +32,11 @@ def render_access_denied_response() -> HTMLResponse:
     return HTMLResponse(
         content=(
             "<!DOCTYPE html><html><head><title>Access denied</title>"
-            "<link rel=\"stylesheet\" href=\"/static/style.css\" /></head>"
-            "<body><div class=\"page\">"
+            '<link rel="stylesheet" href="/static/style.css" /></head>'
+            '<body><div class="page">'
             "<h1>Access denied</h1>"
-            f"<div class=\"alert error\">{html.escape(ROLE_FORBIDDEN_DETAIL)}</div>"
-            "<p><a class=\"button\" href=\"/admin\">Back to dashboard</a></p>"
+            f'<div class="alert error">{html.escape(ROLE_FORBIDDEN_DETAIL)}</div>'
+            '<p><a class="button" href="/admin">Back to dashboard</a></p>'
             "</div></body></html>"
         ),
         status_code=403,
@@ -67,13 +67,10 @@ templates.env.globals["page_nav"] = _page_nav
 def render_error_response(request: Request, error: Exception, status_code: int = 500):
     traceback_text = traceback.format_exc()
     LOGGER.exception("Application error: %s", error)
-    from .security import allow_insecure_defaults
+    from .security import debug_errors_enabled
 
-    if allow_insecure_defaults():
-        detail = (
-            f"<p>{html.escape(str(error))}</p>"
-            f"<pre>{html.escape(traceback_text)}</pre>"
-        )
+    if debug_errors_enabled():
+        detail = f"<p>{html.escape(str(error))}</p><pre>{html.escape(traceback_text)}</pre>"
     else:
         detail = "<p>An unexpected error occurred. Details are available in the server logs.</p>"
     content = f"<html><body><h1>Application error</h1>{detail}</body></html>"

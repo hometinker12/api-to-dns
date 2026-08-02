@@ -14,10 +14,16 @@
 #   HTTP_PORT    — listener port when SSL is disabled (default 8000)
 #   TLS_PORT     — listener port when SSL is enabled (default 8443)
 #   SSL_ENABLED  — optional override of the DB-stored ssl_enabled toggle (1/0)
+#
+# Runs as non-root uid/gid 10001. If upgrading from a previous root-owned named
+# volume, fix ownership once (do not keep starting the app as root):
+#   docker run --rm -v api-to-dns_api-to-dns-data:/vol alpine chown -R 10001:10001 /vol
+#   docker run --rm -v api-to-dns_api-to-dns-ssl:/vol alpine chown -R 10001:10001 /vol
+#   docker run --rm -v api-to-dns_api-to-dns-logs:/vol alpine chown -R 10001:10001 /vol
 
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
 
-ARG VERSION=0.6.0
+ARG VERSION=0.6.2
 
 LABEL org.opencontainers.image.title="api-to-dns" \
       org.opencontainers.image.description="DNS REST API and admin UI (Azure, Cloudflare, Microsoft DNS, BIND/TSIG)" \
@@ -36,13 +42,13 @@ ENV PYTHONUNBUFFERED=1 \
 # openssl is used by the self-signed cert generator in src/ssl_certs.py.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends openssl \
-    && rm -rf /var/lib/apt/lists/*
-
-# Persistent state, operational logs, and SSL material.
-RUN mkdir -p /app/data /app/data/ssl /app/logs
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 app \
+    && useradd --uid 10001 --gid 10001 --home-dir /app --shell /usr/sbin/nologin app
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('pytest') is None else 1)"
 
 COPY VERSION ./VERSION
 COPY src ./src
@@ -51,7 +57,11 @@ COPY scripts ./scripts
 # (otherwise the shebang becomes "#!/bin/sh\r" and exec fails with
 # "no such file or directory"), then make it executable.
 RUN sed -i 's/\r$//' ./scripts/entrypoint.sh \
-    && chmod +x ./scripts/entrypoint.sh
+    && chmod +x ./scripts/entrypoint.sh \
+    && mkdir -p /app/data /app/data/ssl /app/logs \
+    && chown -R app:app /app
+
+USER app
 
 EXPOSE 8000 8443
 

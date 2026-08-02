@@ -1,11 +1,11 @@
 from datetime import datetime
 
-from .time_utils import utc_now
-from typing import List, Optional
-
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import Index, UniqueConstraint
-from sqlmodel import Field as SQLField, SQLModel
+from sqlmodel import Field as SQLField
+from sqlmodel import SQLModel
+
+from .time_utils import utc_now
 
 _ALLOWED_DELETE_RR = frozenset({"A", "AAAA", "CNAME", "TXT"})
 _ALLOWED_PUBLIC_RECORD_TYPES = frozenset({"A", "AAAA", "CNAME", "TXT"})
@@ -53,7 +53,7 @@ class DnsRecordRequest(BaseModel):
     the public REST API uses dedicated HTTP methods (POST/PUT/PATCH/DELETE) on ``/dns-record``.
     """
 
-    zone_name: Optional[str] = Field(
+    zone_name: str | None = Field(
         None,
         description=(
             "Configured zone name (required). Unique key for this zone configuration in the admin UI; "
@@ -65,10 +65,10 @@ class DnsRecordRequest(BaseModel):
         description="DNS record type: A, AAAA, CNAME, TXT, or DELETE (internal) to remove a record.",
     )
     record_name: str = Field(..., description="Record name relative to the zone, e.g. www")
-    ttl: Optional[int] = Field(300, description="Time to live in seconds")
-    values: List[str] = Field(
+    ttl: int | None = Field(300, description="Time to live in seconds")
+    values: list[str] = Field(
         default_factory=list,
-        description="Record values. For record_type DELETE, send the RR type to remove as the first element, e.g. [\"A\"].",
+        description='Record values. For record_type DELETE, send the RR type to remove as the first element, e.g. ["A"].',
     )
 
     @model_validator(mode="after")
@@ -99,7 +99,7 @@ def _validate_public_record_type(record_type: str) -> str:
 class DnsRecordCreateRequest(BaseModel):
     """Body for ``POST /dns-record`` (create only). Returns 409 if the record type already exists."""
 
-    zone_name: Optional[str] = Field(
+    zone_name: str | None = Field(
         None,
         description=(
             "Configured zone name (required). Unique key for this zone configuration; "
@@ -108,8 +108,8 @@ class DnsRecordCreateRequest(BaseModel):
     )
     record_type: str = Field(..., description="DNS record type: A, AAAA, CNAME, or TXT.")
     record_name: str = Field(..., description="Record name relative to the zone, e.g. www")
-    ttl: Optional[int] = Field(300, description="Time to live in seconds (default 300).")
-    values: List[str] = Field(
+    ttl: int | None = Field(300, description="Time to live in seconds (default 300).")
+    values: list[str] = Field(
         default_factory=list,
         description="Record values; must contain at least one entry.",
     )
@@ -125,7 +125,7 @@ class DnsRecordCreateRequest(BaseModel):
 class DnsRecordReplaceRequest(BaseModel):
     """Body for ``PUT /dns-record`` (full replacement). Returns 404 if the record type does not exist."""
 
-    zone_name: Optional[str] = Field(
+    zone_name: str | None = Field(
         None,
         description=(
             "Configured zone name (required). Unique key for this zone configuration; "
@@ -135,7 +135,7 @@ class DnsRecordReplaceRequest(BaseModel):
     record_type: str = Field(..., description="DNS record type: A, AAAA, CNAME, or TXT.")
     record_name: str = Field(..., description="Record name relative to the zone, e.g. www")
     ttl: int = Field(..., description="Time to live in seconds (required for full replacement).")
-    values: List[str] = Field(
+    values: list[str] = Field(
         default_factory=list,
         description="Replacement values; must contain at least one entry.",
     )
@@ -154,7 +154,7 @@ class DnsRecordPatchRequest(BaseModel):
     Send ``ttl`` and/or ``values``; omitted fields are preserved from the live record.
     """
 
-    zone_name: Optional[str] = Field(
+    zone_name: str | None = Field(
         None,
         description=(
             "Configured zone name (required). Unique key for this zone configuration; "
@@ -163,8 +163,8 @@ class DnsRecordPatchRequest(BaseModel):
     )
     record_type: str = Field(..., description="DNS record type: A, AAAA, CNAME, or TXT.")
     record_name: str = Field(..., description="Record name relative to the zone, e.g. www")
-    ttl: Optional[int] = Field(None, description="New TTL in seconds; omit to preserve the existing TTL.")
-    values: Optional[List[str]] = Field(
+    ttl: int | None = Field(None, description="New TTL in seconds; omit to preserve the existing TTL.")
+    values: list[str] | None = Field(
         None,
         description="New record values; omit to preserve existing values.",
     )
@@ -182,8 +182,8 @@ class DnsRecordPatchRequest(BaseModel):
 class DnsRecordInfo(BaseModel):
     record_name: str = Field(..., description="Record name relative to the zone, e.g. www or @")
     record_type: str = Field(..., description="DNS record type: A, AAAA, CNAME, or TXT")
-    ttl: Optional[int] = Field(None, description="Time to live in seconds when the record exists.")
-    values: Optional[List[str]] = Field(
+    ttl: int | None = Field(None, description="Time to live in seconds when the record exists.")
+    values: list[str] | None = Field(
         None,
         description="Record rdata values in the same format as POST/PUT when available from the provider.",
     )
@@ -197,7 +197,7 @@ class DnsRecordGetResponse(BaseModel):
     zone_name: str
     dns_zone: str
     record_name: str
-    records: List[DnsRecordInfo] = Field(
+    records: list[DnsRecordInfo] = Field(
         default_factory=list,
         description=(
             "Matching records at the name. Each element includes record_name, record_type, and ttl "
@@ -211,7 +211,7 @@ class DnsRecordResponse(BaseModel):
         ...,
         description=(
             'Outcome: "success" on 2xx; "error" on 4xx (e.g. 409 record_already_exists '
-            'on POST, 404 not_found on PUT/PATCH/DELETE).'
+            "on POST, 404 not_found on PUT/PATCH/DELETE)."
         ),
     )
     action: str = Field(
@@ -225,7 +225,7 @@ class DnsRecordResponse(BaseModel):
     dns_zone: str
     record_name: str
     record_type: str
-    values: List[str]
+    values: list[str]
 
 
 class DnsZoneSummary(BaseModel):
@@ -235,18 +235,33 @@ class DnsZoneSummary(BaseModel):
 
 
 class User(SQLModel, table=True):
-    id: Optional[int] = SQLField(default=None, primary_key=True)
+    id: int | None = SQLField(default=None, primary_key=True)
     username: str = SQLField(index=True, unique=True)
     password_hash: str
-    roles: Optional[str] = SQLField(default="")
+    roles: str | None = SQLField(default="")
     disabled: bool = SQLField(default=False)
+    session_version: int = SQLField(default=0)
+
+
+class RateLimitBucket(SQLModel, table=True):
+    """Shared SQLite-backed rate-limit counters for multi-worker deployments."""
+
+    __tablename__ = "rate_limit_bucket"
+    __table_args__ = (UniqueConstraint("route_prefix", "identity_hash", "window_start", name="uq_rate_limit_bucket"),)
+
+    id: int | None = SQLField(default=None, primary_key=True)
+    route_prefix: str = SQLField(index=True)
+    identity_hash: str = SQLField(index=True)
+    window_start: int = SQLField(index=True)
+    count: int = SQLField(default=0)
+    expires_at: int = SQLField(index=True)
 
 
 class ApiKey(SQLModel, table=True):
-    id: Optional[int] = SQLField(default=None, primary_key=True)
+    id: int | None = SQLField(default=None, primary_key=True)
     label: str
     key: str = SQLField(index=True, unique=True)  # SHA-256 hex digest of the raw key
-    key_prefix: Optional[str] = SQLField(default="")
+    key_prefix: str | None = SQLField(default="")
     active: bool = SQLField(default=True)
     created_at: datetime = SQLField(default_factory=utc_now)
 
@@ -256,7 +271,7 @@ class DnsZoneConfig(SQLModel, table=True):
 
     __tablename__ = "dns_zone_config"
 
-    id: Optional[int] = SQLField(default=None, primary_key=True)
+    id: int | None = SQLField(default=None, primary_key=True)
     zone_name: str = SQLField(index=True, unique=True)
     encrypted_config: str
 
@@ -267,13 +282,13 @@ class ApiKeyAllowedZone(SQLModel, table=True):
     __tablename__ = "api_key_allowed_zone"
     __table_args__ = (UniqueConstraint("api_key_id", "dns_zone_config_id", name="uq_api_key_zone"),)
 
-    id: Optional[int] = SQLField(default=None, primary_key=True)
+    id: int | None = SQLField(default=None, primary_key=True)
     api_key_id: int = SQLField(foreign_key="apikey.id", index=True)
     dns_zone_config_id: int = SQLField(foreign_key="dns_zone_config.id", index=True)
 
 
 class Setting(SQLModel, table=True):
-    id: Optional[int] = SQLField(default=None, primary_key=True)
+    id: int | None = SQLField(default=None, primary_key=True)
     name: str = SQLField(index=True, unique=True)
     value: str
 
@@ -295,37 +310,37 @@ class ActivityLog(SQLModel, table=True):
         Index("ix_activity_log_zone_name", "zone_name"),
     )
 
-    id: Optional[int] = SQLField(default=None, primary_key=True)
+    id: int | None = SQLField(default=None, primary_key=True)
     timestamp: datetime = SQLField(default_factory=utc_now)
     level: str = SQLField(default=LOG_LEVEL_INFORMATIONAL)
-    category: Optional[str] = SQLField(default=None)
+    category: str | None = SQLField(default=None)
     event_type: str = SQLField(default="")
-    status: Optional[str] = SQLField(default=None)
-    actor_type: Optional[str] = SQLField(default=None)
-    actor_id: Optional[str] = SQLField(default=None)
-    actor_label: Optional[str] = SQLField(default=None)
-    zone_name: Optional[str] = SQLField(default=None)
-    record_name: Optional[str] = SQLField(default=None)
-    message: Optional[str] = SQLField(default=None)
-    details_json: Optional[str] = SQLField(default=None)
-    request_method: Optional[str] = SQLField(default=None)
-    request_path: Optional[str] = SQLField(default=None)
-    request_status_code: Optional[int] = SQLField(default=None)
-    request_ip: Optional[str] = SQLField(default=None)
+    status: str | None = SQLField(default=None)
+    actor_type: str | None = SQLField(default=None)
+    actor_id: str | None = SQLField(default=None)
+    actor_label: str | None = SQLField(default=None)
+    zone_name: str | None = SQLField(default=None)
+    record_name: str | None = SQLField(default=None)
+    message: str | None = SQLField(default=None)
+    details_json: str | None = SQLField(default=None)
+    request_method: str | None = SQLField(default=None)
+    request_path: str | None = SQLField(default=None)
+    request_status_code: int | None = SQLField(default=None)
+    request_ip: str | None = SQLField(default=None)
 
 
 class AlertRule(SQLModel, table=True):
     __tablename__ = "alert_rule"
 
-    id: Optional[int] = SQLField(default=None, primary_key=True)
+    id: int | None = SQLField(default=None, primary_key=True)
     enabled: bool = SQLField(default=True)
     name: str = SQLField(default="")
-    event_type: Optional[str] = SQLField(default=None)
-    category: Optional[str] = SQLField(default=None)
+    event_type: str | None = SQLField(default=None)
+    category: str | None = SQLField(default=None)
     minimum_level: str = SQLField(default=LOG_LEVEL_WARNING)
-    message_contains: Optional[str] = SQLField(default=None)
+    message_contains: str | None = SQLField(default=None)
     email_recipients: str = SQLField(default="")
     email_subject_template: str = SQLField(default="")
     email_body_template: str = SQLField(default="")
     cooldown_minutes: int = SQLField(default=0)
-    last_triggered_at: Optional[datetime] = SQLField(default=None)
+    last_triggered_at: datetime | None = SQLField(default=None)

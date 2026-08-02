@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Set
+from typing import Any
 
 from fastapi import Depends, HTTPException
 from sqlmodel import select
@@ -18,13 +18,13 @@ ROLE_DNS_ZONES_UPDATE = "dns_zones.update"
 ROLE_PLUGIN_UPDATE = "plugin.update"
 ROLE_SYSTEM_UPDATE = "system.update"
 
-ROLE_DEPENDENCIES: Dict[str, str] = {
+ROLE_DEPENDENCIES: dict[str, str] = {
     ROLE_API_KEYS_UPDATE: ROLE_API_KEYS_READ,
     ROLE_DNS_ZONES_UPDATE: ROLE_DNS_ZONES_READ,
 }
-MANDATORY_ROLES: Set[str] = {ROLE_DNS_ZONES_READ}
+MANDATORY_ROLES: set[str] = {ROLE_DNS_ZONES_READ}
 
-ALL_ROLES: List[str] = [
+ALL_ROLES: list[str] = [
     ROLE_GLOBAL_ADMIN,
     ROLE_GLOBAL_READ,
     ROLE_ACCOUNT_UPDATE,
@@ -36,9 +36,27 @@ ALL_ROLES: List[str] = [
     ROLE_PLUGIN_UPDATE,
     ROLE_SYSTEM_UPDATE,
 ]
-LEGACY_DEFAULT_ROLES: Set[str] = set(ALL_ROLES) - {ROLE_GLOBAL_ADMIN}
+LEGACY_DEFAULT_ROLES: set[str] = set(ALL_ROLES) - {ROLE_GLOBAL_ADMIN}
 
-ROLE_LABELS: List[Dict[str, str]] = [
+# Roles that account.update may assign without being a global admin.
+ACCOUNT_ADMIN_GRANTABLE_ROLES: set[str] = {
+    ROLE_GLOBAL_READ,
+    ROLE_API_KEYS_READ,
+    ROLE_DNS_ZONES_READ,
+    ROLE_DNS_ZONES_UPDATE,
+}
+
+# Roles that only a global.admin may grant or remove.
+SENSITIVE_ROLES: set[str] = {
+    ROLE_GLOBAL_ADMIN,
+    ROLE_ACCOUNT_UPDATE,
+    ROLE_ACCOUNT_RESET_PASSWORD,
+    ROLE_API_KEYS_UPDATE,
+    ROLE_PLUGIN_UPDATE,
+    ROLE_SYSTEM_UPDATE,
+}
+
+ROLE_LABELS: list[dict[str, str]] = [
     {"key": ROLE_GLOBAL_ADMIN, "label": "Global: admin"},
     {"key": ROLE_GLOBAL_READ, "label": "Global: read-only"},
     {"key": ROLE_ACCOUNT_UPDATE, "label": "Account: update"},
@@ -51,7 +69,7 @@ ROLE_LABELS: List[Dict[str, str]] = [
     {"key": ROLE_SYSTEM_UPDATE, "label": "System: update"},
 ]
 
-SETTINGS_AREAS: List[Dict[str, Any]] = [
+SETTINGS_AREAS: list[dict[str, Any]] = [
     {
         "key": "authentication",
         "label": "Authentication",
@@ -79,12 +97,12 @@ SETTINGS_AREAS: List[Dict[str, Any]] = [
     },
 ]
 
-LEGACY_SETTINGS_AREA_ALIASES: Dict[str, str] = {
+LEGACY_SETTINGS_AREA_ALIASES: dict[str, str] = {
     "logging": "log_viewing",
     "activity_logging": "log_viewing",
 }
 
-SYSTEM_SETTINGS_SECTIONS: List[Dict[str, str]] = [
+SYSTEM_SETTINGS_SECTIONS: list[dict[str, str]] = [
     {"key": "system_identity", "label": "App DNS Name"},
     {"key": "ssl_certificate", "label": "SSL Certificate"},
     {"key": "smtp_delivery", "label": "SMTP Delivery"},
@@ -95,7 +113,7 @@ SYSTEM_SETTINGS_SECTIONS: List[Dict[str, str]] = [
 
 _SYSTEM_SETTINGS_SECTION_KEYS = {section["key"] for section in SYSTEM_SETTINGS_SECTIONS}
 
-_LEGACY_SYSTEM_SETTINGS_SECTION_ALIASES: Dict[str, str] = {
+_LEGACY_SYSTEM_SETTINGS_SECTION_ALIASES: dict[str, str] = {
     "ssl_planned": "ssl_certificate",
 }
 
@@ -104,7 +122,7 @@ def default_system_settings_section() -> str:
     return SYSTEM_SETTINGS_SECTIONS[0]["key"]
 
 
-def normalize_system_settings_section(section: Optional[str]) -> str:
+def normalize_system_settings_section(section: str | None) -> str:
     key = (section or "").strip().lower()
     key = _LEGACY_SYSTEM_SETTINGS_SECTION_ALIASES.get(key, key)
     if key in _SYSTEM_SETTINGS_SECTION_KEYS:
@@ -115,7 +133,7 @@ def normalize_system_settings_section(section: Optional[str]) -> str:
 ROLE_FORBIDDEN_DETAIL = "You do not have permission to access this resource."
 
 
-def parse_roles(raw: Optional[str]) -> Set[str]:
+def parse_roles(raw: str | None) -> set[str]:
     if not raw:
         return set()
     return {part.strip() for part in raw.split(",") if part.strip()}
@@ -129,7 +147,7 @@ def serialize_roles(roles) -> str:
     return ",".join(sorted(cleaned))
 
 
-def normalize_selected_roles(roles) -> List[str]:
+def normalize_selected_roles(roles) -> list[str]:
     selected = {r for r in roles if r in ALL_ROLES}
     if ROLE_GLOBAL_ADMIN in selected:
         return sorted(ALL_ROLES)
@@ -140,13 +158,13 @@ def normalize_selected_roles(roles) -> List[str]:
     return sorted(selected)
 
 
-def effective_roles(stored_roles: Set[str]) -> Set[str]:
+def effective_roles(stored_roles: set[str]) -> set[str]:
     if ROLE_GLOBAL_ADMIN in stored_roles:
         return set(ALL_ROLES)
     return stored_roles | MANDATORY_ROLES
 
 
-def get_user_roles(db, username: str) -> Set[str]:
+def get_user_roles(db, username: str) -> set[str]:
     user_row = db.exec(select(User).where(User.username == username)).first()
     if user_row is None:
         return set()
@@ -155,8 +173,10 @@ def get_user_roles(db, username: str) -> Set[str]:
 
 def user_has_role(db, username: str, role: str) -> bool:
     roles = get_user_roles(db, username)
-    return ROLE_GLOBAL_ADMIN in roles or role in roles or (
-        ROLE_GLOBAL_READ in roles and role in {ROLE_API_KEYS_READ, ROLE_DNS_ZONES_READ}
+    return (
+        ROLE_GLOBAL_ADMIN in roles
+        or role in roles
+        or (ROLE_GLOBAL_READ in roles and role in {ROLE_API_KEYS_READ, ROLE_DNS_ZONES_READ})
     )
 
 
@@ -172,10 +192,65 @@ def target_is_global_admin(target: User) -> bool:
     return ROLE_GLOBAL_ADMIN in effective_roles(parse_roles(target.roles))
 
 
-def global_admin_guard_message(db, actor: str, target: User) -> Optional[str]:
+def global_admin_guard_message(db, actor: str, target: User) -> str | None:
     if target_is_global_admin(target) and not user_is_global_admin(db, actor):
         return "Only a global admin can manage another global admin account."
     return None
+
+
+def role_is_grantable_by(actor_is_global_admin: bool, role: str) -> bool:
+    """Return True when ``actor`` may assign ``role`` to another account."""
+    if role not in ALL_ROLES:
+        return False
+    if actor_is_global_admin:
+        return True
+    return role in ACCOUNT_ADMIN_GRANTABLE_ROLES
+
+
+def validate_role_assignment(
+    db,
+    actor: str,
+    selected_roles,
+    *,
+    previous_roles: set[str] | None = None,
+) -> str | None:
+    """Validate that ``actor`` may assign ``selected_roles``.
+
+    Returns an error message when the assignment is forbidden, otherwise ``None``.
+    Account admins may only grant roles in ``ACCOUNT_ADMIN_GRANTABLE_ROLES`` and may
+    not add or remove sensitive roles on an existing account.
+    """
+    selected = set(normalize_selected_roles(selected_roles))
+    previous = set(previous_roles or set())
+    actor_is_ga = user_is_global_admin(db, actor)
+    if actor_is_ga:
+        return None
+
+    # Account admins may keep previously assigned sensitive roles, but may not
+    # add or remove them. Newly selected non-grantable roles are rejected.
+    newly_selected = selected - previous
+    disallowed = sorted(
+        role for role in newly_selected if role not in ACCOUNT_ADMIN_GRANTABLE_ROLES and role not in MANDATORY_ROLES
+    )
+    if disallowed:
+        return "Only a global admin can grant sensitive roles: " + ", ".join(disallowed) + "."
+
+    removed_sensitive = sorted((previous - selected) & SENSITIVE_ROLES)
+    if removed_sensitive:
+        return "Only a global admin can remove sensitive roles: " + ", ".join(removed_sensitive) + "."
+    return None
+
+
+def role_catalog_for_actor(db, actor: str) -> list[dict[str, Any]]:
+    """Return ROLE_LABELS annotated with whether the actor may grant each role."""
+    actor_is_ga = user_is_global_admin(db, actor)
+    catalog: list[dict[str, Any]] = []
+    for entry in ROLE_LABELS:
+        item = dict(entry)
+        item["grantable"] = role_is_grantable_by(actor_is_ga, entry["key"])
+        item["sensitive"] = entry["key"] in SENSITIVE_ROLES
+        catalog.append(item)
+    return catalog
 
 
 def require_role(role: str):
@@ -188,7 +263,7 @@ def require_role(role: str):
     return _dependency
 
 
-def user_public_dict(u: User) -> Dict[str, Any]:
+def user_public_dict(u: User) -> dict[str, Any]:
     stored_roles = parse_roles(u.roles)
     display_roles = stored_roles or LEGACY_DEFAULT_ROLES
     effective_display_roles = effective_roles(display_roles)
@@ -203,7 +278,7 @@ def user_public_dict(u: User) -> Dict[str, Any]:
     }
 
 
-def accessible_settings_areas(user_roles: Set[str]) -> List[Dict[str, str]]:
+def accessible_settings_areas(user_roles: set[str]) -> list[dict[str, str]]:
     return [
         area
         for area in SETTINGS_AREAS

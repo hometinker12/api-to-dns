@@ -2,19 +2,28 @@
 
 from __future__ import annotations
 
+import os
 from urllib.parse import urlparse
 
 from fastapi import Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from .http_utils import api_key_from_headers, wants_json_response
-from .security import allow_insecure_defaults
 
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
 _EXEMPT_PREFIXES = (
     "/.well-known/",
     "/static/",
 )
+
+
+def relax_csrf_for_tests() -> bool:
+    """Return True only when ``API_TO_DNS_RELAX_CSRF=1`` (test harness).
+
+    Intentionally independent of ``API_TO_DNS_ALLOW_INSECURE_DEFAULTS`` so
+    crypto placeholders never weaken CSRF or CORS.
+    """
+    return os.getenv("API_TO_DNS_RELAX_CSRF", "").strip().lower() in {"1", "true", "yes"}
 
 
 def _host_matches(url: str, host: str) -> bool:
@@ -57,10 +66,9 @@ def csrf_origin_allowed(request: Request) -> bool:
     referer = request.headers.get("referer")
     if referer:
         return _host_matches(referer, host)
-    # Browsers send Origin on cross-site POSTs; missing both is common in
-    # TestClient and some non-browser clients. Allow only when insecure
-    # defaults are explicitly permitted (tests/dev).
-    return allow_insecure_defaults()
+    # Browsers send Origin on cross-site POSTs. Missing both Origin and Referer
+    # fails closed unless an explicit test-only override is set.
+    return relax_csrf_for_tests()
 
 
 def csrf_rejection_response(request: Request):

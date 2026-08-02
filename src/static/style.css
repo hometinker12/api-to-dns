@@ -34,6 +34,10 @@ header {
 .nav-links {
   flex-wrap: nowrap;
 }
+.nav-links form.inline-form {
+  display: inline;
+  margin: 0;
+}
 .actions {
   flex-wrap: wrap;
 }

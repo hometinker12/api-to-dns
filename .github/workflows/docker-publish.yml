@@ -1,3 +1,7 @@
+# Publish Docker image on push to main (or workflow_dispatch).
+# After a successful publish, creates a GitHub Release + v* tag when VERSION
+# does not already have a matching tag (typical after a version-bumped
+# release → main merge).
 name: Publish Docker image
 
 on:
@@ -20,14 +24,16 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
           cache: pip
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+        run: python -m pip install -r requirements-dev.txt
       - name: Run tests
         run: python -m pytest
 
@@ -35,12 +41,14 @@ jobs:
     name: Build and smoke-test container
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v6
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Build smoke-test image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: ./Dockerfile
@@ -51,7 +59,18 @@ jobs:
           cache-from: type=gha,scope=container-smoke
           cache-to: type=gha,mode=max,scope=container-smoke
 
-      - name: Run container smoke test
+      - name: Scan smoke image with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: api-to-dns:smoke-${{ github.sha }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          trivyignores: .trivyignore
+
+      - name: Run hardened container smoke test
         shell: bash
         run: |
           set -euo pipefail
@@ -68,12 +87,30 @@ jobs:
 
           docker run -d \
             --name "$CONTAINER_NAME" \
+            --user 10001:10001 \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --tmpfs /tmp:size=64M,mode=1777 \
+            --tmpfs /app/data:size=64M,uid=10001,gid=10001,mode=1755 \
+            --tmpfs /app/logs:size=16M,uid=10001,gid=10001,mode=1755 \
             -p 127.0.0.1:8000:8000 \
             -e "ENCRYPTION_KEY=$ENC_KEY" \
             -e "SECRET_KEY=$SESSION_KEY" \
             -e "ADMIN_USER=admin" \
             -e "ADMIN_PASSWORD=container-smoke-password" \
             "$IMAGE_TAG"
+
+          UID_IN_CONTAINER="$(docker exec "$CONTAINER_NAME" id -u)"
+          if [ "$UID_IN_CONTAINER" = "0" ]; then
+            echo "Container process is running as root"
+            exit 1
+          fi
+
+          if docker exec "$CONTAINER_NAME" python -c "import pytest" 2>/dev/null; then
+            echo "pytest must not be importable in the production image"
+            exit 1
+          fi
 
           for attempt in $(seq 1 30); do
             if curl --fail --silent --show-error http://127.0.0.1:8000/health; then
@@ -94,8 +131,11 @@ jobs:
     needs: container-smoke
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Read and validate version
         id: version
@@ -108,18 +148,18 @@ jobs:
           fi
           echo "value=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Generate image metadata
         id: metadata
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
@@ -129,14 +169,19 @@ jobs:
           labels: |
             org.opencontainers.image.version=${{ steps.version.outputs.value }}
 
-      - name: Build and push
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+
+      - name: Build and push multi-arch image
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: ./Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          sbom: true
+          provenance: mode=max
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
           build-args: |
@@ -144,7 +189,93 @@ jobs:
           cache-from: type=gha,scope=container-smoke
           cache-to: type=gha,mode=max,scope=container-smoke
 
+      - name: Keyless sign published digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${IMAGE_NAME}@${DIGEST}"
+
       - name: Write publication summary
         run: |
           echo "Published \`${{ env.IMAGE_NAME }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "Digest: \`${{ steps.build.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Cosign: keyless signature attached to digest" >> "$GITHUB_STEP_SUMMARY"
+          echo "SBOM/provenance: BuildKit attestations enabled (sbom=true, provenance=mode=max)" >> "$GITHUB_STEP_SUMMARY"
+
+  github-release:
+    name: Create GitHub Release
+    needs: publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Read and validate version
+        id: version
+        shell: bash
+        run: |
+          VERSION="$(tr -d '\r\n' < VERSION)"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid VERSION value: $VERSION"
+            exit 1
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create release if tag is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.value }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; skipping."
+            echo "Skipped: release \`$TAG\` already exists." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          NOTES_FILE="$(mktemp)"
+          NOTES_VERSION="$VERSION" NOTES_PATH="$NOTES_FILE" \
+          NOTES_IMAGE="$IMAGE_NAME" NOTES_SHA="${GITHUB_SHA}" \
+          python3 <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ["NOTES_VERSION"]
+          notes_path = Path(os.environ["NOTES_PATH"])
+          image_name = os.environ["NOTES_IMAGE"]
+          sha = os.environ["NOTES_SHA"]
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          pattern = re.compile(
+              rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|\Z)",
+              re.MULTILINE | re.DOTALL,
+          )
+          match = pattern.search(changelog)
+          if match and match.group(1).strip():
+              body = match.group(1).strip() + "\n"
+          else:
+              body = (
+                  f"Release {version}.\n\n"
+                  f"- Docker image: `{image_name}:{version}`\n"
+                  f"- Commit: `{sha}`\n"
+              )
+          notes_path.write_text(body, encoding="utf-8")
+          PY
+
+          URL="$(gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file "$NOTES_FILE" \
+            --target "${GITHUB_SHA}")"
+
+          echo "Created release: $URL"
+          echo "Created GitHub Release: $URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "Docker image: \`${IMAGE_NAME}:${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"

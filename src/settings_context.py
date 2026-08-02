@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from fastapi import Request
 from sqlmodel import select
@@ -15,13 +15,13 @@ from .activity_logging import (
     system_identity,
 )
 from .db import SessionLocal
+from .letsencrypt import config_view as letsencrypt_config_view
 from .models import LOG_CATEGORY_VALUES, LOG_LEVEL_VALUES, AlertRule, User
 from .rbac import (
     ROLE_ACCOUNT_RESET_PASSWORD,
     ROLE_ACCOUNT_UPDATE,
     ROLE_GLOBAL_ADMIN,
     ROLE_GLOBAL_READ,
-    ROLE_LABELS,
     ROLE_PLUGIN_UPDATE,
     ROLE_SYSTEM_UPDATE,
     SYSTEM_SETTINGS_SECTIONS,
@@ -29,12 +29,16 @@ from .rbac import (
     default_system_settings_section,
     get_user_roles,
     normalize_system_settings_section,
+    role_catalog_for_actor,
     user_public_dict,
 )
+from .restart import is_restart_required
 from .settings_store import get_setting
 from .ssl_certs import (
     DEFAULT_HTTP_PORT,
     DEFAULT_TLS_PORT,
+    SOURCE_LETSENCRYPT,
+    access_url,
     cert_exists,
     cert_metadata,
     cert_paths,
@@ -42,14 +46,11 @@ from .ssl_certs import (
     is_ssl_enabled,
     tls_port,
 )
-from .letsencrypt import config_view as letsencrypt_config_view
-from .restart import is_restart_required
-from .ssl_certs import SOURCE_LETSENCRYPT, access_url
 from .web import nav_context, templates
 from .zone_service import dns_provider_options_with_state
 
 LOG_SEARCH_PAGE_SIZE = 25
-ALERT_TEMPLATE_VARIABLES: List[Dict[str, str]] = [
+ALERT_TEMPLATE_VARIABLES: list[dict[str, str]] = [
     {"name": "{event_type}", "description": "Activity event identifier (e.g. dns.record_created)"},
     {"name": "{level}", "description": "Event severity: VERBOSE, INFORMATIONAL, WARNING, or ERROR"},
     {"name": "{category}", "description": "Event category, such as security, http, dns, alert, system, or user"},
@@ -62,22 +63,25 @@ ALERT_TEMPLATE_VARIABLES: List[Dict[str, str]] = [
     {"name": "{record_name}", "description": "DNS record name (if any)"},
     {"name": "{details}", "description": "JSON-encoded sanitized event detail payload"},
     {"name": "{system_dns_name}", "description": "Configured app DNS name (System Settings → App DNS Name)"},
-    {"name": "{system_ip_address}", "description": "Detected system IP address (or Docker container runtime message when containerized)"},
+    {
+        "name": "{system_ip_address}",
+        "description": "Detected system IP address (or Docker container runtime message when containerized)",
+    },
 ]
 
 
 def settings_context(
     request: Request,
     user: str,
-    area: Optional[str],
-    message: Optional[str] = None,
+    area: str | None,
+    message: str | None = None,
     message_kind: str = "success",
-    auth_form_error: Optional[str] = None,
-    auth_form_username: Optional[str] = None,
-    auth_form_selected_roles: Optional[List[str]] = None,
-    log_search_params: Optional[Dict[str, Any]] = None,
-    section: Optional[str] = None,
-) -> Dict[str, Any]:
+    auth_form_error: str | None = None,
+    auth_form_username: str | None = None,
+    auth_form_selected_roles: list[str] | None = None,
+    log_search_params: dict[str, Any] | None = None,
+    section: str | None = None,
+) -> dict[str, Any]:
     with SessionLocal() as db:
         user_roles = get_user_roles(db, user)
         can_view_accounts = bool(
@@ -107,9 +111,9 @@ def settings_context(
         )
         system_settings_sections = list(SYSTEM_SETTINGS_SECTIONS) if can_access_system_settings else []
 
-        system_settings_view: Optional[Dict[str, Any]] = None
-        log_view: Optional[Dict[str, Any]] = None
-        alert_view: Optional[Dict[str, Any]] = None
+        system_settings_view: dict[str, Any] | None = None
+        log_view: dict[str, Any] | None = None
+        alert_view: dict[str, Any] | None = None
 
         if requested_area in {"system_settings", "log_viewing", "email_alerting"} and (
             ROLE_GLOBAL_READ in user_roles or ROLE_SYSTEM_UPDATE in user_roles
@@ -157,7 +161,17 @@ def settings_context(
                     {"value": 180, "label": "180 days"},
                     {"value": 365, "label": "365 days"},
                 ],
-                "smtp": {**smtp, "password_set": bool(smtp.get("password"))},
+                "smtp": {
+                    "servers": smtp.get("servers") or [],
+                    "port": smtp.get("port"),
+                    "anonymous": bool(smtp.get("anonymous")),
+                    "username": smtp.get("username") or "",
+                    "from_address": smtp.get("from_address") or "",
+                    "security": smtp.get("security") or activity_logging.DEFAULT_SMTP_SECURITY,
+                    "timeout": smtp.get("timeout"),
+                    "allow_insecure_auth": bool(smtp.get("allow_insecure_auth")),
+                    "password_set": bool(smtp.get("password_set") or smtp.get("password")),
+                },
                 "ssl": ssl_status,
                 "operational_log": {
                     "log_file": get_setting(db, activity_logging.SETTING_LOG_FILE) or "",
@@ -255,7 +269,7 @@ def settings_context(
         "accessible_areas": accessible,
         "selected_area": requested_area,
         "users": users_view,
-        "role_catalog": ROLE_LABELS,
+        "role_catalog": role_catalog_for_actor(db, user) if can_view_accounts else [],
         "plugins": plugin_options,
         "message": message,
         "message_kind": message_kind,
@@ -277,7 +291,7 @@ def settings_context(
     }
 
 
-def render_settings(request: Request, user: str, area: Optional[str], **kwargs: Any):
+def render_settings(request: Request, user: str, area: str | None, **kwargs: Any):
     return templates.TemplateResponse(
         request=request,
         name="settings.html",

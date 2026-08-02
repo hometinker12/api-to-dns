@@ -19,6 +19,9 @@ on:
       - develop
       - release
 
+permissions:
+  contents: read
+
 jobs:
   pytest:
     name: pytest (ubuntu)
@@ -34,7 +37,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-dev.txt
 
       - name: Run pytest
         run: python -m pytest
@@ -207,10 +210,34 @@ jobs:
             exit 1
           fi
 
-          docker run -d --name dns-api-test --network "${NETWORK_NAME}" --env-file .env -p 8000:8000 "$IMAGE_TAG"
+          # Image USER default must be non-root even without an explicit --user override.
+          DEFAULT_IMAGE_USER="$(docker run --rm --entrypoint id "$IMAGE_TAG" -u)"
+          if [ "${DEFAULT_IMAGE_USER}" = "0" ]; then
+            echo "Image default USER is root; Dockerfile must set USER app (10001)"
+            exit 1
+          fi
+
+          docker run -d --name dns-api-test --network "${NETWORK_NAME}" \
+            --read-only \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --tmpfs /tmp:size=64M,mode=1777 \
+            --tmpfs /app/data:size=64M,uid=10001,gid=10001,mode=1755 \
+            --tmpfs /app/logs:size=16M,uid=10001,gid=10001,mode=1755 \
+            --env-file .env \
+            -e RATE_LIMIT_LOGIN=3:8 \
+            -p 127.0.0.1:8000:8000 \
+            "$IMAGE_TAG"
+
+          UID_IN_CONTAINER="$(docker exec dns-api-test id -u)"
+          if [ "$UID_IN_CONTAINER" = "0" ]; then
+            echo "API container process is running as root"
+            exit 1
+          fi
 
           for i in $(seq 1 60); do
-            if curl --fail --silent --max-time 5 http://localhost:8000/login >/dev/null; then
+            # Probe /health (not /login) so readiness checks do not consume RATE_LIMIT_LOGIN.
+            if curl --fail --silent --max-time 5 http://127.0.0.1:8000/health >/dev/null; then
               break
             fi
             if [ -z "$(docker ps -q -f name=dns-api-test -f status=running)" ]; then
@@ -220,24 +247,105 @@ jobs:
             sleep 2
           done
 
-          echo "[bind] Login as admin"
-          curl --fail --silent -c /tmp/cookies -X POST http://localhost:8000/login \
+          echo "[bind] Security defaults: OpenAPI/docs off, headers, CSRF, logout method"
+          for path in /openapi.json /docs /redoc; do
+            code="$(curl --silent --show-error -o /dev/null -w "%{http_code}" "http://127.0.0.1:8000${path}")"
+            if [ "${code}" != "404" ]; then
+              echo "Expected ${path} to return 404 when OPENAPI_ENABLED is unset; got ${code}"
+              exit 1
+            fi
+          done
+          curl --fail --silent -D /tmp/health-headers -o /dev/null http://127.0.0.1:8000/health
+          python3 - <<'PY'
+          from pathlib import Path
+          headers = Path("/tmp/health-headers").read_text(encoding="utf-8", errors="replace").lower()
+          for name in (
+              "x-content-type-options: nosniff",
+              "x-frame-options: deny",
+              "referrer-policy: same-origin",
+              "content-security-policy:",
+          ):
+              assert name in headers, f"missing security header: {name}\n{headers}"
+          PY
+          logout_get_code="$(curl --silent --show-error -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/logout)"
+          if [ "${logout_get_code}" != "405" ]; then
+            echo "Expected GET /logout to return 405; got ${logout_get_code}"
+            exit 1
+          fi
+
+          echo "[bind] Login rate limit (RATE_LIMIT_LOGIN=3:8) before other /login probes"
+          for i in $(seq 1 4); do
+            rl_code="$(curl --silent --show-error -o /dev/null -w "%{http_code}" -X POST http://127.0.0.1:8000/login \
+              -H "Content-Type: application/x-www-form-urlencoded" \
+              -H "Origin: http://127.0.0.1:8000" \
+              -H "Referer: http://127.0.0.1:8000/login" \
+              -d "username=nobody&password=wrong-password")"
+            if [ "${i}" -le 3 ] && [ "${rl_code}" = "429" ]; then
+              echo "Login rate-limited too early on attempt ${i}"
+              exit 1
+            fi
+            if [ "${i}" -eq 4 ] && [ "${rl_code}" != "429" ]; then
+              echo "Expected 429 on 4th login attempt; got ${rl_code}"
+              exit 1
+            fi
+          done
+          # Wait for the short login window to expire before CSRF + real login.
+          sleep 9
+
+          csrf_code="$(curl --silent --show-error -o /dev/null -w "%{http_code}" -X POST http://127.0.0.1:8000/login \
             -H "Content-Type: application/x-www-form-urlencoded" \
-            -H "Origin: http://localhost:8000" \
-            -H "Referer: http://localhost:8000/login" \
+            -H "Origin: https://evil.example" \
+            -d "username=admin&password=your-admin-password")"
+          if [ "${csrf_code}" != "403" ]; then
+            echo "Expected cross-origin login POST to return 403; got ${csrf_code}"
+            exit 1
+          fi
+
+          echo "[bind] Login as admin"
+          curl --fail --silent -c /tmp/cookies -D /tmp/login-headers -X POST http://127.0.0.1:8000/login \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/login" \
             -d "username=admin&password=your-admin-password" \
             -o /dev/null
+          python3 - <<'PY'
+          from pathlib import Path
+          headers = Path("/tmp/login-headers").read_text(encoding="utf-8", errors="replace")
+          assert "set-cookie:" in headers.lower(), headers
+          # HTTP smoke has no TLS; Secure cookie must not be forced unless SESSION_COOKIE_SECURE=1.
+          cookie_lines = [line for line in headers.splitlines() if line.lower().startswith("set-cookie:")]
+          assert cookie_lines, headers
+          assert all("secure" not in line.lower() for line in cookie_lines), cookie_lines
+          PY
           echo "[bind] Verify admin page"
-          curl --fail --silent -b /tmp/cookies http://localhost:8000/admin | python3 -c "import sys; assert 'api-to-dns App Dashboard' in sys.stdin.read()"
+          curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/admin | python3 -c "import sys; assert 'api-to-dns App Dashboard' in sys.stdin.read()"
+
+          echo "[bind] POST logout clears session"
+          curl --fail --silent -b /tmp/cookies -c /tmp/cookies -X POST http://127.0.0.1:8000/logout \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/admin" \
+            -o /dev/null
+          admin_after_logout="$(curl --silent --show-error -o /dev/null -w "%{http_code}" -b /tmp/cookies http://127.0.0.1:8000/admin)"
+          if [ "${admin_after_logout}" != "303" ] && [ "${admin_after_logout}" != "401" ] && [ "${admin_after_logout}" != "302" ]; then
+            # Unauthenticated browser /admin redirects to /login (303) via exception handler.
+            echo "Expected unauthenticated /admin after logout; got ${admin_after_logout}"
+            exit 1
+          fi
+          curl --fail --silent -c /tmp/cookies -X POST http://127.0.0.1:8000/login \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/login" \
+            -d "username=admin&password=your-admin-password" \
+            -o /dev/null
 
           for zone in smoke.test denied.test; do
             echo "[bind] Configure zone ${zone}"
             zone_body="/tmp/zone-create-${zone}.html"
-            zone_status="$(curl --silent --show-error -b /tmp/cookies -X POST http://localhost:8000/zones \
+            zone_status="$(curl --silent --show-error -b /tmp/cookies -X POST http://127.0.0.1:8000/zones \
               -w "%{http_code}" \
               -H "Content-Type: application/x-www-form-urlencoded" \
-              -H "Origin: http://localhost:8000" \
-              -H "Referer: http://localhost:8000/zones" \
+              -H "Origin: http://127.0.0.1:8000" \
+              -H "Referer: http://127.0.0.1:8000/zones" \
               --data-urlencode "zone_name=${zone}" \
               --data-urlencode "dns_zone=${zone}" \
               --data-urlencode "dns_provider_type=bind" \
@@ -254,15 +362,15 @@ jobs:
           done
 
           echo "[bind] Fetch API key management page"
-          curl --fail --silent -b /tmp/cookies http://localhost:8000/api-keys -o /tmp/api-keys.html
+          curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/api-keys -o /tmp/api-keys.html
           SMOKE_ZONE_ID="$(python3 -c 'import re; html=open("/tmp/api-keys.html", encoding="utf-8").read(); match=re.search(r"name=\"zone_ids\" value=\"(\d+)\"\s*/>\s*<code>smoke\.test</code>", html, re.DOTALL); assert match, "Could not find smoke.test zone ID"; print(match.group(1))')"
           : "${SMOKE_ZONE_ID:?Could not extract smoke.test zone ID}"
 
           echo "[bind] Create API key for smoke.test"
-          curl --fail --silent -L -b /tmp/cookies -X POST http://localhost:8000/api-keys \
+          curl --fail --silent -L -b /tmp/cookies -X POST http://127.0.0.1:8000/api-keys \
             -H "Content-Type: application/x-www-form-urlencoded" \
-            -H "Origin: http://localhost:8000" \
-            -H "Referer: http://localhost:8000/api-keys" \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/api-keys" \
             --data-urlencode "label=bind-smoke-test" \
             --data-urlencode "zone_ids=${SMOKE_ZONE_ID}" \
             -o /tmp/api-key-create.html
@@ -271,7 +379,7 @@ jobs:
           : "${API_KEY:?Could not extract API key}"
 
           echo "[bind] Validate API key with /keycheck"
-          curl --fail --silent -H "X-API-Key: $API_KEY" http://localhost:8000/keycheck \
+          curl --fail --silent -H "X-API-Key: $API_KEY" http://127.0.0.1:8000/keycheck \
             | python3 -c "import json, sys; assert json.load(sys.stdin)['status'] == 'success'"
 
           call_dns_api() {
@@ -335,8 +443,8 @@ jobs:
             exit 1
           }
 
-          DNS_RECORD_URL='http://localhost:8000/dns-record'
-          DELETE_SMOKE_URL='http://localhost:8000/dns-record?zone_name=smoke.test&record_name=www&record_type=A'
+          DNS_RECORD_URL='http://127.0.0.1:8000/dns-record'
+          DELETE_SMOKE_URL='http://127.0.0.1:8000/dns-record?zone_name=smoke.test&record_name=www&record_type=A'
 
           call_dns_api POST 200 created "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.10"]}'
           wait_for_record_value www.smoke.test 192.0.2.10
@@ -352,6 +460,72 @@ jobs:
           call_dns_api DELETE 404 not_found "${DELETE_SMOKE_URL}" ''
           call_dns_api PUT 404 not_found "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.40"]}'
           call_dns_api POST 403 access_denied "${DNS_RECORD_URL}" '{"zone_name":"denied.test","record_type":"A","record_name":"blocked","ttl":300,"values":["192.0.2.55"]}'
+
+          echo "[compose] Validate hardened Compose config and startup against the smoke image"
+          APP_VERSION="$(tr -d '\r\n' < VERSION)"
+          docker tag "${IMAGE_TAG}" "hometinker12/api-to-dns:${APP_VERSION}"
+          APP_VERSION="${APP_VERSION}" python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          expected_image = f"hometinker12/api-to-dns:{os.environ['APP_VERSION']}"
+          cfg = json.loads(subprocess.check_output(["docker", "compose", "config", "--format", "json"], text=True))
+          svc = cfg["services"]["dns-api"]
+          assert svc.get("image") == expected_image, (svc.get("image"), expected_image)
+          assert str(svc.get("user") or "") in {"10001:10001", "10001"}, svc.get("user")
+          assert svc.get("read_only") is True, svc
+          cap_drop = {str(item).upper() for item in (svc.get("cap_drop") or [])}
+          assert "ALL" in cap_drop, cap_drop
+          security_opt = [str(item) for item in (svc.get("security_opt") or [])]
+          assert any("no-new-privileges" in item for item in security_opt), security_opt
+          ports = svc.get("ports") or []
+
+          def _has_mapping(published: str, target: int) -> bool:
+              return any(
+                  isinstance(port, dict)
+                  and str(port.get("published")) == published
+                  and int(port.get("target") or 0) == target
+                  # host_ip may be omitted (all interfaces) or set to 127.0.0.1
+                  and str(port.get("host_ip") or "") in {"", "0.0.0.0", "127.0.0.1"}
+                  for port in ports
+              )
+
+          assert _has_mapping("8001", 8000), ports
+          assert _has_mapping("8443", 8443), ports
+          targets = {
+              volume.get("target")
+              for volume in (svc.get("volumes") or [])
+              if isinstance(volume, dict)
+          }
+          assert {"/app/data", "/app/data/ssl", "/app/logs"} <= targets, targets
+          print("compose config hardening assertions passed")
+          PY
+          docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+          docker compose up -d --no-build
+          for i in $(seq 1 60); do
+            if curl --fail --silent --max-time 5 http://127.0.0.1:8001/health >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          curl --fail --silent http://127.0.0.1:8001/health >/dev/null
+          COMPOSE_UID="$(docker compose exec -T dns-api id -u | tr -d '\r')"
+          if [ "${COMPOSE_UID}" = "0" ]; then
+            echo "Compose service process is running as root"
+            docker compose logs dns-api || true
+            docker compose down -v --remove-orphans || true
+            exit 1
+          fi
+          curl --fail --silent -c /tmp/compose-cookies -X POST http://127.0.0.1:8001/login \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "Origin: http://127.0.0.1:8001" \
+            -H "Referer: http://127.0.0.1:8001/login" \
+            -d "username=admin&password=your-admin-password" \
+            -o /dev/null
+          curl --fail --silent -b /tmp/compose-cookies http://127.0.0.1:8001/admin \
+            | python3 -c "import sys; assert 'api-to-dns App Dashboard' in sys.stdin.read()"
+          docker compose down -v --remove-orphans
 
           echo "BIND smoke on Linux completed successfully."
 
@@ -490,7 +664,7 @@ jobs:
           $workspace = $env:GITHUB_WORKSPACE
           Set-Location $workspace
 
-          $base = 'http://localhost:8000'
+          $base = 'http://127.0.0.1:8000'
           $apiProcess = $null
           $apiOut = Join-Path $env:RUNNER_TEMP 'api-to-dns-uvicorn.out.log'
           $apiErr = Join-Path $env:RUNNER_TEMP 'api-to-dns-uvicorn.err.log'
@@ -790,6 +964,8 @@ jobs:
                 }
                 if ($env:REMOTE_WINRM_SSL -in @('true', 'True', '1')) {
                   $form['dns_winrm_ssl'] = 'true'
+                  # Ephemeral self-signed lab hosts only; production must leave this unchecked.
+                  $form['dns_winrm_insecure_tls'] = 'true'
                 }
                 $zoneResp = Invoke-FormPost -Uri "$base/zones" -WebSession $WebSession -Form $form
                 if ($zoneResp.StatusCode -ne 200 -or (

@@ -1,6 +1,6 @@
 import json
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set
+from datetime import UTC, datetime
+from typing import Any
 
 from sqlmodel import select
 
@@ -48,6 +48,7 @@ DISABLED_DNS_PLUGINS_SETTING = "disabled_dns_plugins"
 class DnsProviderDisabledError(RuntimeError):
     """Raised when a zone's DNS provider plugin has been disabled in Settings."""
 
+
 LEGACY_DNS_SETTING_NAMES = [
     "dns_provider_type",
     "dns_server",
@@ -68,18 +69,18 @@ def normalize_zone_name(zone: str) -> str:
     return zone.strip().rstrip(".").lower()
 
 
-def provider_dns_zone(settings: Dict[str, Any]) -> str:
+def provider_dns_zone(settings: dict[str, Any]) -> str:
     zone = normalize_zone_name(str(settings.get("dns_zone") or ""))
     if not zone:
         raise ValueError("DNS zone (domain) is required in the zone configuration.")
     return zone
 
 
-def get_dns_provider_options() -> List[dict]:
+def get_dns_provider_options() -> list[dict]:
     return provider_options_for_template()
 
 
-def get_known_dns_provider_keys() -> Set[str]:
+def get_known_dns_provider_keys() -> set[str]:
     return {plugin["key"] for plugin in get_dns_provider_options()}
 
 
@@ -93,7 +94,7 @@ def create_dns_client_from_settings(settings: dict, db=None):
     return create_dns_client(settings)
 
 
-def get_disabled_dns_plugins(db) -> Set[str]:
+def get_disabled_dns_plugins(db) -> set[str]:
     raw = get_setting(db, DISABLED_DNS_PLUGINS_SETTING)
     if not raw:
         return set()
@@ -116,9 +117,9 @@ def set_disabled_dns_plugins(db, plugin_keys) -> None:
         delete_setting(db, DISABLED_DNS_PLUGINS_SETTING)
 
 
-def dns_provider_options_with_state(db) -> List[dict]:
+def dns_provider_options_with_state(db) -> list[dict]:
     disabled = get_disabled_dns_plugins(db)
-    options: List[dict] = []
+    options: list[dict] = []
     for plugin in get_dns_provider_options():
         row = dict(plugin)
         row["enabled"] = row["key"] not in disabled
@@ -127,25 +128,25 @@ def dns_provider_options_with_state(db) -> List[dict]:
     return options
 
 
-def enabled_dns_provider_options(db) -> List[dict]:
+def enabled_dns_provider_options(db) -> list[dict]:
     return [plugin for plugin in dns_provider_options_with_state(db) if plugin["enabled"]]
 
 
-def list_dns_zones(db) -> List[DnsZoneConfig]:
+def list_dns_zones(db) -> list[DnsZoneConfig]:
     return sorted(db.exec(select(DnsZoneConfig)).all(), key=lambda z: z.zone_name)
 
 
-def decode_zone_config(row: DnsZoneConfig) -> Dict[str, Any]:
+def decode_zone_config(row: DnsZoneConfig) -> dict[str, Any]:
     raw = decrypt_value(row.encrypted_config)
     return json.loads(raw)
 
 
-def encode_zone_config_dict(cfg: Dict[str, Any]) -> str:
+def encode_zone_config_dict(cfg: dict[str, Any]) -> str:
     return encrypt_value(json.dumps(cfg))
 
 
-def zones_using_dns_provider(db, provider_key: str) -> List[str]:
-    matches: List[str] = []
+def zones_using_dns_provider(db, provider_key: str) -> list[str]:
+    matches: list[str] = []
     for zone in list_dns_zones(db):
         settings = decode_zone_config(zone)
         provider = (settings.get("dns_provider_type") or "azure").strip().lower()
@@ -178,16 +179,16 @@ def migrate_legacy_dns_settings_if_needed(db) -> None:
     db.add(row)
     db.commit()
     db.refresh(row)
-    for key in db.exec(select(ApiKey).where(ApiKey.active == True)).all():
+    for key in db.exec(select(ApiKey).where(ApiKey.active.is_(True))).all():
         db.add(ApiKeyAllowedZone(api_key_id=key.id, dns_zone_config_id=row.id))
     db.commit()
     for name in LEGACY_DNS_SETTING_NAMES:
         delete_setting(db, name)
 
 
-def api_key_allowed_zone_names(db, api_key_id: int) -> List[str]:
+def api_key_allowed_zone_names(db, api_key_id: int) -> list[str]:
     links = db.exec(select(ApiKeyAllowedZone).where(ApiKeyAllowedZone.api_key_id == api_key_id)).all()
-    names: List[str] = []
+    names: list[str] = []
     for link in links:
         z = db.get(DnsZoneConfig, link.dns_zone_config_id)
         if z:
@@ -196,9 +197,7 @@ def api_key_allowed_zone_names(db, api_key_id: int) -> List[str]:
 
 
 def api_key_count_for_zone(db, zone_id: int) -> int:
-    links = db.exec(
-        select(ApiKeyAllowedZone).where(ApiKeyAllowedZone.dns_zone_config_id == zone_id)
-    ).all()
+    links = db.exec(select(ApiKeyAllowedZone).where(ApiKeyAllowedZone.dns_zone_config_id == zone_id)).all()
     return len(links)
 
 
@@ -216,7 +215,7 @@ def _is_api_key_dns_usage(row: ActivityLog) -> bool:
     return status in ("success", "not_found")
 
 
-def api_key_last_used_at(db, api_key_id: int) -> Optional[datetime]:
+def api_key_last_used_at(db, api_key_id: int) -> datetime | None:
     rows = db.exec(
         select(ActivityLog)
         .where(ActivityLog.actor_type == "api_key")
@@ -229,17 +228,17 @@ def api_key_last_used_at(db, api_key_id: int) -> Optional[datetime]:
     return None
 
 
-def format_api_key_last_used_label(last_used: Optional[datetime]) -> str:
+def format_api_key_last_used_label(last_used: datetime | None) -> str:
     if last_used is None:
         return "Never used"
     if last_used.tzinfo is None:
-        last_used = last_used.replace(tzinfo=timezone.utc)
+        last_used = last_used.replace(tzinfo=UTC)
     else:
-        last_used = last_used.astimezone(timezone.utc)
+        last_used = last_used.astimezone(UTC)
     return last_used.strftime("%Y-%m-%d %H:%M UTC")
 
 
-def dns_zone_admin_dict(db, z: DnsZoneConfig) -> Dict[str, Any]:
+def dns_zone_admin_dict(db, z: DnsZoneConfig) -> dict[str, Any]:
     from . import letsencrypt
 
     base = dns_zone_public_dict(z)
@@ -250,7 +249,7 @@ def dns_zone_admin_dict(db, z: DnsZoneConfig) -> Dict[str, Any]:
     return base
 
 
-def dns_zone_public_dict(z: DnsZoneConfig) -> Dict[str, Any]:
+def dns_zone_public_dict(z: DnsZoneConfig) -> dict[str, Any]:
     cfg = decode_zone_config(z)
     provider_key = cfg.get("dns_provider_type", "") or "azure"
     dns_zone = (cfg.get("dns_zone") or "").strip()
@@ -264,18 +263,18 @@ def dns_zone_public_dict(z: DnsZoneConfig) -> Dict[str, Any]:
     }
 
 
-def dns_zone_summary_dict(z: DnsZoneConfig) -> Dict[str, Any]:
+def dns_zone_summary_dict(z: DnsZoneConfig) -> dict[str, Any]:
     cfg = decode_zone_config(z)
     return {"id": z.id, "zone_name": z.zone_name, "dns_zone": provider_dns_zone(cfg)}
 
 
-def api_key_public_dict(k: ApiKey) -> Dict[str, Any]:
+def api_key_public_dict(k: ApiKey) -> dict[str, Any]:
     # Never expose the stored hash; UI shows the non-secret prefix only.
     display = (k.key_prefix or "").strip() or "********"
     return {"id": k.id, "label": k.label, "key": display, "key_prefix": display, "active": k.active}
 
 
-def api_key_admin_dict(db, k: ApiKey) -> Dict[str, Any]:
+def api_key_admin_dict(db, k: ApiKey) -> dict[str, Any]:
     base = api_key_public_dict(k)
     key_id = k.id
     assert key_id is not None
@@ -290,7 +289,7 @@ def get_api_key(db, api_key: str):
     from .security import hash_api_key
 
     digest = hash_api_key(api_key)
-    return db.exec(select(ApiKey).where(ApiKey.key == digest, ApiKey.active == True)).first()
+    return db.exec(select(ApiKey).where(ApiKey.key == digest, ApiKey.active.is_(True))).first()
 
 
 def _blank_preserve_secret(new_val: str, old_val: str) -> str:
@@ -299,9 +298,9 @@ def _blank_preserve_secret(new_val: str, old_val: str) -> str:
 
 def build_zone_config_from_form(
     form,
-    existing: Optional[Dict[str, Any]] = None,
-    provider_plugins: Optional[List[dict]] = None,
-) -> Dict[str, Any]:
+    existing: dict[str, Any] | None = None,
+    provider_plugins: list[dict] | None = None,
+) -> dict[str, Any]:
     ex = existing or {}
     provider = (form.get("dns_provider_type") or ex.get("dns_provider_type") or "azure").strip().lower()
     plugins = provider_plugins if provider_plugins is not None else get_dns_provider_options()
@@ -314,7 +313,7 @@ def build_zone_config_from_form(
         available = ", ".join(p["key"] for p in plugins) or "none"
         raise ValueError(f"Unknown DNS provider type: {provider}. Available providers: {available}.")
 
-    cfg: Dict[str, Any] = {"dns_provider_type": provider}
+    cfg: dict[str, Any] = {"dns_provider_type": provider}
     for field in plugin["fields"]:
         name = field["name"]
         if field["type"] == "checkbox":
@@ -330,12 +329,12 @@ def build_zone_config_from_form(
 
 
 def test_zone_record_lookup(
-    cfg: Dict[str, Any],
+    cfg: dict[str, Any],
     *,
     record_name: str,
-    record_type: Optional[str] = None,
+    record_type: str | None = None,
     db=None,
-) -> List[DnsRecordInfo]:
+) -> list[DnsRecordInfo]:
     client = create_dns_client_from_settings(cfg, db=db)
     return client.get_record(
         record_name=record_name,

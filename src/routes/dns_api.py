@@ -1,5 +1,3 @@
-from typing import Optional
-
 from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from starlette.status import HTTP_404_NOT_FOUND, HTTP_409_CONFLICT
@@ -72,8 +70,8 @@ router = APIRouter(tags=["dns"])
     },
 )
 def keycheck(
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+    authorization: str | None = Header(None, alias="Authorization"),
 ):
     api_key = api_key_from_headers(x_api_key, authorization)
 
@@ -109,12 +107,12 @@ def keycheck(
 def get_dns_record(
     zone_name: str = Query(..., description="DNS zone name. Must match a configured zone allowed for this API key."),
     record_name: str = Query(..., description="Record name relative to the zone, e.g. www or @"),
-    record_type: Optional[str] = Query(
+    record_type: str | None = Query(
         None,
         description="Optional DNS record type: A, AAAA, CNAME, or TXT. Omit to return all supported types at the name.",
     ),
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+    authorization: str | None = Header(None, alias="Authorization"),
 ):
     api_key = api_key_from_headers(x_api_key, authorization)
 
@@ -242,8 +240,8 @@ def get_dns_record(
 )
 def create_dns_record(
     payload: DnsRecordCreateRequest,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+    authorization: str | None = Header(None, alias="Authorization"),
 ):
     api_key = api_key_from_headers(x_api_key, authorization)
     return _apply_dns_mutation(
@@ -277,8 +275,8 @@ def create_dns_record(
 )
 def replace_dns_record(
     payload: DnsRecordReplaceRequest,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+    authorization: str | None = Header(None, alias="Authorization"),
 ):
     api_key = api_key_from_headers(x_api_key, authorization)
     return _apply_dns_mutation(
@@ -312,8 +310,8 @@ def replace_dns_record(
 )
 def patch_dns_record(
     payload: DnsRecordPatchRequest,
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+    authorization: str | None = Header(None, alias="Authorization"),
 ):
     api_key = api_key_from_headers(x_api_key, authorization)
     return _apply_dns_mutation(
@@ -352,8 +350,8 @@ def delete_dns_record(
     zone_name: str = Query(..., description="DNS zone name. Must match a configured zone allowed for this API key."),
     record_name: str = Query(..., description="Record name relative to the zone, e.g. www or @"),
     record_type: str = Query(..., description="DNS record type to remove: A, AAAA, CNAME, or TXT."),
-    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(None, alias="Authorization"),
+    x_api_key: str | None = Header(None, alias="X-API-Key"),
+    authorization: str | None = Header(None, alias="Authorization"),
 ):
     api_key = api_key_from_headers(x_api_key, authorization)
     try:

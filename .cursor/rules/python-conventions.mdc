@@ -1,0 +1,36 @@
+---
+description: Python and FastAPI conventions for api-to-dns source and tests
+globs: "{src,tests}/**/*.py"
+alwaysApply: false
+---
+
+# Python conventions (api-to-dns)
+
+## Layout
+
+- Application code lives under `src/`; pytest under `tests/`.
+- Prefer new HTTP routes in `src/routes/` over growing `src/app.py`.
+- DNS provider logic belongs in `src/plugins/` implementing the plugin base contract.
+
+## Style and lint
+
+- Target Python 3.12; Ruff config in `pyproject.toml` (line length 120, rules E/F/I/UP).
+- Run before commit: `python -m ruff check src tests` and `python -m ruff format --check src tests`.
+
+## Security defaults
+
+- Never log or return raw API keys, zone passwords, TSIG secrets, or SMTP passwords.
+- Fail fast when `ENCRYPTION_KEY` / `SECRET_KEY` are missing in production (`API_TO_DNS_ALLOW_INSECURE_DEFAULTS=1` is test-only).
+- Browser POSTs need CSRF; JSON API routes use `X-API-Key` or session auth as appropriate.
+- Sanitize DNS provider errors before returning them to clients; log full detail server-side.
+
+## Tests
+
+- Use fixtures from `tests/conftest.py` for isolated SQLite and test settings.
+- Mock external DNS/WinRM/ACME calls; integration behavior is covered by CI smoke workflows.
+- Name tests `tests/test_<module>.py` matching the module under test.
+
+## Version and docs
+
+- User-visible changes need `CHANGELOG.md` `[Unreleased]` entries.
+- New env vars need `.env.example` entries with safe placeholders.

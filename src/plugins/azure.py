@@ -1,7 +1,4 @@
-from typing import Dict, List, Optional
-
 from ..models import DnsRecordInfo, DnsRecordRequest
-
 from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
 from .utils import lookup_record_types_to_query
 
@@ -16,9 +13,7 @@ class AzureDnsClient:
         resource_group: str,
     ):
         if not tenant_id or not client_id or not client_secret:
-            raise ValueError(
-                "Azure DNS requires tenant id, client id, and client secret in application settings."
-            )
+            raise ValueError("Azure DNS requires tenant id, client id, and client secret in application settings.")
         if not subscription_id:
             raise ValueError("Azure DNS requires subscription id in zone settings.")
         if not resource_group:
@@ -29,10 +24,7 @@ class AzureDnsClient:
             from azure.mgmt.dns import DnsManagementClient
             from azure.mgmt.dns.models import RecordSet
         except ImportError as e:
-            raise ImportError(
-                "Azure SDK not installed. Install azure-identity and azure-mgmt-dns: "
-                f"{e}"
-            ) from e
+            raise ImportError(f"Azure SDK not installed. Install azure-identity and azure-mgmt-dns: {e}") from e
 
         self.credential = ClientSecretCredential(tenant_id, client_id, client_secret)
         self.DnsManagementClient = DnsManagementClient
@@ -44,8 +36,8 @@ class AzureDnsClient:
     def create_or_update_record(
         self,
         payload: DnsRecordRequest,
-        dns_server: Optional[str] = None,
-        dns_zone: Optional[str] = None,
+        dns_server: str | None = None,
+        dns_zone: str | None = None,
     ) -> bool:
         if dns_server:
             raise ValueError("Azure DNS ignores per-server host settings; use Azure fields on the zone configuration.")
@@ -102,10 +94,10 @@ class AzureDnsClient:
         self,
         *,
         record_name: str,
-        record_type: Optional[str] = None,
-        dns_server: Optional[str] = None,
-        dns_zone: Optional[str] = None,
-    ) -> List[DnsRecordInfo]:
+        record_type: str | None = None,
+        dns_server: str | None = None,
+        dns_zone: str | None = None,
+    ) -> list[DnsRecordInfo]:
         if dns_server:
             raise ValueError("Azure DNS ignores per-server host settings; use Azure fields on the zone configuration.")
         if not dns_zone:
@@ -115,7 +107,7 @@ class AzureDnsClient:
         display_name = record_set_name
         client = self.DnsManagementClient(self.credential, self.subscription_id)
         types_to_query = lookup_record_types_to_query(record_type)
-        results: List[DnsRecordInfo] = []
+        results: list[DnsRecordInfo] = []
         for rt in types_to_query:
             existing = self._get_existing_record_set(
                 client,
@@ -131,7 +123,7 @@ class AzureDnsClient:
     def _record_set_to_info(self, record_set, display_name: str, record_type: str) -> DnsRecordInfo:
         ttl = int(record_set.ttl or 300)
         rt = record_type.upper()
-        values: List[str] = []
+        values: list[str] = []
         if rt == "A":
             values = [r.ipv4_address for r in (record_set.a_records or [])]
         elif rt == "AAAA":
@@ -165,7 +157,7 @@ class AzureDnsClient:
         except self.ResourceNotFoundError:
             return None
 
-    def _build_record_set(self, record_type: str, values: List[str], ttl: int):
+    def _build_record_set(self, record_type: str, values: list[str], ttl: int):
         if record_type == "A":
             return self.RecordSet(ttl=ttl, a_records=[{"ipv4_address": value} for value in values])
         if record_type == "AAAA":
@@ -177,7 +169,7 @@ class AzureDnsClient:
         raise ValueError(f"Unsupported record type: {record_type}")
 
 
-def create_client(settings: Dict[str, Optional[str]]) -> AzureDnsClient:
+def create_client(settings: dict[str, str | None]) -> AzureDnsClient:
     return AzureDnsClient(
         tenant_id=settings.get("azure_tenant_id") or "",
         client_id=settings.get("azure_client_id") or "",

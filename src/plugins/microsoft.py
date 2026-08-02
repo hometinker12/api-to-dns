@@ -1,9 +1,8 @@
 import json
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from ..models import DnsRecordInfo, DnsRecordRequest
-
 from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
 from .utils import dns_relative_name, lookup_record_types_to_query, ps_single_quoted, winrm_rr_type
 
@@ -27,12 +26,19 @@ class MicrosoftWinRmDnsClient:
         "denied access",
     )
 
-    def __init__(self, username: str, password: str, use_ssl: bool = False):
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        use_ssl: bool = False,
+        insecure_tls: bool = False,
+    ):
         if not username or not password:
             raise ValueError("Microsoft DNS (WinRM) requires username and password in settings.")
         self.username = username
         self.password = password
         self.use_ssl = use_ssl
+        self.insecure_tls = bool(insecure_tls)
 
     @classmethod
     def _looks_like_access_denied(cls, text: str) -> bool:
@@ -46,9 +52,10 @@ class MicrosoftWinRmDnsClient:
             raise ImportError("pywinrm is required for Microsoft DNS (WinRM). Install pywinrm.") from e
 
         transport = "ssl" if self.use_ssl else "ntlm"
-        kwargs: Dict[str, Any] = {"transport": transport}
+        kwargs: dict[str, Any] = {"transport": transport}
         if self.use_ssl:
-            kwargs["server_cert_validation"] = "ignore"
+            # Validate the WinRM HTTPS certificate unless the zone explicitly opts out.
+            kwargs["server_cert_validation"] = "ignore" if self.insecure_tls else "validate"
         return winrm.Session(server, (self.username, self.password), **kwargs)
 
     def _run_ps_with_retry(self, server: str, script: str):
@@ -62,15 +69,11 @@ class MicrosoftWinRmDnsClient:
                 combined = f"{stderr}\n{stdout}"
                 if result.status_code != 0:
                     if self._looks_like_access_denied(combined):
-                        raise RuntimeError(
-                            f"WinRM/PowerShell failed ({result.status_code}): {stderr or stdout}"
-                        )
+                        raise RuntimeError(f"WinRM/PowerShell failed ({result.status_code}): {stderr or stdout}")
                     if attempt + 1 < self._WINRM_MAX_ATTEMPTS:
                         time.sleep(self._WINRM_RETRY_DELAY_SEC)
                         continue
-                    raise RuntimeError(
-                        f"WinRM/PowerShell failed ({result.status_code}): {stderr or stdout}"
-                    )
+                    raise RuntimeError(f"WinRM/PowerShell failed ({result.status_code}): {stderr or stdout}")
                 return result
             except ImportError:
                 raise
@@ -92,11 +95,13 @@ class MicrosoftWinRmDnsClient:
     def create_or_update_record(
         self,
         payload: DnsRecordRequest,
-        dns_server: Optional[str] = None,
-        dns_zone: Optional[str] = None,
+        dns_server: str | None = None,
+        dns_zone: str | None = None,
     ) -> bool:
         if not dns_server:
-            raise ValueError("DNS server host is required for Microsoft DNS (set Target DNS Server to the DNS/DC WinRM endpoint).")
+            raise ValueError(
+                "DNS server host is required for Microsoft DNS (set Target DNS Server to the DNS/DC WinRM endpoint)."
+            )
         zone = (dns_zone or "").strip()
         if not zone:
             raise ValueError("DNS zone (domain) is required in the zone configuration.")
@@ -115,7 +120,7 @@ class MicrosoftWinRmDnsClient:
             existed = self._record_exists(dns_server, zone, name_at, ps_rr)
             if not existed:
                 return False
-            lines: List[str] = [
+            lines: list[str] = [
                 "$ErrorActionPreference = 'Stop'",
                 f"$ComputerName = {ps_single_quoted(dns_server)}",
                 f"$ZoneName = {ps_single_quoted(zone)}",
@@ -133,7 +138,7 @@ class MicrosoftWinRmDnsClient:
 
         existed = self._record_exists(dns_server, zone, name_at, winrm_rr_type(record_type))
 
-        lines: List[str] = [
+        lines: list[str] = [
             "$ErrorActionPreference = 'Stop'",
             f"$ComputerName = {ps_single_quoted(dns_server)}",
             f"$ZoneName = {ps_single_quoted(zone)}",
@@ -204,12 +209,14 @@ class MicrosoftWinRmDnsClient:
         self,
         *,
         record_name: str,
-        record_type: Optional[str] = None,
-        dns_server: Optional[str] = None,
-        dns_zone: Optional[str] = None,
-    ) -> List[DnsRecordInfo]:
+        record_type: str | None = None,
+        dns_server: str | None = None,
+        dns_zone: str | None = None,
+    ) -> list[DnsRecordInfo]:
         if not dns_server:
-            raise ValueError("DNS server host is required for Microsoft DNS (set Target DNS Server to the DNS/DC WinRM endpoint).")
+            raise ValueError(
+                "DNS server host is required for Microsoft DNS (set Target DNS Server to the DNS/DC WinRM endpoint)."
+            )
         zone = (dns_zone or "").strip()
         if not zone:
             raise ValueError("DNS zone (domain) is required in the zone configuration.")
@@ -218,7 +225,7 @@ class MicrosoftWinRmDnsClient:
         name_at = "@" if name == "@" else name
 
         types_to_query = lookup_record_types_to_query(record_type)
-        results: List[DnsRecordInfo] = []
+        results: list[DnsRecordInfo] = []
         for rt in types_to_query:
             info = self._get_record_details(dns_server, zone, name_at, rt)
             if info is not None:
@@ -231,7 +238,7 @@ class MicrosoftWinRmDnsClient:
         zone: str,
         name: str,
         api_rr_type: str,
-    ) -> Optional[DnsRecordInfo]:
+    ) -> DnsRecordInfo | None:
         ps_rr = winrm_rr_type(api_rr_type)
         ps = (
             "Import-Module DnsServer -ErrorAction SilentlyContinue\n"
@@ -283,12 +290,19 @@ class MicrosoftWinRmDnsClient:
         return out.startswith("yes")
 
 
-def create_client(settings: Dict[str, Optional[str]]) -> MicrosoftWinRmDnsClient:
-    use_ssl = (settings.get("dns_winrm_ssl") or "").lower() in ("1", "true", "yes", "on")
+def _truthy_setting(value: str | None) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def create_client(settings: dict[str, str | None]) -> MicrosoftWinRmDnsClient:
+    use_ssl = _truthy_setting(settings.get("dns_winrm_ssl"))
+    # Absent dns_winrm_insecure_tls means certificate validation is enabled.
+    insecure_tls = _truthy_setting(settings.get("dns_winrm_insecure_tls"))
     return MicrosoftWinRmDnsClient(
         username=settings.get("dns_username") or "",
         password=settings.get("dns_password") or "",
         use_ssl=use_ssl,
+        insecure_tls=insecure_tls,
     )
 
 
@@ -296,7 +310,11 @@ PLUGIN = DnsProviderPlugin(
     key="microsoft",
     label="Microsoft DNS (WinRM)",
     heading="Microsoft DNS (WinRM)",
-    help_text="Use a DNS server or domain controller that accepts WinRM connections. The account must have rights to manage records in the zone.",
+    help_text=(
+        "Use a DNS server or domain controller that accepts WinRM connections. "
+        "The account must have rights to manage records in the zone. "
+        "HTTPS WinRM validates the server certificate by default."
+    ),
     fields=[
         DNS_ZONE_DOMAIN_FIELD,
         PluginField("dns_server", "Target DNS Server", placeholder="dc01.corp.local or 192.0.2.10"),
@@ -309,6 +327,16 @@ PLUGIN = DnsProviderPlugin(
             preserve_on_blank=True,
         ),
         PluginField("dns_winrm_ssl", "Use HTTPS WinRM (port 5986)", type="checkbox"),
+        PluginField(
+            "dns_winrm_insecure_tls",
+            "Disable WinRM TLS certificate validation (insecure)",
+            type="checkbox",
+            help=(
+                "WARNING: Disables certificate validation for HTTPS WinRM. "
+                "Use only for lab hosts with self-signed certificates. "
+                "Leave unchecked in production so the server certificate is verified."
+            ),
+        ),
     ],
     create_client=create_client,
 )

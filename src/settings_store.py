@@ -1,12 +1,10 @@
-from typing import Optional
-
 from sqlmodel import select
 
 from .models import Setting
 from .security import decrypt_value, encrypt_value
 
 
-def get_setting(db, name: str) -> Optional[str]:
+def get_setting(db, name: str) -> str | None:
     record = db.exec(select(Setting).where(Setting.name == name)).first()
     return decrypt_value(record.value) if record else None
 

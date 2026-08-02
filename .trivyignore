@@ -1,0 +1,4 @@
+# Reviewed, time-bounded vulnerability exceptions for Trivy image scans.
+# Add CVE IDs here only after documenting risk acceptance and an expiry note.
+# Example:
+# CVE-2024-XXXXX  # expires 2026-12-31 — tracked upstream issue URL

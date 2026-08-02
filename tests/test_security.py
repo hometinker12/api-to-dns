@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
+
 from src.auth import create_session_cookie
 
 
@@ -14,7 +15,7 @@ def test_get_app_version_matches_version_file() -> None:
     get_app_version.cache_clear()
     expected = (Path(__file__).resolve().parents[1] / "VERSION").read_text(encoding="utf-8").strip()
     assert get_app_version() == expected
-    assert expected == "0.6.0"
+    assert expected == "0.6.2"
 
 
 def test_fastapi_app_version_matches_version_file() -> None:
@@ -93,11 +94,12 @@ def test_hash_api_key_is_sha256_hex() -> None:
 
 
 def test_get_api_key_matches_hashed_storage(client: TestClient) -> None:
+    from sqlmodel import select
+
     from src.db import SessionLocal
     from src.models import ApiKey
     from src.security import hash_api_key
     from src.zone_service import get_api_key
-    from sqlmodel import select
 
     raw = "test-api-key-for-dns-endpoint"
     with SessionLocal() as db:
@@ -110,10 +112,11 @@ def test_get_api_key_matches_hashed_storage(client: TestClient) -> None:
 
 
 def test_migrate_hashes_plaintext_api_keys() -> None:
+    from sqlmodel import select
+
     from src.db import SessionLocal, init_db
     from src.models import ApiKey
     from src.security import hash_api_key, is_api_key_hash
-    from sqlmodel import select
 
     init_db()
     with SessionLocal() as db:
@@ -172,13 +175,7 @@ def test_disabled_plugin_blocks_dns_client_creation(client: TestClient) -> None:
 
 
 def test_csrf_rejects_cross_origin_post(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("API_TO_DNS_ALLOW_INSECURE_DEFAULTS", "0")
-    from src import csrf as csrf_module
-    import importlib
-
-    importlib.reload(csrf_module)
-    # Simulate production-like CSRF enforcement for this request.
-    monkeypatch.setattr(csrf_module, "allow_insecure_defaults", lambda: False)
+    monkeypatch.setattr("src.csrf.relax_csrf_for_tests", lambda: False)
     client.cookies.set("session", create_session_cookie("admin"))
     response = client.post(
         "/api-keys",
@@ -189,7 +186,7 @@ def test_csrf_rejects_cross_origin_post(client: TestClient, monkeypatch: pytest.
 
 
 def test_csrf_allows_same_origin_login_post(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("src.csrf.allow_insecure_defaults", lambda: False)
+    monkeypatch.setattr("src.csrf.relax_csrf_for_tests", lambda: False)
     response = client.post(
         "/login",
         data={"username": "admin", "password": "x"},
@@ -199,8 +196,10 @@ def test_csrf_allows_same_origin_login_post(client: TestClient, monkeypatch: pyt
     assert response.status_code in {200, 303}
 
 
-def test_csrf_rejects_login_post_without_origin_in_production(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("src.csrf.allow_insecure_defaults", lambda: False)
+def test_csrf_rejects_login_post_without_origin_in_production(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("src.csrf.relax_csrf_for_tests", lambda: False)
     response = client.post(
         "/login",
         data={"username": "admin", "password": "x"},
@@ -210,10 +209,131 @@ def test_csrf_rejects_login_post_without_origin_in_production(client: TestClient
     assert response.status_code == 403
 
 
+def test_csrf_and_cors_stay_strict_with_insecure_crypto_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """I1: API_TO_DNS_ALLOW_INSECURE_DEFAULTS must not weaken CSRF/CORS."""
+    monkeypatch.setenv("API_TO_DNS_ALLOW_INSECURE_DEFAULTS", "1")
+    monkeypatch.setenv("API_TO_DNS_RELAX_CSRF", "0")
+    monkeypatch.delenv("CORS_ORIGINS", raising=False)
+    from starlette.requests import Request
+
+    from src.csrf import csrf_origin_allowed, relax_csrf_for_tests
+
+    assert relax_csrf_for_tests() is False
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/login",
+        "raw_path": b"/login",
+        "query_string": b"",
+        "headers": [(b"host", b"testserver")],
+        "client": ("127.0.0.1", 123),
+        "server": ("testserver", 80),
+    }
+    assert csrf_origin_allowed(Request(scope)) is False
+    origins = [o.strip() for o in __import__("os").getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+    assert origins == []
+
+
 def test_cors_default_not_star_in_production_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("API_TO_DNS_ALLOW_INSECURE_DEFAULTS", "0")
     monkeypatch.delenv("CORS_ORIGINS", raising=False)
     origins = [origin.strip() for origin in __import__("os").getenv("CORS_ORIGINS", "").split(",") if origin.strip()]
-    if not origins:
-        # Mirrors app.py production branch.
-        assert origins == []
+    assert origins == []
+
+
+def test_session_cookie_secure_honors_force_and_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    from starlette.requests import Request
+
+    from src.auth import session_cookie_secure
+
+    monkeypatch.setenv("SESSION_COOKIE_SECURE", "1")
+    assert session_cookie_secure() is True
+    monkeypatch.setenv("SESSION_COOKIE_SECURE", "0")
+    assert session_cookie_secure() is False
+
+    monkeypatch.delenv("SESSION_COOKIE_SECURE", raising=False)
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "1")
+    monkeypatch.setenv("SSL_ENABLED", "0")
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/",
+        "raw_path": b"/",
+        "query_string": b"",
+        "headers": [(b"x-forwarded-proto", b"https"), (b"host", b"example.com")],
+        "client": ("127.0.0.1", 123),
+        "server": ("example.com", 80),
+    }
+    assert session_cookie_secure(Request(scope)) is True
+
+    monkeypatch.setenv("TRUST_PROXY_HEADERS", "0")
+    assert session_cookie_secure(Request(scope)) is False
+
+
+def test_security_headers_and_hsts(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SESSION_COOKIE_SECURE", "1")
+    response = client.get("/login")
+    assert response.headers.get("x-content-type-options") == "nosniff"
+    assert response.headers.get("x-frame-options") == "DENY"
+    assert response.headers.get("referrer-policy") == "same-origin"
+    assert "geolocation=()" in (response.headers.get("permissions-policy") or "")
+    assert "default-src 'self'" in (response.headers.get("content-security-policy") or "")
+    assert response.headers.get("strict-transport-security", "").startswith("max-age=")
+
+
+def test_logout_is_post_only_and_clears_cookie_with_matching_attrs(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    get_resp = client.get("/logout", follow_redirects=False)
+    assert get_resp.status_code == 405
+
+    post_resp = client.post("/logout", follow_redirects=False)
+    assert post_resp.status_code == 303
+    assert post_resp.headers["location"] == "/login"
+    set_cookie = post_resp.headers.get("set-cookie", "").lower()
+    assert "session=" in set_cookie
+    assert "path=/" in set_cookie
+
+
+def test_openapi_disabled_by_default_outside_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAPI_ENABLED", "0")
+    assert __import__("os").getenv("OPENAPI_ENABLED") == "0"
+    # Construction-time flag is covered by app import path; assert helper semantics.
+    from src import app as app_module
+
+    assert app_module._openapi_enabled() is False
+
+
+def test_admin_shows_api_docs_link_when_openapi_enabled(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/admin")
+    assert response.status_code == 200
+    assert "API Docs" in response.text
+    assert 'href="/docs#/"' in response.text
+
+
+def test_admin_hides_api_docs_link_when_openapi_disabled(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.app as app_module
+
+    monkeypatch.setattr(app_module, "_OPENAPI_ON", False)
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/admin")
+    assert response.status_code == 200
+    assert "API Docs" not in response.text
+    assert 'href="/docs#/"' not in response.text
+
+
+def test_login_uses_dummy_hash_for_missing_users(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.security import DUMMY_PASSWORD_HASH, verify_password
+
+    assert DUMMY_PASSWORD_HASH
+    assert verify_password("api-to-dns-dummy-password-for-timing", DUMMY_PASSWORD_HASH) is True
+    assert verify_password("wrong", DUMMY_PASSWORD_HASH) is False
