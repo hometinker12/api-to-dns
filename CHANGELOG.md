@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-08-02
+
+### Security
+
+- Bump `cryptography` to 48.0.1 (GHSA-537c-gmf6-5ccf) and `python-multipart` to 0.0.30 (CVE-2026-53539).
+- Release BIND/Docker smoke scans the built image with Trivy (High/Critical, same gate as Docker publish).
+
+### Changed
+
+- Application version metadata aligned to **0.6.3** (`VERSION`, OpenAPI, `pyproject.toml`, Docker label, Compose pin).
+
 ## [0.6.2] - 2026-08-02
 
 ### Security
