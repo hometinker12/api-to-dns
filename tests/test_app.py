@@ -1,5 +1,4 @@
-import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
@@ -21,13 +20,13 @@ from src.activity_logging import (
 )
 from src.app import (
     ALL_ROLES,
-    ROLE_GLOBAL_ADMIN,
     ROLE_ACCOUNT_RESET_PASSWORD,
     ROLE_ACCOUNT_UPDATE,
     ROLE_API_KEYS_READ,
     ROLE_API_KEYS_UPDATE,
     ROLE_DNS_ZONES_READ,
     ROLE_DNS_ZONES_UPDATE,
+    ROLE_GLOBAL_ADMIN,
     ROLE_GLOBAL_READ,
     ROLE_PLUGIN_UPDATE,
     ROLE_SYSTEM_UPDATE,
@@ -35,14 +34,12 @@ from src.app import (
     app,
     encode_zone_config_dict,
     get_user_roles,
-    user_has_role,
     normalize_zone_name,
-    set_disabled_dns_plugins,
+    user_has_role,
 )
 from src.auth import SESSION_IDLE_TIMEOUT_SECONDS, create_session_cookie
 from src.db import SessionLocal, init_db
 from src.dns_client import create_dns_client, discover_plugins, dns_provider_display_name
-from src.zone_service import provider_dns_zone
 from src.models import (
     LOG_CATEGORY_SECURITY,
     LOG_LEVEL_ERROR,
@@ -59,6 +56,7 @@ from src.models import (
 from src.plugins.bind import BindTsigDnsClient
 from src.security import hash_api_key, hash_password
 from src.time_utils import utc_now
+from src.zone_service import provider_dns_zone
 
 
 def test_root_redirects_to_login_without_session(client: TestClient) -> None:
@@ -267,6 +265,8 @@ def test_zone_form_renders_plugins_from_metadata(client: TestClient) -> None:
     assert 'name="cloudflare_api_token"' in response.text
     assert 'name="cloudflare_proxied"' in response.text
     assert 'name="dns_winrm_ssl"' in response.text
+    assert 'name="dns_winrm_insecure_tls"' in response.text
+    assert "Disable WinRM TLS certificate validation" in response.text
     assert 'name="dns_tsig_algorithm"' in response.text
     assert 'id="zone-test-btn"' in response.text
     assert 'id="test-record-type"' in response.text
@@ -292,9 +292,7 @@ def test_zone_test_success(client: TestClient, monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr(
         "src.app.test_zone_record_lookup",
-        lambda _cfg, **kwargs: [
-            DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])
-        ],
+        lambda _cfg, **kwargs: [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])],
     )
     response = client.post(
         "/zones/test",
@@ -314,9 +312,7 @@ def test_zone_test_success(client: TestClient, monkeypatch: pytest.MonkeyPatch) 
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "success"
-    assert body["records"] == [
-        {"record_name": "www", "record_type": "A", "ttl": 300, "values": ["192.0.2.1"]}
-    ]
+    assert body["records"] == [{"record_name": "www", "record_type": "A", "ttl": 300, "values": ["192.0.2.1"]}]
     assert set(body["records"][0]) == {"record_name", "record_type", "ttl", "values"}
 
 
@@ -367,7 +363,9 @@ def test_zone_test_invalid_record_type(client: TestClient) -> None:
 def test_zones_json_request_returns_zone_ids(client: TestClient) -> None:
     from src.zone_service import api_key_last_used_at, get_api_key
 
-    response = client.get("/zones", headers={"Accept": "application/json", "X-API-Key": "test-api-key-for-dns-endpoint"})
+    response = client.get(
+        "/zones", headers={"Accept": "application/json", "X-API-Key": "test-api-key-for-dns-endpoint"}
+    )
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/json")
     zones = response.json()
@@ -425,10 +423,7 @@ def test_two_zone_configs_can_share_dns_domain(client: TestClient) -> None:
         assert response.status_code == 200, response.text[:500]
 
     with SessionLocal() as db:
-        rows = [
-            db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == name)).first()
-            for name in config_names
-        ]
+        rows = [db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == name)).first() for name in config_names]
         assert all(row is not None for row in rows)
 
 
@@ -616,14 +611,14 @@ def test_dns_record_get_requires_api_key(client: TestClient) -> None:
     assert response.status_code == 401
 
 
-def test_dns_record_get_with_mock_client(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dns_record_get_with_mock_client(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from src.models import DnsRecordInfo
 
     monkeypatch.setattr(
         "src.app.test_zone_record_lookup",
-        lambda _settings, **kwargs: [
-            DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])
-        ],
+        lambda _settings, **kwargs: [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])],
     )
     response = client.get(
         "/dns-record",
@@ -640,12 +635,12 @@ def test_dns_record_get_with_mock_client(client: TestClient, api_key_value: str,
     assert body["zone_name"] == "example.com"
     assert body["dns_zone"] == "example.com"
     assert body["record_name"] == "www"
-    assert body["records"] == [
-        {"record_name": "www", "record_type": "A", "ttl": 300, "values": ["192.0.2.1"]}
-    ]
+    assert body["records"] == [{"record_name": "www", "record_type": "A", "ttl": 300, "values": ["192.0.2.1"]}]
 
 
-def test_dns_record_get_untyped_multi_type(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dns_record_get_untyped_multi_type(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from src.models import DnsRecordInfo
 
     monkeypatch.setattr(
@@ -923,9 +918,7 @@ def test_dns_record_patch_updates_values(
     from src.models import DnsRecordInfo
 
     fake = MagicMock()
-    fake.get_record.return_value = [
-        DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])
-    ]
+    fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])]
     fake.create_or_update_record.return_value = True
     monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
 
@@ -950,15 +943,11 @@ def test_dns_record_patch_updates_values(
     assert internal.ttl == 300
 
 
-def test_dns_record_patch_ttl_only(
-    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_dns_record_patch_ttl_only(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
     from src.models import DnsRecordInfo
 
     fake = MagicMock()
-    fake.get_record.return_value = [
-        DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])
-    ]
+    fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])]
     fake.create_or_update_record.return_value = True
     monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
 
@@ -978,15 +967,11 @@ def test_dns_record_patch_ttl_only(
     assert internal.values == ["192.0.2.1"]
 
 
-def test_dns_record_patch_both_fields(
-    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_dns_record_patch_both_fields(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
     from src.models import DnsRecordInfo
 
     fake = MagicMock()
-    fake.get_record.return_value = [
-        DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])
-    ]
+    fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])]
     fake.create_or_update_record.return_value = True
     monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
 
@@ -1058,7 +1043,9 @@ def test_dns_record_patch_missing_returns_404(
     fake.create_or_update_record.assert_not_called()
 
 
-def test_dns_record_delete_with_mock_client(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dns_record_delete_with_mock_client(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from src.models import DnsRecordInfo
 
     fake = MagicMock()
@@ -1102,9 +1089,7 @@ def test_dns_record_delete_not_found_returns_404(
     fake.create_or_update_record.assert_not_called()
 
 
-def test_dns_record_delete_rejects_unknown_record_type(
-    client: TestClient, api_key_value: str
-) -> None:
+def test_dns_record_delete_rejects_unknown_record_type(client: TestClient, api_key_value: str) -> None:
     response = client.delete(
         "/dns-record",
         headers={"X-API-Key": api_key_value},
@@ -1599,7 +1584,7 @@ def test_global_admin_edit_dialog_checks_all_roles_and_js_locks_them(client: Tes
     assert "disabled" not in global_admin_input
     assert "checked" in account_update_input
     assert "setGlobalAdminRoles(true)" in response.text
-    assert 'input.disabled = true;' in response.text
+    assert "input.disabled = true;" in response.text
 
 
 def test_global_admin_selection_persists_all_roles(client: TestClient) -> None:
@@ -1716,7 +1701,8 @@ def test_non_global_admin_cannot_create_global_admin_user(client: TestClient) ->
         },
     )
     assert response.status_code == 200
-    assert "Only a global admin can grant global admin." in response.text
+    assert "Only a global admin can grant sensitive roles" in response.text
+    assert ROLE_GLOBAL_ADMIN in response.text
     with SessionLocal() as db:
         assert db.exec(select(User).where(User.username == "new-global-admin")).first() is None
 
@@ -1758,7 +1744,7 @@ def test_non_global_admin_cannot_assign_or_remove_global_admin_role(client: Test
         data={"roles": [ROLE_GLOBAL_ADMIN]},
     )
     assert response.status_code == 200
-    assert "Only a global admin can change global admin role assignments." in response.text
+    assert "Only a global admin can grant sensitive roles" in response.text
     with SessionLocal() as db:
         target = db.get(User, target_id)
         assert target is not None
@@ -1774,6 +1760,175 @@ def test_non_global_admin_cannot_assign_or_remove_global_admin_role(client: Test
         protected = db.get(User, protected_id)
         assert protected is not None
         assert ROLE_GLOBAL_ADMIN in (protected.roles or "").split(",")
+
+
+def test_account_admin_cannot_grant_sensitive_roles_but_can_grant_basic_roles(client: TestClient) -> None:
+    """H1: account.update may only grant the documented non-sensitive role set."""
+    client.cookies.set("session", create_session_cookie("account-admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "account-admin", "x", [ROLE_ACCOUNT_UPDATE])
+
+    for sensitive in (
+        ROLE_SYSTEM_UPDATE,
+        ROLE_PLUGIN_UPDATE,
+        ROLE_API_KEYS_UPDATE,
+        ROLE_ACCOUNT_UPDATE,
+        ROLE_ACCOUNT_RESET_PASSWORD,
+    ):
+        response = client.post(
+            "/settings/users",
+            data={
+                "username": f"denied-{sensitive.replace('.', '-')}",
+                "password": "passw0rd!",
+                "roles": [sensitive],
+            },
+        )
+        assert response.status_code == 200
+        assert "Only a global admin can grant sensitive roles" in response.text
+        with SessionLocal() as db:
+            assert db.exec(select(User).where(User.username == f"denied-{sensitive.replace('.', '-')}")).first() is None
+
+    response = client.post(
+        "/settings/users",
+        data={
+            "username": "basic-user",
+            "password": "passw0rd!",
+            "roles": [ROLE_GLOBAL_READ, ROLE_API_KEYS_READ, ROLE_DNS_ZONES_UPDATE],
+        },
+    )
+    assert response.status_code == 200
+    with SessionLocal() as db:
+        created = db.exec(select(User).where(User.username == "basic-user")).first()
+        assert created is not None
+        assert set((created.roles or "").split(",")) == {
+            ROLE_GLOBAL_READ,
+            ROLE_API_KEYS_READ,
+            ROLE_DNS_ZONES_READ,
+            ROLE_DNS_ZONES_UPDATE,
+        }
+
+
+def test_global_admin_can_grant_sensitive_roles(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("global-admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "global-admin", "x", [ROLE_GLOBAL_ADMIN])
+
+    response = client.post(
+        "/settings/users",
+        data={
+            "username": "ops-admin",
+            "password": "passw0rd!",
+            "roles": [ROLE_SYSTEM_UPDATE, ROLE_PLUGIN_UPDATE, ROLE_API_KEYS_UPDATE],
+        },
+    )
+    assert response.status_code == 200
+    with SessionLocal() as db:
+        created = db.exec(select(User).where(User.username == "ops-admin")).first()
+        assert created is not None
+        roles = set((created.roles or "").split(","))
+        assert ROLE_SYSTEM_UPDATE in roles
+        assert ROLE_PLUGIN_UPDATE in roles
+        assert ROLE_API_KEYS_UPDATE in roles
+        assert ROLE_API_KEYS_READ in roles  # dependency
+        assert ROLE_DNS_ZONES_READ in roles  # mandatory
+
+
+def test_stale_session_cookie_rejected_after_password_change(client: TestClient) -> None:
+    """M1: password change bumps session_version and revokes other sessions."""
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "self-service", "old-password", [])
+
+    stale = create_session_cookie("self-service", 0)
+    client.cookies.set("session", stale)
+    response = client.post(
+        "/settings/account/password",
+        data={
+            "current_password": "old-password",
+            "new_password": "new-password!",
+            "confirm_password": "new-password!",
+        },
+    )
+    assert response.status_code == 200
+    assert "Password changed" in response.text
+    # Active browser receives a reissued cookie with the new version.
+    assert "session=" in response.headers.get("set-cookie", "").lower()
+
+    other_client = TestClient(app)
+    other_client.cookies.set("session", stale)
+    denied = other_client.get("/settings", follow_redirects=False)
+    assert denied.status_code == 303
+    assert denied.headers["location"] == "/login"
+
+    with SessionLocal() as db:
+        user = db.exec(select(User).where(User.username == "self-service")).first()
+        assert user is not None
+        assert int(user.session_version) == 1
+
+
+def test_stale_session_cookie_rejected_after_admin_password_reset(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "admin", "x", ALL_ROLES)
+        target = _create_user(db, "reset-me", "old", [ROLE_DNS_ZONES_READ])
+        target_id = target.id
+
+    stale = create_session_cookie("reset-me", 0)
+    response = client.post(
+        f"/settings/users/{target_id}/password",
+        data={"password": "brand-new!", "confirm_password": "brand-new!"},
+    )
+    assert response.status_code == 200
+
+    victim = TestClient(app)
+    victim.cookies.set("session", stale)
+    denied = victim.get("/admin", follow_redirects=False)
+    assert denied.status_code == 303
+    assert denied.headers["location"] == "/login"
+
+
+def test_stale_session_cookie_rejected_after_disable_and_role_change(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "admin", "x", ALL_ROLES)
+        target = _create_user(db, "mutate-me", "x", [ROLE_API_KEYS_READ])
+        target_id = target.id
+
+    stale_before_roles = create_session_cookie("mutate-me", 0)
+    response = client.post(
+        f"/settings/users/{target_id}/roles",
+        data={"roles": [ROLE_DNS_ZONES_UPDATE]},
+    )
+    assert response.status_code == 200
+    with SessionLocal() as db:
+        target = db.get(User, target_id)
+        assert target is not None
+        assert int(target.session_version) == 1
+
+    victim = TestClient(app)
+    victim.cookies.set("session", stale_before_roles)
+    denied = victim.get("/admin", follow_redirects=False)
+    assert denied.status_code == 303
+
+    stale_before_disable = create_session_cookie("mutate-me", 1)
+    # Re-enable path isn't needed; disable after ensuring user is enabled.
+    with SessionLocal() as db:
+        target = db.get(User, target_id)
+        assert target is not None
+        target.disabled = False
+        db.add(target)
+        db.commit()
+
+    response = client.post(f"/settings/users/{target_id}/disable")
+    assert response.status_code == 200
+    victim.cookies.set("session", stale_before_disable)
+    denied = victim.get("/admin", follow_redirects=False)
+    assert denied.status_code == 303
+    assert denied.headers["location"] == "/login"
 
 
 def test_global_admin_can_update_other_global_admin_roles(client: TestClient) -> None:
@@ -2287,8 +2442,7 @@ def test_manual_zone_create_with_disabled_provider_is_rejected(client: TestClien
     assert "BIND / RFC 2136 (TSIG) is disabled." in response.text
     with SessionLocal() as db:
         assert (
-            db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == "disabled-provider.example")).first()
-            is None
+            db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == "disabled-provider.example")).first() is None
         )
 
 
@@ -2324,7 +2478,7 @@ def test_settings_system_section_shows_single_panel(client: TestClient) -> None:
     assert response.status_code == 200
     assert 'name="smtp_servers"' in response.text
     assert 'name="log_level"' not in response.text
-    assert 'settings-submenu-item selected' in response.text or "settings-submenu-item selected" in response.text
+    assert "settings-submenu-item selected" in response.text or "settings-submenu-item selected" in response.text
     assert "section=smtp_delivery" in response.text
 
     response = client.get("/settings?area=system_settings&section=logging_configuration")
@@ -2435,8 +2589,8 @@ def _generate_test_pem_pair(common_name: str = "ssl-test.example") -> tuple[byte
         .issuer_name(subject)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.now(timezone.utc) - timedelta(minutes=5))
-        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=30))
+        .not_valid_before(datetime.now(UTC) - timedelta(minutes=5))
+        .not_valid_after(datetime.now(UTC) + timedelta(days=30))
         .add_extension(
             x509.SubjectAlternativeName([x509.DNSName(common_name), x509.DNSName("localhost")]),
             critical=False,
@@ -2662,6 +2816,26 @@ def test_settings_ssl_upload_installs_and_unlocks_enable(client: TestClient) -> 
     assert "before enabling SSL" not in response.text
 
 
+def test_settings_ssl_upload_rejects_oversized_key(client: TestClient) -> None:
+    from src import ssl_certs as _ssl
+
+    _clear_ssl_state()
+    client.cookies.set("session", create_session_cookie("admin"))
+    _, cert_pem = _generate_test_pem_pair("oversized-key.example")
+    oversized_key = b"A" * (_ssl.MAX_SSL_KEY_UPLOAD_BYTES + 1)
+    response = client.post(
+        "/settings/system/ssl-upload",
+        data={"redirect_section": "ssl_certificate"},
+        files={
+            "ssl_key": ("server.key", oversized_key, "application/x-pem-file"),
+            "ssl_cert": ("server.crt", cert_pem, "application/x-pem-file"),
+        },
+    )
+    assert response.status_code == 200
+    assert "maximum allowed size" in response.text.lower()
+    assert _ssl.cert_exists() is False
+
+
 def test_settings_ssl_upload_rejects_mismatched_key(client: TestClient) -> None:
     _clear_ssl_state()
     client.cookies.set("session", create_session_cookie("admin"))
@@ -2734,9 +2908,7 @@ def test_settings_ssl_regenerate_without_openssl_returns_error(
     assert response.status_code == 200
     assert "openssl" in response.text.lower()
     with SessionLocal() as db:
-        event = db.exec(
-            select(ActivityLog).where(ActivityLog.event_type == "system.ssl_regenerate_failed")
-        ).first()
+        event = db.exec(select(ActivityLog).where(ActivityLog.event_type == "system.ssl_regenerate_failed")).first()
         assert event is not None
         assert event.level == LOG_LEVEL_WARNING
         assert event.category == LOG_CATEGORY_SECURITY
@@ -2744,9 +2916,7 @@ def test_settings_ssl_regenerate_without_openssl_returns_error(
 
 def _latest_ssl_audit(db, event_type: str) -> ActivityLog | None:
     return db.exec(
-        select(ActivityLog)
-        .where(ActivityLog.event_type == event_type)
-        .order_by(ActivityLog.id.desc())
+        select(ActivityLog).where(ActivityLog.event_type == event_type).order_by(ActivityLog.id.desc())
     ).first()
 
 
@@ -3277,6 +3447,68 @@ def test_smtp_failures_are_reported_without_exception(client: TestClient) -> Non
 
     assert sent is False
     assert failures[0]["error"] == "No SMTP servers configured"
+
+
+def test_smtp_rejects_credentialed_cleartext_without_opt_in(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post(
+        "/settings/system/smtp",
+        data={
+            "smtp_servers": "smtp.example.com",
+            "smtp_port": "25",
+            "smtp_security": "none",
+            "smtp_username": "user",
+            "smtp_password": "secret",
+            "smtp_from": "alerts@example.com",
+            "smtp_timeout": "10",
+            "redirect_section": "smtp_delivery",
+        },
+    )
+    assert response.status_code == 200
+    assert "Credentialed SMTP requires STARTTLS or SSL" in response.text
+
+
+def test_smtp_password_not_rendered_in_settings_html(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        set_smtp_config(
+            db,
+            servers="smtp.example.com",
+            port=587,
+            anonymous=False,
+            username="mailer",
+            password="super-secret-smtp-password",
+            from_address="alerts@example.com",
+            security="starttls",
+            timeout=10,
+        )
+    response = client.get("/settings?area=system_settings&section=smtp_delivery")
+    assert response.status_code == 200
+    assert "super-secret-smtp-password" not in response.text
+    assert 'name="smtp_password"' in response.text
+    assert "(unchanged)" in response.text
+
+
+def test_send_blocks_legacy_cleartext_credentialed_smtp(client: TestClient) -> None:
+    from src.settings_store import set_setting
+
+    with SessionLocal() as db:
+        set_setting(db, activity_logging.SETTING_SMTP_SERVERS, "smtp.example.com")
+        set_setting(db, activity_logging.SETTING_SMTP_PORT, "25")
+        set_setting(db, activity_logging.SETTING_SMTP_ANONYMOUS, "false")
+        set_setting(db, activity_logging.SETTING_SMTP_USERNAME, "user")
+        set_setting(db, activity_logging.SETTING_SMTP_PASSWORD, "secret")
+        set_setting(db, activity_logging.SETTING_SMTP_FROM, "alerts@example.com")
+        set_setting(db, activity_logging.SETTING_SMTP_SECURITY, "none")
+        set_setting(db, activity_logging.SETTING_SMTP_ALLOW_INSECURE_AUTH, "false")
+        sent, failures = activity_logging.send_alert_email(
+            db,
+            recipients=["ops@example.com"],
+            subject="test",
+            body="body",
+        )
+    assert sent is False
+    assert "STARTTLS or SSL" in failures[0]["error"]
 
 
 def test_retention_cleanup_deletes_only_rows_older_than_retention(client: TestClient) -> None:

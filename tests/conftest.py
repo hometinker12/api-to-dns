@@ -21,6 +21,11 @@ os.environ["SSL_ENABLED"] = "0"
 # refuses placeholder/missing keys; tests may use dedicated values.
 os.environ.setdefault("API_TO_DNS_ALLOW_INSECURE_DEFAULTS", "1")
 os.environ.setdefault("API_TO_DNS_DISABLE_RATE_LIMIT", "1")
+# TestClient posts often omit Origin/Referer; keep CSRF fail-closed in app code
+# and relax only via this explicit test harness flag.
+os.environ.setdefault("API_TO_DNS_RELAX_CSRF", "1")
+# Schema tests exercise /openapi.json; production defaults docs off.
+os.environ.setdefault("OPENAPI_ENABLED", "1")
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-pytest-only")
 os.environ.setdefault("ENCRYPTION_KEY", Fernet.generate_key().decode())
 

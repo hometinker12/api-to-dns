@@ -1,6 +1,7 @@
 import os
-from sqlmodel import SQLModel, Session, create_engine
+
 from sqlalchemy.orm import sessionmaker
+from sqlmodel import Session, SQLModel, create_engine
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/app.db")
 
@@ -23,11 +24,13 @@ def init_db() -> None:
     SQLModel.metadata.create_all(engine)
     _migrate_add_user_roles_column()
     _migrate_add_user_disabled_column()
+    _migrate_add_user_session_version_column()
     _migrate_activity_log_category_column()
     _migrate_alert_rule_category_column()
     _migrate_activity_log_indexes()
     _migrate_add_api_key_prefix_column()
     _migrate_hash_plaintext_api_keys()
+    _migrate_rate_limit_bucket_table()
 
 
 def _migrate_add_api_key_prefix_column() -> None:
@@ -97,6 +100,32 @@ def _migrate_add_user_disabled_column() -> None:
     with engine.begin() as conn:
         default_value = "false" if engine.dialect.name != "sqlite" else "0"
         conn.execute(text(f"ALTER TABLE user ADD COLUMN disabled BOOLEAN DEFAULT {default_value} NOT NULL"))
+
+
+def _migrate_add_user_session_version_column() -> None:
+    """Add ``session_version`` so password/role changes can invalidate cookies."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if "user" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("user")}
+    if "session_version" in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE user ADD COLUMN session_version INTEGER DEFAULT 0 NOT NULL"))
+
+
+def _migrate_rate_limit_bucket_table() -> None:
+    """Ensure the shared rate-limit table exists (create_all covers new installs)."""
+    from sqlalchemy import inspect
+
+    from .models import RateLimitBucket
+
+    inspector = inspect(engine)
+    if RateLimitBucket.__tablename__ in inspector.get_table_names():
+        return
+    RateLimitBucket.__table__.create(bind=engine, checkfirst=True)
 
 
 def _migrate_activity_log_indexes() -> None:

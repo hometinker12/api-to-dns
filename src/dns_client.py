@@ -1,9 +1,9 @@
-from typing import Any, Dict, Optional
+from typing import Any
 
 from .plugins import discover_plugins, get_plugin, provider_options_for_template
 
 
-def create_dns_client(settings: Dict[str, Optional[str]]) -> Any:
+def create_dns_client(settings: dict[str, str | None]) -> Any:
     provider = (settings.get("dns_provider_type") or "azure").strip().lower()
     plugin = get_plugin(provider)
     return plugin.create_client(settings)

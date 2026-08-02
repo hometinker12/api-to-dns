@@ -5,9 +5,9 @@ from fastapi.testclient import TestClient
 import src.app as app_module
 import src.letsencrypt as letsencrypt_module
 import src.ssl_certs as ssl_certs_module
+from src.app import _apply_le_renewal_restart_policy, _maybe_scheduled_le_restart, startup_event
 from src.auth import create_session_cookie
 from src.db import SessionLocal
-from src.app import startup_event, _apply_le_renewal_restart_policy, _maybe_scheduled_le_restart
 from src.restart import (
     clear_le_renewal_pending_restart,
     clear_restart_required,
@@ -119,9 +119,7 @@ def test_startup_clears_pending_renewal_restart(client: TestClient) -> None:
         assert is_le_renewal_pending_restart(db) is False
 
 
-def test_letsencrypt_install_marks_restart_even_with_scheduled_restart(
-    client: TestClient, monkeypatch
-) -> None:
+def test_letsencrypt_install_marks_restart_even_with_scheduled_restart(client: TestClient, monkeypatch) -> None:
     issued_config = {
         "scheduled_restart_enabled": True,
         "scheduled_restart_time": "03:00",

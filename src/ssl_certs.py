@@ -10,6 +10,7 @@ The active listener (HTTP or HTTPS) is chosen at process start by
 ``bootstrap()``; toggling SSL in the UI updates the DB immediately but
 requires a restart to swap listeners.
 """
+
 from __future__ import annotations
 
 import logging
@@ -17,9 +18,9 @@ import os
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -28,6 +29,7 @@ from cryptography.x509.oid import NameOID
 
 from .activity_logging import get_app_dns_name
 from .db import SessionLocal, init_db
+from .hostnames import validate_dns_hostname
 from .settings_store import get_setting, set_setting
 
 LOGGER = logging.getLogger("api_to_dns")
@@ -45,6 +47,10 @@ SOURCE_LETSENCRYPT = "letsencrypt"
 DEFAULT_HTTP_PORT = 8000
 DEFAULT_TLS_PORT = 8443
 DEFAULT_CERT_VALIDITY_DAYS = 825
+
+# Conservative PEM upload limits (reject before parsing).
+MAX_SSL_KEY_UPLOAD_BYTES = 64 * 1024
+MAX_SSL_CERT_UPLOAD_BYTES = 256 * 1024
 
 _DOCKER_DEFAULT_CERT_DIR = "/app/data/ssl"
 _LOCAL_DEFAULT_CERT_DIR = "./data/ssl"
@@ -64,7 +70,7 @@ def _running_in_docker() -> bool:
     if os.path.exists("/.dockerenv"):
         return True
     try:
-        with open("/proc/1/cgroup", "rt", encoding="utf-8") as handle:
+        with open("/proc/1/cgroup", encoding="utf-8") as handle:
             return any("docker" in line or "kubepods" in line or "containerd" in line for line in handle)
     except OSError:
         return False
@@ -81,7 +87,7 @@ def cert_dir() -> Path:
     return path
 
 
-def cert_paths() -> Tuple[Path, Path]:
+def cert_paths() -> tuple[Path, Path]:
     directory = cert_dir()
     return directory / KEY_FILENAME, directory / CERT_FILENAME
 
@@ -99,7 +105,7 @@ def _write_source(value: str) -> None:
     _source_path().write_text(value.strip() + "\n", encoding="utf-8")
 
 
-def _read_source() -> Optional[str]:
+def _read_source() -> str | None:
     path = _source_path()
     if not path.is_file():
         return None
@@ -107,7 +113,7 @@ def _read_source() -> Optional[str]:
     return value if value in {SOURCE_SELF_SIGNED, SOURCE_UPLOADED, SOURCE_LETSENCRYPT} else None
 
 
-def _coerce_truthy(raw: Optional[str]) -> Optional[bool]:
+def _coerce_truthy(raw: str | None) -> bool | None:
     if raw is None:
         return None
     value = raw.strip().lower()
@@ -139,7 +145,7 @@ def set_ssl_enabled(db, enabled: bool) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _openssl_executable() -> Optional[str]:
+def _openssl_executable() -> str | None:
     return shutil.which("openssl")
 
 
@@ -163,7 +169,22 @@ def _write_atomic(path: Path, data: bytes, mode: int) -> None:
     os.replace(tmp_path, path)
 
 
-def create_self_signed_cert(db) -> Dict[str, Any]:
+async def read_upload_bounded(upload, max_bytes: int) -> bytes:
+    """Read an UploadFile up to ``max_bytes``; reject oversized payloads early."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await upload.read(64 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise CertificateInstallError(f"Upload exceeds the maximum allowed size of {max_bytes} bytes.")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def create_self_signed_cert(db) -> dict[str, Any]:
     """Generate a self-signed certificate via the system ``openssl`` binary.
 
     Uses the configured App DNS Name as CN and as a DNS SAN, plus ``localhost``
@@ -175,7 +196,10 @@ def create_self_signed_cert(db) -> Dict[str, Any]:
             "The 'openssl' command was not found on PATH. Install OpenSSL or upload a PEM certificate instead."
         )
 
-    app_dns_name = (get_app_dns_name(db) or "").strip() or "apitodns.local"
+    raw_name = (get_app_dns_name(db) or "").strip() or "apitodns.local"
+    # Validate again immediately before shelling out so OpenSSL never sees
+    # attacker-controlled subject/SAN content from a poisoned setting.
+    app_dns_name = validate_dns_hostname(raw_name)
 
     directory = cert_dir()
     key_path, cert_path = cert_paths()
@@ -245,7 +269,7 @@ def create_self_signed_cert(db) -> Dict[str, Any]:
     return metadata
 
 
-def regenerate_self_signed_cert(db) -> Dict[str, Any]:
+def regenerate_self_signed_cert(db) -> dict[str, Any]:
     """Delete any existing cert files, then create a fresh self-signed pair."""
     for path in cert_paths():
         try:
@@ -301,13 +325,21 @@ def _public_keys_match(private_key, certificate) -> bool:
     return cert_bytes == key_bytes
 
 
-def install_uploaded_cert(key_pem: bytes, cert_pem: bytes) -> Dict[str, Any]:
+def install_uploaded_cert(key_pem: bytes, cert_pem: bytes) -> dict[str, Any]:
     """Validate and atomically install an uploaded PEM key/cert pair.
 
     The first certificate in ``cert_pem`` is treated as the leaf certificate;
     any additional PEM blocks are preserved (treated as the chain) and written
     into ``server.crt`` exactly as uploaded.
     """
+    if key_pem is not None and len(key_pem) > MAX_SSL_KEY_UPLOAD_BYTES:
+        raise CertificateInstallError(
+            f"Private key upload exceeds the maximum allowed size of {MAX_SSL_KEY_UPLOAD_BYTES} bytes."
+        )
+    if cert_pem is not None and len(cert_pem) > MAX_SSL_CERT_UPLOAD_BYTES:
+        raise CertificateInstallError(
+            f"Certificate upload exceeds the maximum allowed size of {MAX_SSL_CERT_UPLOAD_BYTES} bytes."
+        )
     if not key_pem or not key_pem.strip():
         raise CertificateInstallError("Private key file is empty.")
     if not cert_pem or not cert_pem.strip():
@@ -320,10 +352,10 @@ def install_uploaded_cert(key_pem: bytes, cert_pem: bytes) -> Dict[str, Any]:
     if not _public_keys_match(private_key, leaf):
         raise CertificateInstallError("Private key does not match the certificate.")
 
-    not_after = leaf.not_valid_after_utc if hasattr(leaf, "not_valid_after_utc") else leaf.not_valid_after.replace(
-        tzinfo=timezone.utc
+    not_after = (
+        leaf.not_valid_after_utc if hasattr(leaf, "not_valid_after_utc") else leaf.not_valid_after.replace(tzinfo=UTC)
     )
-    if not_after <= datetime.now(timezone.utc):
+    if not_after <= datetime.now(UTC):
         raise CertificateInstallError("Certificate is expired. Upload a current certificate.")
 
     key_path, cert_path = cert_paths()
@@ -340,7 +372,7 @@ def install_uploaded_cert(key_pem: bytes, cert_pem: bytes) -> Dict[str, Any]:
     return metadata
 
 
-def install_letsencrypt_cert(key_pem: bytes, cert_pem: bytes) -> Dict[str, Any]:
+def install_letsencrypt_cert(key_pem: bytes, cert_pem: bytes) -> dict[str, Any]:
     """Validate and install a Let's Encrypt-issued key/certificate pair."""
     metadata = install_uploaded_cert(key_pem, cert_pem)
     _write_source(SOURCE_LETSENCRYPT)
@@ -374,7 +406,7 @@ def _subject_alt_names(certificate) -> list:
         return []
 
 
-def cert_metadata() -> Optional[Dict[str, Any]]:
+def cert_metadata() -> dict[str, Any] | None:
     if not cert_exists():
         return None
     _, cert_path = cert_paths()
@@ -394,9 +426,7 @@ def cert_metadata() -> Optional[Dict[str, Any]]:
         }
 
     not_after = (
-        cert.not_valid_after_utc
-        if hasattr(cert, "not_valid_after_utc")
-        else cert.not_valid_after.replace(tzinfo=timezone.utc)
+        cert.not_valid_after_utc if hasattr(cert, "not_valid_after_utc") else cert.not_valid_after.replace(tzinfo=UTC)
     )
     fingerprint = cert.fingerprint(hashes.SHA256()).hex().upper()
     formatted_fp = ":".join(fingerprint[i : i + 2] for i in range(0, len(fingerprint), 2))
@@ -406,7 +436,7 @@ def cert_metadata() -> Optional[Dict[str, Any]]:
         "not_after_iso": not_after.isoformat(),
         "fingerprint": formatted_fp,
         "source": _read_source() or SOURCE_SELF_SIGNED,
-        "expired": not_after <= datetime.now(timezone.utc),
+        "expired": not_after <= datetime.now(UTC),
         "subject_alt_names": _subject_alt_names(cert),
     }
 

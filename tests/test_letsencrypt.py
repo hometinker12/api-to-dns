@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -289,7 +289,7 @@ def test_legacy_domains_config_normalizes() -> None:
 def test_renew_threshold_honors_configured_days() -> None:
     metadata = {
         "source": ssl_certs.SOURCE_LETSENCRYPT,
-        "not_after": datetime.now(timezone.utc) + timedelta(days=10),
+        "not_after": datetime.now(UTC) + timedelta(days=10),
     }
     assert letsencrypt.should_renew_cert(metadata, 30) is True
     assert letsencrypt.should_renew_cert(metadata, 7) is False
@@ -464,7 +464,7 @@ def test_maybe_renew_certificate_skips_when_auto_renew_not_supported(monkeypatch
         "cert_metadata",
         lambda: {
             "source": ssl_certs.SOURCE_LETSENCRYPT,
-            "not_after": datetime.now(timezone.utc) + timedelta(days=10),
+            "not_after": datetime.now(UTC) + timedelta(days=10),
         },
     )
     _ensure_db()
@@ -517,7 +517,7 @@ def test_maybe_renew_certificate_skips_when_auto_renew_disabled(client: TestClie
         "cert_metadata",
         lambda: {
             "source": ssl_certs.SOURCE_LETSENCRYPT,
-            "not_after": datetime.now(timezone.utc) + timedelta(days=10),
+            "not_after": datetime.now(UTC) + timedelta(days=10),
         },
     )
     _ensure_db()
@@ -533,7 +533,7 @@ def test_config_view_omits_renewal_hint_when_auto_renew_disabled(monkeypatch) ->
         "cert_metadata",
         lambda: {
             "source": ssl_certs.SOURCE_LETSENCRYPT,
-            "not_after": datetime.now(timezone.utc) + timedelta(days=60),
+            "not_after": datetime.now(UTC) + timedelta(days=60),
         },
     )
     _ensure_db()
@@ -569,7 +569,7 @@ def test_maybe_renew_certificate_publishes_dns_challenges_before_finalize(monkey
         "cert_metadata",
         lambda: {
             "source": ssl_certs.SOURCE_LETSENCRYPT,
-            "not_after": datetime.now(timezone.utc) + timedelta(days=10),
+            "not_after": datetime.now(UTC) + timedelta(days=10),
         },
     )
     monkeypatch.setattr(
@@ -614,7 +614,7 @@ def test_maybe_renew_certificate_publishes_dns_challenges_before_finalize(monkey
     monkeypatch.setattr(
         letsencrypt,
         "install_letsencrypt_cert",
-        lambda key_pem, cert_pem: {"source": ssl_certs.SOURCE_LETSENCRYPT, "not_after": datetime.now(timezone.utc)},
+        lambda key_pem, cert_pem: {"source": ssl_certs.SOURCE_LETSENCRYPT, "not_after": datetime.now(UTC)},
     )
 
     _ensure_db()
@@ -898,3 +898,38 @@ def test_detach_dns_zone_cancels_enrollment_referencing_zone(monkeypatch) -> Non
         assert letsencrypt.detach_dns_zone_from_letsencrypt(db, int(row.id)) is True
         assert letsencrypt.get_enrollment(db) is None
     assert deleted == ["api.example.com"]
+
+
+def test_acme_account_key_is_created_encrypted(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("APP_SSL_DIR", str(tmp_path))
+    key = letsencrypt._load_or_create_account_key()
+    path = tmp_path / letsencrypt.ACME_ACCOUNT_KEY_FILENAME
+    assert path.is_file()
+    raw = path.read_bytes()
+    assert b"BEGIN" not in raw
+    assert b"PRIVATE KEY" not in raw
+    # Reloading decrypts transparently and returns an equivalent key object.
+    reloaded = letsencrypt._load_or_create_account_key()
+    assert letsencrypt._private_key_pem(reloaded) == letsencrypt._private_key_pem(key)
+
+
+def test_acme_account_key_migrates_legacy_pem(tmp_path, monkeypatch) -> None:
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    monkeypatch.setenv("APP_SSL_DIR", str(tmp_path))
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = letsencrypt._private_key_pem(key)
+    path = tmp_path / letsencrypt.ACME_ACCOUNT_KEY_FILENAME
+    path.write_bytes(pem)
+    loaded = letsencrypt._load_or_create_account_key()
+    raw = path.read_bytes()
+    assert b"BEGIN" not in raw
+    assert letsencrypt._private_key_pem(loaded) == pem
+
+
+def test_acme_account_key_corrupt_fails_closed(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("APP_SSL_DIR", str(tmp_path))
+    path = tmp_path / letsencrypt.ACME_ACCOUNT_KEY_FILENAME
+    path.write_bytes(b"not-a-valid-fernet-token")
+    with pytest.raises(letsencrypt.LetsEncryptError, match="corrupt or was encrypted"):
+        letsencrypt._load_or_create_account_key()

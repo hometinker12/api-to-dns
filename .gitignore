@@ -1,7 +1,14 @@
 .env
 data/
 data/ssl/
-.cursor/
+# Cursor IDE — track project agents, rules, and skills; ignore local/ephemeral files
+.cursor/*
+!.cursor/agents/
+!.cursor/agents/**
+!.cursor/rules/
+!.cursor/rules/**
+!.cursor/skills/
+!.cursor/skills/**
 docker-compose.override.yml
 
 # Pytest cache and artifacts

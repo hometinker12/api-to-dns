@@ -3,8 +3,8 @@
 import json
 from unittest.mock import MagicMock, patch
 
-import dns.rdataclass
 import dns.rdata
+import dns.rdataclass
 import dns.rdataset
 import dns.rrset
 import httpx
@@ -15,6 +15,7 @@ from src.plugins.azure import AzureDnsClient
 from src.plugins.bind import BindTsigDnsClient
 from src.plugins.cloudflare import CloudflareDnsClient
 from src.plugins.microsoft import MicrosoftWinRmDnsClient
+from src.plugins.microsoft import create_client as create_microsoft_client
 from src.plugins.utils import normalize_lookup_record_type, query_dns_records_at_name
 
 
@@ -44,9 +45,7 @@ def test_query_dns_records_at_name_returns_all_types(mock_tcp) -> None:
 
     mock_tcp.side_effect = side_effect
     records = query_dns_records_at_name("127.0.0.1", "example.com", "www")
-    assert records == [
-        DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])
-    ]
+    assert records == [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])]
 
 
 @patch("src.plugins.utils.dns.query.tcp")
@@ -105,9 +104,7 @@ def test_azure_get_record_single_type(mock_get) -> None:
     record_set.txt_records = None
     mock_get.return_value = record_set
     records = client.get_record(record_name="www", record_type="A", dns_zone="example.com")
-    assert records == [
-        DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.10"])
-    ]
+    assert records == [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.10"])]
     mock_get.assert_called_once()
 
 
@@ -146,9 +143,7 @@ def test_azure_get_record_all_types(mock_get) -> None:
 
 @patch.object(MicrosoftWinRmDnsClient, "_get_record_details")
 def test_microsoft_get_record_single_type(mock_details) -> None:
-    mock_details.return_value = DnsRecordInfo(
-        record_name="www", record_type="A", ttl=300, values=["192.0.2.10"]
-    )
+    mock_details.return_value = DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.10"])
     client = MicrosoftWinRmDnsClient(username="user", password="pass")
     records = client.get_record(
         record_name="www",
@@ -156,9 +151,7 @@ def test_microsoft_get_record_single_type(mock_details) -> None:
         dns_server="dc01",
         dns_zone="example.com",
     )
-    assert records == [
-        DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.10"])
-    ]
+    assert records == [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.10"])]
     mock_details.assert_called_once()
 
 
@@ -189,17 +182,13 @@ def test_microsoft_get_record_details_parses_json(mock_run) -> None:
     mock_run.return_value = MagicMock(std_out=json.dumps(payload).encode(), std_err=b"")
     client = MicrosoftWinRmDnsClient(username="user", password="pass")
     info = client._get_record_details("dc01", "example.com", "www", "A")
-    assert info == DnsRecordInfo(
-        record_name="www", record_type="A", ttl=450, values=["192.0.2.55", "192.0.2.56"]
-    )
+    assert info == DnsRecordInfo(record_name="www", record_type="A", ttl=450, values=["192.0.2.55", "192.0.2.56"])
 
 
 @patch.object(BindTsigDnsClient, "__init__", lambda self, *args, **kwargs: None)
 @patch("src.plugins.bind.query_dns_records_at_name")
 def test_bind_get_record_delegates(mock_query) -> None:
-    mock_query.return_value = [
-        DnsRecordInfo(record_name="@", record_type="TXT", ttl=600, values=["hello"])
-    ]
+    mock_query.return_value = [DnsRecordInfo(record_name="@", record_type="TXT", ttl=600, values=["hello"])]
     client = BindTsigDnsClient.__new__(BindTsigDnsClient)
     records = client.get_record(
         record_name="@",
@@ -263,9 +252,7 @@ def test_cloudflare_get_record_single_type() -> None:
         ]
     )
     records = client.get_record(record_name="www", record_type="A", dns_zone="example.com")
-    assert records == [
-        DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.10"])
-    ]
+    assert records == [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.10"])]
 
     auth_headers = {req.headers.get("authorization") for req in fake.requests}
     assert auth_headers == {"Bearer test-token"}
@@ -288,9 +275,7 @@ def test_cloudflare_get_record_skips_zone_lookup_when_zone_id_set() -> None:
         zone_id="zone-from-config",
     )
     records = client.get_record(record_name="@", record_type="TXT", dns_zone="example.com")
-    assert records == [
-        DnsRecordInfo(record_name="@", record_type="TXT", ttl=600, values=["hello"])
-    ]
+    assert records == [DnsRecordInfo(record_name="@", record_type="TXT", ttl=600, values=["hello"])]
     assert fake.requests[0].url.path == "/client/v4/zones/zone-from-config/dns_records"
 
 
@@ -323,15 +308,17 @@ def test_cloudflare_update_txt_matches_existing_quoted_content() -> None:
     client, fake = _cloudflare_client(
         [
             _ok([{"id": "z1", "name": "example.com"}]),
-            _ok([
-                {
-                    "id": "r1",
-                    "type": "TXT",
-                    "name": "_acme-challenge.example.com",
-                    "content": '"token-value"',
-                    "ttl": 120,
-                }
-            ]),
+            _ok(
+                [
+                    {
+                        "id": "r1",
+                        "type": "TXT",
+                        "name": "_acme-challenge.example.com",
+                        "content": '"token-value"',
+                        "ttl": 120,
+                    }
+                ]
+            ),
             _ok({"id": "r1"}),
         ]
     )
@@ -355,12 +342,24 @@ def test_cloudflare_get_record_all_types_aggregates_only_present() -> None:
     client, fake = _cloudflare_client(
         [
             _ok([{"id": "z1", "name": "example.com"}]),
-            _ok([
-                {"id": "a1", "type": "A", "name": "www.example.com", "content": "10.0.0.1", "ttl": 300},
-                {"id": "a2", "type": "A", "name": "www.example.com", "content": "10.0.0.2", "ttl": 500},
-            ]),
+            _ok(
+                [
+                    {"id": "a1", "type": "A", "name": "www.example.com", "content": "10.0.0.1", "ttl": 300},
+                    {"id": "a2", "type": "A", "name": "www.example.com", "content": "10.0.0.2", "ttl": 500},
+                ]
+            ),
             _ok([]),
-            _ok([{"id": "c1", "type": "CNAME", "name": "www.example.com", "content": "target.example.com.", "ttl": 1000}]),
+            _ok(
+                [
+                    {
+                        "id": "c1",
+                        "type": "CNAME",
+                        "name": "www.example.com",
+                        "content": "target.example.com.",
+                        "ttl": 1000,
+                    }
+                ]
+            ),
             _ok([]),
         ]
     )
@@ -452,10 +451,12 @@ def test_cloudflare_multi_value_sync_deletes_stale_and_creates_missing() -> None
     client, fake = _cloudflare_client(
         [
             _ok([{"id": "z1", "name": "example.com"}]),
-            _ok([
-                {"id": "keep", "type": "A", "name": "www.example.com", "content": "192.0.2.10", "ttl": 300},
-                {"id": "drop", "type": "A", "name": "www.example.com", "content": "192.0.2.99", "ttl": 300},
-            ]),
+            _ok(
+                [
+                    {"id": "keep", "type": "A", "name": "www.example.com", "content": "192.0.2.10", "ttl": 300},
+                    {"id": "drop", "type": "A", "name": "www.example.com", "content": "192.0.2.99", "ttl": 300},
+                ]
+            ),
             _ok({"id": "drop"}),
             _ok({"id": "keep"}),
             _ok({"id": "new"}),
@@ -486,17 +487,17 @@ def test_cloudflare_delete_pseudo_payload_removes_all_matching_rows() -> None:
     client, fake = _cloudflare_client(
         [
             _ok([{"id": "z1", "name": "example.com"}]),
-            _ok([
-                {"id": "r1", "type": "A", "name": "www.example.com", "content": "192.0.2.10", "ttl": 300},
-                {"id": "r2", "type": "A", "name": "www.example.com", "content": "192.0.2.20", "ttl": 300},
-            ]),
+            _ok(
+                [
+                    {"id": "r1", "type": "A", "name": "www.example.com", "content": "192.0.2.10", "ttl": 300},
+                    {"id": "r2", "type": "A", "name": "www.example.com", "content": "192.0.2.20", "ttl": 300},
+                ]
+            ),
             _ok({"id": "r1"}),
             _ok({"id": "r2"}),
         ]
     )
-    payload = DnsRecordRequest(
-        zone_name="example.com", record_type="DELETE", record_name="www", values=["A"]
-    )
+    payload = DnsRecordRequest(zone_name="example.com", record_type="DELETE", record_name="www", values=["A"])
     existed = client.create_or_update_record(payload, dns_zone="example.com")
     assert existed is True
     methods = [(req.method, req.url.path) for req in fake.requests]
@@ -513,9 +514,7 @@ def test_cloudflare_delete_missing_record_returns_false() -> None:
             _ok([]),
         ]
     )
-    payload = DnsRecordRequest(
-        zone_name="example.com", record_type="DELETE", record_name="www", values=["A"]
-    )
+    payload = DnsRecordRequest(zone_name="example.com", record_type="DELETE", record_name="www", values=["A"])
     existed = client.create_or_update_record(payload, dns_zone="example.com")
     assert existed is False
 
@@ -533,3 +532,64 @@ def test_cloudflare_api_error_envelope_raises_runtime_error() -> None:
 def test_cloudflare_missing_api_token_raises() -> None:
     with pytest.raises(ValueError, match="API token"):
         CloudflareDnsClient(api_token="")
+
+
+def test_microsoft_https_validates_tls_by_default(monkeypatch) -> None:
+    import sys
+    import types
+
+    captured = {}
+
+    class FakeSession:
+        def __init__(self, server, auth, **kwargs):
+            captured["kwargs"] = kwargs
+
+    stub = types.ModuleType("winrm")
+    stub.Session = FakeSession
+    monkeypatch.setitem(sys.modules, "winrm", stub)
+
+    client = MicrosoftWinRmDnsClient("user", "pass", use_ssl=True, insecure_tls=False)
+    client._session("dc.example.com")
+    assert captured["kwargs"]["transport"] == "ssl"
+    assert captured["kwargs"]["server_cert_validation"] == "validate"
+
+
+def test_microsoft_https_can_opt_out_of_tls_validation(monkeypatch) -> None:
+    import sys
+    import types
+
+    captured = {}
+
+    class FakeSession:
+        def __init__(self, server, auth, **kwargs):
+            captured["kwargs"] = kwargs
+
+    stub = types.ModuleType("winrm")
+    stub.Session = FakeSession
+    monkeypatch.setitem(sys.modules, "winrm", stub)
+
+    client = MicrosoftWinRmDnsClient("user", "pass", use_ssl=True, insecure_tls=True)
+    client._session("dc.example.com")
+    assert captured["kwargs"]["server_cert_validation"] == "ignore"
+
+
+def test_microsoft_create_client_defaults_insecure_tls_off() -> None:
+    client = create_microsoft_client(
+        {
+            "dns_username": "user",
+            "dns_password": "pass",
+            "dns_winrm_ssl": "true",
+        }
+    )
+    assert client.use_ssl is True
+    assert client.insecure_tls is False
+
+    opted = create_microsoft_client(
+        {
+            "dns_username": "user",
+            "dns_password": "pass",
+            "dns_winrm_ssl": "true",
+            "dns_winrm_insecure_tls": "true",
+        }
+    )
+    assert opted.insecure_tls is True

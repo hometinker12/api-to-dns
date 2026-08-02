@@ -25,7 +25,9 @@
     {% if _show_dashboard %}
       <a class="button" href="/admin">Dashboard</a>
     {% endif %}
-    <a class="button danger" href="/logout">Logout</a>
+    <form action="/logout" method="post" class="inline-form">
+      <button type="submit" class="button danger">Logout</button>
+    </form>
   </nav>
 </header>
 

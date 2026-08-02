@@ -1,7 +1,6 @@
 import hashlib
 import logging
 import re
-from typing import Optional
 
 from fastapi import HTTPException, Request
 
@@ -14,12 +13,13 @@ _SECRETISH_RE = re.compile(
 
 
 def wants_json_response(request: Request) -> bool:
-    return "application/json" in request.headers.get("accept", "").lower() or "application/json" in request.headers.get(
-        "content-type", ""
-    ).lower()
+    return (
+        "application/json" in request.headers.get("accept", "").lower()
+        or "application/json" in request.headers.get("content-type", "").lower()
+    )
 
 
-def api_key_from_headers(x_api_key: Optional[str], authorization: Optional[str]) -> Optional[str]:
+def api_key_from_headers(x_api_key: str | None, authorization: str | None) -> str | None:
     api_key = x_api_key
     if not api_key and authorization:
         prefix = "Bearer "

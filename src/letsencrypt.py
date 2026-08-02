@@ -4,13 +4,15 @@ The live ACME calls are isolated behind small private functions so tests can
 mock issuance without talking to Let's Encrypt. DNS automation reuses the same
 configured zone plugins as the public DNS API.
 """
+
 from __future__ import annotations
 
 import json
 import os
 import time
-from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -19,6 +21,7 @@ from cryptography.x509.oid import NameOID
 
 from .activity_logging import emit_activity_event, get_app_dns_name
 from .models import LOG_LEVEL_INFORMATIONAL, DnsRecordRequest, DnsZoneConfig
+from .security import decrypt_value, encrypt_value
 from .settings_store import delete_setting, get_setting, set_setting
 from .ssl_certs import SOURCE_LETSENCRYPT, _read_source, cert_dir, cert_metadata, install_letsencrypt_cert
 from .zone_service import (
@@ -55,7 +58,7 @@ class LetsEncryptError(RuntimeError):
     """Raised when enrollment or renewal cannot proceed."""
 
 
-def _le_dns_provider(cfg: Dict[str, Any]) -> str:
+def _le_dns_provider(cfg: dict[str, Any]) -> str:
     return (cfg.get("dns_provider_type") or "azure").strip().lower()
 
 
@@ -92,7 +95,7 @@ def _emit_le_dns_audit(
     )
 
 
-def _read_json_setting(db, name: str) -> Optional[Dict[str, Any]]:
+def _read_json_setting(db, name: str) -> dict[str, Any] | None:
     raw = get_setting(db, name)
     if not raw:
         return None
@@ -103,18 +106,18 @@ def _read_json_setting(db, name: str) -> Optional[Dict[str, Any]]:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _write_json_setting(db, name: str, value: Dict[str, Any]) -> None:
+def _write_json_setting(db, name: str, value: dict[str, Any]) -> None:
     set_setting(db, name, json.dumps(value, sort_keys=True))
 
 
-def get_config(db) -> Optional[Dict[str, Any]]:
+def get_config(db) -> dict[str, Any] | None:
     raw = _read_json_setting(db, SETTING_CONFIG)
     if not raw:
         return None
     return _normalize_config(raw, app_dns_name=get_app_dns_name(db), db=db)
 
 
-def get_enrollment(db) -> Optional[Dict[str, Any]]:
+def get_enrollment(db) -> dict[str, Any] | None:
     return _read_json_setting(db, SETTING_ENROLLMENT)
 
 
@@ -129,8 +132,8 @@ def write_enrollment_progress(
     percent: int,
     message: str,
     done: bool = False,
-    error: Optional[str] = None,
-    result_status: Optional[str] = None,
+    error: str | None = None,
+    result_status: str | None = None,
 ) -> None:
     payload = {
         "phase": phase,
@@ -143,7 +146,7 @@ def write_enrollment_progress(
     _write_json_setting(db, SETTING_ENROLLMENT_PROGRESS, payload)
 
 
-def get_enrollment_progress(db) -> Dict[str, Any]:
+def get_enrollment_progress(db) -> dict[str, Any]:
     raw = _read_json_setting(db, SETTING_ENROLLMENT_PROGRESS)
     if not raw:
         return {
@@ -176,12 +179,12 @@ def _normalize_hostname(value: str) -> str:
     return str(value or "").strip().strip(".").lower()
 
 
-def _split_names(names: str | List[str]) -> List[str]:
+def _split_names(names: str | list[str]) -> list[str]:
     if isinstance(names, str):
         parts = names.replace("\n", ",").split(",")
     else:
         parts = names
-    cleaned: List[str] = []
+    cleaned: list[str] = []
     for part in parts:
         domain = _normalize_hostname(part)
         if domain and domain not in cleaned:
@@ -195,8 +198,8 @@ def _name_under_root(name: str, root: str) -> bool:
     return normalized == root_name or normalized.endswith("." + root_name)
 
 
-def _cert_identities(config: Dict[str, Any]) -> List[str]:
-    identities: List[str] = []
+def _cert_identities(config: dict[str, Any]) -> list[str]:
+    identities: list[str] = []
     common_name = _normalize_hostname(config.get("common_name") or "")
     if common_name:
         identities.append(common_name)
@@ -210,7 +213,7 @@ def _cert_identities(config: Dict[str, Any]) -> List[str]:
     return identities
 
 
-def _normalize_config(config: Dict[str, Any], *, app_dns_name: str = "", db=None) -> Dict[str, Any]:
+def _normalize_config(config: dict[str, Any], *, app_dns_name: str = "", db=None) -> dict[str, Any]:
     default_cn = _normalize_hostname(app_dns_name)
     if "root_dns_domain" in config:
         normalized = dict(config)
@@ -232,8 +235,10 @@ def _normalize_config(config: Dict[str, Any], *, app_dns_name: str = "", db=None
     if isinstance(legacy, str):
         legacy = _split_names(legacy)
     common_name = legacy[0] if legacy else _normalize_hostname(app_dns_name)
-    subject_alt_names = legacy[1:] if len(legacy) > 1 else (
-        [_normalize_hostname(app_dns_name)] if _normalize_hostname(app_dns_name) else []
+    subject_alt_names = (
+        legacy[1:]
+        if len(legacy) > 1
+        else ([_normalize_hostname(app_dns_name)] if _normalize_hostname(app_dns_name) else [])
     )
     root_dns_domain = ""
     zone_id = config.get("zone_id")
@@ -272,7 +277,7 @@ def _valid_time(value: str) -> bool:
     return True
 
 
-def _zone_row(db, zone_id: Optional[int]) -> Optional[DnsZoneConfig]:
+def _zone_row(db, zone_id: int | None) -> DnsZoneConfig | None:
     if not zone_id:
         return None
     return db.get(DnsZoneConfig, zone_id)
@@ -285,7 +290,9 @@ def _relative_acme_name(domain: str, zone_name: str) -> str:
     return f"_acme-challenge.{prefix}".rstrip(".") or "_acme-challenge"
 
 
-def create_dns_txt_challenge(db, *, zone_id: int, domain: str, value: str, ttl: int = DNS_TXT_CHALLENGE_TTL) -> Dict[str, str]:
+def create_dns_txt_challenge(
+    db, *, zone_id: int, domain: str, value: str, ttl: int = DNS_TXT_CHALLENGE_TTL
+) -> dict[str, str]:
     zone = _zone_row(db, zone_id)
     if zone is None:
         raise LetsEncryptError("Selected DNS zone was not found.")
@@ -321,7 +328,9 @@ def delete_dns_txt_challenge(db, *, zone_id: int, domain: str) -> None:
     record_name = _relative_acme_name(domain, provider_domain)
     client = create_dns_client_from_settings(cfg)
     client.create_or_update_record(
-        DnsRecordRequest(zone_name=zone.zone_name, record_type="DELETE", record_name=record_name, ttl=120, values=["TXT"]),
+        DnsRecordRequest(
+            zone_name=zone.zone_name, record_type="DELETE", record_name=record_name, ttl=120, values=["TXT"]
+        ),
         dns_server=cfg.get("dns_server"),
         dns_zone=provider_domain,
     )
@@ -337,7 +346,7 @@ def delete_dns_txt_challenge(db, *, zone_id: int, domain: str) -> None:
     )
 
 
-def _txt_record_matches(records: List[Any], expected_value: str) -> bool:
+def _txt_record_matches(records: list[Any], expected_value: str) -> bool:
     for row in records:
         values = getattr(row, "values", None) or []
         if expected_value in values:
@@ -351,9 +360,9 @@ def _verify_dns_txt_challenge(
     zone_id: int,
     domain: str,
     expected_value: str,
-    progress_cb: Optional[ProgressCallback] = None,
+    progress_cb: ProgressCallback | None = None,
     attempt_offset: int = 0,
-    attempt_total: Optional[int] = None,
+    attempt_total: int | None = None,
 ) -> None:
     zone = _zone_row(db, zone_id)
     if zone is None:
@@ -404,7 +413,7 @@ def _verify_dns_txt_challenge(
     raise LetsEncryptError("DNS TXT record for _acme-challenge did not propagate after 2 minutes.")
 
 
-def _cleanup_dns_txt_challenges(db, *, zone_id: int, domains: List[str]) -> None:
+def _cleanup_dns_txt_challenges(db, *, zone_id: int, domains: list[str]) -> None:
     for domain in domains:
         try:
             delete_dns_txt_challenge(db, zone_id=zone_id, domain=domain)
@@ -428,22 +437,53 @@ def _load_pem_private_key(pem: bytes):
     return serialization.load_pem_private_key(pem, password=None)
 
 
-def _load_or_create_account_key():
-    path = cert_dir() / ACME_ACCOUNT_KEY_FILENAME
-    if path.is_file():
-        return _load_pem_private_key(path.read_bytes())
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+def _looks_like_pem_private_key(raw: bytes) -> bool:
+    text = raw.decode("utf-8", errors="ignore")
+    return "BEGIN" in text and "PRIVATE KEY" in text
+
+
+def _write_encrypted_account_key(path, pem: bytes) -> None:
+    """Atomically write the ACME account key as a Fernet token with mode 0600."""
+    token = encrypt_value(pem.decode("utf-8")).encode("utf-8")
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_bytes(_private_key_pem(key))
+    tmp_path.write_bytes(token)
     try:
         os.chmod(tmp_path, 0o600)
     except OSError:
         pass
     os.replace(tmp_path, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _load_account_key_bytes(path) -> bytes:
+    """Load PEM bytes from an encrypted (or legacy plaintext) ACME account key file."""
+    raw = path.read_bytes()
+    if _looks_like_pem_private_key(raw):
+        # Migrate legacy plaintext PEM to encrypted storage.
+        _write_encrypted_account_key(path, raw)
+        return raw
+    try:
+        return decrypt_value(raw.decode("utf-8")).encode("utf-8")
+    except Exception as exc:
+        raise LetsEncryptError(
+            "ACME account key file is corrupt or was encrypted with a different FERNET_KEY. "
+            "Restore a valid acme_account.key or remove it only if you intend to register a new ACME account."
+        ) from exc
+
+
+def _load_or_create_account_key():
+    path = cert_dir() / ACME_ACCOUNT_KEY_FILENAME
+    if path.is_file():
+        return _load_pem_private_key(_load_account_key_bytes(path))
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    _write_encrypted_account_key(path, _private_key_pem(key))
     return key
 
 
-def _csr_pem(private_key, common_name: str, subject_alt_names: List[str]) -> bytes:
+def _csr_pem(private_key, common_name: str, subject_alt_names: list[str]) -> bytes:
     identities = _cert_identities({"common_name": common_name, "subject_alt_names": subject_alt_names})
     if not identities:
         raise LetsEncryptError("At least one certificate identity is required.")
@@ -467,7 +507,7 @@ def _acme_imports():
     return jose, errors, messages, ClientNetwork, ClientV2
 
 
-def _acme_client(config: Dict[str, Any]):
+def _acme_client(config: dict[str, Any]):
     jose, errors, messages, ClientNetwork, ClientV2 = _acme_imports()
     account_key = _load_or_create_account_key()
     account_jwk = jose.JWKRSA(key=account_key)
@@ -519,15 +559,15 @@ def _acme_challenge_not_offered_error(challenge_type: str, domain: str) -> LetsE
     return LetsEncryptError(message)
 
 
-def _order_challenges(order_resource: Any, account_jwk: Any, challenge_type: str) -> List[Dict[str, Any]]:
-    selected: List[Dict[str, Any]] = []
+def _order_challenges(order_resource: Any, account_jwk: Any, challenge_type: str) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
     for authz in order_resource.authorizations:
         domain = str(authz.body.identifier.value)
         challb = next((body for body in authz.body.challenges if _challenge_type(body) == challenge_type), None)
         if challb is None:
             raise _acme_challenge_not_offered_error(challenge_type, domain)
         validation = challb.validation(account_jwk)
-        challenge: Dict[str, Any] = {
+        challenge: dict[str, Any] = {
             "domain": domain,
             "type": challenge_type,
             "uri": _challenge_uri(challb),
@@ -546,7 +586,7 @@ def _order_challenges(order_resource: Any, account_jwk: Any, challenge_type: str
     return selected
 
 
-def _acme_prepare_order(config: Dict[str, Any]) -> Dict[str, Any]:
+def _acme_prepare_order(config: dict[str, Any]) -> dict[str, Any]:
     """Create an ACME order and return serializable challenge details.
 
     The generated certificate private key is stored with the transient order so
@@ -556,7 +596,6 @@ def _acme_prepare_order(config: Dict[str, Any]) -> Dict[str, Any]:
         client, account_jwk, _messages = _acme_client(config)
         cert_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         cert_key_pem = _private_key_pem(cert_key)
-        identities = _cert_identities(config)
         order_resource = client.new_order(
             _csr_pem(cert_key, config["common_name"], config.get("subject_alt_names") or [])
         )
@@ -574,7 +613,7 @@ def _acme_prepare_order(config: Dict[str, Any]) -> Dict[str, Any]:
         raise LetsEncryptError(f"Failed to create ACME order: {exc}") from exc
 
 
-def _acme_finalize_order(enrollment: Dict[str, Any]) -> Dict[str, bytes]:
+def _acme_finalize_order(enrollment: dict[str, Any]) -> dict[str, bytes]:
     try:
         config = enrollment.get("config") or {}
         order = enrollment.get("order") or {}
@@ -602,13 +641,13 @@ def _acme_finalize_order(enrollment: Dict[str, Any]) -> Dict[str, bytes]:
         raise LetsEncryptError(f"Failed to finalize ACME order: {exc}") from exc
 
 
-def auto_renew_supported(challenge_type: str, zone_id: Optional[int]) -> bool:
+def auto_renew_supported(challenge_type: str, zone_id: int | None) -> bool:
     if challenge_type == CHALLENGE_HTTP:
         return True
     return bool(zone_id)
 
 
-def http_auto_renew_notice(db, config: Dict[str, Any]) -> str:
+def http_auto_renew_notice(db, config: dict[str, Any]) -> str:
     if config.get("challenge_type") != CHALLENGE_HTTP:
         return ""
     app_dns_name = get_app_dns_name(db)
@@ -625,15 +664,15 @@ def save_config(
     email: str,
     root_dns_domain: str,
     common_name: str,
-    subject_alt_names: str | List[str],
+    subject_alt_names: str | list[str],
     challenge_type: str,
-    zone_id: Optional[int],
+    zone_id: int | None,
     staging: bool,
     renew_before_expiry_days: Any = DEFAULT_RENEW_BEFORE_DAYS,
     scheduled_restart_enabled: bool = True,
     scheduled_restart_time: str = DEFAULT_SCHEDULED_RESTART_TIME,
-    auto_renew_enabled: Optional[bool] = None,
-) -> Dict[str, Any]:
+    auto_renew_enabled: bool | None = None,
+) -> dict[str, Any]:
     challenge = challenge_type if challenge_type in {CHALLENGE_DNS, CHALLENGE_HTTP} else CHALLENGE_DNS
     if challenge == CHALLENGE_HTTP:
         zone_id = None
@@ -684,11 +723,11 @@ def save_config(
 
 def _attach_challenges_to_enrollment(
     db,
-    enrollment: Dict[str, Any],
+    enrollment: dict[str, Any],
     *,
-    progress_cb: Optional[ProgressCallback] = None,
+    progress_cb: ProgressCallback | None = None,
     automated_only: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Publish DNS/HTTP challenge material onto ``enrollment`` and set status.
 
     When ``automated_only`` is True (renewal), manual challenge paths raise
@@ -703,7 +742,7 @@ def _attach_challenges_to_enrollment(
 
     if config.get("challenge_type") == CHALLENGE_DNS:
         if config.get("zone_id"):
-            provisioned_domains: List[str] = []
+            provisioned_domains: list[str] = []
             try:
                 report("create_dns_records", 25, "Creating DNS TXT records...")
                 enrollment["dns_records"] = []
@@ -790,7 +829,7 @@ def _attach_challenges_to_enrollment(
     return enrollment
 
 
-def _cleanup_enrollment_challenges(db, enrollment: Dict[str, Any]) -> None:
+def _cleanup_enrollment_challenges(db, enrollment: dict[str, Any]) -> None:
     config = enrollment.get("config") or {}
     if config.get("zone_id"):
         domains = [
@@ -802,7 +841,7 @@ def _cleanup_enrollment_challenges(db, enrollment: Dict[str, Any]) -> None:
             _cleanup_dns_txt_challenges(db, zone_id=int(config["zone_id"]), domains=domains)
 
 
-def start_enrollment(db, *, progress_cb: Optional[ProgressCallback] = None, **kwargs: Any) -> Dict[str, Any]:
+def start_enrollment(db, *, progress_cb: ProgressCallback | None = None, **kwargs: Any) -> dict[str, Any]:
     report = progress_cb or _noop_progress
     report("save_config", 5, "Saving configuration...")
     config = save_config(db, **kwargs)
@@ -812,7 +851,7 @@ def start_enrollment(db, *, progress_cb: Optional[ProgressCallback] = None, **kw
         "status": "awaiting_validation",
         "config": config,
         "order": order,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now(UTC).isoformat(),
     }
     try:
         _attach_challenges_to_enrollment(db, enrollment, progress_cb=progress_cb, automated_only=False)
@@ -825,7 +864,7 @@ def start_enrollment(db, *, progress_cb: Optional[ProgressCallback] = None, **kw
     return enrollment
 
 
-def continue_enrollment(db, *, progress_cb: Optional[ProgressCallback] = None) -> Dict[str, Any]:
+def continue_enrollment(db, *, progress_cb: ProgressCallback | None = None) -> dict[str, Any]:
     report = progress_cb or _noop_progress
     enrollment = get_enrollment(db)
     if not enrollment:
@@ -884,7 +923,7 @@ def detach_dns_zone_from_letsencrypt(db, zone_id: int) -> bool:
     return changed
 
 
-def http_challenge_response(db, token: str) -> Optional[str]:
+def http_challenge_response(db, token: str) -> str | None:
     enrollment = get_enrollment(db)
     challenge = (enrollment or {}).get("http_challenge") or {}
     if challenge.get("token") == token:
@@ -895,7 +934,7 @@ def http_challenge_response(db, token: str) -> Optional[str]:
     return None
 
 
-def should_renew_cert(metadata: Optional[Dict[str, Any]], renew_before_days: int) -> bool:
+def should_renew_cert(metadata: dict[str, Any] | None, renew_before_days: int) -> bool:
     if not metadata or metadata.get("source") != SOURCE_LETSENCRYPT:
         return False
     not_after = metadata.get("not_after")
@@ -907,11 +946,11 @@ def should_renew_cert(metadata: Optional[Dict[str, Any]], renew_before_days: int
     if not isinstance(not_after, datetime):
         return False
     if not_after.tzinfo is None:
-        not_after = not_after.replace(tzinfo=timezone.utc)
-    return not_after <= datetime.now(timezone.utc) + timedelta(days=renew_before_days)
+        not_after = not_after.replace(tzinfo=UTC)
+    return not_after <= datetime.now(UTC) + timedelta(days=renew_before_days)
 
 
-def maybe_renew_certificate(db) -> Optional[Dict[str, Any]]:
+def maybe_renew_certificate(db) -> dict[str, Any] | None:
     if _read_source() != SOURCE_LETSENCRYPT:
         return None
     config = get_config(db)
@@ -927,7 +966,7 @@ def maybe_renew_certificate(db) -> Optional[Dict[str, Any]]:
     if not should_renew_cert(cert_metadata(), renew_days):
         return None
     order = _acme_prepare_order(config)
-    enrollment: Dict[str, Any] = {"status": "renewing", "config": config, "order": order}
+    enrollment: dict[str, Any] = {"status": "renewing", "config": config, "order": order}
     try:
         _attach_challenges_to_enrollment(db, enrollment, automated_only=True)
         # Persist so HTTP-01 renewals can serve challenge tokens during finalize.
@@ -940,7 +979,7 @@ def maybe_renew_certificate(db) -> Optional[Dict[str, Any]]:
         clear_enrollment(db)
 
 
-def config_view(db) -> Dict[str, Any]:
+def config_view(db) -> dict[str, Any]:
     config = get_config(db) or {}
     app_dns_name = get_app_dns_name(db)
     metadata = cert_metadata()

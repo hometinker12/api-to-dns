@@ -4,13 +4,13 @@ The process cannot swap HTTP/HTTPS listener mode or TLS files in-place. These
 helpers persist a visible pending flag and terminate the current process after
 the restart response has been sent.
 """
+
 from __future__ import annotations
 
 import asyncio
 import os
 import signal
 from datetime import datetime
-from typing import Dict, Optional
 
 from .settings_store import delete_setting, get_setting, set_setting
 from .ssl_certs import access_url
@@ -56,7 +56,7 @@ def is_le_renewal_pending_restart(db) -> bool:
     }
 
 
-def preview_restart_urls(db) -> Dict[str, str]:
+def preview_restart_urls(db) -> dict[str, str]:
     return {
         "current_url": access_url(db, use_env_override=True),
         "after_restart_url": access_url(db, use_env_override=False),
@@ -78,7 +78,7 @@ def perform_application_restart(*, scheduled: bool = False, delay_seconds: float
     loop.create_task(_terminate_self(delay_seconds))
 
 
-def scheduled_restart_due(db, *, configured_time: str, now: Optional[datetime] = None) -> bool:
+def scheduled_restart_due(db, *, configured_time: str, now: datetime | None = None) -> bool:
     current = now or datetime.now().astimezone()
     if current.strftime("%H:%M") != configured_time:
         return False

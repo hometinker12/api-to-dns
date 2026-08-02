@@ -1,20 +1,22 @@
-"""Simple in-process rate limiting for auth and DNS endpoints."""
+"""SQLite-backed rate limiting shared across workers/processes."""
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import os
-import threading
+import random
 import time
-from collections import defaultdict, deque
-from typing import Deque, Dict, Tuple
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, PlainTextResponse
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
-from .http_utils import wants_json_response
+from .db import SessionLocal
+from .http_utils import api_key_from_headers, wants_json_response
 
-_LOCK = threading.Lock()
-_BUCKETS: Dict[Tuple[str, str], Deque[float]] = defaultdict(deque)
+LOGGER = logging.getLogger("api-to-dns")
 
 # path prefix -> (max_requests, window_seconds)
 _DEFAULT_LIMITS = {
@@ -24,7 +26,7 @@ _DEFAULT_LIMITS = {
 }
 
 
-def _limits() -> Dict[str, Tuple[int, int]]:
+def _limits() -> dict[str, tuple[int, int]]:
     """Allow env overrides like RATE_LIMIT_LOGIN=30:60."""
     limits = dict(_DEFAULT_LIMITS)
     mapping = {
@@ -44,14 +46,31 @@ def _limits() -> Dict[str, Tuple[int, int]]:
     return limits
 
 
-def _client_key(request: Request) -> str:
+def _match_route(path: str, limits: dict[str, tuple[int, int]]) -> tuple[str, tuple[int, int]] | None:
+    for prefix, rule in limits.items():
+        if path == prefix or path.startswith(prefix + "/"):
+            return prefix, rule
+    return None
+
+
+def _identity_hash(request: Request) -> str:
+    api_key = api_key_from_headers(
+        request.headers.get("x-api-key"),
+        request.headers.get("authorization"),
+    )
+    if api_key:
+        digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+        return f"key:{digest}"
     client = getattr(request, "client", None)
     host = client.host if client else "unknown"
-    api_key = request.headers.get("x-api-key") or ""
-    if api_key:
-        # Bound cardinality while still isolating keys.
-        return f"key:{api_key[:16]}"
     return f"ip:{host}"
+
+
+def _maybe_cleanup_expired(db, now: int) -> None:
+    # Opportunistic cleanup keeps the table small without a dedicated sweeper.
+    if random.random() > 0.05:
+        return
+    db.execute(text("DELETE FROM rate_limit_bucket WHERE expires_at < :now"), {"now": now})
 
 
 def rate_limit_exceeded(request: Request) -> bool:
@@ -59,24 +78,60 @@ def rate_limit_exceeded(request: Request) -> bool:
         return False
     path = request.url.path or ""
     limits = _limits()
-    matched = None
-    for prefix, rule in limits.items():
-        if path == prefix or path.startswith(prefix + "/"):
-            matched = rule
-            break
+    matched = _match_route(path, limits)
     if matched is None:
         return False
-    max_requests, window = matched
-    key = (_client_key(request), path if path in limits else next(p for p in limits if path == p or path.startswith(p + "/")))
-    now = time.monotonic()
-    with _LOCK:
-        bucket = _BUCKETS[key]
-        while bucket and bucket[0] <= now - window:
-            bucket.popleft()
-        if len(bucket) >= max_requests:
-            return True
-        bucket.append(now)
-    return False
+    route_prefix, (max_requests, window) = matched
+    identity = _identity_hash(request)
+    now = int(time.time())
+    window_start = now - (now % window)
+    expires_at = window_start + window
+
+    try:
+        with SessionLocal() as db:
+            _maybe_cleanup_expired(db, now)
+            # Atomic upsert/increment shared across workers.
+            db.execute(
+                text(
+                    """
+                    INSERT INTO rate_limit_bucket (route_prefix, identity_hash, window_start, count, expires_at)
+                    VALUES (:route_prefix, :identity_hash, :window_start, 1, :expires_at)
+                    ON CONFLICT(route_prefix, identity_hash, window_start)
+                    DO UPDATE SET count = count + 1
+                    """
+                ),
+                {
+                    "route_prefix": route_prefix,
+                    "identity_hash": identity,
+                    "window_start": window_start,
+                    "expires_at": expires_at,
+                },
+            )
+            row = db.execute(
+                text(
+                    """
+                    SELECT count FROM rate_limit_bucket
+                    WHERE route_prefix = :route_prefix
+                      AND identity_hash = :identity_hash
+                      AND window_start = :window_start
+                    """
+                ),
+                {
+                    "route_prefix": route_prefix,
+                    "identity_hash": identity,
+                    "window_start": window_start,
+                },
+            ).first()
+            db.commit()
+            count = int(row[0]) if row else 1
+            return count > max_requests
+    except OperationalError as exc:
+        # Fail closed on transient lock contention without taking the app down.
+        LOGGER.warning("rate limit check failed closed due to database error: %s", exc)
+        return True
+    except Exception:
+        LOGGER.exception("rate limit check failed closed due to unexpected error")
+        return True
 
 
 def rate_limit_rejection_response(request: Request):

@@ -1,5 +1,6 @@
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -28,11 +29,11 @@ class DnsProviderPlugin:
     label: str
     heading: str
     help_text: str
-    fields: List[PluginField]
-    create_client: Callable[[Dict[str, Optional[str]]], Any]
+    fields: list[PluginField]
+    create_client: Callable[[dict[str, str | None]], Any]
 
 
-def plugin_to_template_dict(plugin: DnsProviderPlugin) -> Dict[str, Any]:
+def plugin_to_template_dict(plugin: DnsProviderPlugin) -> dict[str, Any]:
     return {
         "key": plugin.key,
         "label": plugin.label,

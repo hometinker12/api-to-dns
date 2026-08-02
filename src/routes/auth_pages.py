@@ -1,5 +1,3 @@
-from typing import Optional
-
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlmodel import select
@@ -9,7 +7,7 @@ from ..activity_logging import LOGGER, emit_activity_event
 from ..auth import create_session_cookie, session_cookie_secure, session_cookie_settings
 from ..db import SessionLocal
 from ..models import LOG_LEVEL_INFORMATIONAL, LOG_LEVEL_WARNING, User
-from ..security import verify_password
+from ..security import DUMMY_PASSWORD_HASH, verify_password
 from ..web import client_ip, record_activity, render_error_response, templates
 
 router = APIRouter(tags=["auth"], include_in_schema=False)
@@ -30,9 +28,14 @@ def login_form(request: Request):
 @router.post("/login", response_class=HTMLResponse)
 def login(request: Request, username: str = Form(...), password: str = Form(...)):
     ip = client_ip(request)
+    session_version = 0
     with SessionLocal() as db:
         user = db.exec(select(User).where(User.username == username)).first()
-        if not user or user.disabled or not verify_password(password, user.password_hash):
+        # Always verify against a real PBKDF2 hash so missing/disabled users
+        # incur the same work as a valid account lookup.
+        password_hash = user.password_hash if user is not None and not user.disabled else DUMMY_PASSWORD_HASH
+        password_ok = verify_password(password, password_hash)
+        if user is None or user.disabled or not password_ok:
             try:
                 emit_activity_event(
                     db,
@@ -52,6 +55,7 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
                 name="login.html",
                 context={"error": "Invalid credentials."},
             )
+        session_version = int(getattr(user, "session_version", 0) or 0)
         try:
             emit_activity_event(
                 db,
@@ -68,21 +72,21 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
     response = RedirectResponse(url="/admin", status_code=HTTP_303_SEE_OTHER)
     response.set_cookie(
         "session",
-        create_session_cookie(username),
-        **session_cookie_settings(secure=session_cookie_secure()),
+        create_session_cookie(username, session_version),
+        **session_cookie_settings(secure=session_cookie_secure(request)),
     )
     return response
 
 
-@router.get("/logout")
+@router.post("/logout")
 def logout(request: Request) -> RedirectResponse:
     session_token = request.cookies.get("session")
-    actor: Optional[str] = None
+    actor: str | None = None
     if session_token:
         try:
             from ..auth import verify_session_cookie
 
-            actor = verify_session_cookie(session_token)
+            actor, _version = verify_session_cookie(session_token)
         except Exception:  # pragma: no cover - invalid sessions still log out
             actor = None
     if actor:
@@ -95,6 +99,14 @@ def logout(request: Request) -> RedirectResponse:
             message=f"Logout for {actor!r}",
             request_ip=client_ip(request),
         )
+    secure = session_cookie_secure(request)
     response = RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
-    response.delete_cookie("session")
+    # Match set_cookie attributes so browsers reliably clear the session.
+    response.delete_cookie(
+        "session",
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=secure,
+    )
     return response
