@@ -23,7 +23,9 @@
       {% else %}
         <span class="button disabled" aria-disabled="true">API Keys</span>
       {% endif %}
-      <a class="button neutral" href="/docs#/">API Docs</a>
+      {% if openapi_enabled %}
+        <a class="button neutral" href="/docs#/">API Docs</a>
+      {% endif %}
     </nav>
     <section>
       <h2>DNS zones</h2>

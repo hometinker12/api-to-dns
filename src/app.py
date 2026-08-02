@@ -341,12 +341,31 @@ _SECURITY_HEADERS = {
     ),
 }
 
+# FastAPI's default Swagger/ReDoc UIs load assets from jsDelivr (and a FastAPI favicon).
+# Keep the strict CSP for the admin app; only relax these paths when OpenAPI is enabled.
+_DOCS_PATHS = frozenset({"/docs", "/redoc", "/docs/oauth2-redirect"})
+_DOCS_CSP = (
+    "default-src 'self'; "
+    "base-uri 'self'; "
+    "object-src 'none'; "
+    "frame-ancestors 'none'; "
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "img-src 'self' data: https://fastapi.tiangolo.com https://cdn.jsdelivr.net; "
+    "font-src 'self' https://cdn.jsdelivr.net data:; "
+    "connect-src 'self' https://cdn.jsdelivr.net"
+)
+
 
 @app.middleware("http")
 async def security_headers_middleware(request: Request, call_next):
     response = await call_next(request)
-    for header, value in _SECURITY_HEADERS.items():
-        response.headers.setdefault(header, value)
+    path = request.url.path or ""
+    headers = dict(_SECURITY_HEADERS)
+    if path in _DOCS_PATHS:
+        headers["Content-Security-Policy"] = _DOCS_CSP
+    for header, value in headers.items():
+        response.headers[header] = value
     if session_cookie_secure(request):
         response.headers.setdefault(
             "Strict-Transport-Security",
@@ -473,6 +492,7 @@ def admin(request: Request, user: str = Depends(get_current_user)):
                 "key_zones": key_zones,
                 "can_view_zones": can_view_zones,
                 "can_view_api_keys": can_view_api_keys,
+                "openapi_enabled": _OPENAPI_ON,
             },
         )
     except Exception as exc:

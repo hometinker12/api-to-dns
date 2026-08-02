@@ -309,6 +309,28 @@ def test_openapi_disabled_by_default_outside_tests(monkeypatch: pytest.MonkeyPat
     assert app_module._openapi_enabled() is False
 
 
+def test_admin_shows_api_docs_link_when_openapi_enabled(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/admin")
+    assert response.status_code == 200
+    assert "API Docs" in response.text
+    assert 'href="/docs#/"' in response.text
+
+
+def test_admin_hides_api_docs_link_when_openapi_disabled(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.app as app_module
+
+    monkeypatch.setattr(app_module, "_OPENAPI_ON", False)
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/admin")
+    assert response.status_code == 200
+    assert "API Docs" not in response.text
+    assert 'href="/docs#/"' not in response.text
+
+
 def test_login_uses_dummy_hash_for_missing_users(monkeypatch: pytest.MonkeyPatch) -> None:
     from src.security import DUMMY_PASSWORD_HASH, verify_password
 
