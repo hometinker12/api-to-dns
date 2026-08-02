@@ -1,6 +1,6 @@
 # Tests: pytest on **develop**; BIND and Microsoft DNS smoke tests on **release**.
 # - **pytest**: unit tests on ubuntu (`python -m pytest`).
-# - **bind-smoke-linux**: checkout on ubuntu, `docker build`, BIND + API in Docker (bash), same idea as release CI.
+# - **bind-smoke-linux**: checkout on ubuntu, `docker build`, Trivy High/Critical scan, BIND + API in Docker (bash).
 # - **microsoft-dns-smoke-windows**: install DNS Server on windows-2025, run the API natively with Python/uvicorn,
 #   then inline PowerShell (Invoke-WebRequest / Invoke-RestMethod) exercises local + optional remote Microsoft DNS.
 #
@@ -75,6 +75,17 @@ jobs:
           IMAGE_TAG="api-to-dns-bind-smoke:$(date +%s)"
           docker build . --file Dockerfile --tag "$IMAGE_TAG"
           echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Scan smoke image with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_TAG }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          trivyignores: .trivyignore
 
       - name: Run BIND-backed smoke test
         env:
