@@ -1,6 +1,6 @@
 services:
   dns-api:
-    image: hometinker12/api-to-dns:0.6.0
+    image: hometinker12/api-to-dns:0.6.2
     build: .
     user: "10001:10001"
     read_only: true

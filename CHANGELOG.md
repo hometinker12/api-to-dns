@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-08-02
+
 ### Security
 
 - Account admins can no longer grant sensitive roles (`global.admin`, `account.*`, `api_keys.update`, `plugin.update`, `system.update`); only `global.admin` may assign those. Account admins may still grant `global.read`, `api_keys.read`, `dns_zones.read`, and `dns_zones.update`.
@@ -12,8 +14,13 @@
 - CSRF and CORS no longer weaken when `API_TO_DNS_ALLOW_INSECURE_DEFAULTS=1`; use explicit `API_TO_DNS_RELAX_CSRF` only in the test harness. Tracebacks require `DEBUG_ERRORS=1`.
 - Rate limits are SQLite-backed (shared across workers) and treat `Authorization: Bearer` like `X-API-Key`.
 - SSL uploads are size-bounded; App DNS names are validated before OpenSSL; SMTP defaults to STARTTLS and blocks credentialed cleartext unless `smtp_allow_insecure_auth` is set; SMTP passwords are not rendered into the settings HTML context.
-- Container runs as non-root uid/gid 10001 with pinned `python:3.12-slim` digest; Compose pins `hometinker12/api-to-dns:0.6.0`, `read_only`, `cap_drop: ALL`, `no-new-privileges`, localhost-bound ports, and `/tmp` tmpfs.
+- Container runs as non-root uid/gid 10001 with pinned `python:3.12-slim` digest; Compose pins `hometinker12/api-to-dns:0.6.2`, `read_only`, `cap_drop: ALL`, `no-new-privileges`, localhost-bound ports, and `/tmp` tmpfs.
 - Docker publish workflow adds Trivy High/Critical gates, BuildKit SBOM/provenance, and keyless Cosign signing; CI actions pinned to commit SHAs where practical. Pytest moved to `requirements-dev.txt`.
+
+### Changed
+
+- Application version metadata aligned to **0.6.2** (`VERSION`, OpenAPI, `pyproject.toml`, Docker label, Compose pin).
+- Docker publish on `main` creates a GitHub Release (`v${VERSION}`) after a successful image publish when that tag does not already exist.
 
 ## [0.6.0] - 2026-07-27
 

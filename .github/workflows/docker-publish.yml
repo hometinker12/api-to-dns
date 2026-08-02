@@ -1,3 +1,7 @@
+# Publish Docker image on push to main (or workflow_dispatch).
+# After a successful publish, creates a GitHub Release + v* tag when VERSION
+# does not already have a matching tag (typical after a version-bumped
+# release → main merge).
 name: Publish Docker image
 
 on:
@@ -198,3 +202,80 @@ jobs:
           echo "Digest: \`${{ steps.build.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "Cosign: keyless signature attached to digest" >> "$GITHUB_STEP_SUMMARY"
           echo "SBOM/provenance: BuildKit attestations enabled (sbom=true, provenance=mode=max)" >> "$GITHUB_STEP_SUMMARY"
+
+  github-release:
+    name: Create GitHub Release
+    needs: publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Read and validate version
+        id: version
+        shell: bash
+        run: |
+          VERSION="$(tr -d '\r\n' < VERSION)"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid VERSION value: $VERSION"
+            exit 1
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create release if tag is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.value }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; skipping."
+            echo "Skipped: release \`$TAG\` already exists." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          NOTES_FILE="$(mktemp)"
+          NOTES_VERSION="$VERSION" NOTES_PATH="$NOTES_FILE" \
+          NOTES_IMAGE="$IMAGE_NAME" NOTES_SHA="${GITHUB_SHA}" \
+          python3 <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ["NOTES_VERSION"]
+          notes_path = Path(os.environ["NOTES_PATH"])
+          image_name = os.environ["NOTES_IMAGE"]
+          sha = os.environ["NOTES_SHA"]
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          pattern = re.compile(
+              rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|\Z)",
+              re.MULTILINE | re.DOTALL,
+          )
+          match = pattern.search(changelog)
+          if match and match.group(1).strip():
+              body = match.group(1).strip() + "\n"
+          else:
+              body = (
+                  f"Release {version}.\n\n"
+                  f"- Docker image: `{image_name}:{version}`\n"
+                  f"- Commit: `{sha}`\n"
+              )
+          notes_path.write_text(body, encoding="utf-8")
+          PY
+
+          URL="$(gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file "$NOTES_FILE" \
+            --target "${GITHUB_SHA}")"
+
+          echo "Created release: $URL"
+          echo "Created GitHub Release: $URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "Docker image: \`${IMAGE_NAME}:${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"

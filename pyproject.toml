@@ -1,6 +1,6 @@
 [project]
 name = "api-to-dns"
-version = "0.6.0"
+version = "0.6.2"
 requires-python = ">=3.11"
 
 [tool.ruff]
