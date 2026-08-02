@@ -462,13 +462,17 @@ jobs:
           call_dns_api POST 403 access_denied "${DNS_RECORD_URL}" '{"zone_name":"denied.test","record_type":"A","record_name":"blocked","ttl":300,"values":["192.0.2.55"]}'
 
           echo "[compose] Validate hardened Compose config and startup against the smoke image"
-          docker tag "${IMAGE_TAG}" hometinker12/api-to-dns:0.6.0
-          python3 - <<'PY'
+          APP_VERSION="$(tr -d '\r\n' < VERSION)"
+          docker tag "${IMAGE_TAG}" "hometinker12/api-to-dns:${APP_VERSION}"
+          APP_VERSION="${APP_VERSION}" python3 - <<'PY'
           import json
+          import os
           import subprocess
 
+          expected_image = f"hometinker12/api-to-dns:{os.environ['APP_VERSION']}"
           cfg = json.loads(subprocess.check_output(["docker", "compose", "config", "--format", "json"], text=True))
           svc = cfg["services"]["dns-api"]
+          assert svc.get("image") == expected_image, (svc.get("image"), expected_image)
           assert str(svc.get("user") or "") in {"10001:10001", "10001"}, svc.get("user")
           assert svc.get("read_only") is True, svc
           cap_drop = {str(item).upper() for item in (svc.get("cap_drop") or [])}

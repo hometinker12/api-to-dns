@@ -1,6 +1,6 @@
 # DNS REST Service
 
-[![License: MIT + Commons Clause](https://img.shields.io/badge/License-MIT%20+%20Commons%20Clause-orange)](LICENSE.md) [![Release](https://img.shields.io/badge/release-0.6.0-blue)](VERSION) [![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/) [![Python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/) [![AI Assisted](https://img.shields.io/badge/AI%20Assisted-yes-blue)](https://cursor.com)
+[![License: MIT + Commons Clause](https://img.shields.io/badge/License-MIT%20+%20Commons%20Clause-orange)](LICENSE.md) [![Release](https://img.shields.io/badge/release-0.6.2-blue)](VERSION) [![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/) [![Python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/) [![AI Assisted](https://img.shields.io/badge/AI%20Assisted-yes-blue)](https://cursor.com)
 
 
 A Dockerized FastAPI service to manage DNS records through a protected admin web UI and secure API key authentication.
@@ -28,6 +28,7 @@ A Dockerized FastAPI service to manage DNS records through a protected admin web
   - [Partial update (`PATCH`)](#partial-update-patch)
   - [Delete a record (`DELETE`)](#delete-a-record-delete)
   - [Look up records (`GET`)](#look-up-records-get)
+- [Publishing a release](#publishing-a-release)
 - [License](#license)
 
 ## Supported Backend DNS Providers
@@ -75,7 +76,7 @@ http://127.0.0.1:8001/login
 
 > SSL is **off by default**; the container listens on plain HTTP on port `8000` (mapped to host `127.0.0.1:8001`). See **Optional: HTTPS with self-signed or uploaded certificates** below for the enable workflow.
 >
-> The image runs as non-root uid/gid **10001**. Compose pins `hometinker12/api-to-dns:0.6.0`, enables `read_only`, drops capabilities, and binds published ports to localhost. If you upgrade from a root-owned named volume, fix ownership once (do not start the app as root):
+> The image runs as non-root uid/gid **10001**. Compose pins `hometinker12/api-to-dns:0.6.2`, enables `read_only`, drops capabilities, and binds published ports to localhost. If you upgrade from a root-owned named volume, fix ownership once (do not start the app as root):
 >
 > ```bash
 > docker run --rm -v api-to-dns_api-to-dns-data:/vol alpine chown -R 10001:10001 /vol
@@ -441,6 +442,15 @@ Invoke-RestMethod -Method GET `
   "http://localhost:8000/dns-record?zone_name=prod-azure&record_name=www&record_type=A" `
   -Headers @{ "X-API-Key" = $apiKey }
 ```
+
+## Publishing a release
+
+Promotion to production is a manual **`release` → `main`** pull request. Before merging:
+
+1. Bump [`VERSION`](VERSION) (keep `pyproject.toml`, Dockerfile `ARG VERSION`, Compose image pin, README badge, and version tests in sync).
+2. Cut a matching `## [X.Y.Z] - YYYY-MM-DD` section in [`CHANGELOG.md`](CHANGELOG.md) out of `[Unreleased]`.
+
+Push to `main` runs [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml): tests, container smoke, Docker Hub publish (`latest`, `${VERSION}`, `sha-*`), then a GitHub Release `v${VERSION}` when that tag does not already exist. Release notes are taken from the matching CHANGELOG section (or a short fallback naming the image and commit).
 
 ## License
 
