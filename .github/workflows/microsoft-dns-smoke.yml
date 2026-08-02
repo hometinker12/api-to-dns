@@ -476,13 +476,19 @@ jobs:
           security_opt = [str(item) for item in (svc.get("security_opt") or [])]
           assert any("no-new-privileges" in item for item in security_opt), security_opt
           ports = svc.get("ports") or []
-          assert any(
-              isinstance(port, dict)
-              and port.get("host_ip") == "127.0.0.1"
-              and str(port.get("published")) == "8001"
-              and int(port.get("target") or 0) == 8000
-              for port in ports
-          ), ports
+
+          def _has_mapping(published: str, target: int) -> bool:
+              return any(
+                  isinstance(port, dict)
+                  and str(port.get("published")) == published
+                  and int(port.get("target") or 0) == target
+                  # host_ip may be omitted (all interfaces) or set to 127.0.0.1
+                  and str(port.get("host_ip") or "") in {"", "0.0.0.0", "127.0.0.1"}
+                  for port in ports
+              )
+
+          assert _has_mapping("8001", 8000), ports
+          assert _has_mapping("8443", 8443), ports
           targets = {
               volume.get("target")
               for volume in (svc.get("volumes") or [])
