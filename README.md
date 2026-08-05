@@ -150,7 +150,7 @@ The web interface allows you to:
 - Add and edit **DNS zones** (each configuration name is unique; each has its own provider type, DNS domain, server, and credentials). Use the **Test Configuration** button on a zone form to verify credentials and zone access by looking up a known record before saving.
 - Create and revoke **API keys**, and **edit** keys to change their label or **allowed zones**
 - Review and search activity logs under **Settings → Log Viewing / Searching**
-- Export and restore configuration under **Settings → Backup** (global admin only): password-encrypted archives (default) include settings, users, DNS zones, API key hashes, alert rules, SSL files, and `SECRET_KEY` / `ENCRYPTION_KEY`. Audit logs are optional. Restore is destructive for selected categories and shows an inline progress dialog; restoring application secrets writes durable secrets and restarts the app.
+- Export and restore configuration under **Settings → Backup** (global admin only): password-encrypted archives include settings, users, DNS zones, API key hashes, alert rules, SSL files, and `SECRET_KEY` / `ENCRYPTION_KEY` (application secrets require encryption). Audit logs are optional. Restore is destructive for selected categories and shows an inline progress dialog; restoring application secrets writes durable secrets and restarts the app.
 - Configure logging level, retention, SMTP delivery, and operational log rotation under **Settings → System Settings**
 - Create email alert rules under **Settings → Email Alerting**
 
