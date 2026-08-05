@@ -398,6 +398,119 @@ def _progress(cb: ProgressCallback | None, phase: str, percent: int, message: st
         cb(phase, percent, message)
 
 
+def _require_mapping(item: Any, *, label: str) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        raise BackupError(f"{label} entry must be an object.")
+    return item
+
+
+def validate_restore_records(categories: list[str], payload: dict[str, Any]) -> None:
+    """Validate every selected category before any destructive wipe/commit."""
+    cats = normalize_categories(categories, default_on=False)
+    validate_import_categories(cats, payload)
+
+    if CATEGORY_SETTINGS in cats:
+        settings = payload.get(CATEGORY_SETTINGS) or []
+        if not isinstance(settings, list):
+            raise BackupError("Backup settings category must be a list.")
+        for item in settings:
+            row = _require_mapping(item, label="Settings")
+            name = (row.get("name") or "").strip()
+            if name and name not in _EXCLUDED_SETTING_NAMES and row.get("value") is not None:
+                if not isinstance(row.get("value"), str):
+                    raise BackupError(f"Setting '{name}' value must be a string.")
+
+    if CATEGORY_USERS in cats:
+        users = payload.get(CATEGORY_USERS) or []
+        if not isinstance(users, list) or not users:
+            raise BackupError("Backup users category is empty; refusing to leave the system with no accounts.")
+        seen: set[str] = set()
+        for item in users:
+            row = _require_mapping(item, label="User")
+            username = (row.get("username") or "").strip()
+            password_hash = row.get("password_hash")
+            if not username:
+                raise BackupError("User entry missing username.")
+            if not isinstance(password_hash, str) or not password_hash.strip():
+                raise BackupError(f"User '{username}' is missing password_hash.")
+            if username in seen:
+                raise BackupError(f"Duplicate user '{username}' in backup.")
+            seen.add(username)
+            try:
+                int(row.get("session_version") or 0)
+            except (TypeError, ValueError) as exc:
+                raise BackupError(f"User '{username}' has invalid session_version.") from exc
+
+    if CATEGORY_ZONES in cats:
+        zones = payload.get(CATEGORY_ZONES) or []
+        if not isinstance(zones, list):
+            raise BackupError("Backup zones category must be a list.")
+        for item in zones:
+            row = _require_mapping(item, label="Zone")
+            if not (row.get("zone_name") or "").strip():
+                raise BackupError("Zone entry missing zone_name.")
+            if not isinstance(row.get("encrypted_config"), str) or not row.get("encrypted_config"):
+                raise BackupError(f"Zone '{row.get('zone_name')}' is missing encrypted_config.")
+
+    if CATEGORY_API_KEYS in cats:
+        keys = payload.get(CATEGORY_API_KEYS) or []
+        if not isinstance(keys, list):
+            raise BackupError("Backup API keys category must be a list.")
+        for item in keys:
+            row = _require_mapping(item, label="API key")
+            if not isinstance(row.get("key"), str) or not row.get("key"):
+                raise BackupError("API key entry missing key digest.")
+            allowed = row.get("allowed_zones") or []
+            if allowed is not None and not isinstance(allowed, list):
+                raise BackupError("API key allowed_zones must be a list.")
+
+    if CATEGORY_ALERT_RULES in cats:
+        rules = payload.get(CATEGORY_ALERT_RULES) or []
+        if not isinstance(rules, list):
+            raise BackupError("Backup alert rules category must be a list.")
+        for item in rules:
+            row = _require_mapping(item, label="Alert rule")
+            try:
+                int(row.get("cooldown_minutes") or 0)
+            except (TypeError, ValueError) as exc:
+                raise BackupError("Alert rule has invalid cooldown_minutes.") from exc
+
+    if CATEGORY_SSL_FILES in cats:
+        files = payload.get(CATEGORY_SSL_FILES) or {}
+        if not isinstance(files, dict):
+            raise BackupError("Backup SSL files category must be an object.")
+        for name, b64 in files.items():
+            if name not in SSL_FILE_NAMES:
+                continue
+            if not isinstance(b64, str) or not b64.strip():
+                raise BackupError(f"SSL file '{name}' is empty.")
+            try:
+                base64.b64decode(b64, validate=True)
+            except Exception as exc:  # noqa: BLE001
+                raise BackupError(f"SSL file '{name}' is not valid base64.") from exc
+
+    if CATEGORY_ACTIVITY_LOGS in cats:
+        logs = payload.get(CATEGORY_ACTIVITY_LOGS) or []
+        if not isinstance(logs, list):
+            raise BackupError("Backup activity logs category must be a list.")
+        for item in logs:
+            _require_mapping(item, label="Activity log")
+
+    if CATEGORY_APPLICATION_SECRETS in cats:
+        secrets = payload.get(CATEGORY_APPLICATION_SECRETS) or {}
+        if not isinstance(secrets, dict):
+            raise BackupError("Backup application secrets must be an object.")
+        secret_key = (secrets.get("SECRET_KEY") or "").strip()
+        encryption_key = (secrets.get("ENCRYPTION_KEY") or "").strip()
+        if not secret_key or not encryption_key:
+            raise BackupError("Backup application secrets are incomplete.")
+        try:
+            env_bootstrap._validate_persisted_secret("SECRET_KEY", secret_key)
+            env_bootstrap._validate_persisted_secret("ENCRYPTION_KEY", encryption_key)
+        except ValueError as exc:
+            raise BackupError(str(exc)) from exc
+
+
 def restore_payload(
     db,
     payload: dict[str, Any],
@@ -408,10 +521,11 @@ def restore_payload(
     cats = normalize_categories(categories, default_on=False)
     if not cats:
         raise BackupError("Select at least one category to restore.")
-    validate_import_categories(cats, payload)
 
     summary: dict[str, int] = {}
     _progress(progress_cb, "validate", 5, "Validating backup archive…")
+    # Full structural validation before any wipe so a bad archive cannot lock out admins.
+    validate_restore_records(cats, payload)
 
     # Wipe phase
     _progress(progress_cb, "wipe", 10, "Removing selected data on this installation…")
@@ -464,16 +578,17 @@ def restore_payload(
     if CATEGORY_USERS in cats:
         _progress(progress_cb, "users", _step_percent(), "Restoring users…")
         users = payload.get(CATEGORY_USERS) or []
-        if not users:
-            raise BackupError("Backup users category is empty; refusing to leave the system with no accounts.")
         for item in users:
+            # Bump session_version so cookies from the backup source installation
+            # cannot replay against the restored target (same SECRET_KEY).
+            source_version = int(item.get("session_version") or 0)
             db.add(
                 User(
-                    username=item["username"],
+                    username=str(item["username"]).strip(),
                     password_hash=item["password_hash"],
                     roles=item.get("roles") or "",
                     disabled=bool(item.get("disabled")),
-                    session_version=int(item.get("session_version") or 0),
+                    session_version=source_version + 1,
                 )
             )
         db.commit()

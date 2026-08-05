@@ -539,7 +539,7 @@ jobs:
             | python3 -c "import sys; assert 'api-to-dns App Dashboard' in sys.stdin.read()"
 
           echo "[compose] Persisted app_secrets.env overrides Compose env_file on restart"
-          # Distinct from .env so we prove entrypoint + env_bootstrap win over env_file.
+          # Distinct from .env so we prove Python env_bootstrap (not shell source) wins over env_file.
           RESTORED_KEYS="$(python3 - <<'PY'
           import base64
           import hashlib

@@ -362,3 +362,84 @@ def test_api_key_hash_survives_restore(client: TestClient, api_key_value: str) -
         assert key is not None
         zones = list(db.exec(select(DnsZoneConfig)).all())
         assert zones
+
+
+def test_restore_rejects_malformed_users_before_wipe() -> None:
+    from src.backup_service import validate_restore_records
+
+    with SessionLocal() as db:
+        before = {u.username for u in db.exec(select(User)).all()}
+        assert "admin" in before
+        payload = build_payload(db, [CATEGORY_USERS])
+        payload[CATEGORY_USERS] = [{"username": "broken"}]  # missing password_hash
+        with pytest.raises(BackupError, match="password_hash"):
+            validate_restore_records([CATEGORY_USERS], payload)
+        with pytest.raises(BackupError, match="password_hash"):
+            restore_payload(db, payload, [CATEGORY_USERS])
+        after = {u.username for u in db.exec(select(User)).all()}
+        assert after == before
+
+
+def test_restore_users_bumps_session_version() -> None:
+    with SessionLocal() as db:
+        admin = db.exec(select(User).where(User.username == "admin")).first()
+        assert admin is not None
+        previous = int(admin.session_version or 0)
+        try:
+            admin.session_version = 7
+            db.add(admin)
+            db.commit()
+            payload = build_payload(db, [CATEGORY_USERS])
+            assert payload[CATEGORY_USERS][0]["session_version"] == 7
+            restore_payload(db, payload, [CATEGORY_USERS])
+            restored = db.exec(select(User).where(User.username == "admin")).first()
+            assert restored is not None
+            assert int(restored.session_version) == 8
+        finally:
+            admin = db.exec(select(User).where(User.username == "admin")).first()
+            if admin is not None:
+                admin.session_version = previous
+                db.add(admin)
+                db.commit()
+
+
+def test_shell_export_quotes_metacharacters(tmp_path, monkeypatch) -> None:
+    import shlex
+
+    from src import env_bootstrap
+
+    secrets = tmp_path / "app_secrets.env"
+    # Hostile value that would execute if the file were shell-sourced.
+    secrets.write_text(
+        "SECRET_KEY=$(touch /tmp/pwned)\nENCRYPTION_KEY=not-a-fernet\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(env_bootstrap, "app_secrets_path", lambda: secrets)
+    # ENCRYPTION_KEY invalid → skipped; SECRET_KEY exported with shlex.quote.
+    exported = env_bootstrap.shell_export_persisted_secrets()
+    assert exported == "export SECRET_KEY=" + shlex.quote("$(touch /tmp/pwned)")
+    words = shlex.split(exported)
+    assert words == ["export", "SECRET_KEY=$(touch /tmp/pwned)"]
+
+
+def test_write_rejects_control_chars_in_secrets(tmp_path, monkeypatch) -> None:
+    from cryptography.fernet import Fernet
+
+    from src import env_bootstrap
+
+    monkeypatch.setattr(env_bootstrap, "app_secrets_path", lambda: tmp_path / "app_secrets.env")
+    monkeypatch.setattr(env_bootstrap, "project_env_path", lambda: tmp_path / "missing.env")
+    with pytest.raises(ValueError, match="control characters"):
+        env_bootstrap.write_application_secrets(
+            secret_key="good-secret\nbad",
+            encryption_key=Fernet.generate_key().decode(),
+        )
+
+
+def test_decrypt_rejects_extreme_pbkdf2_iterations() -> None:
+    from src.backup_crypto import MAX_PBKDF2_ITERATIONS, decrypt_envelope, encrypt_payload
+
+    envelope = encrypt_payload(b'{"manifest":{}}', "password1")
+    envelope["iterations"] = MAX_PBKDF2_ITERATIONS + 1
+    with pytest.raises(ValueError, match="too high|Invalid PBKDF2"):
+        decrypt_envelope(envelope, "password1")
