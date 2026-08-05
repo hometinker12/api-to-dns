@@ -39,6 +39,9 @@ from .version import get_app_version
 # Soft limit for uploaded backup archives (JSON envelope in memory).
 MAX_BACKUP_UPLOAD_BYTES = 32 * 1024 * 1024
 MANIFEST_ENVELOPE_ENCRYPTED = "envelope_encrypted"
+# Bound imported passlib PBKDF2 work factors (default hash uses 29000).
+MIN_PASSWORD_HASH_ROUNDS = 10_000
+MAX_PASSWORD_HASH_ROUNDS = 600_000
 
 LOGGER = logging.getLogger("api_to_dns")
 
@@ -417,6 +420,23 @@ def _require_mapping(item: Any, *, label: str) -> dict[str, Any]:
     return item
 
 
+def _validate_password_hash(password_hash: str, *, username: str) -> None:
+    if pwd_context.identify(password_hash) is None:
+        raise BackupError(f"User '{username}' has an unrecognized password_hash format.")
+    # passlib: $pbkdf2-sha256$<rounds>$<salt>$<digest>
+    parts = password_hash.split("$")
+    if len(parts) >= 3 and parts[1].startswith("pbkdf2"):
+        try:
+            rounds = int(parts[2])
+        except ValueError as exc:
+            raise BackupError(f"User '{username}' has an invalid password_hash rounds value.") from exc
+        if rounds < MIN_PASSWORD_HASH_ROUNDS or rounds > MAX_PASSWORD_HASH_ROUNDS:
+            raise BackupError(
+                f"User '{username}' password_hash rounds must be between "
+                f"{MIN_PASSWORD_HASH_ROUNDS} and {MAX_PASSWORD_HASH_ROUNDS}."
+            )
+
+
 def validate_restore_records(categories: list[str], payload: dict[str, Any]) -> None:
     """Validate every selected category before any destructive wipe/commit."""
     cats = normalize_categories(categories, default_on=False)
@@ -447,8 +467,7 @@ def validate_restore_records(categories: list[str], payload: dict[str, Any]) -> 
                 raise BackupError("User entry missing username.")
             if not isinstance(password_hash, str) or not password_hash.strip():
                 raise BackupError(f"User '{username}' is missing password_hash.")
-            if pwd_context.identify(password_hash) is None:
-                raise BackupError(f"User '{username}' has an unrecognized password_hash format.")
+            _validate_password_hash(password_hash, username=username)
             if username in seen:
                 raise BackupError(f"Duplicate user '{username}' in backup.")
             seen.add(username)
@@ -754,6 +773,13 @@ def restore_payload(
         encryption_key = (secrets.get("ENCRYPTION_KEY") or "").strip()
         if not secret_key or not encryption_key:
             raise BackupError("Backup application secrets are incomplete.")
+        # Secrets-only restore keeps existing users; bump sessions so source
+        # cookies signed with the restored SECRET_KEY cannot be replayed.
+        if CATEGORY_USERS not in cats:
+            for user_row in list(db.exec(select(User)).all()):
+                user_row.session_version = int(getattr(user_row, "session_version", 0) or 0) + 1
+                db.add(user_row)
+            db.commit()
         env_bootstrap.write_application_secrets(secret_key=secret_key, encryption_key=encryption_key)
         summary[CATEGORY_APPLICATION_SECRETS] = 2
         restarting = True

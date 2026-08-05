@@ -100,7 +100,15 @@ def client(api_key_value: str) -> TestClient:
     with SessionLocal() as db:
         set_disabled_dns_plugins(db, set())
         _seed_example_zone_and_permission(db, api_key_value)
-        if not db.exec(select(User).where(User.username == "admin")).first():
+        admin = db.exec(select(User).where(User.username == "admin")).first()
+        if admin is None:
             db.add(User(username="admin", password_hash=hash_password("x"), roles=_serialize_roles(ALL_ROLES)))
             db.commit()
+        else:
+            # Backup secrets-only restore bumps session_version; reset so tests that
+            # use create_session_cookie("admin") (version 0) keep working.
+            if int(getattr(admin, "session_version", 0) or 0) != 0:
+                admin.session_version = 0
+                db.add(admin)
+                db.commit()
     return TestClient(app)
