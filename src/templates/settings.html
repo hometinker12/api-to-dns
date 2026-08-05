@@ -1167,8 +1167,8 @@
             <h2>Backup Export</h2>
             <p class="help">
               Download a configuration archive. At-rest Fernet ciphertext is copied as stored;
-              include Application secrets so a restore can decrypt it. Encryption wraps the whole
-              archive with a password (recommended).
+              include Application secrets so a restore can decrypt it. Application secrets require
+              password encryption for the archive.
             </p>
             <section class="form-card">
               <form id="backup-export-form" action="/settings/backup/export" method="post">
@@ -1180,7 +1180,7 @@
                   <label class="inline-check"><input type="checkbox" name="categories" value="api_keys" checked /> API keys</label>
                   <label class="inline-check"><input type="checkbox" name="categories" value="alert_rules" checked /> Email alert rules</label>
                   <label class="inline-check"><input type="checkbox" name="categories" value="ssl_files" checked /> SSL certificate files</label>
-                  <label class="inline-check"><input type="checkbox" name="categories" value="application_secrets" checked /> Application secrets (<code>SECRET_KEY</code>, <code>ENCRYPTION_KEY</code>)</label>
+                  <label class="inline-check"><input type="checkbox" name="categories" value="application_secrets" checked id="backup-export-secrets" /> Application secrets (<code>SECRET_KEY</code>, <code>ENCRYPTION_KEY</code>)</label>
                   <label class="inline-check"><input type="checkbox" name="categories" value="activity_logs" /> Include audit logs</label>
                 </fieldset>
                 <label class="inline-check">
@@ -1196,8 +1196,8 @@
                   </label>
                 </div>
                 <div class="alert error" id="backup-unencrypted-warning" hidden>
-                  Warning: an unencrypted backup includes <code>ENCRYPTION_KEY</code> / <code>SECRET_KEY</code>
-                  (which can decrypt all Fernet fields) and SSL private key material. Store it securely.
+                  Warning: an unencrypted backup may still include SSL private key material and Fernet
+                  ciphertext. Application secrets cannot be exported without encryption.
                 </div>
                 <button type="submit">Download backup</button>
               </form>
@@ -1579,7 +1579,15 @@
       const backupPassword = document.getElementById("backup-password");
       const backupPasswordConfirm = document.getElementById("backup-password-confirm");
       const backupExportForm = document.getElementById("backup-export-form");
+      const backupExportSecrets = document.getElementById("backup-export-secrets");
       function syncBackupEncryptUi() {
+        const secretsOn = !!backupExportSecrets?.checked;
+        if (secretsOn && backupEncrypt && !backupEncrypt.checked) {
+          backupEncrypt.checked = true;
+        }
+        if (backupEncrypt) {
+          backupEncrypt.disabled = secretsOn;
+        }
         const on = !backupEncrypt || backupEncrypt.checked;
         if (backupEncryptFields) {
           backupEncryptFields.hidden = !on;
@@ -1595,8 +1603,14 @@
         }
       }
       backupEncrypt?.addEventListener("change", syncBackupEncryptUi);
+      backupExportSecrets?.addEventListener("change", syncBackupEncryptUi);
       syncBackupEncryptUi();
       backupExportForm?.addEventListener("submit", (event) => {
+        if (backupExportSecrets?.checked && backupEncrypt && !backupEncrypt.checked) {
+          event.preventDefault();
+          window.alert("Application secrets require a password-encrypted backup.");
+          return;
+        }
         if (backupEncrypt && backupEncrypt.checked) {
           if ((backupPassword?.value || "") !== (backupPasswordConfirm?.value || "")) {
             event.preventDefault();

@@ -29,10 +29,16 @@ from .models import (
     Setting,
     User,
 )
+from .rbac import ROLE_GLOBAL_ADMIN, effective_roles, parse_roles
+from .security import pwd_context
 from .settings_store import delete_setting, get_setting, set_setting
 from .ssl_certs import CERT_FILENAME, KEY_FILENAME, SOURCE_FILENAME, cert_dir
 from .time_utils import utc_now
 from .version import get_app_version
+
+# Soft limit for uploaded backup archives (JSON envelope in memory).
+MAX_BACKUP_UPLOAD_BYTES = 32 * 1024 * 1024
+MANIFEST_ENVELOPE_ENCRYPTED = "envelope_encrypted"
 
 LOGGER = logging.getLogger("api_to_dns")
 
@@ -336,6 +342,8 @@ def serialize_backup(
     password: str | None,
 ) -> bytes:
     created = (payload.get("manifest") or {}).get("created_at") or utc_now().isoformat()
+    if CATEGORY_APPLICATION_SECRETS in payload and not encrypt:
+        raise BackupError("Application secrets require a password-encrypted backup.")
     if encrypt:
         if not password:
             raise BackupError("Password is required when encryption is enabled.")
@@ -362,7 +370,8 @@ def load_backup_bytes(raw: bytes, password: str | None) -> dict[str, Any]:
         raise BackupError("Backup file is not valid JSON.") from exc
     if envelope.get("format") != BACKUP_FORMAT:
         raise BackupError("Unrecognized backup format.")
-    if envelope.get("encrypted"):
+    encrypted = bool(envelope.get("encrypted"))
+    if encrypted:
         if not password:
             raise BackupError("Password is required to decrypt this backup.")
         try:
@@ -377,8 +386,11 @@ def load_backup_bytes(raw: bytes, password: str | None) -> dict[str, Any]:
         payload = envelope.get("payload")
         if not isinstance(payload, dict):
             raise BackupError("Unencrypted backup is missing payload.")
-    if not isinstance(payload.get("manifest"), dict):
+    manifest = payload.get("manifest")
+    if not isinstance(manifest, dict):
         raise BackupError("Backup payload is missing manifest.")
+    # Record envelope integrity so restore can refuse secrets from plaintext archives.
+    manifest[MANIFEST_ENVELOPE_ENCRYPTED] = encrypted
     return payload
 
 
@@ -387,10 +399,11 @@ def backup_filename() -> str:
     return f"api-to-dns-backup-{stamp}.atdb"
 
 
-def _delete_all(db, model) -> None:
+def _delete_all(db, model, *, commit: bool = True) -> None:
     for row in list(db.exec(select(model)).all()):
         db.delete(row)
-    db.commit()
+    if commit:
+        db.commit()
 
 
 def _progress(cb: ProgressCallback | None, phase: str, percent: int, message: str) -> None:
@@ -425,6 +438,7 @@ def validate_restore_records(categories: list[str], payload: dict[str, Any]) -> 
         if not isinstance(users, list) or not users:
             raise BackupError("Backup users category is empty; refusing to leave the system with no accounts.")
         seen: set[str] = set()
+        enabled_global_admin = False
         for item in users:
             row = _require_mapping(item, label="User")
             username = (row.get("username") or "").strip()
@@ -433,6 +447,8 @@ def validate_restore_records(categories: list[str], payload: dict[str, Any]) -> 
                 raise BackupError("User entry missing username.")
             if not isinstance(password_hash, str) or not password_hash.strip():
                 raise BackupError(f"User '{username}' is missing password_hash.")
+            if pwd_context.identify(password_hash) is None:
+                raise BackupError(f"User '{username}' has an unrecognized password_hash format.")
             if username in seen:
                 raise BackupError(f"Duplicate user '{username}' in backup.")
             seen.add(username)
@@ -440,26 +456,42 @@ def validate_restore_records(categories: list[str], payload: dict[str, Any]) -> 
                 int(row.get("session_version") or 0)
             except (TypeError, ValueError) as exc:
                 raise BackupError(f"User '{username}' has invalid session_version.") from exc
+            if not bool(row.get("disabled")):
+                roles = effective_roles(parse_roles(row.get("roles") or ""))
+                if ROLE_GLOBAL_ADMIN in roles:
+                    enabled_global_admin = True
+        if not enabled_global_admin:
+            raise BackupError("Backup users must include at least one enabled global administrator.")
 
     if CATEGORY_ZONES in cats:
         zones = payload.get(CATEGORY_ZONES) or []
         if not isinstance(zones, list):
             raise BackupError("Backup zones category must be a list.")
+        seen_zones: set[str] = set()
         for item in zones:
             row = _require_mapping(item, label="Zone")
-            if not (row.get("zone_name") or "").strip():
+            zone_name = (row.get("zone_name") or "").strip()
+            if not zone_name:
                 raise BackupError("Zone entry missing zone_name.")
+            if zone_name in seen_zones:
+                raise BackupError(f"Duplicate zone '{zone_name}' in backup.")
+            seen_zones.add(zone_name)
             if not isinstance(row.get("encrypted_config"), str) or not row.get("encrypted_config"):
-                raise BackupError(f"Zone '{row.get('zone_name')}' is missing encrypted_config.")
+                raise BackupError(f"Zone '{zone_name}' is missing encrypted_config.")
 
     if CATEGORY_API_KEYS in cats:
         keys = payload.get(CATEGORY_API_KEYS) or []
         if not isinstance(keys, list):
             raise BackupError("Backup API keys category must be a list.")
+        seen_keys: set[str] = set()
         for item in keys:
             row = _require_mapping(item, label="API key")
-            if not isinstance(row.get("key"), str) or not row.get("key"):
+            digest = row.get("key")
+            if not isinstance(digest, str) or not digest:
                 raise BackupError("API key entry missing key digest.")
+            if digest in seen_keys:
+                raise BackupError("Duplicate API key digest in backup.")
+            seen_keys.add(digest)
             allowed = row.get("allowed_zones") or []
             if allowed is not None and not isinstance(allowed, list):
                 raise BackupError("API key allowed_zones must be a list.")
@@ -497,6 +529,9 @@ def validate_restore_records(categories: list[str], payload: dict[str, Any]) -> 
             _require_mapping(item, label="Activity log")
 
     if CATEGORY_APPLICATION_SECRETS in cats:
+        manifest = payload.get("manifest") or {}
+        if not isinstance(manifest, dict) or not manifest.get(MANIFEST_ENVELOPE_ENCRYPTED):
+            raise BackupError("Application secrets can only be restored from a password-encrypted backup.")
         secrets = payload.get(CATEGORY_APPLICATION_SECRETS) or {}
         if not isinstance(secrets, dict):
             raise BackupError("Backup application secrets must be an object.")
@@ -527,27 +562,167 @@ def restore_payload(
     # Full structural validation before any wipe so a bad archive cannot lock out admins.
     validate_restore_records(cats, payload)
 
-    # Wipe phase
-    _progress(progress_cb, "wipe", 10, "Removing selected data on this installation…")
-    if CATEGORY_API_KEYS in cats or CATEGORY_ZONES in cats:
-        # ACLs first when either side is replaced
-        _delete_all(db, ApiKeyAllowedZone)
-    if CATEGORY_API_KEYS in cats:
-        _delete_all(db, ApiKey)
-    if CATEGORY_ZONES in cats:
-        _delete_all(db, DnsZoneConfig)
-    if CATEGORY_USERS in cats:
-        _delete_all(db, User)
-    if CATEGORY_ALERT_RULES in cats:
-        _delete_all(db, AlertRule)
-    if CATEGORY_ACTIVITY_LOGS in cats:
-        _delete_all(db, ActivityLog)
-    if CATEGORY_SETTINGS in cats:
-        for row in list(db.exec(select(Setting)).all()):
-            if row.name != SETTING_BACKUP_PROGRESS:
-                db.delete(row)
-        db.commit()
+    db_categories = {
+        CATEGORY_SETTINGS,
+        CATEGORY_USERS,
+        CATEGORY_ZONES,
+        CATEGORY_API_KEYS,
+        CATEGORY_ALERT_RULES,
+        CATEGORY_ACTIVITY_LOGS,
+    }
+    touches_db = bool(db_categories.intersection(cats))
+
+    # Progress updates open a separate SQLite session; only call them outside
+    # the restore write transaction to avoid "database is locked".
+    if touches_db:
+        _progress(progress_cb, "database", 15, "Restoring database categories…")
+
+    try:
+        # Wipe + restore DB rows in one transaction so failures roll back the wipe.
+        if CATEGORY_API_KEYS in cats or CATEGORY_ZONES in cats:
+            _delete_all(db, ApiKeyAllowedZone, commit=False)
+        if CATEGORY_API_KEYS in cats:
+            _delete_all(db, ApiKey, commit=False)
+        if CATEGORY_ZONES in cats:
+            _delete_all(db, DnsZoneConfig, commit=False)
+        if CATEGORY_USERS in cats:
+            _delete_all(db, User, commit=False)
+        if CATEGORY_ALERT_RULES in cats:
+            _delete_all(db, AlertRule, commit=False)
+        if CATEGORY_ACTIVITY_LOGS in cats:
+            _delete_all(db, ActivityLog, commit=False)
+        if CATEGORY_SETTINGS in cats:
+            for row in list(db.exec(select(Setting)).all()):
+                if row.name != SETTING_BACKUP_PROGRESS:
+                    db.delete(row)
+        # Apply deletes before inserts so unique constraints (username, zone_name, …) succeed.
+        if touches_db:
+            db.flush()
+
+        if CATEGORY_SETTINGS in cats:
+            for item in payload.get(CATEGORY_SETTINGS) or []:
+                name = (item.get("name") or "").strip()
+                if not name or name in _EXCLUDED_SETTING_NAMES:
+                    continue
+                db.add(Setting(name=name, value=item.get("value") or ""))
+            summary[CATEGORY_SETTINGS] = len(payload.get(CATEGORY_SETTINGS) or [])
+
+        if CATEGORY_USERS in cats:
+            users = payload.get(CATEGORY_USERS) or []
+            for item in users:
+                # Bump session_version so cookies from the backup source installation
+                # cannot replay against the restored target (same SECRET_KEY).
+                source_version = int(item.get("session_version") or 0)
+                db.add(
+                    User(
+                        username=str(item["username"]).strip(),
+                        password_hash=item["password_hash"],
+                        roles=item.get("roles") or "",
+                        disabled=bool(item.get("disabled")),
+                        session_version=source_version + 1,
+                    )
+                )
+            summary[CATEGORY_USERS] = len(users)
+
+        zone_id_by_name: dict[str, int] = {}
+        if CATEGORY_ZONES in cats:
+            zones = payload.get(CATEGORY_ZONES) or []
+            for item in zones:
+                row = DnsZoneConfig(
+                    zone_name=item["zone_name"],
+                    encrypted_config=item["encrypted_config"],
+                )
+                db.add(row)
+                db.flush()
+                db.refresh(row)
+                zone_id_by_name[row.zone_name] = int(row.id)
+            summary[CATEGORY_ZONES] = len(zones)
+        else:
+            zone_id_by_name = {z.zone_name: int(z.id) for z in db.exec(select(DnsZoneConfig)).all() if z.id is not None}
+
+        if CATEGORY_API_KEYS in cats:
+            keys = payload.get(CATEGORY_API_KEYS) or []
+            for item in keys:
+                row = ApiKey(
+                    label=item.get("label") or "",
+                    key=item["key"],
+                    key_prefix=item.get("key_prefix") or "",
+                    active=bool(item.get("active", True)),
+                    created_at=_parse_dt(item.get("created_at")) or utc_now(),
+                )
+                db.add(row)
+                db.flush()
+                db.refresh(row)
+                for zname in item.get("allowed_zones") or []:
+                    zid = zone_id_by_name.get(zname)
+                    if zid is None:
+                        continue
+                    db.add(ApiKeyAllowedZone(api_key_id=row.id, dns_zone_config_id=zid))
+            summary[CATEGORY_API_KEYS] = len(keys)
+
+        if CATEGORY_ALERT_RULES in cats:
+            rules = payload.get(CATEGORY_ALERT_RULES) or []
+            for item in rules:
+                db.add(
+                    AlertRule(
+                        enabled=bool(item.get("enabled", True)),
+                        name=item.get("name") or "",
+                        event_type=item.get("event_type"),
+                        category=item.get("category"),
+                        minimum_level=item.get("minimum_level") or "WARNING",
+                        message_contains=item.get("message_contains"),
+                        email_recipients=item.get("email_recipients") or "",
+                        email_subject_template=item.get("email_subject_template") or "",
+                        email_body_template=item.get("email_body_template") or "",
+                        cooldown_minutes=int(item.get("cooldown_minutes") or 0),
+                        last_triggered_at=_parse_dt(item.get("last_triggered_at")),
+                    )
+                )
+            summary[CATEGORY_ALERT_RULES] = len(rules)
+
+        if CATEGORY_ACTIVITY_LOGS in cats:
+            logs = payload.get(CATEGORY_ACTIVITY_LOGS) or []
+            batch: list[ActivityLog] = []
+            for item in logs:
+                batch.append(
+                    ActivityLog(
+                        timestamp=_parse_dt(item.get("timestamp")) or utc_now(),
+                        level=item.get("level") or "INFORMATIONAL",
+                        category=item.get("category"),
+                        event_type=item.get("event_type") or "",
+                        status=item.get("status"),
+                        actor_type=item.get("actor_type"),
+                        actor_id=item.get("actor_id"),
+                        actor_label=item.get("actor_label"),
+                        zone_name=item.get("zone_name"),
+                        record_name=item.get("record_name"),
+                        message=item.get("message"),
+                        details_json=item.get("details_json"),
+                        request_method=item.get("request_method"),
+                        request_path=item.get("request_path"),
+                        request_status_code=item.get("request_status_code"),
+                        request_ip=item.get("request_ip"),
+                    )
+                )
+                if len(batch) >= 200:
+                    db.add_all(batch)
+                    db.flush()
+                    batch = []
+            if batch:
+                db.add_all(batch)
+                db.flush()
+            summary[CATEGORY_ACTIVITY_LOGS] = len(logs)
+
+        if touches_db:
+            db.commit()
+            _progress(progress_cb, "database", 70, "Database categories restored…")
+    except Exception:
+        db.rollback()
+        raise
+
+    # Filesystem categories after DB commit so a failed DB restore cannot orphan SSL/secrets.
     if CATEGORY_SSL_FILES in cats:
+        _progress(progress_cb, "ssl_files", 85, "Restoring SSL certificate files…")
         directory = cert_dir()
         for name in SSL_FILE_NAMES:
             path = directory / name
@@ -556,109 +731,7 @@ def restore_payload(
                     path.unlink()
                 except OSError as exc:
                     LOGGER.warning("Failed to remove SSL file %s: %s", path, exc)
-
-    step = 0
-    total_steps = max(1, len(cats))
-
-    def _step_percent(base: int = 20) -> int:
-        nonlocal step
-        step += 1
-        return min(95, base + int(70 * step / total_steps))
-
-    if CATEGORY_SETTINGS in cats:
-        _progress(progress_cb, "settings", _step_percent(), "Restoring system settings…")
-        for item in payload.get(CATEGORY_SETTINGS) or []:
-            name = (item.get("name") or "").strip()
-            if not name or name in _EXCLUDED_SETTING_NAMES:
-                continue
-            db.add(Setting(name=name, value=item.get("value") or ""))
-        db.commit()
-        summary[CATEGORY_SETTINGS] = len(payload.get(CATEGORY_SETTINGS) or [])
-
-    if CATEGORY_USERS in cats:
-        _progress(progress_cb, "users", _step_percent(), "Restoring users…")
-        users = payload.get(CATEGORY_USERS) or []
-        for item in users:
-            # Bump session_version so cookies from the backup source installation
-            # cannot replay against the restored target (same SECRET_KEY).
-            source_version = int(item.get("session_version") or 0)
-            db.add(
-                User(
-                    username=str(item["username"]).strip(),
-                    password_hash=item["password_hash"],
-                    roles=item.get("roles") or "",
-                    disabled=bool(item.get("disabled")),
-                    session_version=source_version + 1,
-                )
-            )
-        db.commit()
-        summary[CATEGORY_USERS] = len(users)
-
-    zone_id_by_name: dict[str, int] = {}
-    if CATEGORY_ZONES in cats:
-        _progress(progress_cb, "zones", _step_percent(), "Restoring DNS zones…")
-        zones = payload.get(CATEGORY_ZONES) or []
-        for item in zones:
-            row = DnsZoneConfig(
-                zone_name=item["zone_name"],
-                encrypted_config=item["encrypted_config"],
-            )
-            db.add(row)
-            db.commit()
-            db.refresh(row)
-            zone_id_by_name[row.zone_name] = int(row.id)
-        summary[CATEGORY_ZONES] = len(zones)
-    else:
-        zone_id_by_name = {z.zone_name: int(z.id) for z in db.exec(select(DnsZoneConfig)).all() if z.id is not None}
-
-    if CATEGORY_API_KEYS in cats:
-        _progress(progress_cb, "api_keys", _step_percent(), "Restoring API keys…")
-        keys = payload.get(CATEGORY_API_KEYS) or []
-        for item in keys:
-            row = ApiKey(
-                label=item.get("label") or "",
-                key=item["key"],
-                key_prefix=item.get("key_prefix") or "",
-                active=bool(item.get("active", True)),
-                created_at=_parse_dt(item.get("created_at")) or utc_now(),
-            )
-            db.add(row)
-            db.commit()
-            db.refresh(row)
-            for zname in item.get("allowed_zones") or []:
-                zid = zone_id_by_name.get(zname)
-                if zid is None:
-                    continue
-                db.add(ApiKeyAllowedZone(api_key_id=row.id, dns_zone_config_id=zid))
-            db.commit()
-        summary[CATEGORY_API_KEYS] = len(keys)
-
-    if CATEGORY_ALERT_RULES in cats:
-        _progress(progress_cb, "alert_rules", _step_percent(), "Restoring email alert rules…")
-        rules = payload.get(CATEGORY_ALERT_RULES) or []
-        for item in rules:
-            db.add(
-                AlertRule(
-                    enabled=bool(item.get("enabled", True)),
-                    name=item.get("name") or "",
-                    event_type=item.get("event_type"),
-                    category=item.get("category"),
-                    minimum_level=item.get("minimum_level") or "WARNING",
-                    message_contains=item.get("message_contains"),
-                    email_recipients=item.get("email_recipients") or "",
-                    email_subject_template=item.get("email_subject_template") or "",
-                    email_body_template=item.get("email_body_template") or "",
-                    cooldown_minutes=int(item.get("cooldown_minutes") or 0),
-                    last_triggered_at=_parse_dt(item.get("last_triggered_at")),
-                )
-            )
-        db.commit()
-        summary[CATEGORY_ALERT_RULES] = len(rules)
-
-    if CATEGORY_SSL_FILES in cats:
-        _progress(progress_cb, "ssl_files", _step_percent(), "Restoring SSL certificate files…")
         files = payload.get(CATEGORY_SSL_FILES) or {}
-        directory = cert_dir()
         directory.mkdir(parents=True, exist_ok=True)
         count = 0
         for name, b64 in files.items():
@@ -673,43 +746,9 @@ def restore_payload(
             count += 1
         summary[CATEGORY_SSL_FILES] = count
 
-    if CATEGORY_ACTIVITY_LOGS in cats:
-        _progress(progress_cb, "activity_logs", _step_percent(), "Restoring audit logs…")
-        logs = payload.get(CATEGORY_ACTIVITY_LOGS) or []
-        batch: list[ActivityLog] = []
-        for item in logs:
-            batch.append(
-                ActivityLog(
-                    timestamp=_parse_dt(item.get("timestamp")) or utc_now(),
-                    level=item.get("level") or "INFORMATIONAL",
-                    category=item.get("category"),
-                    event_type=item.get("event_type") or "",
-                    status=item.get("status"),
-                    actor_type=item.get("actor_type"),
-                    actor_id=item.get("actor_id"),
-                    actor_label=item.get("actor_label"),
-                    zone_name=item.get("zone_name"),
-                    record_name=item.get("record_name"),
-                    message=item.get("message"),
-                    details_json=item.get("details_json"),
-                    request_method=item.get("request_method"),
-                    request_path=item.get("request_path"),
-                    request_status_code=item.get("request_status_code"),
-                    request_ip=item.get("request_ip"),
-                )
-            )
-            if len(batch) >= 200:
-                db.add_all(batch)
-                db.commit()
-                batch = []
-        if batch:
-            db.add_all(batch)
-            db.commit()
-        summary[CATEGORY_ACTIVITY_LOGS] = len(logs)
-
     restarting = False
     if CATEGORY_APPLICATION_SECRETS in cats:
-        _progress(progress_cb, "application_secrets", _step_percent(), "Writing application secrets…")
+        _progress(progress_cb, "application_secrets", 95, "Writing application secrets…")
         secrets = payload.get(CATEGORY_APPLICATION_SECRETS) or {}
         secret_key = (secrets.get("SECRET_KEY") or "").strip()
         encryption_key = (secrets.get("ENCRYPTION_KEY") or "").strip()

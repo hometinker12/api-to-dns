@@ -2497,9 +2497,16 @@ async def settings_backup_import_async(
     selected = _backup_categories_from_form(categories)
     if not selected:
         return JSONResponse({"detail": "Select at least one category to restore."}, status_code=400)
-    raw = await backup_file.read()
+    raw = await backup_file.read(backup_service.MAX_BACKUP_UPLOAD_BYTES + 1)
     if not raw:
         return JSONResponse({"detail": "Backup file is empty."}, status_code=400)
+    if len(raw) > backup_service.MAX_BACKUP_UPLOAD_BYTES:
+        return JSONResponse(
+            {
+                "detail": f"Backup file exceeds the {backup_service.MAX_BACKUP_UPLOAD_BYTES // (1024 * 1024)} MiB upload limit."
+            },
+            status_code=400,
+        )
     # Fail fast on decrypt / full record validation before starting the worker.
     # Decrypt off the event loop so attacker-controlled PBKDF2 cannot stall requests.
     try:

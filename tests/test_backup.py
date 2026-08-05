@@ -130,7 +130,8 @@ def test_export_encrypted_download(client: TestClient) -> None:
 def test_export_unencrypted_warning_present(client: TestClient) -> None:
     _admin_client(client)
     response = client.get("/settings?area=backup&section=export")
-    assert "unencrypted backup includes" in response.text
+    assert "unencrypted backup may still include" in response.text
+    assert "Application secrets cannot be exported without encryption" in response.text
     assert 'id="backup-unencrypted-warning"' in response.text
 
 
@@ -283,11 +284,12 @@ def test_import_requires_confirm(client: TestClient) -> None:
     _admin_client(client)
     with SessionLocal() as db:
         payload = build_payload(db, [CATEGORY_SETTINGS, CATEGORY_APPLICATION_SECRETS])
-        raw = serialize_backup(payload, encrypt=False, password=None)
+        raw = serialize_backup(payload, encrypt=True, password="password1")
     response = client.post(
         "/settings/backup/import-async",
         data={
             "categories": [CATEGORY_SETTINGS, CATEGORY_APPLICATION_SECRETS],
+            "password": "password1",
             "confirm_replace": "0",
         },
         files={"backup_file": ("test.atdb", raw, "application/octet-stream")},
@@ -300,11 +302,12 @@ def test_import_fernet_categories_require_secrets(client: TestClient) -> None:
     _admin_client(client)
     with SessionLocal() as db:
         payload = build_payload(db, [CATEGORY_SETTINGS, CATEGORY_APPLICATION_SECRETS])
-        raw = serialize_backup(payload, encrypt=False, password=None)
+        raw = serialize_backup(payload, encrypt=True, password="password1")
     response = client.post(
         "/settings/backup/import-async",
         data={
             "categories": [CATEGORY_SETTINGS],
+            "password": "password1",
             "confirm_replace": "1",
         },
         files={"backup_file": ("test.atdb", raw, "application/octet-stream")},
@@ -348,11 +351,11 @@ def test_api_key_hash_survives_restore(client: TestClient, api_key_value: str) -
     digest = hash_api_key(api_key_value)
     with SessionLocal() as db:
         payload = build_payload(db, [CATEGORY_API_KEYS, CATEGORY_ZONES, CATEGORY_APPLICATION_SECRETS])
-        raw = serialize_backup(payload, encrypt=False, password=None)
+        raw = serialize_backup(payload, encrypt=True, password="password1")
         for row in list(db.exec(select(ApiKey)).all()):
             db.delete(row)
         db.commit()
-        restored = load_backup_bytes(raw, None)
+        restored = load_backup_bytes(raw, "password1")
         restore_payload(
             db,
             restored,
@@ -443,3 +446,39 @@ def test_decrypt_rejects_extreme_pbkdf2_iterations() -> None:
     envelope["iterations"] = MAX_PBKDF2_ITERATIONS + 1
     with pytest.raises(ValueError, match="too high|Invalid PBKDF2"):
         decrypt_envelope(envelope, "password1")
+
+
+def test_application_secrets_require_encrypted_archive() -> None:
+    with SessionLocal() as db:
+        payload = build_payload(db, [CATEGORY_APPLICATION_SECRETS])
+    with pytest.raises(BackupError, match="password-encrypted"):
+        serialize_backup(payload, encrypt=False, password=None)
+
+
+def test_restore_secrets_rejects_unencrypted_envelope() -> None:
+    from src.backup_service import MANIFEST_ENVELOPE_ENCRYPTED, validate_restore_records
+
+    with SessionLocal() as db:
+        payload = build_payload(db, [CATEGORY_APPLICATION_SECRETS])
+    payload.setdefault("manifest", {})[MANIFEST_ENVELOPE_ENCRYPTED] = False
+    with pytest.raises(BackupError, match="password-encrypted"):
+        validate_restore_records([CATEGORY_APPLICATION_SECRETS], payload)
+
+
+def test_restore_users_requires_enabled_global_admin() -> None:
+    from src.backup_service import validate_restore_records
+    from src.rbac import ROLE_GLOBAL_READ, serialize_roles
+
+    with SessionLocal() as db:
+        payload = build_payload(db, [CATEGORY_USERS])
+    payload[CATEGORY_USERS] = [
+        {
+            "username": "locked-out",
+            "password_hash": payload[CATEGORY_USERS][0]["password_hash"],
+            "roles": serialize_roles([ROLE_GLOBAL_READ]),
+            "disabled": False,
+            "session_version": 0,
+        }
+    ]
+    with pytest.raises(BackupError, match="global administrator"):
+        validate_restore_records([CATEGORY_USERS], payload)
