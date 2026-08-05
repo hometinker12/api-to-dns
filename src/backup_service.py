@@ -6,6 +6,7 @@ import base64
 import json
 import logging
 import os
+import secrets
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any
@@ -420,6 +421,11 @@ def _require_mapping(item: Any, *, label: str) -> dict[str, Any]:
     return item
 
 
+def _fresh_session_version() -> int:
+    """Return an unpredictable session_version that cannot collide via +1 arithmetic."""
+    return secrets.randbits(31) or 1
+
+
 def _validate_password_hash(password_hash: str, *, username: str) -> None:
     if pwd_context.identify(password_hash) is None:
         raise BackupError(f"User '{username}' has an unrecognized password_hash format.")
@@ -629,16 +635,15 @@ def restore_payload(
         if CATEGORY_USERS in cats:
             users = payload.get(CATEGORY_USERS) or []
             for item in users:
-                # Bump session_version so cookies from the backup source installation
+                # Assign a fresh unpredictable session_version so source cookies
                 # cannot replay against the restored target (same SECRET_KEY).
-                source_version = int(item.get("session_version") or 0)
                 db.add(
                     User(
                         username=str(item["username"]).strip(),
                         password_hash=item["password_hash"],
                         roles=item.get("roles") or "",
                         disabled=bool(item.get("disabled")),
-                        session_version=source_version + 1,
+                        session_version=_fresh_session_version(),
                     )
                 )
             summary[CATEGORY_USERS] = len(users)
@@ -773,11 +778,11 @@ def restore_payload(
         encryption_key = (secrets.get("ENCRYPTION_KEY") or "").strip()
         if not secret_key or not encryption_key:
             raise BackupError("Backup application secrets are incomplete.")
-        # Secrets-only restore keeps existing users; bump sessions so source
-        # cookies signed with the restored SECRET_KEY cannot be replayed.
+        # Secrets-only restore keeps existing users; assign fresh session versions
+        # so source cookies signed with the restored SECRET_KEY cannot be replayed.
         if CATEGORY_USERS not in cats:
             for user_row in list(db.exec(select(User)).all()):
-                user_row.session_version = int(getattr(user_row, "session_version", 0) or 0) + 1
+                user_row.session_version = _fresh_session_version()
                 db.add(user_row)
             db.commit()
         env_bootstrap.write_application_secrets(secret_key=secret_key, encryption_key=encryption_key)
