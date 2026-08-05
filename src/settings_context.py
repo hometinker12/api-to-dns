@@ -18,6 +18,7 @@ from .db import SessionLocal
 from .letsencrypt import config_view as letsencrypt_config_view
 from .models import LOG_CATEGORY_VALUES, LOG_LEVEL_VALUES, AlertRule, User
 from .rbac import (
+    BACKUP_SECTIONS,
     ROLE_ACCOUNT_RESET_PASSWORD,
     ROLE_ACCOUNT_UPDATE,
     ROLE_GLOBAL_ADMIN,
@@ -26,8 +27,10 @@ from .rbac import (
     ROLE_SYSTEM_UPDATE,
     SYSTEM_SETTINGS_SECTIONS,
     accessible_settings_areas,
+    default_backup_section,
     default_system_settings_section,
     get_user_roles,
+    normalize_backup_section,
     normalize_system_settings_section,
     role_catalog_for_actor,
     user_public_dict,
@@ -110,6 +113,14 @@ def settings_context(
             else default_system_settings_section()
         )
         system_settings_sections = list(SYSTEM_SETTINGS_SECTIONS) if can_access_system_settings else []
+
+        can_access_backup = "backup" in accessible_keys
+        selected_backup_section = (
+            normalize_backup_section(section)
+            if requested_area == "backup" and can_access_backup
+            else default_backup_section()
+        )
+        backup_sections = list(BACKUP_SECTIONS) if can_access_backup else []
 
         system_settings_view: dict[str, Any] | None = None
         log_view: dict[str, Any] | None = None
@@ -285,6 +296,9 @@ def settings_context(
         "system_settings_view": system_settings_view,
         "system_settings_sections": system_settings_sections,
         "selected_system_section": selected_system_section,
+        "backup_sections": backup_sections,
+        "selected_backup_section": selected_backup_section,
+        "can_backup": can_access_backup,
         "log_view": log_view,
         "alert_view": alert_view,
         **nav,

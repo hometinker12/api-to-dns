@@ -103,6 +103,7 @@ jobs:
             docker logs dns-api-test 2>/dev/null || true
             docker logs bind-test 2>/dev/null || true
             docker rm -f dns-api-test bind-test 2>/dev/null || true
+            docker compose down -v --remove-orphans >/dev/null 2>&1 || true
             docker network rm "${NETWORK_NAME}" 2>/dev/null || true
           }
           trap cleanup EXIT
@@ -535,6 +536,82 @@ jobs:
             -d "username=admin&password=your-admin-password" \
             -o /dev/null
           curl --fail --silent -b /tmp/compose-cookies http://127.0.0.1:8001/admin \
+            | python3 -c "import sys; assert 'api-to-dns App Dashboard' in sys.stdin.read()"
+
+          echo "[compose] Persisted app_secrets.env overrides Compose env_file on restart"
+          # Distinct from .env so we prove entrypoint + env_bootstrap win over env_file.
+          RESTORED_KEYS="$(python3 - <<'PY'
+          import base64
+          import hashlib
+          import os
+          import secrets
+
+          enc = base64.urlsafe_b64encode(os.urandom(32)).decode()
+          secret = secrets.token_urlsafe(32)
+          print(enc)
+          print(secret)
+          print(hashlib.sha256(enc.encode()).hexdigest())
+          print(hashlib.sha256(secret.encode()).hexdigest())
+          PY
+          )"
+          RESTORED_ENC="$(printf '%s\n' "$RESTORED_KEYS" | sed -n '1p')"
+          RESTORED_SECRET="$(printf '%s\n' "$RESTORED_KEYS" | sed -n '2p')"
+          EXPECTED_ENC_HASH="$(printf '%s\n' "$RESTORED_KEYS" | sed -n '3p')"
+          EXPECTED_SECRET_HASH="$(printf '%s\n' "$RESTORED_KEYS" | sed -n '4p')"
+          # Write via stdin so restored secret values are not argv-visible in process listings.
+          {
+            printf 'SECRET_KEY=%s\n' "${RESTORED_SECRET}"
+            printf 'ENCRYPTION_KEY=%s\n' "${RESTORED_ENC}"
+          } | docker compose exec -T dns-api sh -c 'cat > /app/data/app_secrets.env && chmod 600 /app/data/app_secrets.env'
+          unset RESTORED_ENC RESTORED_SECRET RESTORED_KEYS
+          docker compose restart dns-api
+          for i in $(seq 1 60); do
+            if curl --fail --silent --max-time 5 http://127.0.0.1:8001/health >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          curl --fail --silent http://127.0.0.1:8001/health >/dev/null
+          # Read PID 1 environ (entrypoint-sourced overrides); docker exec env alone still shows Compose env_file.
+          ACTUAL_HASHES="$(
+            EXPECTED_ENC_HASH="${EXPECTED_ENC_HASH}" EXPECTED_SECRET_HASH="${EXPECTED_SECRET_HASH}" \
+            docker compose exec -T \
+              -e EXPECTED_ENC_HASH \
+              -e EXPECTED_SECRET_HASH \
+              dns-api python - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+
+          raw = Path("/proc/1/environ").read_bytes()
+          env: dict[str, str] = {}
+          for item in raw.split(b"\0"):
+              if b"=" not in item:
+                  continue
+              key, _, value = item.partition(b"=")
+              env[key.decode()] = value.decode(errors="replace")
+          enc_hash = hashlib.sha256(env.get("ENCRYPTION_KEY", "").encode()).hexdigest()
+          secret_hash = hashlib.sha256(env.get("SECRET_KEY", "").encode()).hexdigest()
+          assert enc_hash == os.environ["EXPECTED_ENC_HASH"], (enc_hash, os.environ["EXPECTED_ENC_HASH"])
+          assert secret_hash == os.environ["EXPECTED_SECRET_HASH"], (secret_hash, os.environ["EXPECTED_SECRET_HASH"])
+          print("pid1 secret hashes match restored app_secrets.env")
+          PY
+          )"
+          echo "${ACTUAL_HASHES}"
+          stale_admin="$(curl --silent --show-error -o /dev/null -w "%{http_code}" -b /tmp/compose-cookies http://127.0.0.1:8001/admin)"
+          if [ "${stale_admin}" != "303" ] && [ "${stale_admin}" != "401" ] && [ "${stale_admin}" != "302" ]; then
+            echo "Expected pre-restart session rejected after SECRET_KEY restore; got ${stale_admin}"
+            docker compose logs dns-api || true
+            docker compose down -v --remove-orphans || true
+            exit 1
+          fi
+          curl --fail --silent -c /tmp/compose-cookies-restored -X POST http://127.0.0.1:8001/login \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "Origin: http://127.0.0.1:8001" \
+            -H "Referer: http://127.0.0.1:8001/login" \
+            -d "username=admin&password=your-admin-password" \
+            -o /dev/null
+          curl --fail --silent -b /tmp/compose-cookies-restored http://127.0.0.1:8001/admin \
             | python3 -c "import sys; assert 'api-to-dns App Dashboard' in sys.stdin.read()"
           docker compose down -v --remove-orphans
 

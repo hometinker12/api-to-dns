@@ -7,7 +7,7 @@ alwaysApply: true
 
 When the user asks to **commit** (or "commit all pending changes"), perform this full sequence without asking for confirmation:
 
-**Workflow path:** commit → push → **wait for matching CI (blocking; SHA-matched green required)** → PR to `release` → merge → watch integration smoke until green. On any CI failure, fix on **`develop`** and **restart from §1 Commit**. **Never open a PR while CI is pending or red.**
+**Workflow path:** commit → push → **wait for matching CI (blocking; SHA-matched green required)** → **adversarial security review (blocking)** → PR to `release` → merge → watch integration smoke until green. On any CI or security-gate failure, fix on **`develop`** and **restart from §1 Commit**. **Never open a PR while CI is pending or red, or while security review is FAIL.**
 
 **Stop at `release`.** Do **not** open PRs to `main`, merge to `main`, or push to `main` as part of this workflow. Docker publish ([`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml)) is a separate, manual step the user performs when ready.
 
@@ -165,21 +165,53 @@ gh run view <run-id> --log-failed
 2. For pytest failures, run scoped local checks via **`test-runner`** before committing a fix.
 3. Fix the root cause on **`develop`**, then **restart from §1 Commit**.
 
-## 3. Pull request `develop` → `release` — **only after §2 green**
+## 3. Security review — **hard gate before any `release` promotion**
 
-**Hard gate:** Do **not** run `gh pr create` until §2 preconditions are satisfied for the pushed commit.
+After §2 is green for the exact push SHA, and **before** opening or merging a PR that updates `release`, run an adversarial security review of the changes that would land on `release`.
+
+**Hard gate:** Do **not** run `gh pr create`, `gh pr merge`, or otherwise push/promote commits onto **`release`** until this review returns **PASS**. A **FAIL** (any High or Medium confidence finding) stops the workflow here.
+
+### 3.1 When to run
+
+Run on **every** full commit→release promotion (default when the user says "commit" without narrowing scope).
+
+**Skip** only when the pending promotion diff is clearly non-security (docs-only markdown, comments-only, pure `.cursor/` agent/rule edits with no `src/`, `tests/`, `scripts/`, Docker, or workflow changes). When in doubt, run the review.
+
+**Commit-only** requests (user explicitly narrows to commit/push `develop` without release) may skip this section; still do not promote to `release` later without running it.
+
+### 3.2 Invoke `security-reviewer`
+
+1. Delegate to **`security-reviewer`** (read-only) via the Task tool (`subagent_type: security-reviewer`, `run_in_background: false`) with this prompt shape:
+
+   ```
+   Full Repository Path: <absolute repository path>
+   Diff: branch changes
+   Base Branch: release
+   Custom Instructions: Adversarial security review for develop→release promotion. FAIL the gate if any High or Medium confidence finding exists. Review only the merge-base diff against release plus directly affected auth/crypto call sites.
+   ```
+
+2. Treat the subagent **Verdict** as authoritative:
+   - **FAIL** (any High or Medium confidence finding) → **Stop**. Do not create or merge a release PR. Report findings to the user (compact table: Confidence, Severity, Location, Finding). Fix on **`develop`**, then **restart from §1 Commit**.
+   - **PASS** (no High/Medium findings; Low-only is allowed) → proceed to §4. Note "security: PASS" in the PR body.
+   - If the subagent is blocked or crashes → treat as **FAIL**; retry once; if still blocked, stop and report—do not promote to `release`.
+
+3. Do **not** downgrade High/Medium findings yourself to proceed. Only a clean re-review after fixes may PASS.
+
+## 4. Pull request `develop` → `release` — **only after §2 green and §3 PASS**
+
+**Hard gate:** Do **not** run `gh pr create` until §2 preconditions are satisfied for the pushed commit **and** §3 security review is **PASS**.
 
 1. Create a PR: **head `develop` → base `release`** via `gh pr create`.
-2. Title: short summary of the main change. Body: Summary bullets + Test plan checklist + smoke coverage note + docs note + **CI run URL** and **matching commit SHA**.
+2. Title: short summary of the main change. Body: Summary bullets + Test plan checklist + smoke coverage note + docs note + **security: PASS** + **CI run URL** and **matching commit SHA**.
 
-## 4. Merge to `release` — **only after §2 green on PR head**
+## 5. Merge to `release` — **only after §2 green on PR head and §3 PASS**
 
-**Hard gate:** Do **not** run `gh pr merge` until the PR head commit has a green **`microsoft-dns-smoke.yml`** pytest run.
+**Hard gate:** Do **not** run `gh pr merge` until the PR head commit has a green **`microsoft-dns-smoke.yml`** pytest run **and** §3 security review is **PASS** for that same change set. If new commits landed on the PR after the review, re-run §3 on the updated head before merge.
 
 1. Merge the PR with `gh pr merge --merge` (or `--squash` only if the user requests it).
 2. Pull latest: `git checkout develop; git pull origin develop`.
 
-## 5. Watch integration smoke on `release`
+## 6. Watch integration smoke on `release`
 
 After merge to **`release`**, wait for [`.github/workflows/microsoft-dns-smoke.yml`](.github/workflows/microsoft-dns-smoke.yml):
 
@@ -202,9 +234,9 @@ On failure:
 gh run view <run-id> --log-failed
 ```
 
-Diagnose with **`ci-investigator`**, fix on **`develop`**, and **restart from §1 Commit** (full loop through develop CI → release PR → release smoke).
+Diagnose with **`ci-investigator`**, fix on **`develop`**, and **restart from §1 Commit** (full loop through develop CI → security review → release PR → release smoke).
 
-## 6. Completion criteria
+## 7. Completion criteria
 
 Report to the user when the requested scope is done:
 
@@ -213,8 +245,9 @@ Report to the user when the requested scope is done:
 **Full release (default when user says "commit" without narrowing scope)** — report when **all** of the following are true:
 
 - **`develop`** pytest CI green for the feature commit(s).
+- **§3 security review PASS** (no High/Medium confidence findings) before the release PR/merge.
 - **`release`** BIND + Microsoft smoke jobs green for the merge commit.
-- Include commit SHAs, CI run URLs (`gh run view <run-id> --web`), and a one-line confirmation.
+- Include commit SHAs, CI run URLs (`gh run view <run-id> --web`), security verdict, and a one-line confirmation.
 
 Do **not** proceed to `main` or Docker publish unless the user explicitly asks in a separate request.
 
@@ -227,10 +260,12 @@ Do **not** proceed to `main` or Docker publish unless the user explicitly asks i
 
 - Proceed with commit before the **local test gate** passes.
 - Proceed when production-impacting changes lack CI smoke coverage.
+- **Open or merge a PR to `release` before §3 security review PASS** — High or Medium confidence findings are a hard stop.
+- Downgrade or ignore High/Medium security findings to force a release promotion.
 - **Push to `main`**, merge to `main`, or open a **`release` → `main`** PR as part of this workflow.
 - **Open a promotion PR before CI green preconditions are satisfied** for the exact pushed commit SHA.
 - **Merge while CI is red, in progress, or green only for a different SHA** than the PR head.
 - Skip CI monitoring or exit the workflow while a required pipeline is still running or failed.
 - Skip CI failure investigation — use **`ci-investigator`** for failed steps.
-- Stop after the develop→release merge if §5 release smoke is still pending or failed — keep the fix loop going until release smoke is green.
+- Stop after the develop→release merge if §6 release smoke is still pending or failed — keep the fix loop going until release smoke is green.
 - Create empty commits when there is nothing to commit — report that instead.

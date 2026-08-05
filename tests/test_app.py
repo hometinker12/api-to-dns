@@ -2991,11 +2991,11 @@ def test_ssl_audit_letsencrypt_cancel_and_config(client: TestClient) -> None:
         assert config_event.category == LOG_CATEGORY_SECURITY
 
 
-def test_settings_backup_area_removed(client: TestClient) -> None:
+def test_settings_backup_area_available_for_admin(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
-    response = client.get("/settings?area=backup")
+    response = client.get("/settings?area=backup&section=export")
     assert response.status_code == 200
-    assert "System Backup" not in response.text
+    assert "Backup Export" in response.text
     assert "not implemented yet" not in response.text
 
 
