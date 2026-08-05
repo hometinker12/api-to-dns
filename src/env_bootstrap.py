@@ -9,6 +9,7 @@ root filesystem would otherwise keep stale host ``.env`` values.
 from __future__ import annotations
 
 import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -68,14 +69,59 @@ def apply_persisted_secrets() -> None:
     """Overlay ``SECRET_KEY`` / ``ENCRYPTION_KEY`` from the durable secrets file."""
     path = app_secrets_path()
     for key, value in parse_env_file(path).items():
-        if value:
-            os.environ[key] = value
+        if not value:
+            continue
+        try:
+            os.environ[key] = _validate_persisted_secret(key, value)
+        except ValueError:
+            # Fail closed for the overlay: leave existing process env unchanged
+            # rather than applying a corrupt/hostile durable file.
+            continue
+
+
+def shell_export_persisted_secrets() -> str:
+    """Return ``export KEY=...`` lines for the entrypoint (shell-safe quoting).
+
+    Parses only known keys via :func:`parse_env_file` — never sources the file.
+    """
+    path = app_secrets_path()
+    lines: list[str] = []
+    for key, value in parse_env_file(path).items():
+        if not value:
+            continue
+        try:
+            cleaned = _validate_persisted_secret(key, value)
+        except ValueError:
+            continue
+        lines.append(f"export {key}={shlex.quote(cleaned)}")
+    return "\n".join(lines)
+
+
+def _validate_persisted_secret(name: str, value: str) -> str:
+    """Reject empty or shell-unsafe secret values before durable write."""
+    cleaned = (value or "").strip()
+    if not cleaned:
+        raise ValueError(f"{name} is empty.")
+    # Reject control chars / newlines so a KEY=value line cannot smuggle keys.
+    # Values may contain '=' (Fernet padding); shell export uses shlex.quote.
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in cleaned):
+        raise ValueError(f"{name} contains control characters.")
+    if name == "ENCRYPTION_KEY":
+        try:
+            from cryptography.fernet import Fernet
+
+            Fernet(cleaned.encode("utf-8"))
+        except Exception as exc:  # noqa: BLE001 — normalize Fernet errors
+            raise ValueError("ENCRYPTION_KEY is not a valid Fernet key.") from exc
+    return cleaned
 
 
 def write_application_secrets(*, secret_key: str, encryption_key: str) -> list[str]:
     """Persist secrets for the next process start. Returns paths written."""
+    secret_key = _validate_persisted_secret("SECRET_KEY", secret_key)
+    encryption_key = _validate_persisted_secret("ENCRYPTION_KEY", encryption_key)
     written: list[str] = []
-    body = f"SECRET_KEY={secret_key.strip()}\nENCRYPTION_KEY={encryption_key.strip()}\n"
+    body = f"SECRET_KEY={secret_key}\nENCRYPTION_KEY={encryption_key}\n"
     durable = app_secrets_path()
     durable.parent.mkdir(parents=True, exist_ok=True)
     durable.write_text(body, encoding="utf-8")
@@ -84,8 +130,8 @@ def write_application_secrets(*, secret_key: str, encryption_key: str) -> list[s
     except OSError:
         pass
     written.append(str(durable))
-    os.environ["SECRET_KEY"] = secret_key.strip()
-    os.environ["ENCRYPTION_KEY"] = encryption_key.strip()
+    os.environ["SECRET_KEY"] = secret_key
+    os.environ["ENCRYPTION_KEY"] = encryption_key
 
     # Never rewrite the project ``.env`` under pytest — that file is often the
     # live Compose secrets source for a local Docker volume.

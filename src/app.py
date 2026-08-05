@@ -2500,10 +2500,11 @@ async def settings_backup_import_async(
     raw = await backup_file.read()
     if not raw:
         return JSONResponse({"detail": "Backup file is empty."}, status_code=400)
-    # Fail fast on decrypt / category validation before starting the worker.
+    # Fail fast on decrypt / full record validation before starting the worker.
+    # Decrypt off the event loop so attacker-controlled PBKDF2 cannot stall requests.
     try:
-        payload = backup_service.load_backup_bytes(raw, password or None)
-        backup_service.validate_import_categories(selected, payload)
+        payload = await asyncio.to_thread(backup_service.load_backup_bytes, raw, password or None)
+        backup_service.validate_restore_records(selected, payload)
     except BackupError as exc:
         return JSONResponse({"detail": str(exc)}, status_code=400)
 

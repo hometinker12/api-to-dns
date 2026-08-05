@@ -13,19 +13,30 @@ BACKUP_FORMAT = "api-to-dns-backup"
 BACKUP_VERSION = 1
 BACKUP_KDF = "pbkdf2_sha256"
 DEFAULT_PBKDF2_ITERATIONS = 600_000
+MIN_PBKDF2_ITERATIONS = 100_000
+# Cap attacker-controlled iteration counts from imported archives (DoS).
+MAX_PBKDF2_ITERATIONS = 1_200_000
+
+
+def _validated_iterations(iterations: int) -> int:
+    value = int(iterations)
+    if value < MIN_PBKDF2_ITERATIONS:
+        raise ValueError("PBKDF2 iteration count is too low.")
+    if value > MAX_PBKDF2_ITERATIONS:
+        raise ValueError("PBKDF2 iteration count is too high.")
+    return value
 
 
 def derive_backup_fernet(password: str, salt: bytes, iterations: int = DEFAULT_PBKDF2_ITERATIONS) -> Fernet:
     """Derive a Fernet key from a backup password via PBKDF2-HMAC-SHA256."""
     if not password:
         raise ValueError("Backup password is required.")
-    if iterations < 100_000:
-        raise ValueError("PBKDF2 iteration count is too low.")
+    iterations = _validated_iterations(iterations)
     key_material = hashlib.pbkdf2_hmac(
         "sha256",
         password.encode("utf-8"),
         salt,
-        int(iterations),
+        iterations,
         dklen=32,
     )
     return Fernet(base64.urlsafe_b64encode(key_material))
@@ -56,7 +67,10 @@ def decrypt_envelope(envelope: dict[str, Any], password: str) -> bytes:
     if (envelope.get("kdf") or "") != BACKUP_KDF:
         raise ValueError("Unsupported backup key derivation.")
     salt = base64.b64decode(envelope["salt"])
-    iterations = int(envelope.get("iterations") or DEFAULT_PBKDF2_ITERATIONS)
+    try:
+        iterations = _validated_iterations(int(envelope.get("iterations") or DEFAULT_PBKDF2_ITERATIONS))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid PBKDF2 iteration count.") from exc
     token = base64.b64decode(envelope["ciphertext"])
     fernet = derive_backup_fernet(password, salt, iterations)
     try:
