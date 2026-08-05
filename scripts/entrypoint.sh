@@ -28,6 +28,15 @@ for dir in "$DATA_DIR" "$SSL_DIR" "$LOG_DIR"; do
   fi
 done
 
+# Secrets restored via Settings → Backup are written here so they survive a
+# read-only root filesystem and override Compose env_file values on restart.
+if [ -f "$DATA_DIR/app_secrets.env" ]; then
+  # shellcheck disable=SC1091
+  set -a
+  . "$DATA_DIR/app_secrets.env"
+  set +a
+fi
+
 MODE="$(python -m src.ssl_certs bootstrap)"
 HTTP_PORT="${HTTP_PORT:-8000}"
 TLS_PORT="${TLS_PORT:-8443}"

@@ -5,15 +5,18 @@ import tempfile
 
 from cryptography.fernet import Fernet
 
-_db = tempfile.NamedTemporaryFile(prefix="api-to-dns-test-", suffix=".db", delete=False)
-_db.close()
-os.environ["DATABASE_URL"] = "sqlite:///" + os.path.abspath(_db.name).replace("\\", "/")
+# Isolate DB, SSL, and restored app_secrets.env under one temp directory so
+# backup restore tests cannot pollute the system temp root or other runs.
+_test_root = tempfile.mkdtemp(prefix="api-to-dns-test-")
+_db_path = os.path.join(_test_root, "app.db")
+os.environ["DATABASE_URL"] = "sqlite:///" + os.path.abspath(_db_path).replace("\\", "/")
 
 # Keep the test client on plain HTTP regardless of any persisted ssl_enabled
 # setting, and isolate any SSL artefacts under a per-test-process temp dir so
 # CI runners do not need openssl on PATH and never share cert state with the
 # host repository checkout.
-_ssl_cert_dir = tempfile.mkdtemp(prefix="api-to-dns-test-ssl-")
+_ssl_cert_dir = os.path.join(_test_root, "ssl")
+os.makedirs(_ssl_cert_dir, exist_ok=True)
 os.environ["APP_SSL_DIR"] = _ssl_cert_dir
 os.environ["SSL_ENABLED"] = "0"
 

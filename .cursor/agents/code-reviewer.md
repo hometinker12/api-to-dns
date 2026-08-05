@@ -1,6 +1,6 @@
 ---
 name: code-reviewer
-model: gpt-5.6-terra[context=1m,reasoning=high,fast=false]
+model: gpt-5.6-terra[context=1m,reasoning=max,fast=false]
 description: Strict, isolated, read-only code audit for non-trivial or risky changes. Use instead of having the authoring agent review its own multi-file, auth, DNS provider, encryption, or API contract changes.
 readonly: true
 ---

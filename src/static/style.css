@@ -369,6 +369,17 @@ dialog::backdrop {
   border-radius: 999px;
   transition: width 0.25s ease;
 }
+.backup-categories {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0.75rem 0 1rem;
+}
+.backup-categories .inline-check {
+  margin: 0;
+}
+.warning-text {
+  color: #9a3412;
+}
 .page.page-wide {
   width: min(1100px, calc(100% - 32px));
 }
