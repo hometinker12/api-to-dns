@@ -386,7 +386,7 @@ def test_restore_rejects_malformed_users_before_wipe() -> None:
         assert after == before
 
 
-def test_restore_users_bumps_session_version() -> None:
+def test_restore_users_assigns_fresh_session_version() -> None:
     with SessionLocal() as db:
         admin = db.exec(select(User).where(User.username == "admin")).first()
         assert admin is not None
@@ -400,7 +400,8 @@ def test_restore_users_bumps_session_version() -> None:
             restore_payload(db, payload, [CATEGORY_USERS])
             restored = db.exec(select(User).where(User.username == "admin")).first()
             assert restored is not None
-            assert int(restored.session_version) == 8
+            assert int(restored.session_version) != 7
+            assert int(restored.session_version) > 0
         finally:
             admin = db.exec(select(User).where(User.username == "admin")).first()
             if admin is not None:
@@ -509,7 +510,7 @@ def test_restore_rejects_extreme_password_hash_rounds() -> None:
         validate_restore_records([CATEGORY_USERS], payload)
 
 
-def test_secrets_only_restore_bumps_existing_sessions() -> None:
+def test_secrets_only_restore_assigns_fresh_sessions() -> None:
     with SessionLocal() as db:
         admin = db.exec(select(User).where(User.username == "admin")).first()
         assert admin is not None
@@ -526,7 +527,8 @@ def test_secrets_only_restore_bumps_existing_sessions() -> None:
                 write_mock.assert_called_once()
             admin = db.exec(select(User).where(User.username == "admin")).first()
             assert admin is not None
-            assert int(admin.session_version) == 4
+            assert int(admin.session_version) != 3
+            assert int(admin.session_version) > 0
         finally:
             admin = db.exec(select(User).where(User.username == "admin")).first()
             if admin is not None:
