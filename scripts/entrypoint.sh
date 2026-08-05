@@ -28,6 +28,14 @@ for dir in "$DATA_DIR" "$SSL_DIR" "$LOG_DIR"; do
   fi
 done
 
+# Persisted secrets (Settings → Backup) live in $DATA_DIR/app_secrets.env.
+# Never source that file: Python parses known keys only and emits shell-safe
+# export lines. Module import also overlays os.environ for non-entrypoint runs.
+if [ -f "$DATA_DIR/app_secrets.env" ]; then
+  # shellcheck disable=SC3046,SC1091
+  eval "$(python -c "from src.env_bootstrap import shell_export_persisted_secrets; print(shell_export_persisted_secrets())")"
+fi
+
 MODE="$(python -m src.ssl_certs bootstrap)"
 HTTP_PORT="${HTTP_PORT:-8000}"
 TLS_PORT="${TLS_PORT:-8443}"

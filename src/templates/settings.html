@@ -45,6 +45,25 @@
                   {% endfor %}
                 </nav>
               {% endif %}
+            {% elif area.key == "backup" %}
+              <a
+                class="settings-menu-item has-submenu {% if selected_area == 'backup' %}selected{% endif %}"
+                href="/settings?area=backup&section={{ selected_backup_section }}"
+              >
+                {{ area.label }}
+              </a>
+              {% if selected_area == "backup" %}
+                <nav class="settings-submenu" aria-label="Backup sections">
+                  {% for section in backup_sections %}
+                    <a
+                      class="settings-submenu-item {% if section.key == selected_backup_section %}selected{% endif %}"
+                      href="/settings?area=backup&section={{ section.key }}"
+                    >
+                      {{ section.label }}
+                    </a>
+                  {% endfor %}
+                </nav>
+              {% endif %}
             {% else %}
               <a
                 class="settings-menu-item {% if area.key == selected_area %}selected{% endif %}"
@@ -1100,11 +1119,90 @@
           {% endif %}
 
         {% elif selected_area == "backup" %}
-          <h2>System Backup</h2>
-          <div class="placeholder-panel">
-            <p>Backup and restore controls are planned but not implemented yet.</p>
-            <p class="help">When delivered, this area will let you export configuration, schedule backups, and restore from a saved snapshot.</p>
-          </div>
+          {% if not can_backup %}
+            <div class="alert error">Access denied.</div>
+          {% elif selected_backup_section == "import" %}
+            <h2>Backup Import</h2>
+            <p class="help">
+              Restore replaces the selected categories on this installation. Fernet-backed data
+              (settings, zones, SSL ACME key) requires Application secrets. Restoring Application
+              secrets writes durable secrets and <strong>automatically restarts</strong> the application.
+            </p>
+            <section class="form-card">
+              <form id="backup-import-form" action="/settings/backup/import-async" method="post" enctype="multipart/form-data">
+                <label>Backup file (<code>.atdb</code>)
+                  <input type="file" name="backup_file" accept=".atdb,application/json" required />
+                </label>
+                <fieldset class="backup-categories">
+                  <legend>Categories to replace</legend>
+                  <label class="inline-check"><input type="checkbox" name="categories" value="settings" checked /> System settings (includes HTTPS enablement)</label>
+                  <label class="inline-check"><input type="checkbox" name="categories" value="users" checked /> Users &amp; roles</label>
+                  <label class="inline-check"><input type="checkbox" name="categories" value="zones" checked /> DNS zones</label>
+                  <label class="inline-check"><input type="checkbox" name="categories" value="api_keys" checked /> API keys</label>
+                  <label class="inline-check"><input type="checkbox" name="categories" value="alert_rules" checked /> Email alert rules</label>
+                  <label class="inline-check"><input type="checkbox" name="categories" value="ssl_files" checked /> SSL certificate files</label>
+                  <label class="inline-check"><input type="checkbox" name="categories" value="application_secrets" checked id="backup-import-secrets" /> Application secrets (<code>SECRET_KEY</code>, <code>ENCRYPTION_KEY</code>)</label>
+                  <label class="inline-check"><input type="checkbox" name="categories" value="activity_logs" id="backup-import-logs" /> Include audit logs</label>
+                </fieldset>
+                <label>Backup password
+                  <input type="password" name="password" autocomplete="new-password" placeholder="Required if the file is encrypted" />
+                </label>
+                <label class="inline-check">
+                  <input type="checkbox" name="confirm_replace" value="1" required />
+                  Replace selected data on this installation (destructive)
+                </label>
+                <p class="help warning-text" id="backup-import-restart-warn">
+                  Restoring Application secrets will end your session and restart the application.
+                </p>
+                <button type="submit" id="backup-import-submit">Start restore</button>
+              </form>
+            </section>
+            <dialog id="backup-restore-dialog">
+              <div class="dialog-content le-auto-enroll-dialog">
+                <p id="backup-restore-status">Restoring configuration…</p>
+                <progress id="backup-restore-progress" class="le-auto-enroll-progress" max="100" value="0"></progress>
+              </div>
+            </dialog>
+          {% else %}
+            <h2>Backup Export</h2>
+            <p class="help">
+              Download a configuration archive. At-rest Fernet ciphertext is copied as stored;
+              include Application secrets so a restore can decrypt it. Application secrets require
+              password encryption for the archive.
+            </p>
+            <section class="form-card">
+              <form id="backup-export-form" action="/settings/backup/export" method="post">
+                <fieldset class="backup-categories">
+                  <legend>Include in backup</legend>
+                  <label class="inline-check"><input type="checkbox" name="categories" value="settings" checked /> System settings (includes HTTPS enablement)</label>
+                  <label class="inline-check"><input type="checkbox" name="categories" value="users" checked /> Users &amp; roles</label>
+                  <label class="inline-check"><input type="checkbox" name="categories" value="zones" checked /> DNS zones</label>
+                  <label class="inline-check"><input type="checkbox" name="categories" value="api_keys" checked /> API keys</label>
+                  <label class="inline-check"><input type="checkbox" name="categories" value="alert_rules" checked /> Email alert rules</label>
+                  <label class="inline-check"><input type="checkbox" name="categories" value="ssl_files" checked /> SSL certificate files</label>
+                  <label class="inline-check"><input type="checkbox" name="categories" value="application_secrets" checked id="backup-export-secrets" /> Application secrets (<code>SECRET_KEY</code>, <code>ENCRYPTION_KEY</code>)</label>
+                  <label class="inline-check"><input type="checkbox" name="categories" value="activity_logs" /> Include audit logs</label>
+                </fieldset>
+                <label class="inline-check">
+                  <input type="checkbox" name="encrypt" value="1" id="backup-encrypt" checked />
+                  Encrypt backup with a password
+                </label>
+                <div id="backup-encrypt-fields">
+                  <label>Password
+                    <input type="password" name="password" id="backup-password" autocomplete="new-password" minlength="8" />
+                  </label>
+                  <label>Confirm password
+                    <input type="password" name="password_confirm" id="backup-password-confirm" autocomplete="new-password" minlength="8" />
+                  </label>
+                </div>
+                <div class="alert error" id="backup-unencrypted-warning" hidden>
+                  Warning: an unencrypted backup may still include SSL private key material and Fernet
+                  ciphertext. Application secrets cannot be exported without encryption.
+                </div>
+                <button type="submit">Download backup</button>
+              </form>
+            </section>
+          {% endif %}
 
         {% else %}
           <div class="alert error">Unknown settings area: {{ selected_area }}.</div>
@@ -1474,6 +1572,171 @@
       }
       smtpAnonymous?.addEventListener("change", syncSmtpAnonymous);
       syncSmtpAnonymous();
+
+      const backupEncrypt = document.getElementById("backup-encrypt");
+      const backupEncryptFields = document.getElementById("backup-encrypt-fields");
+      const backupUnencryptedWarning = document.getElementById("backup-unencrypted-warning");
+      const backupPassword = document.getElementById("backup-password");
+      const backupPasswordConfirm = document.getElementById("backup-password-confirm");
+      const backupExportForm = document.getElementById("backup-export-form");
+      const backupExportSecrets = document.getElementById("backup-export-secrets");
+      function syncBackupEncryptUi() {
+        const secretsOn = !!backupExportSecrets?.checked;
+        if (secretsOn && backupEncrypt && !backupEncrypt.checked) {
+          backupEncrypt.checked = true;
+        }
+        if (backupEncrypt) {
+          backupEncrypt.disabled = secretsOn;
+        }
+        const on = !backupEncrypt || backupEncrypt.checked;
+        if (backupEncryptFields) {
+          backupEncryptFields.hidden = !on;
+        }
+        if (backupUnencryptedWarning) {
+          backupUnencryptedWarning.hidden = on;
+        }
+        if (backupPassword) {
+          backupPassword.required = on;
+        }
+        if (backupPasswordConfirm) {
+          backupPasswordConfirm.required = on;
+        }
+      }
+      backupEncrypt?.addEventListener("change", syncBackupEncryptUi);
+      backupExportSecrets?.addEventListener("change", syncBackupEncryptUi);
+      syncBackupEncryptUi();
+      backupExportForm?.addEventListener("submit", (event) => {
+        if (backupExportSecrets?.checked && backupEncrypt && !backupEncrypt.checked) {
+          event.preventDefault();
+          window.alert("Application secrets require a password-encrypted backup.");
+          return;
+        }
+        if (backupEncrypt && backupEncrypt.checked) {
+          if ((backupPassword?.value || "") !== (backupPasswordConfirm?.value || "")) {
+            event.preventDefault();
+            window.alert("Backup passwords do not match.");
+          }
+        }
+      });
+
+      const backupImportForm = document.getElementById("backup-import-form");
+      const backupRestoreDialog = document.getElementById("backup-restore-dialog");
+      const backupRestoreProgress = document.getElementById("backup-restore-progress");
+      const backupRestoreStatus = document.getElementById("backup-restore-status");
+      const backupImportSubmit = document.getElementById("backup-import-submit");
+      let backupPollTimer = null;
+      function stopBackupPoll() {
+        if (backupPollTimer !== null) {
+          window.clearInterval(backupPollTimer);
+          backupPollTimer = null;
+        }
+      }
+      function resetBackupDialog() {
+        if (backupRestoreProgress) {
+          backupRestoreProgress.value = 0;
+        }
+        if (backupRestoreStatus) {
+          backupRestoreStatus.textContent = "Restoring configuration…";
+        }
+      }
+      async function pollBackupProgress() {
+        try {
+          const response = await fetch("/settings/backup/import/progress", {
+            credentials: "same-origin",
+            headers: { accept: "application/json" },
+          });
+          if (!response.ok) {
+            if (response.status === 401 || response.status === 403) {
+              stopBackupPoll();
+              window.setTimeout(() => { window.location.href = "/login"; }, 1500);
+            }
+            return;
+          }
+          const payload = await response.json();
+          if (backupRestoreProgress && typeof payload.percent === "number") {
+            backupRestoreProgress.value = payload.percent;
+          }
+          if (backupRestoreStatus && payload.message) {
+            backupRestoreStatus.textContent = payload.message;
+          }
+          if (payload.done) {
+            stopBackupPoll();
+            if (payload.error) {
+              backupRestoreDialog?.close();
+              if (backupImportSubmit) {
+                backupImportSubmit.disabled = false;
+              }
+              window.alert(payload.error);
+              return;
+            }
+            if (backupRestoreProgress) {
+              backupRestoreProgress.value = 100;
+            }
+            if (payload.restarting) {
+              if (backupRestoreStatus) {
+                backupRestoreStatus.textContent = "Restarting application…";
+              }
+              window.setTimeout(() => {
+                window.location.href = "/settings?area=backup&section=import";
+              }, 2500);
+              return;
+            }
+            window.location.href = "/settings?area=backup&section=import";
+          }
+        } catch (_err) {
+          // Process may be restarting after secrets restore.
+          if (backupRestoreStatus) {
+            backupRestoreStatus.textContent = "Waiting for application restart…";
+          }
+          window.setTimeout(() => {
+            window.location.href = "/login";
+          }, 3000);
+        }
+      }
+      backupImportForm?.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const fernetCats = ["settings", "zones", "ssl_files"];
+        const selected = Array.from(backupImportForm.querySelectorAll('input[name="categories"]:checked')).map((el) => el.value);
+        const needsSecrets = selected.some((c) => fernetCats.includes(c));
+        if (needsSecrets && !selected.includes("application_secrets")) {
+          window.alert("Restoring settings, DNS zones, or SSL files requires Application secrets.");
+          return;
+        }
+        stopBackupPoll();
+        resetBackupDialog();
+        if (backupImportSubmit) {
+          backupImportSubmit.disabled = true;
+        }
+        backupRestoreDialog?.showModal();
+        try {
+          const response = await fetch("/settings/backup/import-async", {
+            method: "POST",
+            body: new FormData(backupImportForm),
+            credentials: "same-origin",
+            headers: { accept: "application/json" },
+          });
+          if (!response.ok) {
+            const detail = await response.json().catch(() => ({}));
+            backupRestoreDialog?.close();
+            if (backupImportSubmit) {
+              backupImportSubmit.disabled = false;
+            }
+            window.alert(detail.detail || "Failed to start restore.");
+            return;
+          }
+          await pollBackupProgress();
+          backupPollTimer = window.setInterval(pollBackupProgress, 1000);
+        } catch (_err) {
+          backupRestoreDialog?.close();
+          if (backupImportSubmit) {
+            backupImportSubmit.disabled = false;
+          }
+          window.alert("Failed to start restore.");
+        }
+      });
+      backupRestoreDialog?.addEventListener("cancel", (event) => {
+        event.preventDefault();
+      });
     </script>
   </div>
 </body>

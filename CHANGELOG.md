@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-05
+
+### Added
+
+- **Settings → Backup** (global admin): export/import configuration archives (`.atdb`). Outer password encryption is on by default; at-rest Fernet ciphertext is copied as-is with `SECRET_KEY` / `ENCRYPTION_KEY` so restores remain decryptable. Optional audit-log inclusion; destructive restore with Let's Encrypt–style progress dialog; application-secrets restore persists keys and auto-restarts.
+
+### Security
+
+- Restored `app_secrets.env` is never shell-sourced; the entrypoint exports only known keys via Python `shlex.quote`, and secret values are validated before durable write.
+- Backup restore fully validates selected categories before any destructive wipe (including an enabled global admin + bounded password-hash PBKDF2 rounds); DB wipe/restore is one transaction; user restores and secrets-only restores assign a fresh unpredictable `session_version` to block source-session cookie replay.
+- Application secrets can only be exported/restored inside password-encrypted archives (blocks forging sessions from mutable plaintext backups).
+- Encrypted backup PBKDF2 iterations are capped; decrypt/preflight runs off the event loop; backup uploads are size-limited.
+
+### Changed
+
+- Application version metadata aligned to **0.7.0** (`VERSION`, OpenAPI, `pyproject.toml`, Docker label, Compose pin).
+- BIND/Docker smoke asserts persisted `app_secrets.env` overrides Compose `env_file` after restart (PID-1 secret hashes + stale session rejection).
+
 ## [0.6.3] - 2026-08-02
 
 ### Security

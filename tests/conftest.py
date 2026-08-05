@@ -5,15 +5,18 @@ import tempfile
 
 from cryptography.fernet import Fernet
 
-_db = tempfile.NamedTemporaryFile(prefix="api-to-dns-test-", suffix=".db", delete=False)
-_db.close()
-os.environ["DATABASE_URL"] = "sqlite:///" + os.path.abspath(_db.name).replace("\\", "/")
+# Isolate DB, SSL, and restored app_secrets.env under one temp directory so
+# backup restore tests cannot pollute the system temp root or other runs.
+_test_root = tempfile.mkdtemp(prefix="api-to-dns-test-")
+_db_path = os.path.join(_test_root, "app.db")
+os.environ["DATABASE_URL"] = "sqlite:///" + os.path.abspath(_db_path).replace("\\", "/")
 
 # Keep the test client on plain HTTP regardless of any persisted ssl_enabled
 # setting, and isolate any SSL artefacts under a per-test-process temp dir so
 # CI runners do not need openssl on PATH and never share cert state with the
 # host repository checkout.
-_ssl_cert_dir = tempfile.mkdtemp(prefix="api-to-dns-test-ssl-")
+_ssl_cert_dir = os.path.join(_test_root, "ssl")
+os.makedirs(_ssl_cert_dir, exist_ok=True)
 os.environ["APP_SSL_DIR"] = _ssl_cert_dir
 os.environ["SSL_ENABLED"] = "0"
 
@@ -97,7 +100,15 @@ def client(api_key_value: str) -> TestClient:
     with SessionLocal() as db:
         set_disabled_dns_plugins(db, set())
         _seed_example_zone_and_permission(db, api_key_value)
-        if not db.exec(select(User).where(User.username == "admin")).first():
+        admin = db.exec(select(User).where(User.username == "admin")).first()
+        if admin is None:
             db.add(User(username="admin", password_hash=hash_password("x"), roles=_serialize_roles(ALL_ROLES)))
             db.commit()
+        else:
+            # Backup secrets-only restore bumps session_version; reset so tests that
+            # use create_session_cookie("admin") (version 0) keep working.
+            if int(getattr(admin, "session_version", 0) or 0) != 0:
+                admin.session_version = 0
+                db.add(admin)
+                db.commit()
     return TestClient(app)
