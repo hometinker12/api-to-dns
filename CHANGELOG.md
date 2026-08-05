@@ -11,7 +11,7 @@
 ### Security
 
 - Restored `app_secrets.env` is never shell-sourced; the entrypoint exports only known keys via Python `shlex.quote`, and secret values are validated before durable write.
-- Backup restore fully validates selected categories before any destructive wipe (including an enabled global admin + password-hash format); DB wipe/restore is one transaction; user restores bump `session_version` to block source-session cookie replay.
+- Backup restore fully validates selected categories before any destructive wipe (including an enabled global admin + bounded password-hash PBKDF2 rounds); DB wipe/restore is one transaction; user restores and secrets-only restores bump `session_version` to block source-session cookie replay.
 - Application secrets can only be exported/restored inside password-encrypted archives (blocks forging sessions from mutable plaintext backups).
 - Encrypted backup PBKDF2 iterations are capped; decrypt/preflight runs off the event loop; backup uploads are size-limited.
 

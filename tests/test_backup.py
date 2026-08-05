@@ -47,7 +47,10 @@ from src.ssl_certs import cert_dir
 
 
 def _admin_client(client: TestClient) -> TestClient:
-    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        admin = db.exec(select(User).where(User.username == "admin")).first()
+        version = int(getattr(admin, "session_version", 0) or 0) if admin is not None else 0
+    client.cookies.set("session", create_session_cookie("admin", version))
     return client
 
 
@@ -267,14 +270,14 @@ def test_import_async_progress_and_restart(client: TestClient) -> None:
                 )
                 restart_mock.assert_called_once()
 
-        progress = client.get("/settings/backup/import/progress")
-        assert progress.status_code == 200
-        body = progress.json()
-        assert body["done"] is True
-        assert body.get("error") is None
-        assert body.get("restarting") is True
+        # Avoid HTTP auth after secrets restore (session_version bump + env overlay).
+        from src.backup_service import get_restore_progress
 
         with SessionLocal() as db:
+            body = get_restore_progress(db)
+            assert body["done"] is True
+            assert body.get("error") is None
+            assert body.get("restarting") is True
             assert get_setting(db, "app_dns_name") == "async.example.com"
     finally:
         set_import_in_progress(False)
@@ -482,3 +485,51 @@ def test_restore_users_requires_enabled_global_admin() -> None:
     ]
     with pytest.raises(BackupError, match="global administrator"):
         validate_restore_records([CATEGORY_USERS], payload)
+
+
+def test_restore_rejects_extreme_password_hash_rounds() -> None:
+    from src.backup_service import MAX_PASSWORD_HASH_ROUNDS, validate_restore_records
+    from src.rbac import ALL_ROLES, serialize_roles
+
+    with SessionLocal() as db:
+        payload = build_payload(db, [CATEGORY_USERS])
+    # Keep passlib-identifiable shape but inflate rounds past the restore cap.
+    parts = payload[CATEGORY_USERS][0]["password_hash"].split("$")
+    parts[2] = str(MAX_PASSWORD_HASH_ROUNDS + 1)
+    payload[CATEGORY_USERS] = [
+        {
+            "username": "admin",
+            "password_hash": "$".join(parts),
+            "roles": serialize_roles(ALL_ROLES),
+            "disabled": False,
+            "session_version": 0,
+        }
+    ]
+    with pytest.raises(BackupError, match="rounds"):
+        validate_restore_records([CATEGORY_USERS], payload)
+
+
+def test_secrets_only_restore_bumps_existing_sessions() -> None:
+    with SessionLocal() as db:
+        admin = db.exec(select(User).where(User.username == "admin")).first()
+        assert admin is not None
+        previous = int(admin.session_version or 0)
+        admin.session_version = 3
+        db.add(admin)
+        db.commit()
+        payload = build_payload(db, [CATEGORY_APPLICATION_SECRETS])
+        raw = serialize_backup(payload, encrypt=True, password="password1")
+        restored = load_backup_bytes(raw, "password1")
+        try:
+            with patch("src.backup_service.env_bootstrap.write_application_secrets") as write_mock:
+                restore_payload(db, restored, [CATEGORY_APPLICATION_SECRETS])
+                write_mock.assert_called_once()
+            admin = db.exec(select(User).where(User.username == "admin")).first()
+            assert admin is not None
+            assert int(admin.session_version) == 4
+        finally:
+            admin = db.exec(select(User).where(User.username == "admin")).first()
+            if admin is not None:
+                admin.session_version = previous
+                db.add(admin)
+                db.commit()
