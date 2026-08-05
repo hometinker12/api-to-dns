@@ -10,6 +10,7 @@
 
 ### Security
 
+- Bump `cryptography` to 50.0.0 (CVE-2026-69247, CVE-2026-69249).
 - Restored `app_secrets.env` is never shell-sourced; the entrypoint exports only known keys via Python `shlex.quote`, and secret values are validated before durable write.
 - Backup restore fully validates selected categories before any destructive wipe (including an enabled global admin + bounded password-hash PBKDF2 rounds); DB wipe/restore is one transaction; user restores and secrets-only restores assign a fresh unpredictable `session_version` to block source-session cookie replay.
 - Application secrets can only be exported/restored inside password-encrypted archives (blocks forging sessions from mutable plaintext backups).
