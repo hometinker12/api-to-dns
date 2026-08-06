@@ -422,6 +422,7 @@ jobs:
             --data-urlencode "syslog_minimum_level=INFORMATIONAL" \
             --data-urlencode "syslog_timeout=5" \
             --data-urlencode "syslog_queue_size=1000" \
+            --data-urlencode "syslog_allow_insecure_plaintext=on" \
             --data-urlencode "redirect_section=syslog_forwarding" \
             -o /tmp/syslog-settings.html
           if ! grep -q "Remote syslog settings saved." /tmp/syslog-settings.html; then

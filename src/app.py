@@ -1951,16 +1951,18 @@ def settings_update_syslog(
     request: Request,
     syslog_enabled: str | None = Form(None),
     syslog_host: str = Form(""),
-    syslog_port: int = Form(514),
-    syslog_protocol: str = Form("udp"),
+    syslog_port: int = Form(6514),
+    syslog_protocol: str = Form("tls"),
     syslog_facility: str = Form("local0"),
     syslog_minimum_level: str = Form(LOG_LEVEL_INFORMATIONAL),
     syslog_timeout: float = Form(5.0),
     syslog_queue_size: int = Form(1000),
+    syslog_allow_insecure_plaintext: str | None = Form(None),
     redirect_section: str = Form("syslog_forwarding"),
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
     enabled = syslog_enabled is not None
+    allow_insecure_plaintext = syslog_allow_insecure_plaintext is not None
     try:
         with SessionLocal() as db:
             config = set_remote_syslog_config(
@@ -1973,6 +1975,7 @@ def settings_update_syslog(
                 minimum_level=syslog_minimum_level,
                 timeout=syslog_timeout,
                 queue_size=syslog_queue_size,
+                allow_insecure_plaintext=allow_insecure_plaintext,
             )
             apply_remote_syslog_config(db)
             emit_activity_event(
@@ -1992,6 +1995,7 @@ def settings_update_syslog(
                     "minimum_level": config.get("minimum_level"),
                     "timeout": config.get("timeout"),
                     "queue_size": config.get("queue_size"),
+                    "allow_insecure_plaintext": bool(config.get("allow_insecure_plaintext")),
                 },
             )
     except ValueError as exc:

@@ -513,8 +513,8 @@
             <h2>Remote Syslog</h2>
             <p class="help">
               Optionally forward stored audit/activity events to a remote syslog server as RFC&nbsp;5424
-              messages with a JSON payload. Delivery is best-effort over UDP or TCP and never blocks API
-              requests. Failed or dropped deliveries are recorded only in operational logs.
+              messages with a JSON payload. Prefer TLS (RFC&nbsp;5425). Delivery is best-effort and never
+              blocks API requests. Failed or dropped deliveries are recorded only in operational logs.
             </p>
             <form action="/settings/system/syslog" method="post" id="remote-syslog-form">
               <input type="hidden" name="redirect_section" value="syslog_forwarding" />
@@ -556,6 +556,17 @@
                   {% endfor %}
                 </select>
               </label>
+              <label class="inline-check">
+                <input
+                  type="checkbox"
+                  name="syslog_allow_insecure_plaintext"
+                  id="syslog-allow-insecure"
+                  {% if sys.syslog.allow_insecure_plaintext %}checked{% endif %}
+                  {% if not can_system_update %}disabled{% endif %}
+                />
+                Allow insecure plaintext syslog (UDP/TCP without TLS)
+              </label>
+              <p class="help alert warning">WARNING: Plaintext UDP/TCP syslog sends audit metadata unencrypted. Prefer TLS. Enable this only on trusted networks.</p>
               <label>Facility
                 <select name="syslog_facility" id="syslog-facility" {% if not can_system_update %}disabled{% endif %}>
                   {% for option in sys.syslog.facilities %}
@@ -585,13 +596,13 @@
                   name="syslog_queue_size"
                   id="syslog-queue-size"
                   min="1"
-                  max="100000"
+                  max="5000"
                   value="{{ sys.syslog.queue_size }}"
                   {% if not can_system_update %}disabled{% endif %}
                 />
               </label>
               <p class="help">
-                The in-process queue is non-durable. When the queue is full or the remote server is
+                The in-process queue is non-durable (max 5000). When the queue is full or the remote server is
                 unavailable, events are dropped and a rate-limited warning is written to operational logs.
               </p>
               {% if can_system_update %}
@@ -1661,6 +1672,7 @@
         "syslog-host",
         "syslog-port",
         "syslog-protocol",
+        "syslog-allow-insecure",
         "syslog-facility",
         "syslog-minimum-level",
         "syslog-timeout",

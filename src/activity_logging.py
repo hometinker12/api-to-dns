@@ -82,6 +82,7 @@ SETTING_SYSLOG_FACILITY = "remote_syslog_facility"
 SETTING_SYSLOG_MINIMUM_LEVEL = "remote_syslog_minimum_level"
 SETTING_SYSLOG_TIMEOUT = "remote_syslog_timeout"
 SETTING_SYSLOG_QUEUE_SIZE = "remote_syslog_queue_size"
+SETTING_SYSLOG_ALLOW_INSECURE = "remote_syslog_allow_insecure_plaintext"
 
 DEFAULT_APP_DNS_NAME_DOCKER = "apitodns.local"
 DOCKER_RUNTIME_LABEL = "Detected Docker container runtime."
@@ -571,10 +572,10 @@ def get_remote_syslog_config(db) -> dict[str, Any]:
     from .remote_syslog import (
         DEFAULT_FACILITY,
         DEFAULT_MINIMUM_LEVEL,
-        DEFAULT_PORT,
         DEFAULT_PROTOCOL,
         DEFAULT_QUEUE_SIZE,
         DEFAULT_TIMEOUT,
+        DEFAULT_TLS_PORT,
         SYSLOG_FACILITY,
         SYSLOG_PROTOCOLS,
         validate_syslog_config,
@@ -583,9 +584,9 @@ def get_remote_syslog_config(db) -> dict[str, Any]:
     enabled = _smtp_truthy(get_setting(db, SETTING_SYSLOG_ENABLED))
     host = get_setting(db, SETTING_SYSLOG_HOST) or ""
     try:
-        port = int(get_setting(db, SETTING_SYSLOG_PORT) or DEFAULT_PORT)
+        port = int(get_setting(db, SETTING_SYSLOG_PORT) or DEFAULT_TLS_PORT)
     except ValueError:
-        port = DEFAULT_PORT
+        port = DEFAULT_TLS_PORT
     protocol = (get_setting(db, SETTING_SYSLOG_PROTOCOL) or DEFAULT_PROTOCOL).strip().lower()
     if protocol not in SYSLOG_PROTOCOLS:
         protocol = DEFAULT_PROTOCOL
@@ -603,6 +604,7 @@ def get_remote_syslog_config(db) -> dict[str, Any]:
         queue_size = int(get_setting(db, SETTING_SYSLOG_QUEUE_SIZE) or DEFAULT_QUEUE_SIZE)
     except ValueError:
         queue_size = DEFAULT_QUEUE_SIZE
+    allow_insecure_plaintext = _smtp_truthy(get_setting(db, SETTING_SYSLOG_ALLOW_INSECURE))
 
     # Return a dict even when disabled/incomplete so the UI can render defaults.
     try:
@@ -615,6 +617,7 @@ def get_remote_syslog_config(db) -> dict[str, Any]:
             minimum_level=minimum_level,
             timeout=timeout,
             queue_size=queue_size,
+            allow_insecure_plaintext=allow_insecure_plaintext,
             hostname=get_app_dns_name(db),
         )
         return {
@@ -626,6 +629,7 @@ def get_remote_syslog_config(db) -> dict[str, Any]:
             "minimum_level": validated.minimum_level,
             "timeout": validated.timeout,
             "queue_size": validated.queue_size,
+            "allow_insecure_plaintext": validated.allow_insecure_plaintext,
             "hostname": validated.hostname,
             "facilities": list(SYSLOG_FACILITY.keys()),
             "protocols": list(SYSLOG_PROTOCOLS),
@@ -640,6 +644,7 @@ def get_remote_syslog_config(db) -> dict[str, Any]:
             "minimum_level": minimum_level,
             "timeout": timeout,
             "queue_size": queue_size,
+            "allow_insecure_plaintext": allow_insecure_plaintext,
             "hostname": get_app_dns_name(db),
             "facilities": list(SYSLOG_FACILITY.keys()),
             "protocols": list(SYSLOG_PROTOCOLS),
@@ -657,6 +662,7 @@ def set_remote_syslog_config(
     minimum_level: str,
     timeout: float,
     queue_size: int,
+    allow_insecure_plaintext: bool = False,
 ) -> dict[str, Any]:
     """Validate and persist remote syslog settings; return the sanitized config dict."""
     from .remote_syslog import validate_syslog_config
@@ -670,6 +676,7 @@ def set_remote_syslog_config(
         minimum_level=minimum_level,
         timeout=timeout,
         queue_size=queue_size,
+        allow_insecure_plaintext=allow_insecure_plaintext,
         hostname=get_app_dns_name(db),
     )
     set_setting(db, SETTING_SYSLOG_ENABLED, "true" if validated.enabled else "false")
@@ -680,23 +687,29 @@ def set_remote_syslog_config(
     set_setting(db, SETTING_SYSLOG_MINIMUM_LEVEL, validated.minimum_level)
     set_setting(db, SETTING_SYSLOG_TIMEOUT, str(validated.timeout))
     set_setting(db, SETTING_SYSLOG_QUEUE_SIZE, str(validated.queue_size))
+    set_setting(
+        db,
+        SETTING_SYSLOG_ALLOW_INSECURE,
+        "true" if validated.allow_insecure_plaintext else "false",
+    )
     return get_remote_syslog_config(db)
 
 
 def apply_remote_syslog_config(db) -> None:
     """Load persisted settings and apply them to the process-wide forwarder."""
-    from .remote_syslog import REMOTE_SYSLOG, validate_syslog_config
+    from .remote_syslog import DEFAULT_PROTOCOL, DEFAULT_TLS_PORT, REMOTE_SYSLOG, validate_syslog_config
 
     raw = get_remote_syslog_config(db)
     config = validate_syslog_config(
         enabled=bool(raw.get("enabled")),
         host=str(raw.get("host") or ""),
-        port=int(raw.get("port") or 514),
-        protocol=str(raw.get("protocol") or "udp"),
+        port=int(raw.get("port") or DEFAULT_TLS_PORT),
+        protocol=str(raw.get("protocol") or DEFAULT_PROTOCOL),
         facility=str(raw.get("facility") or "local0"),
         minimum_level=str(raw.get("minimum_level") or LOG_LEVEL_INFORMATIONAL),
         timeout=float(raw.get("timeout") or 5.0),
         queue_size=int(raw.get("queue_size") or 1000),
+        allow_insecure_plaintext=bool(raw.get("allow_insecure_plaintext")),
         hostname=str(raw.get("hostname") or get_app_dns_name(db)),
     )
     REMOTE_SYSLOG.configure(config)
@@ -995,6 +1008,7 @@ __all__ = [
     "SETTING_SYSLOG_MINIMUM_LEVEL",
     "SETTING_SYSLOG_TIMEOUT",
     "SETTING_SYSLOG_QUEUE_SIZE",
+    "SETTING_SYSLOG_ALLOW_INSECURE",
     "apply_remote_syslog_config",
     "configure_operational_logging",
     "default_app_dns_name",

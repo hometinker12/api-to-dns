@@ -184,12 +184,12 @@ SMTP delivery settings live under **System Settings**. The SMTP server field acc
 
 Remote syslog forwarding is optional and off by default. When enabled under **Settings → System Settings → Remote Syslog** (last System Settings entry), the app forwards **stored audit/activity events** to a remote syslog server. Operational Python/Docker logs are not forwarded by this feature.
 
-- **Transport:** UDP or TCP (TCP uses RFC 6587 octet-count framing).
+- **Transport:** TLS (RFC 5425, preferred), or plaintext UDP/TCP with an explicit admin opt-in. TCP/TLS use RFC 6587 octet-count framing.
 - **Message format:** RFC 5424 header with a JSON payload containing non-null audit fields (`event_type`, `level`, `message`, redacted `details`, actors, request metadata, and so on).
-- **Defaults:** disabled; UDP port `514`; facility `local0`; minimum forward level `INFORMATIONAL`.
-- **Delivery model:** a bounded in-process queue drains asynchronously so API requests never wait on the network. The queue is non-durable; when it is full or the remote server is unavailable, events are dropped and a rate-limited warning is written to operational logs (no recursive audit event).
+- **Defaults:** disabled; TLS port `6514`; facility `local0`; minimum forward level `INFORMATIONAL`.
+- **Delivery model:** a bounded in-process queue (max 5000) drains asynchronously so API requests never wait on the network. The queue is non-durable; when it is full or the remote server is unavailable, events are dropped and a rate-limited warning is written to operational logs (no recursive audit event).
 - **Filtering:** the remote minimum level is independent of the activity-log storage level. Security events are always stored in the database, but they still obey the configured remote minimum level when forwarding.
-- **Firewall:** the container or host must be allowed to send outbound UDP/TCP to the configured syslog host/port.
+- **Firewall:** the container or host must be allowed to send outbound TLS/UDP/TCP to the configured syslog host/port.
 
 Saving the Remote Syslog settings writes a `system.syslog_updated` activity event. When forwarding is enabled, that event is also a convenient end-to-end confirmation that the destination is reachable.
 
