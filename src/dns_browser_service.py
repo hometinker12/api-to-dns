@@ -28,6 +28,7 @@ from .models import (
     DnsRecordInfo,
     DnsZoneConfig,
 )
+from .plugins.utils import has_dns_glob
 from .zone_service import (
     create_dns_client_from_settings,
     decode_zone_config,
@@ -35,6 +36,8 @@ from .zone_service import (
     dns_zone_public_dict,
     provider_dns_zone,
 )
+
+DNS_BROWSER_RECORD_LIMIT = 100
 
 
 class AdminRecordMutation(BaseModel):
@@ -88,29 +91,36 @@ def browser_page_context(db, zone_id: int, *, user: str, can_update: bool) -> di
     if row is None:
         raise HTTPException(status_code=404, detail="DNS zone not found")
     zone_view = dns_zone_public_dict(row)
+    settings = decode_zone_config(row)
+    provider = (settings.get("dns_provider_type") or "azure").strip().lower()
+    cloudflare_proxy_enabled = provider == "cloudflare" and str(
+        settings.get("cloudflare_proxied") or ""
+    ).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     return {
         "user": user,
         "zone": zone_view,
         "zone_id": zone_id,
         "can_update_records": can_update,
         "record_type_options": record_type_options(),
-        "page_title": f"DNS browser — {zone_view['zone_name']}",
+        "page_title": "DNS Browser",
+        "page_subtitle": zone_view["zone_name"],
+        "cloudflare_proxy_enabled": cloudflare_proxy_enabled,
     }
 
 
 def lookup_admin_records(
     zone_id: int,
     *,
-    record_name: str,
+    record_name: str | None,
     record_type: str | None,
     actor: str,
 ) -> dict[str, Any]:
     name = (record_name or "").strip()
-    if not name:
-        raise HTTPException(
-            status_code=400,
-            detail={"status": "error", "message": "record_name is required."},
-        )
     try:
         lookup_type = normalize_lookup_record_type(record_type)
     except ValueError as exc:
@@ -123,13 +133,26 @@ def lookup_admin_records(
         ctx = resolve_admin_zone(db, zone_id)
         provider = (ctx.settings.get("dns_provider_type") or "azure").strip().lower()
         dns_zone = provider_dns_zone(ctx.settings)
+        match_mode = "browse" if not name else ("glob" if has_dns_glob(name) else "exact")
         try:
-            records: list[DnsRecordInfo] = ctx.client.get_record(
-                record_name=name,
-                record_type=lookup_type,
-                dns_server=ctx.settings.get("dns_server"),
-                dns_zone=dns_zone,
-            )
+            truncated = False
+            if match_mode == "exact":
+                records: list[DnsRecordInfo] = ctx.client.get_record(
+                    record_name=name,
+                    record_type=lookup_type,
+                    dns_server=ctx.settings.get("dns_server"),
+                    dns_zone=dns_zone,
+                )
+            else:
+                result = ctx.client.list_records(
+                    name_pattern=name or None,
+                    record_type=lookup_type,
+                    limit=DNS_BROWSER_RECORD_LIMIT,
+                    dns_server=ctx.settings.get("dns_server"),
+                    dns_zone=dns_zone,
+                )
+                records = result.records
+                truncated = result.truncated
         except Exception as exc:
             sanitized = sanitize_client_error_message(exc, fallback="DNS provider error")
             emit_activity_event(
@@ -146,6 +169,7 @@ def lookup_admin_records(
                     "provider": provider,
                     "record_type": lookup_type,
                     "dns_zone": dns_zone,
+                    "match_mode": match_mode,
                     "exception_type": type(exc).__name__,
                 },
             )
@@ -161,14 +185,22 @@ def lookup_admin_records(
             actor_label=actor,
             zone_name=ctx.row.zone_name,
             record_name=name,
-            message=f"DNS browser lookup for {name} in {ctx.row.zone_name}",
+            message=f"DNS browser {match_mode} lookup for {name or '*'} in {ctx.row.zone_name}",
             details={
                 "provider": provider,
                 "dns_zone": dns_zone,
                 "record_type": lookup_type,
                 "record_count": len(records),
+                "match_mode": match_mode,
+                "truncated": truncated,
             },
         )
+        if records:
+            message = None
+        elif match_mode == "browse":
+            message = "No records found in this zone."
+        else:
+            message = "No matching records found."
         return {
             "status": status,
             "zone_name": ctx.row.zone_name,
@@ -176,7 +208,9 @@ def lookup_admin_records(
             "record_name": name,
             "record_type": lookup_type,
             "records": [r.model_dump() for r in records],
-            "message": None if records else "No matching records found.",
+            "truncated": truncated,
+            "match_mode": match_mode,
+            "message": message,
         }
 
 

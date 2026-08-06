@@ -51,6 +51,7 @@ from src.models import (
     ApiKey,
     ApiKeyAllowedZone,
     DnsRecordInfo,
+    DnsRecordListResult,
     DnsZoneConfig,
     User,
 )
@@ -3284,6 +3285,36 @@ def test_dns_browser_page_blank_until_search(client: TestClient) -> None:
     assert "All records" in response.text
     assert "SOA" in response.text
     assert "azure_client_secret" not in response.text
+    assert "<h1>DNS Browser</h1>" in response.text
+    assert 'class="page-subtitle"' in response.text
+    assert "IP Address" in response.text
+    assert "Adding new record..." in response.text
+
+
+def test_dns_browser_page_shows_cloudflare_zone_proxy_indicator(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+        config = decode_zone_config(zone)
+        config.update(
+            {
+                "dns_provider_type": "cloudflare",
+                "dns_zone": "example.com",
+                "cloudflare_api_token": "token",
+                "cloudflare_proxied": "true",
+            }
+        )
+        zone.encrypted_config = encode_zone_config_dict(config)
+        db.add(zone)
+        db.commit()
+        zone_id = zone.id
+
+    response = client.get(f"/zones/{zone_id}/records")
+    assert response.status_code == 200
+    assert "<code>Cloudflare DNS (REST API)</code>" in response.text
+    assert "const cloudflareProxyEnabled = true;" in response.text
+    assert 'id="cloudflare-proxy-indicator"' in response.text
 
 
 def test_dashboard_and_zones_link_to_dns_browser(client: TestClient) -> None:
@@ -3342,6 +3373,70 @@ def test_dns_browser_search_success_and_not_found(
     missing = client.get(f"/zones/{zone_id}/records/search", params={"record_name": "missing"})
     assert missing.status_code == 200
     assert missing.json()["status"] == "not_found"
+
+
+def test_dns_browser_browse_and_glob_search(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+        zone_id = zone.id
+
+    fake = MagicMock()
+    fake.list_records.side_effect = [
+        DnsRecordListResult(
+            records=[DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.10"])],
+            truncated=True,
+        ),
+        DnsRecordListResult(
+            records=[DnsRecordInfo(record_name="api-v2", record_type="A", ttl=300, values=["192.0.2.20"])],
+            truncated=False,
+        ),
+    ]
+    monkeypatch.setattr("src.dns_browser_service.create_dns_client_from_settings", lambda *_a, **_k: fake)
+
+    browse = client.get(f"/zones/{zone_id}/records/search")
+    assert browse.status_code == 200
+    assert browse.json()["match_mode"] == "browse"
+    assert browse.json()["truncated"] is True
+    assert browse.json()["records"][0]["record_name"] == "www"
+    fake.list_records.assert_called_with(
+        name_pattern=None,
+        record_type=None,
+        limit=100,
+        dns_server="",
+        dns_zone="example.com",
+    )
+
+    glob = client.get(f"/zones/{zone_id}/records/search", params={"record_name": "api-*", "record_type": "A"})
+    assert glob.status_code == 200
+    assert glob.json()["match_mode"] == "glob"
+    assert glob.json()["truncated"] is False
+    assert glob.json()["records"][0]["record_name"] == "api-v2"
+
+
+def test_dns_browser_browse_reports_bind_enumeration_limitation(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+        zone_id = zone.id
+
+    fake = MagicMock()
+    fake.list_records.side_effect = ValueError(
+        "Browse and wildcard search are not supported for BIND / TSIG. Enter an exact record name instead."
+    )
+    monkeypatch.setattr("src.dns_browser_service.create_dns_client_from_settings", lambda *_a, **_k: fake)
+
+    response = client.get(f"/zones/{zone_id}/records/search")
+    assert response.status_code == 400
+    assert "not supported for BIND" in response.json()["message"]
 
 
 def test_dns_browser_requires_dns_zones_update(

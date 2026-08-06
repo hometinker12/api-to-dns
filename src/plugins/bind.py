@@ -94,6 +94,19 @@ class BindTsigDnsClient:
         relative = dns_relative_name(zone_name, record_name)
         return query_dns_records_at_name(dns_server, zone_name, relative, record_type)
 
+    def list_records(
+        self,
+        *,
+        name_pattern: str | None = None,
+        record_type: str | None = None,
+        limit: int = 100,
+        dns_server: str | None = None,
+        dns_zone: str | None = None,
+    ):
+        raise ValueError(
+            "Browse and wildcard search are not supported for BIND / TSIG. Enter an exact record name instead."
+        )
+
 
 def create_client(settings: dict[str, str | None]) -> BindTsigDnsClient:
     return BindTsigDnsClient(

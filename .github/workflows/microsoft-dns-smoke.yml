@@ -18,6 +18,7 @@ on:
     branches:
       - develop
       - release
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -25,7 +26,7 @@ permissions:
 jobs:
   pytest:
     name: pytest (ubuntu)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.ref == 'refs/heads/develop'
     steps:
       - uses: actions/checkout@v6
@@ -612,6 +613,22 @@ jobs:
           echo "[bind] Admin DNS browser session CRUD for temporary A record"
           browser_page="$(curl --fail --silent -b /tmp/cookies "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records")"
           echo "${browser_page}" | python3 -c "import sys; html=sys.stdin.read(); assert 'dns-browser-search' in html; assert 'dns-browser-results' in html and 'hidden' in html"
+          bind_browse_status="$(curl --silent --show-error -b /tmp/cookies -o /tmp/bind-browser-browse.json -w "%{http_code}" \
+            "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search")"
+          if [ "${bind_browse_status}" != "400" ]; then
+            echo "Expected BIND browser browse to return 400; got ${bind_browse_status}"
+            cat /tmp/bind-browser-browse.json
+            exit 1
+          fi
+          python3 -c "import json; b=json.load(open('/tmp/bind-browser-browse.json')); assert 'not supported for BIND' in b['message'], b"
+          bind_glob_status="$(curl --silent --show-error -b /tmp/cookies -o /tmp/bind-browser-glob.json -w "%{http_code}" \
+            "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search?record_name=browser*")"
+          if [ "${bind_glob_status}" != "400" ]; then
+            echo "Expected BIND browser wildcard search to return 400; got ${bind_glob_status}"
+            cat /tmp/bind-browser-glob.json
+            exit 1
+          fi
+          python3 -c "import json; b=json.load(open('/tmp/bind-browser-glob.json')); assert 'not supported for BIND' in b['message'], b"
           curl --fail --silent -b /tmp/cookies \
             -H "Origin: http://127.0.0.1:8000" \
             -H "Referer: http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
@@ -1229,6 +1246,18 @@ jobs:
             $bc = $browserCreate.Content | ConvertFrom-Json
             if ($bc.action -ne 'created') { throw "browser create failed: $($browserCreate.Content)" }
             Wait-LocalA -Fqdn "browser.$la" -ExpectedIp '192.0.2.77'
+            $browserBrowse = Invoke-RestMethod -Uri "$base/zones/$zoneId/records/search" -WebSession $WebSession
+            if ($browserBrowse.match_mode -ne 'browse' -or -not ($browserBrowse.records | Where-Object { $_.record_name -eq 'browser' -and $_.record_type -eq 'A' })) {
+              throw "browser empty browse failed: $($browserBrowse | ConvertTo-Json -Compress -Depth 6)"
+            }
+            $browserGlob = Invoke-RestMethod -Uri "$base/zones/$zoneId/records/search?record_name=browser*&record_type=A" -WebSession $WebSession
+            if ($browserGlob.match_mode -ne 'glob' -or $browserGlob.records[0].values[0] -ne '192.0.2.77') {
+              throw "browser wildcard search failed: $($browserGlob | ConvertTo-Json -Compress -Depth 6)"
+            }
+            $browserQGlob = Invoke-RestMethod -Uri "$base/zones/$zoneId/records/search?record_name=BROW?ER&record_type=A" -WebSession $WebSession
+            if ($browserQGlob.match_mode -ne 'glob' -or $browserQGlob.records[0].values[0] -ne '192.0.2.77') {
+              throw "browser case-insensitive ? glob failed: $($browserQGlob | ConvertTo-Json -Compress -Depth 6)"
+            }
             $browserSearch = Invoke-RestMethod -Uri "$base/zones/$zoneId/records/search?record_name=browser&record_type=A" -WebSession $WebSession
             if ($browserSearch.status -ne 'success' -or $browserSearch.records[0].values[0] -ne '192.0.2.77') {
               throw "browser search failed: $($browserSearch | ConvertTo-Json -Compress)"

@@ -16,7 +16,12 @@ from src.plugins.bind import BindTsigDnsClient
 from src.plugins.cloudflare import CloudflareDnsClient
 from src.plugins.microsoft import MicrosoftWinRmDnsClient
 from src.plugins.microsoft import create_client as create_microsoft_client
-from src.plugins.utils import normalize_lookup_record_type, query_dns_records_at_name
+from src.plugins.utils import (
+    has_dns_glob,
+    normalize_lookup_record_type,
+    query_dns_records_at_name,
+    record_name_matches,
+)
 
 
 def test_normalize_lookup_record_type_accepts_supported_types() -> None:
@@ -32,6 +37,14 @@ def test_normalize_lookup_record_type_rejects_unknown() -> None:
 
 def test_normalize_lookup_record_type_accepts_mx() -> None:
     assert normalize_lookup_record_type("MX") == "MX"
+
+
+def test_relative_dns_glob_matching_is_case_insensitive() -> None:
+    assert has_dns_glob("api-?")
+    assert not has_dns_glob("www")
+    assert record_name_matches("API-*", "api-v2")
+    assert record_name_matches("?.internal", "a.internal")
+    assert not record_name_matches("?.internal", "api.internal")
 
 
 def _mock_a_answer(ttl: int = 300, address: str = "192.0.2.1"):
@@ -152,6 +165,42 @@ def test_azure_get_record_all_types(mock_get) -> None:
     ]
 
 
+def test_azure_list_records_filters_case_insensitively_and_caps() -> None:
+    from azure.mgmt.dns.operations import RecordSetsOperations
+
+    client = AzureDnsClient(
+        tenant_id="t",
+        client_id="c",
+        client_secret="s",
+        subscription_id="sub",
+        resource_group="rg",
+    )
+
+    first = MagicMock()
+    first.type = "Microsoft.Network/dnszones/A"
+    first.name = "Api-One"
+    first.ttl = 300
+    first.a_records = [MagicMock(ipv4_address="192.0.2.10")]
+
+    second = MagicMock()
+    second.type = "Microsoft.Network/dnszones/A"
+    second.name = "api-two"
+    second.ttl = 300
+    second.a_records = [MagicMock(ipv4_address="192.0.2.20")]
+
+    record_sets = MagicMock(spec=RecordSetsOperations)
+    record_sets.list_by_dns_zone.return_value = [first, second]
+    mgmt = MagicMock()
+    mgmt.record_sets = record_sets
+    client.DnsManagementClient = MagicMock(return_value=mgmt)
+
+    result = client.list_records(name_pattern="API-*", record_type="A", limit=1, dns_zone="example.com")
+
+    assert result.truncated is True
+    assert result.records == [DnsRecordInfo(record_name="Api-One", record_type="A", ttl=300, values=["192.0.2.10"])]
+    record_sets.list_by_dns_zone.assert_called_once_with("rg", "example.com")
+
+
 @patch.object(MicrosoftWinRmDnsClient, "_get_record_details")
 def test_microsoft_get_record_single_type(mock_details) -> None:
     mock_details.return_value = DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.10"])
@@ -198,6 +247,37 @@ def test_microsoft_get_record_details_parses_json(mock_run) -> None:
     assert info == DnsRecordInfo(record_name="www", record_type="A", ttl=450, values=["192.0.2.55", "192.0.2.56"])
 
 
+@patch.object(MicrosoftWinRmDnsClient, "_run_ps_with_retry")
+def test_microsoft_list_records_filters_remotely_and_preserves_truncation(mock_run) -> None:
+    payload = {
+        "records": [
+            {"record_name": "api-one", "record_type": "A", "ttl": 300, "values": ["192.0.2.10"]},
+        ],
+        "truncated": True,
+    }
+    mock_run.return_value = MagicMock(std_out=json.dumps(payload).encode(), std_err=b"")
+    client = MicrosoftWinRmDnsClient(username="user", password="pass")
+
+    result = client.list_records(
+        name_pattern="api-*",
+        record_type="A",
+        limit=100,
+        dns_server="dc01",
+        dns_zone="example.com",
+    )
+
+    assert result.truncated is True
+    assert result.records == [DnsRecordInfo(record_name="api-one", record_type="A", ttl=300, values=["192.0.2.10"])]
+    script = mock_run.call_args.args[1]
+    assert "-RRType" in script
+    assert "$relative -notlike $NamePattern" in script
+    assert "ForEach-Object" in script
+    assert "$order.Count -ge $Limit" in script
+    assert "Select-Object -First ($Limit + 1)" not in script
+    assert "BrowserRecordName" not in script
+    assert "ConvertTo-Json" in script
+
+
 @patch.object(BindTsigDnsClient, "__init__", lambda self, *args, **kwargs: None)
 @patch("src.plugins.bind.query_dns_records_at_name")
 def test_bind_get_record_delegates(mock_query) -> None:
@@ -210,6 +290,13 @@ def test_bind_get_record_delegates(mock_query) -> None:
     )
     assert records == [DnsRecordInfo(record_name="@", record_type="TXT", ttl=600, values=["hello"])]
     mock_query.assert_called_once_with("127.0.0.1", "example.com", "@", None)
+
+
+@patch.object(BindTsigDnsClient, "__init__", lambda self, *args, **kwargs: None)
+def test_bind_list_records_explains_enumeration_limitation() -> None:
+    client = BindTsigDnsClient.__new__(BindTsigDnsClient)
+    with pytest.raises(ValueError, match="not supported for BIND"):
+        client.list_records(name_pattern="*", dns_server="127.0.0.1", dns_zone="example.com")
 
 
 class _CloudflareFake:
@@ -278,6 +365,60 @@ def test_cloudflare_get_record_single_type() -> None:
     assert list_call.url.path == "/client/v4/zones/z1/dns_records"
     assert list_call.url.params["name"] == "www.example.com"
     assert list_call.url.params["type"] == "A"
+
+
+def test_cloudflare_list_records_pages_with_explicit_page_size_and_caps_rrsets() -> None:
+    first_page = {
+        "success": True,
+        "errors": [],
+        "result": [{"id": "r1", "name": "Api-One.example.com", "type": "A", "content": "192.0.2.10", "ttl": 300}],
+        "result_info": {"page": 1, "per_page": 100, "total_pages": 2},
+    }
+    second_page = {
+        "success": True,
+        "errors": [],
+        "result": [{"id": "r2", "name": "api-two.example.com", "type": "A", "content": "192.0.2.20", "ttl": 300}],
+        "result_info": {"page": 2, "per_page": 100, "total_pages": 2},
+    }
+    client, fake = _cloudflare_client([(200, first_page), (200, second_page)], zone_id="zone-from-config")
+
+    result = client.list_records(name_pattern="API-*", record_type="A", limit=1, dns_zone="example.com")
+
+    assert result.truncated is True
+    assert result.records == [DnsRecordInfo(record_name="Api-One", record_type="A", ttl=300, values=["192.0.2.10"])]
+    assert [request.url.params["page"] for request in fake.requests] == ["1", "2"]
+    assert {request.url.params["per_page"] for request in fake.requests} == {"100"}
+
+
+def test_cloudflare_list_records_completes_open_rrset_across_page_after_cap() -> None:
+    """Once the RRset cap is hit, keep paging to finish already-open multivalue sets."""
+    first_page = {
+        "success": True,
+        "errors": [],
+        "result": [
+            {"id": "r1", "name": "api-one.example.com", "type": "A", "content": "192.0.2.10", "ttl": 300},
+            {"id": "r2", "name": "api-two.example.com", "type": "A", "content": "192.0.2.20", "ttl": 300},
+        ],
+        "result_info": {"page": 1, "per_page": 100, "total_pages": 2},
+    }
+    second_page = {
+        "success": True,
+        "errors": [],
+        "result": [
+            {"id": "r3", "name": "api-one.example.com", "type": "A", "content": "192.0.2.11", "ttl": 300},
+            {"id": "r4", "name": "api-three.example.com", "type": "A", "content": "192.0.2.30", "ttl": 300},
+        ],
+        "result_info": {"page": 2, "per_page": 100, "total_pages": 2},
+    }
+    client, fake = _cloudflare_client([(200, first_page), (200, second_page)], zone_id="zone-from-config")
+
+    result = client.list_records(name_pattern="api-*", record_type="A", limit=1, dns_zone="example.com")
+
+    assert result.truncated is True
+    assert result.records == [
+        DnsRecordInfo(record_name="api-one", record_type="A", ttl=300, values=["192.0.2.10", "192.0.2.11"])
+    ]
+    assert [request.url.params["page"] for request in fake.requests] == ["1", "2"]
 
 
 def test_cloudflare_get_record_skips_zone_lookup_when_zone_id_set() -> None:
