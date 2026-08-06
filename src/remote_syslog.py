@@ -444,6 +444,7 @@ class RemoteSyslogForwarder:
         sock.sendto(message, (config.host, config.port))
 
     def _open_stream(self, config: SyslogConfig) -> socket.socket:
+        """Open a TCP or TLS stream. Must not be called while holding ``_lock``."""
         addr = (config.host, config.port)
         raw = socket.create_connection(addr, timeout=config.timeout)
         raw.settimeout(config.timeout)
@@ -452,32 +453,55 @@ class RemoteSyslogForwarder:
         context = ssl.create_default_context()
         return context.wrap_socket(raw, server_hostname=config.host)
 
+    def _install_stream(self, sock: socket.socket, config: SyslogConfig) -> socket.socket | None:
+        """Install ``sock`` if config generation still matches; otherwise close it."""
+        target = (config.host, config.port, config.protocol)
+        with self._lock:
+            current = self._config
+            if (
+                current.generation != config.generation
+                or not current.enabled
+                or (current.host, current.port, current.protocol) != target
+            ):
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                return None
+            self._close_stream_unlocked()
+            self._stream_sock = sock
+            self._stream_addr = target
+            return sock
+
     def _send_stream(self, message: bytes, config: SyslogConfig) -> None:
         framed = frame_tcp(message)
         target = (config.host, config.port, config.protocol)
         with self._lock:
-            if self._stream_sock is None or self._stream_addr != target:
-                self._close_stream_unlocked()
-                self._stream_sock = self._open_stream(config)
-                self._stream_addr = target
-            sock = self._stream_sock
+            sock = self._stream_sock if self._stream_addr == target else None
             generation = config.generation
+        if sock is None:
+            opened = self._open_stream(config)
+            sock = self._install_stream(opened, config)
+            if sock is None:
+                return
         try:
             sock.sendall(framed)
+            return
         except OSError:
             with self._lock:
+                if self._stream_sock is sock:
+                    self._close_stream_unlocked()
                 current = self._config
                 if current.generation != generation or not current.enabled:
-                    self._close_stream_unlocked()
                     return
-                if current.host != config.host or current.port != config.port or current.protocol != config.protocol:
-                    self._close_stream_unlocked()
+                if (current.host, current.port, current.protocol) != target:
                     return
-                self._close_stream_unlocked()
-                sock = self._open_stream(current)
-                self._stream_sock = sock
-                self._stream_addr = (current.host, current.port, current.protocol)
-            sock.sendall(framed)
+                reconnect_config = current
+        opened = self._open_stream(reconnect_config)
+        sock = self._install_stream(opened, reconnect_config)
+        if sock is None:
+            return
+        sock.sendall(framed)
 
     def _close_sockets_unlocked(self) -> None:
         self._close_udp_unlocked()
