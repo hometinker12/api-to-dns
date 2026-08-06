@@ -92,11 +92,15 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install --yes rsyslog
-          # Avoid fighting the distro unit; smoke uses a dedicated instance on an unprivileged port.
+          # apt postinst may restart the distro unit; stop it before the smoke instance.
           sudo systemctl stop rsyslog.service 2>/dev/null || true
           sudo systemctl disable rsyslog.service 2>/dev/null || true
+          # Ubuntu AppArmor only allows the stock /etc/rsyslog.conf path; unload for this job.
+          if [ -f /etc/apparmor.d/usr.sbin.rsyslogd ]; then
+            sudo ln -sf /etc/apparmor.d/usr.sbin.rsyslogd /etc/apparmor.d/disable/usr.sbin.rsyslogd
+            sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.rsyslogd || true
+          fi
 
-          # AppArmor confines rsyslogd away from $RUNNER_TEMP; keep conf/output under /etc and /var/log.
           SYSLOG_OUTPUT="/var/log/api-to-dns-syslog-smoke.out"
           SYSLOG_CONF="/etc/rsyslog-smoke.conf"
           SYSLOG_PID_FILE="/tmp/rsyslog-smoke.pid"
@@ -123,6 +127,7 @@ jobs:
           done
           if ! kill -0 "$(cat /tmp/rsyslog-smoke.shell.pid)" 2>/dev/null; then
             echo "rsyslog receiver process is not running"
+            sudo dmesg | tail -n 40 || true
             sudo cat /var/log/syslog 2>/dev/null | tail -n 50 || true
             exit 1
           fi
