@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Microsoft DNS browser browse/search no longer fails with WinRM "command line is too long": long PowerShell payloads are staged to a remote tempfile in base64 chunks before execution.
+
 ### Added
 
 - Admin **DNS browser**: open a zone from the Dashboard or DNS Zones list; filter by type (A/AAAA/CNAME/TXT/MX/NS/SRV/CAA/PTR/SOA); and add/edit/delete RRsets. Requires `dns_zones.update` for page, search, and mutations (links hidden without it). SOA is view-only; apex NS is blocked for `@` and the zone FQDN; PTR is limited to reverse zones. Rate-limited via `RATE_LIMIT_DNS_BROWSER` (default `60:60`; session identity, ignoring unvalidated API-key headers). Providers share canonical value formats via `src/dns_record_types.py`.

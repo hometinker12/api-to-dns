@@ -247,6 +247,23 @@ def test_microsoft_get_record_details_parses_json(mock_run) -> None:
     assert info == DnsRecordInfo(record_name="www", record_type="A", ttl=450, values=["192.0.2.55", "192.0.2.56"])
 
 
+def test_microsoft_run_ps_payload_stages_long_scripts_via_tempfile() -> None:
+    client = MicrosoftWinRmDnsClient(username="user", password="pass")
+    session = MagicMock()
+    ok = MagicMock(status_code=0, std_out=b'{"ok":true}', std_err=b"")
+    session.run_ps.return_value = ok
+
+    long_script = "$x = '" + ("a" * 5000) + "'\n$x"
+    result = client._run_ps_payload(session, long_script)
+
+    assert result is ok
+    assert session.run_ps.call_count >= 2
+    staged_scripts = [call.args[0] for call in session.run_ps.call_args_list]
+    assert any("Set-Content" in script and ".b64" in script for script in staged_scripts)
+    assert any("FromBase64String" in script and "& $ps1" in script for script in staged_scripts)
+    assert not any(long_script in script for script in staged_scripts)
+
+
 @patch.object(MicrosoftWinRmDnsClient, "_run_ps_with_retry")
 def test_microsoft_list_records_filters_remotely_and_preserves_truncation(mock_run) -> None:
     payload = {
