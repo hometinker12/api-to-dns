@@ -95,6 +95,12 @@ python -m ruff format --check src tests
 python -m pytest
 ```
 
+Before pushing image-affecting changes to `develop`, also build and scan the Docker image with Trivy (same High/Critical gate as CI publish / release smoke). Requires Docker; uses a local `trivy` CLI when installed, otherwise runs via the `aquasec/trivy` image:
+
+```powershell
+powershell -File scripts/trivy-local-scan.ps1
+```
+
 Test files should be named `tests/test_<module>.py`. Reuse fixtures from `tests/conftest.py` and mock external DNS, WinRM, SMTP, syslog, and ACME services where appropriate.
 
 Changes involving routes, authentication, DNS providers, Docker behavior, or public APIs should include regression or smoke-test coverage.
