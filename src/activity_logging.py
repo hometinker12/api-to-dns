@@ -74,6 +74,15 @@ SETTING_LOG_MAX_BYTES = "operational_log_max_bytes"
 SETTING_LOG_BACKUP_COUNT = "operational_log_backup_count"
 SETTING_APP_DNS_NAME = "app_dns_name"
 
+SETTING_SYSLOG_ENABLED = "remote_syslog_enabled"
+SETTING_SYSLOG_HOST = "remote_syslog_host"
+SETTING_SYSLOG_PORT = "remote_syslog_port"
+SETTING_SYSLOG_PROTOCOL = "remote_syslog_protocol"
+SETTING_SYSLOG_FACILITY = "remote_syslog_facility"
+SETTING_SYSLOG_MINIMUM_LEVEL = "remote_syslog_minimum_level"
+SETTING_SYSLOG_TIMEOUT = "remote_syslog_timeout"
+SETTING_SYSLOG_QUEUE_SIZE = "remote_syslog_queue_size"
+
 DEFAULT_APP_DNS_NAME_DOCKER = "apitodns.local"
 DOCKER_RUNTIME_LABEL = "Detected Docker container runtime."
 DEFAULT_LOG_LEVEL = LOG_LEVEL_INFORMATIONAL
@@ -368,6 +377,13 @@ def emit_activity_event(
     db.refresh(row)
 
     try:
+        from .remote_syslog import REMOTE_SYSLOG, ActivityLogSnapshot
+
+        REMOTE_SYSLOG.enqueue(ActivityLogSnapshot.from_row(row))
+    except Exception:  # pragma: no cover - forwarding must never block events
+        LOGGER.exception("could not enqueue audit event for remote syslog")
+
+    try:
         run_retention_cleanup(db)
     except Exception:  # pragma: no cover - retention failures must never block events
         LOGGER.exception("activity retention cleanup failed")
@@ -548,6 +564,142 @@ def get_smtp_config(db) -> dict[str, Any]:
         "allow_insecure_auth": _smtp_truthy(get_setting(db, SETTING_SMTP_ALLOW_INSECURE_AUTH)),
         "password_set": bool(get_setting(db, SETTING_SMTP_PASSWORD)),
     }
+
+
+def get_remote_syslog_config(db) -> dict[str, Any]:
+    """Return sanitized remote syslog settings for UI and worker configuration."""
+    from .remote_syslog import (
+        DEFAULT_FACILITY,
+        DEFAULT_MINIMUM_LEVEL,
+        DEFAULT_PORT,
+        DEFAULT_PROTOCOL,
+        DEFAULT_QUEUE_SIZE,
+        DEFAULT_TIMEOUT,
+        SYSLOG_FACILITY,
+        SYSLOG_PROTOCOLS,
+        validate_syslog_config,
+    )
+
+    enabled = _smtp_truthy(get_setting(db, SETTING_SYSLOG_ENABLED))
+    host = get_setting(db, SETTING_SYSLOG_HOST) or ""
+    try:
+        port = int(get_setting(db, SETTING_SYSLOG_PORT) or DEFAULT_PORT)
+    except ValueError:
+        port = DEFAULT_PORT
+    protocol = (get_setting(db, SETTING_SYSLOG_PROTOCOL) or DEFAULT_PROTOCOL).strip().lower()
+    if protocol not in SYSLOG_PROTOCOLS:
+        protocol = DEFAULT_PROTOCOL
+    facility = (get_setting(db, SETTING_SYSLOG_FACILITY) or DEFAULT_FACILITY).strip().lower()
+    if facility not in SYSLOG_FACILITY:
+        facility = DEFAULT_FACILITY
+    minimum_level = (get_setting(db, SETTING_SYSLOG_MINIMUM_LEVEL) or DEFAULT_MINIMUM_LEVEL).strip().upper()
+    if minimum_level not in LOG_LEVEL_VALUES:
+        minimum_level = DEFAULT_MINIMUM_LEVEL
+    try:
+        timeout = float(get_setting(db, SETTING_SYSLOG_TIMEOUT) or DEFAULT_TIMEOUT)
+    except ValueError:
+        timeout = DEFAULT_TIMEOUT
+    try:
+        queue_size = int(get_setting(db, SETTING_SYSLOG_QUEUE_SIZE) or DEFAULT_QUEUE_SIZE)
+    except ValueError:
+        queue_size = DEFAULT_QUEUE_SIZE
+
+    # Return a dict even when disabled/incomplete so the UI can render defaults.
+    try:
+        validated = validate_syslog_config(
+            enabled=enabled,
+            host=host,
+            port=port,
+            protocol=protocol,
+            facility=facility,
+            minimum_level=minimum_level,
+            timeout=timeout,
+            queue_size=queue_size,
+            hostname=get_app_dns_name(db),
+        )
+        return {
+            "enabled": validated.enabled,
+            "host": validated.host,
+            "port": validated.port,
+            "protocol": validated.protocol,
+            "facility": validated.facility,
+            "minimum_level": validated.minimum_level,
+            "timeout": validated.timeout,
+            "queue_size": validated.queue_size,
+            "hostname": validated.hostname,
+            "facilities": list(SYSLOG_FACILITY.keys()),
+            "protocols": list(SYSLOG_PROTOCOLS),
+        }
+    except ValueError:
+        return {
+            "enabled": False,
+            "host": host,
+            "port": port,
+            "protocol": protocol,
+            "facility": facility,
+            "minimum_level": minimum_level,
+            "timeout": timeout,
+            "queue_size": queue_size,
+            "hostname": get_app_dns_name(db),
+            "facilities": list(SYSLOG_FACILITY.keys()),
+            "protocols": list(SYSLOG_PROTOCOLS),
+        }
+
+
+def set_remote_syslog_config(
+    db,
+    *,
+    enabled: bool,
+    host: str,
+    port: int,
+    protocol: str,
+    facility: str,
+    minimum_level: str,
+    timeout: float,
+    queue_size: int,
+) -> dict[str, Any]:
+    """Validate and persist remote syslog settings; return the sanitized config dict."""
+    from .remote_syslog import validate_syslog_config
+
+    validated = validate_syslog_config(
+        enabled=enabled,
+        host=host,
+        port=port,
+        protocol=protocol,
+        facility=facility,
+        minimum_level=minimum_level,
+        timeout=timeout,
+        queue_size=queue_size,
+        hostname=get_app_dns_name(db),
+    )
+    set_setting(db, SETTING_SYSLOG_ENABLED, "true" if validated.enabled else "false")
+    set_setting(db, SETTING_SYSLOG_HOST, validated.host)
+    set_setting(db, SETTING_SYSLOG_PORT, str(validated.port))
+    set_setting(db, SETTING_SYSLOG_PROTOCOL, validated.protocol)
+    set_setting(db, SETTING_SYSLOG_FACILITY, validated.facility)
+    set_setting(db, SETTING_SYSLOG_MINIMUM_LEVEL, validated.minimum_level)
+    set_setting(db, SETTING_SYSLOG_TIMEOUT, str(validated.timeout))
+    set_setting(db, SETTING_SYSLOG_QUEUE_SIZE, str(validated.queue_size))
+    return get_remote_syslog_config(db)
+
+
+def apply_remote_syslog_config(db) -> None:
+    """Load persisted settings and apply them to the process-wide forwarder."""
+    from .remote_syslog import REMOTE_SYSLOG, validate_syslog_config
+
+    raw = get_remote_syslog_config(db)
+    config = validate_syslog_config(
+        enabled=bool(raw.get("enabled")),
+        host=str(raw.get("host") or ""),
+        port=int(raw.get("port") or 514),
+        protocol=str(raw.get("protocol") or "udp"),
+        facility=str(raw.get("facility") or "local0"),
+        minimum_level=str(raw.get("minimum_level") or LOG_LEVEL_INFORMATIONAL),
+        timeout=float(raw.get("timeout") or 5.0),
+        queue_size=int(raw.get("queue_size") or 1000),
+        hostname=str(raw.get("hostname") or get_app_dns_name(db)),
+    )
+    REMOTE_SYSLOG.configure(config)
 
 
 def set_smtp_config(
@@ -835,6 +987,15 @@ __all__ = [
     "LOGGER",
     "SETTING_LOG_LEVEL",
     "SETTING_RETENTION_DAYS",
+    "SETTING_SYSLOG_ENABLED",
+    "SETTING_SYSLOG_HOST",
+    "SETTING_SYSLOG_PORT",
+    "SETTING_SYSLOG_PROTOCOL",
+    "SETTING_SYSLOG_FACILITY",
+    "SETTING_SYSLOG_MINIMUM_LEVEL",
+    "SETTING_SYSLOG_TIMEOUT",
+    "SETTING_SYSLOG_QUEUE_SIZE",
+    "apply_remote_syslog_config",
     "configure_operational_logging",
     "default_app_dns_name",
     "detect_system_dns_name",
@@ -843,6 +1004,7 @@ __all__ = [
     "emit_activity_event",
     "evaluate_alert_rules",
     "get_log_level",
+    "get_remote_syslog_config",
     "get_retention_days",
     "get_smtp_config",
     "infer_event_category",
@@ -855,6 +1017,7 @@ __all__ = [
     "send_alert_email",
     "set_app_dns_name",
     "set_log_level",
+    "set_remote_syslog_config",
     "set_retention_days",
     "set_smtp_config",
     "SETTING_APP_DNS_NAME",
