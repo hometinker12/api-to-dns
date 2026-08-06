@@ -27,7 +27,11 @@ def test_normalize_lookup_record_type_accepts_supported_types() -> None:
 
 def test_normalize_lookup_record_type_rejects_unknown() -> None:
     with pytest.raises(ValueError, match="Record type must be one of"):
-        normalize_lookup_record_type("MX")
+        normalize_lookup_record_type("SPF")
+
+
+def test_normalize_lookup_record_type_accepts_mx() -> None:
+    assert normalize_lookup_record_type("MX") == "MX"
 
 
 def _mock_a_answer(ttl: int = 300, address: str = "192.0.2.1"):
@@ -133,7 +137,14 @@ def test_azure_get_record_all_types(mock_get) -> None:
     cname_set.cname_record = MagicMock(cname="target.example.com.")
     cname_set.txt_records = None
 
-    mock_get.side_effect = [a_set, None, cname_set, None]
+    def side_effect(_client, _rg, _zone, _name, record_type):
+        if record_type == "A":
+            return a_set
+        if record_type == "CNAME":
+            return cname_set
+        return None
+
+    mock_get.side_effect = side_effect
     records = client.get_record(record_name="www", dns_zone="example.com")
     assert records == [
         DnsRecordInfo(record_name="www", record_type="A", ttl=500, values=["10.0.0.1"]),
@@ -157,12 +168,14 @@ def test_microsoft_get_record_single_type(mock_details) -> None:
 
 @patch.object(MicrosoftWinRmDnsClient, "_get_record_details")
 def test_microsoft_get_record_all_types(mock_details) -> None:
-    mock_details.side_effect = [
-        DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.10"]),
-        DnsRecordInfo(record_name="www", record_type="AAAA", ttl=300, values=["2001:db8::1"]),
-        None,
-        None,
-    ]
+    def side_effect(_computer, _zone, _name, api_rr_type):
+        if api_rr_type == "A":
+            return DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.10"])
+        if api_rr_type == "AAAA":
+            return DnsRecordInfo(record_name="www", record_type="AAAA", ttl=300, values=["2001:db8::1"])
+        return None
+
+    mock_details.side_effect = side_effect
     client = MicrosoftWinRmDnsClient(username="user", password="pass")
     records = client.get_record(
         record_name="www",
@@ -173,7 +186,7 @@ def test_microsoft_get_record_all_types(mock_details) -> None:
         DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.10"]),
         DnsRecordInfo(record_name="www", record_type="AAAA", ttl=300, values=["2001:db8::1"]),
     ]
-    assert mock_details.call_count == 4
+    assert mock_details.call_count == 10
 
 
 @patch.object(MicrosoftWinRmDnsClient, "_run_ps_with_retry")
@@ -339,30 +352,31 @@ def test_cloudflare_update_txt_matches_existing_quoted_content() -> None:
 
 
 def test_cloudflare_get_record_all_types_aggregates_only_present() -> None:
-    client, fake = _cloudflare_client(
-        [
-            _ok([{"id": "z1", "name": "example.com"}]),
-            _ok(
-                [
-                    {"id": "a1", "type": "A", "name": "www.example.com", "content": "10.0.0.1", "ttl": 300},
-                    {"id": "a2", "type": "A", "name": "www.example.com", "content": "10.0.0.2", "ttl": 500},
-                ]
-            ),
-            _ok([]),
-            _ok(
-                [
-                    {
-                        "id": "c1",
-                        "type": "CNAME",
-                        "name": "www.example.com",
-                        "content": "target.example.com.",
-                        "ttl": 1000,
-                    }
-                ]
-            ),
-            _ok([]),
-        ]
-    )
+    # One response per LOOKUP_RECORD_TYPES entry after zone lookup.
+    type_responses = {
+        "A": _ok(
+            [
+                {"id": "a1", "type": "A", "name": "www.example.com", "content": "10.0.0.1", "ttl": 300},
+                {"id": "a2", "type": "A", "name": "www.example.com", "content": "10.0.0.2", "ttl": 500},
+            ]
+        ),
+        "CNAME": _ok(
+            [
+                {
+                    "id": "c1",
+                    "type": "CNAME",
+                    "name": "www.example.com",
+                    "content": "target.example.com.",
+                    "ttl": 1000,
+                }
+            ]
+        ),
+    }
+    from src.dns_record_types import LOOKUP_RECORD_TYPES
+
+    responses = [_ok([{"id": "z1", "name": "example.com"}])]
+    responses.extend(type_responses.get(rt, _ok([])) for rt in LOOKUP_RECORD_TYPES)
+    client, fake = _cloudflare_client(responses)
     records = client.get_record(record_name="www", dns_zone="example.com")
     assert records == [
         DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["10.0.0.1", "10.0.0.2"]),
@@ -371,15 +385,11 @@ def test_cloudflare_get_record_all_types_aggregates_only_present() -> None:
 
 
 def test_cloudflare_get_record_not_found_returns_empty_list() -> None:
-    client, _fake = _cloudflare_client(
-        [
-            _ok([{"id": "z1", "name": "example.com"}]),
-            _ok([]),
-            _ok([]),
-            _ok([]),
-            _ok([]),
-        ]
-    )
+    from src.dns_record_types import LOOKUP_RECORD_TYPES
+
+    responses = [_ok([{"id": "z1", "name": "example.com"}])]
+    responses.extend(_ok([]) for _ in LOOKUP_RECORD_TYPES)
+    client, _fake = _cloudflare_client(responses)
     assert client.get_record(record_name="missing", dns_zone="example.com") == []
 
 
@@ -593,3 +603,85 @@ def test_microsoft_create_client_defaults_insecure_tls_off() -> None:
         }
     )
     assert opted.insecure_tls is True
+
+
+@patch.object(AzureDnsClient, "_get_existing_record_set")
+def test_azure_mx_round_trip(mock_get) -> None:
+    client = AzureDnsClient(
+        tenant_id="t",
+        client_id="c",
+        client_secret="s",
+        subscription_id="sub",
+        resource_group="rg",
+    )
+    mgmt = MagicMock()
+    client.DnsManagementClient = MagicMock(return_value=mgmt)
+    captured: dict = {}
+
+    def _record_set(**kwargs):
+        captured.update(kwargs)
+        return MagicMock(**kwargs)
+
+    client.RecordSet = _record_set
+    mock_get.return_value = None
+    payload = DnsRecordRequest(
+        zone_name="cfg",
+        record_type="MX",
+        record_name="@",
+        ttl=300,
+        values=["10 mail.example.com"],
+    )
+    client.create_or_update_record(payload, dns_zone="example.com")
+    args = mgmt.record_sets.create_or_update.call_args
+    assert args[0][3] == "MX"
+    assert captured["mx_records"][0]["preference"] == 10
+    assert captured["mx_records"][0]["exchange"] == "mail.example.com"
+
+    existing = MagicMock()
+    existing.ttl = 300
+    existing.mx_records = [MagicMock(preference=10, exchange="mail.example.com.")]
+    existing.a_records = None
+    existing.aaaa_records = None
+    existing.cname_record = None
+    existing.txt_records = None
+    existing.ns_records = None
+    existing.srv_records = None
+    existing.caa_records = None
+    existing.ptr_records = None
+    existing.soa_record = None
+    mock_get.return_value = existing
+    records = client.get_record(record_name="@", record_type="MX", dns_zone="example.com")
+    assert records == [DnsRecordInfo(record_name="@", record_type="MX", ttl=300, values=["10 mail.example.com"])]
+
+
+@patch("src.plugins.bind.dns.query.tcp")
+@patch("src.plugins.bind.record_existed_before_update", return_value=False)
+def test_bind_replace_uses_canonical_mx_text(mock_existed, mock_tcp) -> None:
+    import base64
+
+    response = MagicMock()
+    response.rcode.return_value = 0
+    mock_tcp.return_value = response
+    client = BindTsigDnsClient(
+        tsig_key_name="key.",
+        tsig_secret_b64=base64.b64encode(b"01234567890123456789012345678901").decode(),
+        tsig_algorithm="hmac-sha256",
+    )
+    payload = DnsRecordRequest(
+        zone_name="cfg",
+        record_type="MX",
+        record_name="@",
+        ttl=300,
+        values=["10 mail.example.com"],
+    )
+    existed = client.create_or_update_record(payload, dns_server="127.0.0.1", dns_zone="example.com")
+    assert existed is False
+    update = mock_tcp.call_args[0][0]
+    assert "mail.example.com" in update.to_text()
+
+
+def test_microsoft_add_record_lines_escape_mx() -> None:
+    lines = MicrosoftWinRmDnsClient._add_record_lines("MX", ["10 mail.example.com"])
+    assert any("Add-DnsServerResourceRecordMX" in line for line in lines)
+    assert any("MailExchange 'mail.example.com'" in line for line in lines)
+    assert any("-Preference 10" in line for line in lines)

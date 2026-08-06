@@ -502,6 +502,18 @@ jobs:
           SMOKE_ZONE_ID="$(python3 -c 'import re; html=open("/tmp/api-keys.html", encoding="utf-8").read(); match=re.search(r"name=\"zone_ids\" value=\"(\d+)\"\s*/>\s*<code>smoke\.test</code>", html, re.DOTALL); assert match, "Could not find smoke.test zone ID"; print(match.group(1))')"
           : "${SMOKE_ZONE_ID:?Could not extract smoke.test zone ID}"
 
+          echo "[bind] Dashboard and zones pages link to DNS browser"
+          curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/admin \
+            | python3 -c "import sys; html=sys.stdin.read(); assert f'/zones/${SMOKE_ZONE_ID}/records' in html, html[:800]"
+          curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/zones \
+            | python3 -c "import sys; html=sys.stdin.read(); assert f'/zones/${SMOKE_ZONE_ID}/records' in html, html[:800]"
+          unauth_browser="$(curl --silent --show-error -o /dev/null -w "%{http_code}" "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records")"
+          if [ "${unauth_browser}" != "303" ] && [ "${unauth_browser}" != "401" ]; then
+            # Cookie-less request should not render the authenticated browser page.
+            echo "Expected unauthenticated DNS browser to redirect/deny; got ${unauth_browser}"
+            exit 1
+          fi
+
           echo "[bind] Create API key for smoke.test"
           curl --fail --silent -L -b /tmp/cookies -X POST http://127.0.0.1:8000/api-keys \
             -H "Content-Type: application/x-www-form-urlencoded" \
@@ -596,6 +608,40 @@ jobs:
           call_dns_api DELETE 404 not_found "${DELETE_SMOKE_URL}" ''
           call_dns_api PUT 404 not_found "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.40"]}'
           call_dns_api POST 403 access_denied "${DNS_RECORD_URL}" '{"zone_name":"denied.test","record_type":"A","record_name":"blocked","ttl":300,"values":["192.0.2.55"]}'
+
+          echo "[bind] Admin DNS browser session CRUD for temporary A record"
+          browser_page="$(curl --fail --silent -b /tmp/cookies "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records")"
+          echo "${browser_page}" | python3 -c "import sys; html=sys.stdin.read(); assert 'dns-browser-search' in html; assert 'dns-browser-results' in html and 'hidden' in html"
+          curl --fail --silent -b /tmp/cookies \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -X POST "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
+            -d '{"record_name":"browser","record_type":"A","ttl":300,"values":["192.0.2.77"]}' \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['action']=='created', b"
+          wait_for_record_value browser.smoke.test 192.0.2.77
+          curl --fail --silent -b /tmp/cookies \
+            "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search?record_name=browser&record_type=A" \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['status']=='success'; assert b['records'][0]['values']==['192.0.2.77'], b"
+          curl --fail --silent -b /tmp/cookies \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -X PUT "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
+            -d '{"record_name":"browser","record_type":"A","ttl":300,"values":["192.0.2.78"]}' \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['action']=='updated', b"
+          wait_for_record_value browser.smoke.test 192.0.2.78
+          curl --fail --silent -b /tmp/cookies \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -X DELETE "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
+            -d '{"record_name":"browser","record_type":"A"}' \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['action']=='deleted', b"
+          wait_for_record_absent browser.smoke.test
 
           echo "[compose] Validate hardened Compose config and startup against the smoke image"
           APP_VERSION="$(tr -d '\r\n' < VERSION)"
@@ -1156,6 +1202,45 @@ jobs:
 
             $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 403 -Method POST -JsonBody $jDenied
             Assert-DnsRecordAction -Json $x -ExpectedAction 'access_denied'
+
+            Write-Host '[microsoft-local] Dashboard and zones link to DNS browser'
+            $adminHtml = (Invoke-WebRequest -Uri "$base/admin" -WebSession $WebSession -UseBasicParsing).Content
+            if ($adminHtml -notmatch [regex]::Escape("/zones/$zoneId/records")) { throw 'Dashboard missing DNS browser link' }
+            $zonesHtml = (Invoke-WebRequest -Uri "$base/zones" -WebSession $WebSession -UseBasicParsing).Content
+            if ($zonesHtml -notmatch [regex]::Escape("/zones/$zoneId/records")) { throw 'Zones page missing DNS browser link' }
+            try {
+              Invoke-WebRequest -Uri "$base/zones/$zoneId/records" -UseBasicParsing -MaximumRedirection 0 -ErrorAction Stop | Out-Null
+              throw 'Unauthenticated DNS browser request should not succeed'
+            } catch {
+              $code = $_.Exception.Response.StatusCode.value__
+              if ($code -notin 303, 401, 302) { throw "Expected unauthenticated DNS browser redirect/deny; got $code" }
+            }
+
+            Write-Host '[microsoft-local] Admin DNS browser session CRUD'
+            $browserPage = (Invoke-WebRequest -Uri "$base/zones/$zoneId/records" -WebSession $WebSession -UseBasicParsing).Content
+            if ($browserPage -notmatch 'dns-browser-search') { throw 'DNS browser page missing search form' }
+            $browserHeaders = @{
+              'Content-Type' = 'application/json'
+              'Accept'       = 'application/json'
+              'Origin'       = $base
+              'Referer'      = "$base/zones/$zoneId/records"
+            }
+            $browserCreate = Invoke-WebRequest -Uri "$base/zones/$zoneId/records" -WebSession $WebSession -Method POST -Headers $browserHeaders -Body '{"record_name":"browser","record_type":"A","ttl":300,"values":["192.0.2.77"]}' -UseBasicParsing
+            $bc = $browserCreate.Content | ConvertFrom-Json
+            if ($bc.action -ne 'created') { throw "browser create failed: $($browserCreate.Content)" }
+            Wait-LocalA -Fqdn "browser.$la" -ExpectedIp '192.0.2.77'
+            $browserSearch = Invoke-RestMethod -Uri "$base/zones/$zoneId/records/search?record_name=browser&record_type=A" -WebSession $WebSession
+            if ($browserSearch.status -ne 'success' -or $browserSearch.records[0].values[0] -ne '192.0.2.77') {
+              throw "browser search failed: $($browserSearch | ConvertTo-Json -Compress)"
+            }
+            $browserReplace = Invoke-WebRequest -Uri "$base/zones/$zoneId/records" -WebSession $WebSession -Method PUT -Headers $browserHeaders -Body '{"record_name":"browser","record_type":"A","ttl":300,"values":["192.0.2.78"]}' -UseBasicParsing
+            $br = $browserReplace.Content | ConvertFrom-Json
+            if ($br.action -ne 'updated') { throw "browser replace failed: $($browserReplace.Content)" }
+            Wait-LocalA -Fqdn "browser.$la" -ExpectedIp '192.0.2.78'
+            $browserDelete = Invoke-WebRequest -Uri "$base/zones/$zoneId/records" -WebSession $WebSession -Method DELETE -Headers $browserHeaders -Body '{"record_name":"browser","record_type":"A"}' -UseBasicParsing
+            $bd = $browserDelete.Content | ConvertFrom-Json
+            if ($bd.action -ne 'deleted') { throw "browser delete failed: $($browserDelete.Content)" }
+            Wait-LocalAbsent -Fqdn "browser.$la"
 
             if ($env:REMOTE_WINRM_HOST -and $env:REMOTE_WINRM_USER -and $env:REMOTE_WINRM_PASSWORD) {
               Write-Host '=== Remote Microsoft DNS (secrets) ==='

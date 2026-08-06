@@ -158,12 +158,16 @@ from .zone_service import (
 )
 
 
-def _zones_html_context(db, *, message: str | None = None) -> dict[str, Any]:
+def _zones_html_context(db, *, message: str | None = None, user: str | None = None) -> dict[str, Any]:
     zones = list_dns_zones(db)
-    return {
+    ctx: dict[str, Any] = {
         "zones": [dns_zone_admin_dict(db, z) for z in zones],
         "message": message,
     }
+    if user is not None:
+        ctx["user"] = user
+        ctx["can_update_zones"] = user_has_role(db, user, ROLE_DNS_ZONES_UPDATE)
+    return ctx
 
 
 def _api_keys_html_context(db, *, message: str | None = None, **extra: Any) -> dict[str, Any]:
@@ -583,7 +587,7 @@ def zones_page(
         user = get_current_user(request)
         if not user_has_role(db, user, ROLE_DNS_ZONES_READ):
             raise HTTPException(status_code=403, detail=ROLE_FORBIDDEN_DETAIL)
-        ctx = _zones_html_context(db)
+        ctx = _zones_html_context(db, user=user)
     return templates.TemplateResponse(
         request=request,
         name="zones.html",
@@ -618,7 +622,7 @@ async def zone_create(request: Request, user: str = Depends(require_role(ROLE_DN
     canonical = normalize_zone_name(zone_name)
     if not canonical:
         with SessionLocal() as db:
-            ctx = _zones_html_context(db, message="Zone name is required.")
+            ctx = _zones_html_context(db, message="Zone name is required.", user=user)
         return templates.TemplateResponse(
             request=request,
             name="zones.html",
@@ -627,7 +631,7 @@ async def zone_create(request: Request, user: str = Depends(require_role(ROLE_DN
     with SessionLocal() as db:
         provider_plugins = enabled_dns_provider_options(db)
         if db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == canonical)).first():
-            ctx = _zones_html_context(db, message=f"A zone named {canonical!r} already exists.")
+            ctx = _zones_html_context(db, message=f"A zone named {canonical!r} already exists.", user=user)
             return templates.TemplateResponse(
                 request=request,
                 name="zones.html",
@@ -662,7 +666,7 @@ async def zone_create(request: Request, user: str = Depends(require_role(ROLE_DN
             message=f"Zone {canonical!r} added",
             details={"dns_provider_type": cfg.get("dns_provider_type")},
         )
-        ctx = _zones_html_context(db, message=f"Zone {canonical!r} added.")
+        ctx = _zones_html_context(db, message=f"Zone {canonical!r} added.", user=user)
     return templates.TemplateResponse(
         request=request,
         name="zones.html",
@@ -903,7 +907,7 @@ def zone_delete(request: Request, zone_id: int, user: str = Depends(require_role
                 zone_name=removed_zone_name,
                 message=f"Zone {removed_zone_name!r} deleted",
             )
-        ctx = _zones_html_context(db, message="Zone removed.")
+        ctx = _zones_html_context(db, message="Zone removed.", user=user)
     return templates.TemplateResponse(
         request=request,
         name="zones.html",

@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>{{ page_title }}</title>
+  {% include "_theme_init.html" %}
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="page">
+    {% set page_help = "Look up records by exact name in this zone. The table stays empty until you search." %}
+    {% set page_links = [{"href": "/zones", "label": "All zones"}] %}
+    {% include "_page_header.html" %}
+
+    <section class="form-card dns-browser-meta">
+      <p><strong>Configuration:</strong> <code>{{ zone.zone_name }}</code></p>
+      <p><strong>DNS domain:</strong> {% if zone.dns_zone %}<code>{{ zone.dns_zone }}</code>{% else %}&mdash;{% endif %}</p>
+      <p><strong>Provider:</strong> {{ zone.dns_provider_label }}</p>
+    </section>
+
+    <section class="form-card">
+      <form id="dns-browser-search" class="dns-browser-search" autocomplete="off">
+        <label class="dns-browser-search-name">Record name
+          <input type="text" id="record-name" name="record_name" placeholder="@, www, or host.example.com" />
+        </label>
+        <label class="dns-browser-search-type">Type
+          <select id="record-type" name="record_type">
+            {% for opt in record_type_options %}
+              <option value="{{ opt.value }}">{{ opt.label }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <div class="dns-browser-search-actions">
+          <button type="submit">Search</button>
+          {% if can_update_records %}
+            <button type="button" class="secondary" id="add-record-btn">Add record</button>
+          {% endif %}
+        </div>
+      </form>
+      <p class="help">Enter an exact relative name such as <code>@</code> or <code>www</code>, then search. Filtering by type is optional.</p>
+      <div id="dns-browser-status" class="alert" hidden></div>
+    </section>
+
+    <section id="dns-browser-results" class="dns-browser-results" hidden>
+      <div class="section-title-row">
+        <h2>Results</h2>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Type</th>
+              <th>TTL</th>
+              <th>Values</th>
+              <th class="actions-column">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="dns-browser-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <dialog id="record-dialog">
+      <div class="dialog-content">
+        <div class="dialog-header">
+          <h2 id="record-dialog-title">Add record</h2>
+          <button type="button" class="danger" id="record-dialog-close">Close</button>
+        </div>
+        <form id="record-form">
+          <input type="hidden" id="record-form-mode" value="create" />
+          <label>Record name
+            <input type="text" id="form-record-name" required placeholder="@ or www" />
+          </label>
+          <label>Record type
+            <select id="form-record-type" required>
+              {% for opt in record_type_options if opt.value and opt.mutable %}
+                <option value="{{ opt.value }}"
+                        data-fields="{{ opt.fields | join(',') }}"
+                        data-multiple="{{ 'true' if opt.multiple else 'false' }}">{{ opt.label }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          <label>TTL (seconds)
+            <input type="number" id="form-ttl" min="0" max="2147483647" value="300" required />
+          </label>
+          <div id="form-values-help" class="help"></div>
+          <div id="form-values" class="dns-browser-values"></div>
+          <div class="action-cell">
+            <button type="button" class="secondary" id="add-value-row">Add value</button>
+          </div>
+          <p id="record-form-warning" class="help" hidden>Saving replaces the entire RRset for this name and type.</p>
+          <div id="record-form-error" class="alert error" hidden></div>
+          <div class="dialog-actions">
+            <button type="button" class="secondary" id="record-dialog-cancel">Cancel</button>
+            <button type="submit" id="record-form-submit">Save</button>
+          </div>
+        </form>
+      </div>
+    </dialog>
+
+    <dialog id="delete-record-dialog">
+      <div class="dialog-content">
+        <div class="dialog-header">
+          <h2>Delete record</h2>
+          <button type="button" class="danger" id="delete-record-close">Close</button>
+        </div>
+        <p>Delete <code id="delete-record-summary"></code> from this zone?</p>
+        <p class="help">This removes the entire RRset for that name and type.</p>
+        <div class="dialog-actions">
+          <button type="button" class="secondary" id="delete-record-cancel">Cancel</button>
+          <button type="button" class="danger" id="delete-record-confirm">Delete</button>
+        </div>
+      </div>
+    </dialog>
+
+    <script>
+      (() => {
+        const zoneId = {{ zone_id | tojson }};
+        const canUpdate = {{ can_update_records | tojson }};
+        const typeOptions = {{ record_type_options | tojson }};
+        const searchForm = document.getElementById("dns-browser-search");
+        const recordName = document.getElementById("record-name");
+        const recordType = document.getElementById("record-type");
+        const statusEl = document.getElementById("dns-browser-status");
+        const resultsEl = document.getElementById("dns-browser-results");
+        const tbody = document.getElementById("dns-browser-tbody");
+        const addBtn = document.getElementById("add-record-btn");
+        const recordDialog = document.getElementById("record-dialog");
+        const recordForm = document.getElementById("record-form");
+        const formMode = document.getElementById("record-form-mode");
+        const formName = document.getElementById("form-record-name");
+        const formType = document.getElementById("form-record-type");
+        const formTtl = document.getElementById("form-ttl");
+        const formValues = document.getElementById("form-values");
+        const formValuesHelp = document.getElementById("form-values-help");
+        const formError = document.getElementById("record-form-error");
+        const formWarning = document.getElementById("record-form-warning");
+        const addValueRowBtn = document.getElementById("add-value-row");
+        const deleteDialog = document.getElementById("delete-record-dialog");
+        const deleteSummary = document.getElementById("delete-record-summary");
+        let lastSearch = null;
+        let pendingDelete = null;
+
+        const mutableMeta = {};
+        typeOptions.forEach((opt) => {
+          if (opt.value) mutableMeta[opt.value] = opt;
+        });
+
+        function showStatus(kind, message) {
+          if (!statusEl) return;
+          statusEl.hidden = !message;
+          statusEl.className = "alert";
+          if (kind === "success") statusEl.classList.add("success");
+          if (kind === "error") statusEl.classList.add("error");
+          statusEl.textContent = message || "";
+        }
+
+        function errorMessage(payload, fallback) {
+          if (!payload) return fallback;
+          if (typeof payload.message === "string" && payload.message) return payload.message;
+          if (payload.detail) {
+            if (typeof payload.detail === "string") return payload.detail;
+            if (typeof payload.detail.message === "string") return payload.detail.message;
+          }
+          return fallback;
+        }
+
+        function escapeHtml(value) {
+          return String(value)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;")
+            .replace(/"/g, "&quot;");
+        }
+
+        function serializeValue(type, row) {
+          const v = (name) => {
+            const el = row.querySelector(`[name="${name}"]`);
+            return el ? el.value.trim() : "";
+          };
+          if (type === "MX") return `${Number(v("priority"))} ${v("exchange")}`;
+          if (type === "SRV") {
+            return `${Number(v("priority"))} ${Number(v("weight"))} ${Number(v("port"))} ${v("target")}`;
+          }
+          if (type === "CAA") return `${Number(v("flags"))} ${v("tag")} ${v("value")}`;
+          if (type === "A" || type === "AAAA") return v("address");
+          if (type === "CNAME") return v("target");
+          if (type === "NS" || type === "PTR") return v("hostname");
+          return v("value");
+        }
+
+        function parseValueFields(type, value) {
+          const parts = String(value || "").trim().split(/\s+/);
+          if (type === "MX") return { priority: parts[0] || "10", exchange: parts.slice(1).join(" ") };
+          if (type === "SRV") {
+            return {
+              priority: parts[0] || "0",
+              weight: parts[1] || "0",
+              port: parts[2] || "0",
+              target: parts.slice(3).join(" "),
+            };
+          }
+          if (type === "CAA") {
+            return { flags: parts[0] || "0", tag: parts[1] || "issue", value: parts.slice(2).join(" ") };
+          }
+          if (type === "A" || type === "AAAA") return { address: value || "" };
+          if (type === "CNAME") return { target: value || "" };
+          if (type === "NS" || type === "PTR") return { hostname: value || "" };
+          return { value: value || "" };
+        }
+
+        function fieldHelp(type) {
+          const hints = {
+            A: "IPv4 address, e.g. 192.0.2.10",
+            AAAA: "IPv6 address",
+            CNAME: "Canonical hostname target",
+            TXT: "Text string",
+            MX: "Priority and mail exchange host",
+            NS: "Name server hostname (non-apex only)",
+            SRV: "Priority, weight, port, and target",
+            CAA: "Flags, tag, and value",
+            PTR: "Pointer hostname (reverse zones only)",
+          };
+          return hints[type] || "";
+        }
+
+        function addValueRow(type, initial) {
+          const meta = mutableMeta[type] || { fields: ["value"], multiple: true };
+          const values = initial || {};
+          const row = document.createElement("div");
+          row.className = "dns-browser-value-row";
+          meta.fields.forEach((field) => {
+            const label = document.createElement("label");
+            label.textContent = field;
+            const input = document.createElement("input");
+            input.name = field;
+            input.required = true;
+            if (["priority", "weight", "port", "flags"].includes(field)) {
+              input.type = "number";
+              input.min = "0";
+            } else {
+              input.type = "text";
+            }
+            input.value = values[field] != null ? values[field] : (field === "priority" ? "10" : "");
+            label.appendChild(input);
+            row.appendChild(label);
+          });
+          if (meta.multiple) {
+            const remove = document.createElement("button");
+            remove.type = "button";
+            remove.className = "secondary";
+            remove.textContent = "Remove";
+            remove.addEventListener("click", () => {
+              if (formValues.children.length > 1) row.remove();
+            });
+            row.appendChild(remove);
+          }
+          formValues.appendChild(row);
+        }
+
+        function rebuildValueRows(type, values) {
+          formValues.innerHTML = "";
+          formValuesHelp.textContent = fieldHelp(type);
+          const list = values && values.length ? values : [""];
+          list.forEach((value) => addValueRow(type, parseValueFields(type, value)));
+          const meta = mutableMeta[type] || { multiple: true };
+          addValueRowBtn.hidden = !meta.multiple;
+        }
+
+        function openRecordDialog(mode, record) {
+          formMode.value = mode;
+          formError.hidden = true;
+          formWarning.hidden = mode !== "replace";
+          document.getElementById("record-dialog-title").textContent =
+            mode === "replace" ? "Edit record" : "Add record";
+          formName.value = record?.record_name || recordName.value.trim() || "";
+          formType.value = record?.record_type || "A";
+          formTtl.value = record?.ttl != null ? record.ttl : 300;
+          formName.readOnly = mode === "replace";
+          formType.disabled = mode === "replace";
+          rebuildValueRows(formType.value, record?.values || []);
+          recordDialog.showModal();
+        }
+
+        function collectFormValues() {
+          const type = formType.value;
+          return Array.from(formValues.querySelectorAll(".dns-browser-value-row")).map((row) =>
+            serializeValue(type, row)
+          );
+        }
+
+        async function runCurrentSearch() {
+          if (!lastSearch) return;
+          await renderSearch(lastSearch);
+        }
+
+        async function renderSearch(url) {
+          showStatus("", "");
+          resultsEl.hidden = true;
+          tbody.innerHTML = "";
+          try {
+            const response = await fetch(url, {
+              headers: { Accept: "application/json" },
+              credentials: "same-origin",
+            });
+            const payload = await response.json();
+            if (!response.ok) {
+              showStatus("error", errorMessage(payload, "DNS lookup failed."));
+              return;
+            }
+            lastSearch = url;
+            const records = payload.records || [];
+            if (!records.length) {
+              showStatus("success", payload.message || "No matching records found.");
+              return;
+            }
+            showStatus("success", `Found ${records.length} record set(s).`);
+            records.forEach((rec) => {
+              const tr = document.createElement("tr");
+              const valuesHtml = (rec.values || [])
+                .map((v) => `<li><code>${escapeHtml(v)}</code></li>`)
+                .join("");
+              const mutable = Boolean(mutableMeta[rec.record_type]?.mutable);
+              let actions = "—";
+              if (canUpdate && mutable) {
+                actions =
+                  `<div class="action-cell">` +
+                  `<button type="button" class="secondary" data-edit>Edit</button>` +
+                  `<button type="button" class="danger" data-delete>Delete</button>` +
+                  `</div>`;
+              }
+              tr.innerHTML =
+                `<td><code>${escapeHtml(rec.record_name)}</code></td>` +
+                `<td>${escapeHtml(rec.record_type)}</td>` +
+                `<td>${rec.ttl != null ? escapeHtml(rec.ttl) : "—"}</td>` +
+                `<td><ul class="dns-browser-value-list">${valuesHtml}</ul></td>` +
+                `<td class="actions-column">${actions}</td>`;
+              tr.querySelector("[data-edit]")?.addEventListener("click", () => openRecordDialog("replace", rec));
+              tr.querySelector("[data-delete]")?.addEventListener("click", () => {
+                pendingDelete = { record_name: rec.record_name, record_type: rec.record_type };
+                deleteSummary.textContent = `${rec.record_name} ${rec.record_type}`;
+                deleteDialog.showModal();
+              });
+              tbody.appendChild(tr);
+            });
+            resultsEl.hidden = false;
+          } catch (error) {
+            showStatus("error", "DNS lookup failed.");
+          }
+        }
+
+        async function mutate(method, payload) {
+          const response = await fetch(`/zones/${zoneId}/records`, {
+            method,
+            headers: { "Content-Type": "application/json", Accept: "application/json" },
+            credentials: "same-origin",
+            body: JSON.stringify(payload),
+          });
+          const result = await response.json();
+          if (!response.ok) {
+            throw new Error(errorMessage(result, "DNS operation failed."));
+          }
+          await runCurrentSearch();
+          return result;
+        }
+
+        searchForm?.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          const name = recordName.value.trim();
+          if (!name) {
+            showStatus("error", "Enter a record name such as @ or www.");
+            return;
+          }
+          const query = new URLSearchParams({ record_name: name });
+          if (recordType.value) query.set("record_type", recordType.value);
+          await renderSearch(`/zones/${zoneId}/records/search?${query}`);
+        });
+
+        addBtn?.addEventListener("click", () => openRecordDialog("create", null));
+        formType?.addEventListener("change", () => rebuildValueRows(formType.value, []));
+        addValueRowBtn?.addEventListener("click", () => addValueRow(formType.value));
+        document.getElementById("record-dialog-close")?.addEventListener("click", () => recordDialog.close());
+        document.getElementById("record-dialog-cancel")?.addEventListener("click", () => recordDialog.close());
+        document.getElementById("delete-record-close")?.addEventListener("click", () => deleteDialog.close());
+        document.getElementById("delete-record-cancel")?.addEventListener("click", () => deleteDialog.close());
+
+        recordForm?.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          formError.hidden = true;
+          const mode = formMode.value;
+          const payload = {
+            record_name: formName.value.trim(),
+            record_type: formType.value,
+            ttl: Number(formTtl.value),
+            values: collectFormValues(),
+          };
+          try {
+            await mutate(mode === "replace" ? "PUT" : "POST", payload);
+            recordDialog.close();
+            showStatus("success", mode === "replace" ? "Record updated." : "Record created.");
+          } catch (error) {
+            formError.hidden = false;
+            formError.textContent = error.message || "DNS operation failed.";
+          }
+        });
+
+        document.getElementById("delete-record-confirm")?.addEventListener("click", async () => {
+          if (!pendingDelete) return;
+          try {
+            await mutate("DELETE", pendingDelete);
+            deleteDialog.close();
+            pendingDelete = null;
+            showStatus("success", "Record deleted.");
+          } catch (error) {
+            deleteDialog.close();
+            showStatus("error", error.message || "Delete failed.");
+          }
+        });
+      })();
+    </script>
+  </div>
+</body>
+</html>

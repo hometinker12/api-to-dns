@@ -6,25 +6,26 @@ import dns.name
 import dns.query
 import dns.rdatatype
 
+from ..dns_record_types import (
+    LOOKUP_RECORD_TYPES,
+    lookup_record_types_to_query,
+    normalize_lookup_record_type,
+    normalize_record_value,
+)
 from ..models import DnsRecordInfo
 
-LOOKUP_RECORD_TYPES: tuple[str, ...] = ("A", "AAAA", "CNAME", "TXT")
-
-
-def normalize_lookup_record_type(record_type: str | None) -> str | None:
-    if record_type is None or not str(record_type).strip():
-        return None
-    rt = str(record_type).strip().upper()
-    if rt not in LOOKUP_RECORD_TYPES:
-        raise ValueError(f"Record type must be one of {', '.join(LOOKUP_RECORD_TYPES)}; got {record_type!r}.")
-    return rt
-
-
-def lookup_record_types_to_query(record_type: str | None) -> tuple[str, ...]:
-    normalized = normalize_lookup_record_type(record_type)
-    if normalized:
-        return (normalized,)
-    return LOOKUP_RECORD_TYPES
+__all__ = [
+    "LOOKUP_RECORD_TYPES",
+    "dns_relative_name",
+    "lookup_record_types_to_query",
+    "normalize_lookup_record_type",
+    "ps_single_quoted",
+    "query_dns_records_at_name",
+    "record_existed_before_update",
+    "tcp_endpoint_host",
+    "winrm_record_type_to_api",
+    "winrm_rr_type",
+]
 
 
 def ps_single_quoted(s: str) -> str:
@@ -104,6 +105,23 @@ def _format_rdata_value(record_type: str, rdata) -> str:
     if rt == "TXT":
         parts = rdata.strings or []
         return b"".join(parts).decode("utf-8", errors="replace")
+    if rt == "MX":
+        return normalize_record_value("MX", f"{int(rdata.preference)} {rdata.exchange.to_text(omit_final_dot=True)}")
+    if rt == "NS":
+        return rdata.target.to_text(omit_final_dot=True)
+    if rt == "SRV":
+        return normalize_record_value(
+            "SRV",
+            f"{int(rdata.priority)} {int(rdata.weight)} {int(rdata.port)} {rdata.target.to_text(omit_final_dot=True)}",
+        )
+    if rt == "CAA":
+        tag = rdata.tag.decode("utf-8") if isinstance(rdata.tag, bytes) else str(rdata.tag)
+        value = rdata.value.decode("utf-8") if isinstance(rdata.value, bytes) else str(rdata.value)
+        return normalize_record_value("CAA", f"{int(rdata.flags)} {tag} {value}")
+    if rt == "PTR":
+        return rdata.target.to_text(omit_final_dot=True)
+    if rt == "SOA":
+        return rdata.to_text()
     return rdata.to_text()
 
 

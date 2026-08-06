@@ -50,6 +50,7 @@ from src.models import (
     AlertRule,
     ApiKey,
     ApiKeyAllowedZone,
+    DnsRecordInfo,
     DnsZoneConfig,
     User,
 )
@@ -198,6 +199,7 @@ def test_authenticated_web_pages_render(client: TestClient) -> None:
         "/api-keys",
         "/zones/new",
         f"/zones/{zone.id}/edit",
+        f"/zones/{zone.id}/records",
         f"/api-keys/{api_key.id}/edit",
     ):
         response = client.get(path)
@@ -346,7 +348,7 @@ def test_zone_test_invalid_record_type(client: TestClient) -> None:
         data={
             "zone_name": "example.com",
             "test_record_name": "www",
-            "test_record_type": "MX",
+            "test_record_type": "SPF",
             "dns_provider_type": "azure",
             "dns_zone": "example.com",
             "azure_tenant_id": "tenant",
@@ -543,6 +545,8 @@ def test_session_backed_pages_are_not_in_openapi(client: TestClient) -> None:
         "/zones/{zone_id}/edit",
         "/zones/{zone_id}",
         "/zones/{zone_id}/delete",
+        "/zones/{zone_id}/records",
+        "/zones/{zone_id}/records/search",
         "/settings",
         "/settings/users",
         "/settings/users/{user_id}/disable",
@@ -1370,7 +1374,9 @@ def test_admin_page_links_to_settings(client: TestClient) -> None:
     response = client.get("/admin")
     assert response.status_code == 200
     assert 'href="/settings"' in response.text
-    assert '<code>example.com</code> <span class="help">(example.com)</span>' in response.text
+    assert 'href="/zones/' in response.text
+    assert "<code>example.com</code>" in response.text
+    assert '<span class="help">(example.com)</span>' in response.text
 
 
 def test_dashboard_disables_zone_and_api_key_buttons_without_roles(client: TestClient) -> None:
@@ -3253,6 +3259,176 @@ def test_zone_mutation_requires_dns_zones_update(client: TestClient) -> None:
 
     response = client.get("/zones/new")
     assert response.status_code == 403
+
+
+def test_dns_browser_requires_session(client: TestClient) -> None:
+    with SessionLocal() as db:
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+        zone_id = zone.id
+    response = client.get(f"/zones/{zone_id}/records", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
+
+
+def test_dns_browser_page_blank_until_search(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+        zone_id = zone.id
+    response = client.get(f"/zones/{zone_id}/records")
+    assert response.status_code == 200
+    assert 'id="dns-browser-search"' in response.text
+    assert 'id="dns-browser-results" class="dns-browser-results" hidden' in response.text
+    assert "All records" in response.text
+    assert "SOA" in response.text
+    assert "azure_client_secret" not in response.text
+
+
+def test_dashboard_and_zones_link_to_dns_browser(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+        zone_id = zone.id
+    admin = client.get("/admin")
+    assert admin.status_code == 200
+    assert f"/zones/{zone_id}/records" in admin.text
+    zones = client.get("/zones")
+    assert zones.status_code == 200
+    assert f"/zones/{zone_id}/records" in zones.text
+
+
+def test_dns_browser_search_success_and_not_found(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+        zone_id = zone.id
+
+    fake = MagicMock()
+    fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.10"])]
+    monkeypatch.setattr("src.dns_browser_service.create_dns_client_from_settings", lambda *_a, **_k: fake)
+
+    found = client.get(f"/zones/{zone_id}/records/search", params={"record_name": "www", "record_type": "A"})
+    assert found.status_code == 200
+    body = found.json()
+    assert body["status"] == "success"
+    assert body["records"][0]["values"] == ["192.0.2.10"]
+
+    fake.get_record.return_value = []
+    missing = client.get(f"/zones/{zone_id}/records/search", params={"record_name": "missing"})
+    assert missing.status_code == 200
+    assert missing.json()["status"] == "not_found"
+
+
+def test_dns_browser_read_user_can_search_but_not_mutate(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client.cookies.set("session", create_session_cookie("zonereader"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "zonereader", "x", [ROLE_DNS_ZONES_READ])
+        _create_user(db, "admin", "x", ALL_ROLES)
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+        zone_id = zone.id
+
+    fake = MagicMock()
+    fake.get_record.return_value = []
+    monkeypatch.setattr("src.dns_browser_service.create_dns_client_from_settings", lambda *_a, **_k: fake)
+
+    page = client.get(f"/zones/{zone_id}/records")
+    assert page.status_code == 200
+    assert 'id="add-record-btn"' not in page.text
+
+    search = client.get(f"/zones/{zone_id}/records/search", params={"record_name": "@"})
+    assert search.status_code == 200
+
+    create = client.post(
+        f"/zones/{zone_id}/records",
+        json={"record_name": "www", "record_type": "A", "ttl": 300, "values": ["192.0.2.10"]},
+    )
+    assert create.status_code == 403
+
+
+def test_dns_browser_create_replace_delete(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+        zone_id = zone.id
+
+    fake = MagicMock()
+    fake.get_record.side_effect = [
+        [],  # create existence check
+        [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.10"])],  # replace check
+        [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.11"])],  # delete check
+    ]
+    fake.create_or_update_record.return_value = False
+    monkeypatch.setattr("src.dns_browser_service.create_dns_client_from_settings", lambda *_a, **_k: fake)
+
+    created = client.post(
+        f"/zones/{zone_id}/records",
+        json={"record_name": "www", "record_type": "A", "ttl": 300, "values": ["192.0.2.10"]},
+    )
+    assert created.status_code == 200
+    assert created.json()["action"] == "created"
+
+    updated = client.put(
+        f"/zones/{zone_id}/records",
+        json={"record_name": "www", "record_type": "A", "ttl": 120, "values": ["192.0.2.11"]},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["action"] == "updated"
+
+    deleted = client.request(
+        "DELETE",
+        f"/zones/{zone_id}/records",
+        json={"record_name": "www", "record_type": "A"},
+    )
+    assert deleted.status_code == 200
+    assert deleted.json()["action"] == "deleted"
+
+
+def test_dns_browser_rejects_soa_and_apex_ns(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+        zone_id = zone.id
+
+    soa = client.post(
+        f"/zones/{zone_id}/records",
+        json={
+            "record_name": "@",
+            "record_type": "SOA",
+            "ttl": 300,
+            "values": ["ns.example.com hostmaster.example.com 1 3600 600 86400 300"],
+        },
+    )
+    assert soa.status_code == 422
+
+    apex_ns = client.post(
+        f"/zones/{zone_id}/records",
+        json={"record_name": "@", "record_type": "NS", "ttl": 300, "values": ["ns1.example.com"]},
+    )
+    assert apex_ns.status_code == 400
+    assert "Apex NS" in apex_ns.json()["detail"]["message"]
+
+
+def test_dns_browser_unknown_zone(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/zones/999999/records")
+    assert response.status_code == 404
 
 
 def test_api_key_mutation_requires_api_keys_update(client: TestClient) -> None:

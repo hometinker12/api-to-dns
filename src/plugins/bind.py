@@ -7,6 +7,7 @@ import dns.rdatatype
 import dns.tsig
 import dns.update
 
+from ..dns_record_types import MUTABLE_RECORD_TYPES, normalize_record_values
 from ..models import DnsRecordRequest
 from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
 from .utils import dns_relative_name, query_dns_records_at_name, record_existed_before_update, tcp_endpoint_host
@@ -47,6 +48,8 @@ class BindTsigDnsClient:
 
         if record_type == "DELETE":
             inner = payload.values[0].strip().upper()
+            if inner not in MUTABLE_RECORD_TYPES:
+                raise ValueError(f"Unsupported record type for BIND: {inner}")
             rdtype = dns.rdatatype.from_text(inner)
             existed = record_existed_before_update(dns_server, zone_name, relative, rdtype)
             if not existed:
@@ -59,25 +62,16 @@ class BindTsigDnsClient:
                 raise RuntimeError(f"DNS UPDATE failed: {dns.rcode.to_text(response.rcode())}")
             return True
 
+        if record_type not in MUTABLE_RECORD_TYPES:
+            raise ValueError(f"Unsupported record type for BIND: {record_type}")
+
+        validated = normalize_record_values(record_type, list(payload.values))
         rdtype = dns.rdatatype.from_text(record_type)
         existed = record_existed_before_update(dns_server, zone_name, relative, rdtype)
 
         update = dns.update.Update(origin, keyring=self._keyring, keyname=self._keyname)
         node = relative if relative not in ("@", "") else "@"
-
-        # replace() accepts (ttl, rdtype, *text_values) or (ttl, *rdata_objects) - not (ttl, rdtype, *rdata).
-        if record_type == "A":
-            update.replace(node, ttl, dns.rdatatype.A, *payload.values)
-        elif record_type == "AAAA":
-            update.replace(node, ttl, dns.rdatatype.AAAA, *payload.values)
-        elif record_type == "CNAME":
-            if len(payload.values) != 1:
-                raise ValueError("CNAME requires exactly one value.")
-            update.replace(node, ttl, dns.rdatatype.CNAME, payload.values[0])
-        elif record_type == "TXT":
-            update.replace(node, ttl, dns.rdatatype.TXT, *payload.values)
-        else:
-            raise ValueError(f"Unsupported record type for BIND: {record_type}")
+        update.replace(node, ttl, rdtype, *validated)
 
         response = dns.query.tcp(update, tcp_endpoint_host(dns_server), timeout=15)
         if response.rcode() != dns.rcode.NOERROR:

@@ -4,6 +4,7 @@
 
 ### Added
 
+- Admin **DNS browser**: open a zone from the Dashboard (or DNS Zones list) to search by exact record name, filter by type (A/AAAA/CNAME/TXT/MX/NS/SRV/CAA/PTR/SOA), and add/edit/delete RRsets. Session + RBAC (`dns_zones.read` / `dns_zones.update`); SOA view-only; apex NS mutations blocked; PTR limited to reverse zones. Providers share canonical value formats via `src/dns_record_types.py`. BIND and Microsoft release smoke cover a temporary browser A-record CRUD path.
 - Admin UI dark mode: moon/sun toggle in the page header (left of Settings/Dashboard) with preference stored in the browser; defaults to system color scheme when unset.
 - **Remote Syslog** under **Settings → System Settings** (last entry): optional best-effort forwarding of stored audit/activity events as RFC 5424 messages with JSON payloads over TLS (preferred), UDP, or TCP. Plaintext UDP/TCP require an explicit insecure opt-in. Configurable host, port, protocol, facility, minimum level, timeout, and bounded queue size (max 5000). Delivery is asynchronous and non-durable; failures are rate-limited to operational logs. Saving settings emits `system.syslog_updated`.
 - Release BIND/Docker smoke installs `rsyslog`, enables remote syslog via System Settings (UDP with plaintext opt-in), and asserts an end-to-end delivery of a forwarded audit event.
