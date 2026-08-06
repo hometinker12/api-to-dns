@@ -15,6 +15,7 @@ from starlette.status import HTTP_202_ACCEPTED, HTTP_303_SEE_OTHER, HTTP_404_NOT
 from . import activity_logging, backup_service, letsencrypt, ssl_certs
 from .activity_logging import (
     LOGGER,
+    apply_remote_syslog_config,
     configure_operational_logging,
     emit_activity_event,
     get_log_level,
@@ -22,6 +23,7 @@ from .activity_logging import (
     run_retention_cleanup,
     set_app_dns_name,
     set_log_level,
+    set_remote_syslog_config,
     set_retention_days,
     set_smtp_config,
 )
@@ -40,6 +42,7 @@ from .event_types import (
     EVENT_SYSTEM_BACKUP_EXPORTED,
     EVENT_SYSTEM_BACKUP_IMPORT_FAILED,
     EVENT_SYSTEM_BACKUP_IMPORTED,
+    EVENT_SYSTEM_SYSLOG_UPDATED,
 )
 from .http_utils import (
     api_key_fingerprint,
@@ -204,6 +207,10 @@ def _startup_init() -> None:
     with SessionLocal() as db:
         migrate_legacy_dns_settings_if_needed(db)
         configure_operational_logging(level=get_log_level(db))
+        try:
+            apply_remote_syslog_config(db)
+        except Exception:
+            LOGGER.exception("startup remote syslog configuration failed")
         clear_restart_required(db)
         clear_le_renewal_pending_restart(db)
         letsencrypt.clear_enrollment_progress(db)
@@ -243,6 +250,12 @@ async def lifespan(app: FastAPI):
         for task in (renewal_task, restart_task):
             task.cancel()
         await asyncio.gather(renewal_task, restart_task, return_exceptions=True)
+        try:
+            from .remote_syslog import REMOTE_SYSLOG
+
+            REMOTE_SYSLOG.stop()
+        except Exception:
+            LOGGER.exception("remote syslog shutdown failed")
         signal.signal(signal.SIGTERM, previous_sigterm)
         signal.signal(signal.SIGINT, previous_sigint)
 
@@ -1930,6 +1943,76 @@ def settings_update_smtp(
         )
     return render_settings(
         request, user, "system_settings", message="SMTP delivery settings saved.", section=redirect_section
+    )
+
+
+@app.post("/settings/system/syslog", response_class=HTMLResponse, include_in_schema=False)
+def settings_update_syslog(
+    request: Request,
+    syslog_enabled: str | None = Form(None),
+    syslog_host: str = Form(""),
+    syslog_port: int = Form(6514),
+    syslog_protocol: str = Form("tls"),
+    syslog_facility: str = Form("local0"),
+    syslog_minimum_level: str = Form(LOG_LEVEL_INFORMATIONAL),
+    syslog_timeout: float = Form(5.0),
+    syslog_queue_size: int = Form(1000),
+    syslog_allow_insecure_plaintext: str | None = Form(None),
+    redirect_section: str = Form("syslog_forwarding"),
+    user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
+):
+    enabled = syslog_enabled is not None
+    allow_insecure_plaintext = syslog_allow_insecure_plaintext is not None
+    try:
+        with SessionLocal() as db:
+            config = set_remote_syslog_config(
+                db,
+                enabled=enabled,
+                host=syslog_host,
+                port=syslog_port,
+                protocol=syslog_protocol,
+                facility=syslog_facility,
+                minimum_level=syslog_minimum_level,
+                timeout=syslog_timeout,
+                queue_size=syslog_queue_size,
+                allow_insecure_plaintext=allow_insecure_plaintext,
+            )
+            apply_remote_syslog_config(db)
+            emit_activity_event(
+                db,
+                event_type=EVENT_SYSTEM_SYSLOG_UPDATED,
+                level=LOG_LEVEL_INFORMATIONAL,
+                status="success",
+                actor_type="user",
+                actor_label=user,
+                message="Remote syslog settings updated",
+                details={
+                    "enabled": bool(config.get("enabled")),
+                    "host": config.get("host") or "",
+                    "port": config.get("port"),
+                    "protocol": config.get("protocol"),
+                    "facility": config.get("facility"),
+                    "minimum_level": config.get("minimum_level"),
+                    "timeout": config.get("timeout"),
+                    "queue_size": config.get("queue_size"),
+                    "allow_insecure_plaintext": bool(config.get("allow_insecure_plaintext")),
+                },
+            )
+    except ValueError as exc:
+        return render_settings(
+            request,
+            user,
+            "system_settings",
+            message=str(exc),
+            message_kind="error",
+            section=redirect_section,
+        )
+    return render_settings(
+        request,
+        user,
+        "system_settings",
+        message="Remote syslog settings saved.",
+        section=redirect_section,
     )
 
 

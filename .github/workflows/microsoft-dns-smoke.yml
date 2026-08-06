@@ -87,6 +87,51 @@ jobs:
           severity: HIGH,CRITICAL
           trivyignores: .trivyignore
 
+      - name: Install and start rsyslog receiver
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes rsyslog
+          # Avoid fighting the distro unit; smoke uses a dedicated instance on an unprivileged port.
+          sudo systemctl stop rsyslog.service 2>/dev/null || true
+          sudo systemctl disable rsyslog.service 2>/dev/null || true
+
+          SYSLOG_OUTPUT="${RUNNER_TEMP}/syslog-smoke.out"
+          SYSLOG_CONF="${RUNNER_TEMP}/rsyslog-smoke.conf"
+          SYSLOG_PID_FILE="${RUNNER_TEMP}/rsyslog-smoke.pid"
+          : > "${SYSLOG_OUTPUT}"
+          cat > "${SYSLOG_CONF}" <<EOF
+          module(load="imudp")
+          input(type="imudp" port="5514" address="0.0.0.0")
+          template(name="SmokeFmt" type="string" string="%rawmsg%\n")
+          *.* action(type="omfile" file="${SYSLOG_OUTPUT}" template="SmokeFmt")
+          EOF
+
+          rsyslogd -n -f "${SYSLOG_CONF}" -i "${SYSLOG_PID_FILE}" &
+          echo $! > "${RUNNER_TEMP}/rsyslog-smoke.shell.pid"
+          # Readiness: process alive and UDP 5514 listening.
+          for i in $(seq 1 30); do
+            if kill -0 "$(cat "${RUNNER_TEMP}/rsyslog-smoke.shell.pid")" 2>/dev/null \
+              && ss -lun | grep -q ':5514'; then
+              break
+            fi
+            sleep 0.5
+          done
+          if ! kill -0 "$(cat "${RUNNER_TEMP}/rsyslog-smoke.shell.pid")" 2>/dev/null; then
+            echo "rsyslog receiver process is not running"
+            exit 1
+          fi
+          if ! ss -lun | grep -q ':5514'; then
+            echo "rsyslog did not open UDP 5514"
+            exit 1
+          fi
+          echo "rsyslog receiver ready on UDP 5514"
+          {
+            echo "SYSLOG_OUTPUT=${SYSLOG_OUTPUT}"
+            echo "SYSLOG_PID_FILE=${SYSLOG_PID_FILE}"
+            echo "RSYSLOG_SHELL_PID=$(cat "${RUNNER_TEMP}/rsyslog-smoke.shell.pid")"
+          } >> "$GITHUB_ENV"
+
       - name: Run BIND-backed smoke test
         env:
           IMAGE_TAG: ${{ env.IMAGE_TAG }}
@@ -97,6 +142,8 @@ jobs:
           BIND_DIR="${RUNNER_TEMP}/bind-smoke"
           TSIG_NAME="api-to-dns."
           TSIG_SECRET="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+          : "${SYSLOG_OUTPUT:?SYSLOG_OUTPUT must be set by the rsyslog prerequisite step}"
+          : "${RSYSLOG_SHELL_PID:?RSYSLOG_SHELL_PID must be set by the rsyslog prerequisite step}"
 
           cleanup() {
             echo "Collecting container logs..."
@@ -105,6 +152,15 @@ jobs:
             docker rm -f dns-api-test bind-test 2>/dev/null || true
             docker compose down -v --remove-orphans >/dev/null 2>&1 || true
             docker network rm "${NETWORK_NAME}" 2>/dev/null || true
+            echo "Stopping rsyslog receiver..."
+            if [ -n "${SYSLOG_PID_FILE:-}" ] && [ -f "${SYSLOG_PID_FILE}" ]; then
+              sudo kill "$(cat "${SYSLOG_PID_FILE}")" 2>/dev/null || true
+            fi
+            kill "${RSYSLOG_SHELL_PID}" 2>/dev/null || true
+            if [ -f "${SYSLOG_OUTPUT:-}" ]; then
+              echo "---- syslog receiver output (tail) ----"
+              tail -n 100 "${SYSLOG_OUTPUT}" || true
+            fi
           }
           trap cleanup EXIT
 
@@ -233,6 +289,7 @@ jobs:
             --read-only \
             --cap-drop ALL \
             --security-opt no-new-privileges:true \
+            --add-host=host.docker.internal:host-gateway \
             --tmpfs /tmp:size=64M,mode=1777 \
             --tmpfs /app/data:size=64M,uid=10001,gid=10001,mode=1755 \
             --tmpfs /app/logs:size=16M,uid=10001,gid=10001,mode=1755 \
@@ -349,6 +406,63 @@ jobs:
             -H "Referer: http://127.0.0.1:8000/login" \
             -d "username=admin&password=your-admin-password" \
             -o /dev/null
+
+          echo "[bind] Remote syslog end-to-end (rsyslog already installed and ready)"
+          : > "${SYSLOG_OUTPUT}"
+          curl --fail --silent -b /tmp/cookies -X POST \
+            http://127.0.0.1:8000/settings/system/syslog \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/settings?area=system_settings&section=syslog_forwarding" \
+            --data-urlencode "syslog_enabled=on" \
+            --data-urlencode "syslog_host=host.docker.internal" \
+            --data-urlencode "syslog_port=5514" \
+            --data-urlencode "syslog_protocol=udp" \
+            --data-urlencode "syslog_facility=local0" \
+            --data-urlencode "syslog_minimum_level=INFORMATIONAL" \
+            --data-urlencode "syslog_timeout=5" \
+            --data-urlencode "syslog_queue_size=1000" \
+            --data-urlencode "syslog_allow_insecure_plaintext=on" \
+            --data-urlencode "redirect_section=syslog_forwarding" \
+            -o /tmp/syslog-settings.html
+          if ! grep -q "Remote syslog settings saved." /tmp/syslog-settings.html; then
+            echo "Expected remote syslog settings save confirmation"
+            python3 -c 'from pathlib import Path; print(Path("/tmp/syslog-settings.html").read_text(encoding="utf-8", errors="replace")[:1200])'
+            exit 1
+          fi
+          # The save itself emits system.syslog_updated; poll until the receiver sees it.
+          if ! timeout 20 bash -c \
+            "until grep -q '\"event_type\":\"system.syslog_updated\"' \"${SYSLOG_OUTPUT}\"; do sleep 1; done"; then
+            echo "Timed out waiting for remote syslog delivery of system.syslog_updated"
+            echo "---- syslog output ----"
+            cat "${SYSLOG_OUTPUT}" || true
+            echo "---- api logs ----"
+            docker logs dns-api-test 2>&1 | tail -n 200 || true
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          text = Path(os.environ["SYSLOG_OUTPUT"]).read_text(encoding="utf-8", errors="replace")
+          found = None
+          for line in text.splitlines():
+              if "system.syslog_updated" not in line:
+                  continue
+              # local0(16)*8 + informational(6) => <134>
+              assert re.search(r"<134>1\s+\S+\s+\S+\s+api-to-dns\s+-\s+system\.syslog_updated\s+-", line), line
+              idx = line.find("{")
+              assert idx >= 0, line
+              payload = json.loads(line[idx:])
+              if payload.get("event_type") == "system.syslog_updated":
+                  found = payload
+                  break
+          assert found is not None, f"system.syslog_updated JSON not found in: {text!r}"
+          assert found.get("level") == "INFORMATIONAL"
+          print("remote syslog smoke delivery confirmed")
+          PY
 
           for zone in smoke.test denied.test; do
             echo "[bind] Configure zone ${zone}"

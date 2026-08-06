@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Remote Syslog** under **Settings → System Settings** (last entry): optional best-effort forwarding of stored audit/activity events as RFC 5424 messages with JSON payloads over TLS (preferred), UDP, or TCP. Plaintext UDP/TCP require an explicit insecure opt-in. Configurable host, port, protocol, facility, minimum level, timeout, and bounded queue size (max 5000). Delivery is asynchronous and non-durable; failures are rate-limited to operational logs. Saving settings emits `system.syslog_updated`.
+- Release BIND/Docker smoke installs `rsyslog`, enables remote syslog via System Settings (UDP with plaintext opt-in), and asserts an end-to-end delivery of a forwarded audit event.
+
 ## [0.7.0] - 2026-08-05
 
 ### Added

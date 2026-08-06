@@ -2999,12 +2999,201 @@ def test_settings_backup_area_available_for_admin(client: TestClient) -> None:
     assert "not implemented yet" not in response.text
 
 
-def test_settings_syslog_section_removed(client: TestClient) -> None:
+def test_settings_remote_syslog_is_last_system_section(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
-    response = client.get("/settings?area=system_settings&section=syslog_planned")
+    response = client.get("/settings?area=system_settings")
     assert response.status_code == 200
-    assert "Syslog Server" not in response.text
-    assert "not implemented yet" not in response.text
+    assert "Remote Syslog" in response.text
+    submenu = response.text.split('class="settings-submenu"')[1].split("</nav>")[0]
+    assert submenu.rfind("Remote Syslog") > submenu.rfind("Operational Log Rotation")
+    assert "Syslog Server (planned)" not in response.text
+
+    response = client.get("/settings?area=system_settings&section=syslog_forwarding")
+    assert response.status_code == 200
+    assert "Enable remote audit log forwarding" in response.text
+    assert 'action="/settings/system/syslog"' in response.text
+    assert 'name="syslog_enabled"' in response.text
+    assert 'name="syslog_host"' in response.text
+    assert 'name="syslog_protocol"' in response.text
+    assert 'name="syslog_allow_insecure_plaintext"' in response.text
+
+
+def test_settings_remote_syslog_post_persists_and_emits_audit(client: TestClient) -> None:
+    from src.remote_syslog import REMOTE_SYSLOG, SyslogConfig
+
+    client.cookies.set("session", create_session_cookie("admin"))
+    try:
+        response = client.post(
+            "/settings/system/syslog",
+            data={
+                "syslog_enabled": "on",
+                "syslog_host": "syslog.example.com",
+                "syslog_port": "5514",
+                "syslog_protocol": "udp",
+                "syslog_facility": "local1",
+                "syslog_minimum_level": "WARNING",
+                "syslog_timeout": "3",
+                "syslog_queue_size": "250",
+                "syslog_allow_insecure_plaintext": "on",
+                "redirect_section": "syslog_forwarding",
+            },
+        )
+        assert response.status_code == 200
+        assert "Remote syslog settings saved." in response.text
+        assert 'value="syslog.example.com"' in response.text
+        assert "checked" in response.text.split('name="syslog_enabled"')[1].split(">")[0]
+
+        with SessionLocal() as db:
+            from src.activity_logging import get_remote_syslog_config
+            from src.models import ActivityLog
+
+            config = get_remote_syslog_config(db)
+            assert config["enabled"] is True
+            assert config["host"] == "syslog.example.com"
+            assert config["port"] == 5514
+            assert config["protocol"] == "udp"
+            assert config["facility"] == "local1"
+            assert config["minimum_level"] == "WARNING"
+            assert config["timeout"] == 3.0
+            assert config["queue_size"] == 250
+            assert config["allow_insecure_plaintext"] is True
+            assert REMOTE_SYSLOG.current_config().enabled is True
+            assert REMOTE_SYSLOG.current_config().host == "syslog.example.com"
+            rows = db.exec(select(ActivityLog).where(ActivityLog.event_type == "system.syslog_updated")).all()
+            assert rows
+            assert rows[-1].message == "Remote syslog settings updated"
+    finally:
+        REMOTE_SYSLOG.configure(SyslogConfig(enabled=False))
+
+
+def test_settings_remote_syslog_rejects_plaintext_without_opt_in(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post(
+        "/settings/system/syslog",
+        data={
+            "syslog_enabled": "on",
+            "syslog_host": "syslog.example.com",
+            "syslog_port": "514",
+            "syslog_protocol": "udp",
+            "syslog_facility": "local0",
+            "syslog_minimum_level": "INFORMATIONAL",
+            "syslog_timeout": "5",
+            "syslog_queue_size": "1000",
+            "redirect_section": "syslog_forwarding",
+        },
+    )
+    assert response.status_code == 200
+    assert "Allow insecure plaintext" in response.text
+
+
+def test_settings_remote_syslog_requires_system_update(client: TestClient) -> None:
+    from src.activity_logging import get_remote_syslog_config, set_remote_syslog_config
+    from src.remote_syslog import REMOTE_SYSLOG, SyslogConfig
+
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "reader", "x", [ROLE_GLOBAL_READ, ROLE_DNS_ZONES_READ])
+        _create_user(db, "admin", "x", ALL_ROLES)
+        set_remote_syslog_config(
+            db,
+            enabled=False,
+            host="before.example",
+            port=514,
+            protocol="udp",
+            facility="local0",
+            minimum_level="INFORMATIONAL",
+            timeout=5,
+            queue_size=1000,
+            allow_insecure_plaintext=True,
+        )
+        REMOTE_SYSLOG.configure(SyslogConfig(enabled=False))
+    client.cookies.set("session", create_session_cookie("reader"))
+    response = client.post(
+        "/settings/system/syslog",
+        data={
+            "syslog_enabled": "on",
+            "syslog_host": "evil.example",
+            "syslog_port": "514",
+            "syslog_protocol": "udp",
+            "syslog_facility": "local0",
+            "syslog_minimum_level": "INFORMATIONAL",
+            "syslog_timeout": "5",
+            "syslog_queue_size": "1000",
+            "redirect_section": "syslog_forwarding",
+        },
+    )
+    assert response.status_code == 403
+    with SessionLocal() as db:
+        config = get_remote_syslog_config(db)
+        assert config["enabled"] is False
+        assert config["host"] == "before.example"
+
+
+def test_settings_remote_syslog_validation_error(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post(
+        "/settings/system/syslog",
+        data={
+            "syslog_enabled": "on",
+            "syslog_host": "",
+            "syslog_port": "514",
+            "syslog_protocol": "udp",
+            "syslog_facility": "local0",
+            "syslog_minimum_level": "INFORMATIONAL",
+            "syslog_timeout": "5",
+            "syslog_queue_size": "1000",
+            "redirect_section": "syslog_forwarding",
+        },
+    )
+    assert response.status_code == 200
+    assert "Host is required" in response.text
+
+
+def test_settings_remote_syslog_can_be_disabled(client: TestClient) -> None:
+    from src.remote_syslog import REMOTE_SYSLOG, SyslogConfig
+
+    client.cookies.set("session", create_session_cookie("admin"))
+    try:
+        client.post(
+            "/settings/system/syslog",
+            data={
+                "syslog_enabled": "on",
+                "syslog_host": "syslog.example.com",
+                "syslog_port": "514",
+                "syslog_protocol": "tcp",
+                "syslog_facility": "local0",
+                "syslog_minimum_level": "INFORMATIONAL",
+                "syslog_timeout": "5",
+                "syslog_queue_size": "1000",
+                "syslog_allow_insecure_plaintext": "on",
+                "redirect_section": "syslog_forwarding",
+            },
+        )
+        response = client.post(
+            "/settings/system/syslog",
+            data={
+                "syslog_host": "syslog.example.com",
+                "syslog_port": "514",
+                "syslog_protocol": "tcp",
+                "syslog_facility": "local0",
+                "syslog_minimum_level": "INFORMATIONAL",
+                "syslog_timeout": "5",
+                "syslog_queue_size": "1000",
+                "syslog_allow_insecure_plaintext": "on",
+                "redirect_section": "syslog_forwarding",
+            },
+        )
+        assert response.status_code == 200
+        assert "Remote syslog settings saved." in response.text
+        with SessionLocal() as db:
+            from src.activity_logging import get_remote_syslog_config
+
+            config = get_remote_syslog_config(db)
+            assert config["enabled"] is False
+            assert config["host"] == "syslog.example.com"
+            assert REMOTE_SYSLOG.current_config().enabled is False
+    finally:
+        REMOTE_SYSLOG.configure(SyslogConfig(enabled=False))
 
 
 def test_dns_zones_read_is_required_on_all_user_accounts(client: TestClient) -> None:

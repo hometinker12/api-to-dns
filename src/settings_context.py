@@ -8,6 +8,7 @@ from .activity_logging import (
     DEFAULT_BODY_TEMPLATE,
     DEFAULT_SUBJECT_TEMPLATE,
     get_log_level,
+    get_remote_syslog_config,
     get_retention_days,
     get_smtp_config,
     is_running_in_docker,
@@ -131,6 +132,7 @@ def settings_context(
         ):
             identity = system_identity(db)
             smtp = get_smtp_config(db)
+            syslog = get_remote_syslog_config(db)
             current_level = get_log_level(db)
             retention_days = get_retention_days(db)
             ssl_enabled_flag = is_ssl_enabled(db)
@@ -182,6 +184,19 @@ def settings_context(
                     "timeout": smtp.get("timeout"),
                     "allow_insecure_auth": bool(smtp.get("allow_insecure_auth")),
                     "password_set": bool(smtp.get("password_set") or smtp.get("password")),
+                },
+                "syslog": {
+                    "enabled": bool(syslog.get("enabled")),
+                    "host": syslog.get("host") or "",
+                    "port": syslog.get("port"),
+                    "protocol": syslog.get("protocol") or "tls",
+                    "facility": syslog.get("facility") or "local0",
+                    "minimum_level": syslog.get("minimum_level") or "INFORMATIONAL",
+                    "timeout": syslog.get("timeout"),
+                    "queue_size": syslog.get("queue_size"),
+                    "allow_insecure_plaintext": bool(syslog.get("allow_insecure_plaintext")),
+                    "facilities": syslog.get("facilities") or [],
+                    "protocols": syslog.get("protocols") or ["tls", "udp", "tcp"],
                 },
                 "ssl": ssl_status,
                 "operational_log": {
