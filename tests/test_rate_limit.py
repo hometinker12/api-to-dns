@@ -154,3 +154,26 @@ def test_http_dns_browser_returns_429_when_limited(
     assert limited.status_code == 429
     body = limited.json()
     assert body["detail"]["error"] == "rate_limited"
+
+
+def test_dns_browser_ignores_rotating_api_key_headers(enable_rate_limit) -> None:
+    cookie = create_session_cookie("admin")
+    for i in range(3):
+        assert (
+            rate_limit_exceeded(
+                _request(
+                    "/zones/1/records/search",
+                    headers={"cookie": f"session={cookie}", "x-api-key": f"junk-{i}"},
+                )
+            )
+            is False
+        )
+    assert (
+        rate_limit_exceeded(
+            _request(
+                "/zones/1/records/search",
+                headers={"cookie": f"session={cookie}", "x-api-key": "junk-bypass"},
+            )
+        )
+        is True
+    )

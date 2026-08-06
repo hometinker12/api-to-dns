@@ -70,6 +70,23 @@ def _match_route(path: str, limits: dict[str, tuple[int, int]]) -> tuple[str, tu
 
 
 def _identity_hash(request: Request) -> str:
+    path = request.url.path or ""
+    # Session-only browser routes ignore unvalidated API-key headers so clients
+    # cannot rotate X-API-Key / Bearer values to mint a fresh bucket per request.
+    if _is_dns_browser_path(path):
+        session_token = request.cookies.get("session")
+        if session_token:
+            try:
+                from .auth import verify_session_cookie
+
+                username, _version = verify_session_cookie(session_token)
+                return f"session:{username.strip().lower()}"
+            except Exception:
+                pass
+        client = getattr(request, "client", None)
+        host = client.host if client else "unknown"
+        return f"ip:{host}"
+
     api_key = api_key_from_headers(
         request.headers.get("x-api-key"),
         request.headers.get("authorization"),
