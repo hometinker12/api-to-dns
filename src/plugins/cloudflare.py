@@ -14,9 +14,9 @@ from ..dns_record_types import (
     parse_mx,
     parse_srv,
 )
-from ..models import DnsRecordInfo, DnsRecordRequest
+from ..models import DnsRecordInfo, DnsRecordListResult, DnsRecordRequest
 from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
-from .utils import lookup_record_types_to_query
+from .utils import lookup_record_types_to_query, record_name_matches
 
 CLOUDFLARE_API_BASE_URL = "https://api.cloudflare.com/client/v4"
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -185,6 +185,81 @@ class CloudflareDnsClient:
                     continue
                 results.append(self._rows_to_info(display_name, rt, rows))
         return results
+
+    def list_records(
+        self,
+        *,
+        name_pattern: str | None = None,
+        record_type: str | None = None,
+        limit: int = 100,
+        dns_server: str | None = None,
+        dns_zone: str | None = None,
+    ) -> DnsRecordListResult:
+        if dns_server:
+            raise ValueError(
+                "Cloudflare DNS ignores per-server host settings; use the Cloudflare fields on the zone configuration."
+            )
+        if not dns_zone:
+            raise ValueError("DNS zone (domain) is required in the zone configuration.")
+
+        zone_name = dns_zone.strip().rstrip(".")
+        result_limit = max(1, int(limit))
+        requested_type = record_type.upper() if record_type else None
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        page = 1
+        truncated = False
+
+        with self._client() as client:
+            zone_id = self._resolve_zone_id(client, zone_name)
+            while True:
+                params: dict[str, Any] = {
+                    "page": page,
+                    "per_page": 100,
+                    "order": "name",
+                    "direction": "asc",
+                }
+                if requested_type:
+                    params["type"] = requested_type
+                body = self._request(client, "GET", f"/zones/{zone_id}/dns_records", params=params)
+                rows = [row for row in (body.get("result") or []) if isinstance(row, dict)]
+                appended_existing = False
+
+                for row in rows:
+                    row_type = str(row.get("type") or "").upper()
+                    if row_type not in SUPPORTED_RECORD_TYPES or (requested_type and row_type != requested_type):
+                        continue
+                    display_name = _relative_name(zone_name, str(row.get("name") or ""))
+                    if not record_name_matches(name_pattern, display_name):
+                        continue
+                    key = (display_name, row_type)
+                    if key in grouped:
+                        grouped[key].append(row)
+                        appended_existing = True
+                        continue
+                    if len(grouped) >= result_limit:
+                        # Keep paging only long enough to finish already-open RRsets.
+                        # Cloudflare pages are ordered by name, so same-name values may
+                        # continue across page boundaries after later types appear.
+                        truncated = True
+                        continue
+                    grouped[key] = [row]
+                    appended_existing = True
+
+                info = body.get("result_info") or {}
+                total_pages = int(info.get("total_pages") or 0)
+                if truncated and not appended_existing:
+                    break
+                if not rows or (total_pages and page >= total_pages) or (not total_pages and len(rows) < 100):
+                    break
+                page += 1
+
+        return DnsRecordListResult(
+            records=[
+                self._rows_to_info(display_name, rr_type, record_rows)
+                for (display_name, rr_type), record_rows in grouped.items()
+            ],
+            truncated=truncated,
+        )
 
     def _client(self) -> httpx.Client:
         headers = {

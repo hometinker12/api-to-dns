@@ -7,6 +7,7 @@
 <header class="page-header">
   <div>
     <h1>{{ page_title }}</h1>
+    {% if page_subtitle %}<p class="page-subtitle">{{ page_subtitle }}</p>{% endif %}
     {% if page_help %}<p class="help">{{ page_help }}</p>{% endif %}
   </div>
   <nav class="nav-links">

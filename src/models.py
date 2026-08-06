@@ -185,6 +185,13 @@ class DnsRecordInfo(BaseModel):
     )
 
 
+class DnsRecordListResult(BaseModel):
+    """Internal provider result for bounded DNS browser browse/pattern searches."""
+
+    records: list[DnsRecordInfo] = Field(default_factory=list)
+    truncated: bool = False
+
+
 class DnsRecordGetResponse(BaseModel):
     status: str = Field(
         ...,

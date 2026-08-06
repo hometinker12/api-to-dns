@@ -1,5 +1,6 @@
 import ipaddress
 import socket
+from fnmatch import fnmatchcase
 
 import dns.message
 import dns.name
@@ -17,11 +18,13 @@ from ..models import DnsRecordInfo
 __all__ = [
     "LOOKUP_RECORD_TYPES",
     "dns_relative_name",
+    "has_dns_glob",
     "lookup_record_types_to_query",
     "normalize_lookup_record_type",
     "ps_single_quoted",
     "query_dns_records_at_name",
     "record_existed_before_update",
+    "record_name_matches",
     "tcp_endpoint_host",
     "winrm_record_type_to_api",
     "winrm_rr_type",
@@ -54,6 +57,17 @@ def dns_relative_name(zone_name: str, record_name: str) -> str:
     if r.lower().endswith(suffix.lower()):
         return r[: -len(suffix)] or "@"
     return r
+
+
+def has_dns_glob(record_name: str | None) -> bool:
+    return any(char in (record_name or "") for char in ("*", "?"))
+
+
+def record_name_matches(pattern: str | None, record_name: str) -> bool:
+    """Match a relative DNS owner name using case-insensitive ``*``/``?`` glob syntax."""
+    if not pattern:
+        return True
+    return fnmatchcase(record_name.casefold(), pattern.casefold())
 
 
 def tcp_endpoint_host(host: str) -> str:

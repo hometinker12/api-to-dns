@@ -35,7 +35,7 @@ def dns_browser_page(
 @router.get("/zones/{zone_id}/records/search", include_in_schema=False)
 def search_records(
     zone_id: int,
-    record_name: str = Query(..., min_length=1),
+    record_name: str | None = Query(None),
     record_type: str | None = Query(None),
     user: str = Depends(require_role(ROLE_DNS_ZONES_UPDATE)),
 ):

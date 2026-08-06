@@ -254,6 +254,12 @@ html[data-theme="dark"] .theme-toggle .theme-icon-sun {
 .header-stack h1 {
   margin-bottom: 0;
 }
+.page-subtitle {
+  margin: 0.35rem 0 0;
+  color: var(--text-muted);
+  font-size: 1rem;
+  font-weight: 600;
+}
 .section-title-row {
   display: flex;
   align-items: center;
@@ -699,11 +705,17 @@ dialog::backdrop {
 .dns-browser-meta p {
   margin: 0.25rem 0;
 }
+.dns-browser-meta code {
+  white-space: normal;
+}
 .dns-browser-search {
   display: grid;
   grid-template-columns: minmax(0, 2fr) minmax(8rem, 1fr) auto;
   gap: 0.75rem 1rem;
   align-items: end;
+}
+.dns-browser-search label {
+  margin-bottom: 0;
 }
 .dns-browser-search-actions {
   display: flex;
@@ -719,18 +731,43 @@ dialog::backdrop {
 }
 .dns-browser-values {
   display: grid;
-  gap: 0.75rem;
-  margin: 0.75rem 0;
-}
-.dns-browser-value-row {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr)) auto;
   gap: 0.5rem;
-  align-items: end;
+  margin: 0.75rem 0;
   padding: 0.75rem;
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--bg-surface);
+}
+.dns-browser-add-value-row {
+  justify-content: flex-start;
+  margin: 1.25rem 0 1.5rem;
+}
+.dns-browser-value-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr));
+  gap: 0.5rem;
+  align-items: end;
+}
+.dns-browser-value-row:has(.dns-browser-remove-value) {
+  grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr)) auto;
+}
+.dns-browser-value-row.dns-browser-value-row-single:has(.dns-browser-remove-value) {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+.dns-browser-value-row label {
+  margin: 0;
+}
+.dns-browser-remove-value {
+  min-width: 2.75rem;
+}
+.dns-browser-proxy-indicator {
+  margin: 0.75rem 0 1rem;
+}
+.dns-browser-proxy-indicator label {
+  margin-bottom: 0.25rem;
+}
+.dns-browser-proxy-indicator .help {
+  margin: 0;
 }
 @media (max-width: 640px) {
   header,
@@ -762,5 +799,8 @@ dialog::backdrop {
   }
   .dns-browser-search-actions {
     flex-direction: column;
+  }
+  .dns-browser-remove-value {
+    width: auto;
   }
 }

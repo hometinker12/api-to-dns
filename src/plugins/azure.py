@@ -1,4 +1,5 @@
 from ..dns_record_types import (
+    LOOKUP_RECORD_TYPES,
     format_caa,
     format_mx,
     format_srv,
@@ -8,9 +9,9 @@ from ..dns_record_types import (
     parse_mx,
     parse_srv,
 )
-from ..models import DnsRecordInfo, DnsRecordRequest
+from ..models import DnsRecordInfo, DnsRecordListResult, DnsRecordRequest
 from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
-from .utils import lookup_record_types_to_query
+from .utils import dns_relative_name, lookup_record_types_to_query, record_name_matches
 
 
 class AzureDnsClient:
@@ -135,6 +136,37 @@ class AzureDnsClient:
             if existing is not None:
                 results.append(self._record_set_to_info(existing, display_name, rt))
         return results
+
+    def list_records(
+        self,
+        *,
+        name_pattern: str | None = None,
+        record_type: str | None = None,
+        limit: int = 100,
+        dns_server: str | None = None,
+        dns_zone: str | None = None,
+    ) -> DnsRecordListResult:
+        if dns_server:
+            raise ValueError("Azure DNS ignores per-server host settings; use Azure fields on the zone configuration.")
+        if not dns_zone:
+            raise ValueError("DNS zone (domain) is required in the zone configuration.")
+
+        requested_type = record_type.upper() if record_type else None
+        result_limit = max(1, int(limit))
+        client = self.DnsManagementClient(self.credential, self.subscription_id)
+        records: list[DnsRecordInfo] = []
+        for record_set in client.record_sets.list_by_dns_zone(self.resource_group, dns_zone):
+            raw_type = str(getattr(record_set, "type", "") or "")
+            rr_type = raw_type.rsplit("/", 1)[-1].upper()
+            if rr_type not in LOOKUP_RECORD_TYPES or (requested_type and rr_type != requested_type):
+                continue
+            display_name = dns_relative_name(dns_zone, str(getattr(record_set, "name", "") or "@"))
+            if not record_name_matches(name_pattern, display_name):
+                continue
+            records.append(self._record_set_to_info(record_set, display_name, rr_type))
+            if len(records) > result_limit:
+                return DnsRecordListResult(records=records[:result_limit], truncated=True)
+        return DnsRecordListResult(records=records, truncated=False)
 
     def _record_set_to_info(self, record_set, display_name: str, record_type: str) -> DnsRecordInfo:
         ttl = int(record_set.ttl or 300)
