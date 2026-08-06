@@ -31,7 +31,8 @@ Promotion path: **`develop` → `release`** (end).
 5. Stage all relevant source changes (exclude `__pycache__/`, `.pytest_cache/`, build artifacts, secrets, and `.cursor/*.log`). Include README/CHANGELOG/VERSION/.env.example fixes from step 3 in the same commit.
 6. Write a concise commit message focused on **why**; match recent repo style.
 7. Commit and verify with `git status`.
-8. Push `develop` to `origin` (`git push origin develop`).
+8. **Local Trivy gate** — before push, scan the Docker image on this machine. See [Local Trivy gate](#local-trivy-gate-before-push) below. **Do not push until this gate passes.**
+9. Push `develop` to `origin` (`git push origin develop`).
 
 ### Local test gate (changed files)
 
@@ -73,6 +74,22 @@ python -m ruff format --check src tests
 Note Ruff auto-fixes in the commit body or PR summary when format changed files.
 
 **How to run (optional):** Delegate to **`test-runner`** (`.cursor/agents/test-runner.md`) to keep logs out of the main context.
+
+### Local Trivy gate (before push)
+
+Run **after** a successful commit and **before** `git push origin develop`. Mirrors the CI Trivy gate in [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml) and the release BIND smoke job: High/Critical, `ignore-unfixed`, `os,library`, `.trivyignore`, non-zero exit on findings.
+
+**When to run:** whenever the pending push can change the production image contents, including changes under `Dockerfile`, `requirements*.txt`, `pyproject.toml`, `src/**`, `scripts/entrypoint.sh`, or `.trivyignore`. **When in doubt, run.**
+
+**Skip** only for clearly non-image diffs (markdown/docs only, pure `.cursor/` agent/rule edits, test-only changes with no `src/` or dependency edits).
+
+```powershell
+powershell -File scripts/trivy-local-scan.ps1
+```
+
+Requires Docker. Uses a local `trivy` CLI when present; otherwise runs `aquasec/trivy` via Docker against a saved image tar.
+
+**Stop** on failure — fix vulnerabilities (or a reviewed `.trivyignore` entry), commit the fix, re-run this gate, then push. Do not push a red Trivy scan.
 
 ### Docs alignment review
 
@@ -259,6 +276,7 @@ Do **not** proceed to `main` or Docker publish unless the user explicitly asks i
 ## Do not
 
 - Proceed with commit before the **local test gate** passes.
+- **Push to `develop` before the local Trivy gate passes** (when the gate applies).
 - Proceed when production-impacting changes lack CI smoke coverage.
 - **Open or merge a PR to `release` before §3 security review PASS** — High or Medium confidence findings are a hard stop.
 - Downgrade or ignore High/Medium security findings to force a release promotion.
