@@ -76,13 +76,40 @@ def test_validate_syslog_config_requires_host_when_enabled() -> None:
         validate_syslog_config(
             enabled=True,
             host="",
+            port=6514,
+            protocol="tls",
+            facility="local0",
+            minimum_level=LOG_LEVEL_INFORMATIONAL,
+            timeout=5,
+            queue_size=100,
+        )
+
+
+def test_validate_syslog_config_requires_plaintext_opt_in() -> None:
+    with pytest.raises(ValueError, match="Allow insecure plaintext"):
+        validate_syslog_config(
+            enabled=True,
+            host="syslog.example",
             port=514,
             protocol="udp",
             facility="local0",
             minimum_level=LOG_LEVEL_INFORMATIONAL,
             timeout=5,
             queue_size=100,
+            allow_insecure_plaintext=False,
         )
+    cfg = validate_syslog_config(
+        enabled=True,
+        host="syslog.example",
+        port=514,
+        protocol="udp",
+        facility="local0",
+        minimum_level=LOG_LEVEL_INFORMATIONAL,
+        timeout=5,
+        queue_size=100,
+        allow_insecure_plaintext=True,
+    )
+    assert cfg.uses_plaintext is True
 
 
 def test_snapshot_from_row_parses_details_json() -> None:
@@ -127,6 +154,7 @@ def test_forwarder_udp_delivery(monkeypatch: pytest.MonkeyPatch) -> None:
         minimum_level=LOG_LEVEL_INFORMATIONAL,
         hostname="test-host",
         queue_size=10,
+        allow_insecure_plaintext=True,
     )
     forwarder.configure(config)
     forwarder.enqueue(_snapshot(event_type="system.syslog_updated", level=LOG_LEVEL_INFORMATIONAL))
@@ -174,6 +202,7 @@ def test_forwarder_tcp_framing_and_reconnect(monkeypatch: pytest.MonkeyPatch) ->
             minimum_level=LOG_LEVEL_INFORMATIONAL,
             hostname="test-host",
             queue_size=10,
+            allow_insecure_plaintext=True,
         )
     )
     forwarder.enqueue(_snapshot(event_type="dns.record_created", level=LOG_LEVEL_INFORMATIONAL))
@@ -204,11 +233,20 @@ def test_forwarder_respects_minimum_level_and_disabled() -> None:
             protocol="udp",
             minimum_level=LOG_LEVEL_WARNING,
             queue_size=2,
+            allow_insecure_plaintext=True,
         )
     )
     forwarder.enqueue(_snapshot(level=LOG_LEVEL_INFORMATIONAL, event_type="dns.zones_list"))
     assert forwarder._queue.empty()
-    forwarder.configure(SyslogConfig(enabled=False, host="127.0.0.1", port=5514, queue_size=2))
+    forwarder.configure(
+        SyslogConfig(
+            enabled=False,
+            host="127.0.0.1",
+            port=5514,
+            queue_size=2,
+            allow_insecure_plaintext=True,
+        )
+    )
     forwarder.enqueue(_snapshot(level=LOG_LEVEL_ERROR, event_type="dns.provider_failed"))
     assert forwarder._queue.empty()
     forwarder.stop(drain_timeout=0.5)
@@ -220,7 +258,13 @@ def test_forwarder_drops_when_queue_full(monkeypatch: pytest.MonkeyPatch) -> Non
     forwarder = RemoteSyslogForwarder()
     monkeypatch.setattr(forwarder, "_warn_rate_limited", lambda msg, *a, **k: warnings.append(msg % a if a else msg))
     # Block the worker from draining by not starting it and filling manually.
-    forwarder._config = SyslogConfig(enabled=True, host="127.0.0.1", port=5514, queue_size=1)
+    forwarder._config = SyslogConfig(
+        enabled=True,
+        host="127.0.0.1",
+        port=5514,
+        queue_size=1,
+        allow_insecure_plaintext=True,
+    )
     forwarder._queue = __import__("queue").Queue(maxsize=1)
     forwarder._queue.put_nowait((1, _snapshot()))
     forwarder.enqueue(_snapshot(event_type="system.smtp_updated"))
@@ -230,8 +274,8 @@ def test_forwarder_drops_when_queue_full(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_forwarder_reconfigure_updates_generation() -> None:
     forwarder = RemoteSyslogForwarder()
-    first = SyslogConfig(enabled=True, host="a.example", port=514, queue_size=5)
-    second = SyslogConfig(enabled=True, host="b.example", port=514, queue_size=5)
+    first = SyslogConfig(enabled=True, host="a.example", port=6514, protocol="tls", queue_size=5)
+    second = SyslogConfig(enabled=True, host="b.example", port=6514, protocol="tls", queue_size=5)
     forwarder.configure(first)
     gen1 = forwarder.current_config().generation
     forwarder.configure(second)
@@ -294,6 +338,7 @@ def test_apply_remote_syslog_config_rehydrates_worker(client: TestClient) -> Non
                 minimum_level=LOG_LEVEL_WARNING,
                 timeout=4,
                 queue_size=123,
+                allow_insecure_plaintext=True,
             )
             REMOTE_SYSLOG.configure(SyslogConfig(enabled=False))
             assert REMOTE_SYSLOG.current_config().enabled is False

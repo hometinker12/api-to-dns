@@ -3015,6 +3015,7 @@ def test_settings_remote_syslog_is_last_system_section(client: TestClient) -> No
     assert 'name="syslog_enabled"' in response.text
     assert 'name="syslog_host"' in response.text
     assert 'name="syslog_protocol"' in response.text
+    assert 'name="syslog_allow_insecure_plaintext"' in response.text
 
 
 def test_settings_remote_syslog_post_persists_and_emits_audit(client: TestClient) -> None:
@@ -3033,6 +3034,7 @@ def test_settings_remote_syslog_post_persists_and_emits_audit(client: TestClient
                 "syslog_minimum_level": "WARNING",
                 "syslog_timeout": "3",
                 "syslog_queue_size": "250",
+                "syslog_allow_insecure_plaintext": "on",
                 "redirect_section": "syslog_forwarding",
             },
         )
@@ -3054,6 +3056,7 @@ def test_settings_remote_syslog_post_persists_and_emits_audit(client: TestClient
             assert config["minimum_level"] == "WARNING"
             assert config["timeout"] == 3.0
             assert config["queue_size"] == 250
+            assert config["allow_insecure_plaintext"] is True
             assert REMOTE_SYSLOG.current_config().enabled is True
             assert REMOTE_SYSLOG.current_config().host == "syslog.example.com"
             rows = db.exec(select(ActivityLog).where(ActivityLog.event_type == "system.syslog_updated")).all()
@@ -3061,6 +3064,26 @@ def test_settings_remote_syslog_post_persists_and_emits_audit(client: TestClient
             assert rows[-1].message == "Remote syslog settings updated"
     finally:
         REMOTE_SYSLOG.configure(SyslogConfig(enabled=False))
+
+
+def test_settings_remote_syslog_rejects_plaintext_without_opt_in(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.post(
+        "/settings/system/syslog",
+        data={
+            "syslog_enabled": "on",
+            "syslog_host": "syslog.example.com",
+            "syslog_port": "514",
+            "syslog_protocol": "udp",
+            "syslog_facility": "local0",
+            "syslog_minimum_level": "INFORMATIONAL",
+            "syslog_timeout": "5",
+            "syslog_queue_size": "1000",
+            "redirect_section": "syslog_forwarding",
+        },
+    )
+    assert response.status_code == 200
+    assert "Allow insecure plaintext" in response.text
 
 
 def test_settings_remote_syslog_requires_system_update(client: TestClient) -> None:
@@ -3081,6 +3104,7 @@ def test_settings_remote_syslog_requires_system_update(client: TestClient) -> No
             minimum_level="INFORMATIONAL",
             timeout=5,
             queue_size=1000,
+            allow_insecure_plaintext=True,
         )
         REMOTE_SYSLOG.configure(SyslogConfig(enabled=False))
     client.cookies.set("session", create_session_cookie("reader"))
@@ -3141,6 +3165,7 @@ def test_settings_remote_syslog_can_be_disabled(client: TestClient) -> None:
                 "syslog_minimum_level": "INFORMATIONAL",
                 "syslog_timeout": "5",
                 "syslog_queue_size": "1000",
+                "syslog_allow_insecure_plaintext": "on",
                 "redirect_section": "syslog_forwarding",
             },
         )
@@ -3154,6 +3179,7 @@ def test_settings_remote_syslog_can_be_disabled(client: TestClient) -> None:
                 "syslog_minimum_level": "INFORMATIONAL",
                 "syslog_timeout": "5",
                 "syslog_queue_size": "1000",
+                "syslog_allow_insecure_plaintext": "on",
                 "redirect_section": "syslog_forwarding",
             },
         )

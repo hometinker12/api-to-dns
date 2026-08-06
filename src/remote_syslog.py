@@ -1,8 +1,11 @@
 """Bounded, best-effort remote syslog forwarding for stored audit/activity events.
 
-Forwards RFC 5424 messages with JSON payloads over UDP or TCP (RFC 6587
-octet-count framing). Delivery is asynchronous via a bounded in-process queue
-so request handlers never wait on the network.
+Forwards RFC 5424 messages with JSON payloads over UDP, TCP (RFC 6587
+octet-count framing), or TLS (RFC 5425). Delivery is asynchronous via a
+bounded in-process queue so request handlers never wait on the network.
+
+Plaintext UDP/TCP require an explicit administrator opt-in because audit
+payloads can contain sensitive operational metadata.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ import logging
 import queue
 import re
 import socket
+import ssl
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -32,15 +36,19 @@ LOGGER = logging.getLogger("api_to_dns")
 
 APP_NAME = "api-to-dns"
 DEFAULT_PORT = 514
-DEFAULT_PROTOCOL = "udp"
+DEFAULT_TLS_PORT = 6514
+DEFAULT_PROTOCOL = "tls"
 DEFAULT_FACILITY = "local0"
 DEFAULT_MINIMUM_LEVEL = LOG_LEVEL_INFORMATIONAL
 DEFAULT_TIMEOUT = 5.0
 DEFAULT_QUEUE_SIZE = 1000
+MAX_TIMEOUT_SECONDS = 30.0
+MAX_QUEUE_SIZE = 5000
 DEFAULT_DRAIN_TIMEOUT = 2.0
 WARN_INTERVAL_SECONDS = 30.0
 
-SYSLOG_PROTOCOLS = ("udp", "tcp")
+SYSLOG_PROTOCOLS = ("tls", "udp", "tcp")
+PLAINTEXT_PROTOCOLS = frozenset({"udp", "tcp"})
 
 SYSLOG_FACILITY: dict[str, int] = {
     "kern": 0,
@@ -82,17 +90,22 @@ class SyslogConfig:
 
     enabled: bool = False
     host: str = ""
-    port: int = DEFAULT_PORT
+    port: int = DEFAULT_TLS_PORT
     protocol: str = DEFAULT_PROTOCOL
     facility: str = DEFAULT_FACILITY
     minimum_level: str = DEFAULT_MINIMUM_LEVEL
     timeout: float = DEFAULT_TIMEOUT
     queue_size: int = DEFAULT_QUEUE_SIZE
+    allow_insecure_plaintext: bool = False
     hostname: str = _NILVALUE
     generation: int = 0
 
     def with_generation(self, generation: int) -> SyslogConfig:
         return replace(self, generation=generation)
+
+    @property
+    def uses_plaintext(self) -> bool:
+        return self.protocol in PLAINTEXT_PROTOCOLS
 
 
 @dataclass(frozen=True)
@@ -236,12 +249,13 @@ def validate_syslog_config(
     minimum_level: str,
     timeout: float | str,
     queue_size: int | str,
+    allow_insecure_plaintext: bool = False,
     hostname: str | None = None,
 ) -> SyslogConfig:
     """Validate form/settings values and return an immutable config."""
     cleaned_protocol = (protocol or DEFAULT_PROTOCOL).strip().lower()
     if cleaned_protocol not in SYSLOG_PROTOCOLS:
-        raise ValueError("Protocol must be udp or tcp.")
+        raise ValueError("Protocol must be tls, udp, or tcp.")
 
     cleaned_facility = (facility or DEFAULT_FACILITY).strip().lower()
     if cleaned_facility not in SYSLOG_FACILITY:
@@ -262,19 +276,26 @@ def validate_syslog_config(
         cleaned_timeout = float(timeout)
     except (TypeError, ValueError) as exc:
         raise ValueError("Timeout must be a positive number of seconds.") from exc
-    if cleaned_timeout <= 0 or cleaned_timeout > 120:
-        raise ValueError("Timeout must be between 0 (exclusive) and 120 seconds.")
+    if cleaned_timeout <= 0 or cleaned_timeout > MAX_TIMEOUT_SECONDS:
+        raise ValueError(f"Timeout must be between 0 (exclusive) and {int(MAX_TIMEOUT_SECONDS)} seconds.")
 
     try:
         cleaned_queue = int(queue_size)
     except (TypeError, ValueError) as exc:
-        raise ValueError("Queue size must be an integer between 1 and 100000.") from exc
-    if cleaned_queue < 1 or cleaned_queue > 100_000:
-        raise ValueError("Queue size must be an integer between 1 and 100000.")
+        raise ValueError(f"Queue size must be an integer between 1 and {MAX_QUEUE_SIZE}.") from exc
+    if cleaned_queue < 1 or cleaned_queue > MAX_QUEUE_SIZE:
+        raise ValueError(f"Queue size must be an integer between 1 and {MAX_QUEUE_SIZE}.")
 
     cleaned_host = (host or "").strip()
     if enabled and not cleaned_host:
         raise ValueError("Host is required when remote syslog is enabled.")
+
+    allow_plaintext = bool(allow_insecure_plaintext)
+    if enabled and cleaned_protocol in PLAINTEXT_PROTOCOLS and not allow_plaintext:
+        raise ValueError(
+            "Plaintext UDP/TCP syslog exposes audit metadata on the network. "
+            "Prefer TLS, or enable 'Allow insecure plaintext syslog' only if you accept the risk."
+        )
 
     return SyslogConfig(
         enabled=bool(enabled),
@@ -285,6 +306,7 @@ def validate_syslog_config(
         minimum_level=cleaned_level,
         timeout=cleaned_timeout,
         queue_size=cleaned_queue,
+        allow_insecure_plaintext=allow_plaintext,
         hostname=sanitize_hostname(hostname),
     )
 
@@ -299,8 +321,8 @@ class RemoteSyslogForwarder:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._udp_sock: socket.socket | None = None
-        self._tcp_sock: socket.socket | None = None
-        self._tcp_addr: tuple[str, int] | None = None
+        self._stream_sock: socket.socket | None = None
+        self._stream_addr: tuple[str, int, str] | None = None
         self._last_warn_at = 0.0
         self._generation = 0
 
@@ -407,8 +429,8 @@ class RemoteSyslogForwarder:
                 )
 
     def _send(self, message: bytes, config: SyslogConfig) -> None:
-        if config.protocol == "tcp":
-            self._send_tcp(message, config)
+        if config.protocol in {"tcp", "tls"}:
+            self._send_stream(message, config)
         else:
             self._send_udp(message, config)
 
@@ -421,32 +443,45 @@ class RemoteSyslogForwarder:
                 self._udp_sock = sock
         sock.sendto(message, (config.host, config.port))
 
-    def _send_tcp(self, message: bytes, config: SyslogConfig) -> None:
-        framed = frame_tcp(message)
+    def _open_stream(self, config: SyslogConfig) -> socket.socket:
         addr = (config.host, config.port)
+        raw = socket.create_connection(addr, timeout=config.timeout)
+        raw.settimeout(config.timeout)
+        if config.protocol != "tls":
+            return raw
+        context = ssl.create_default_context()
+        return context.wrap_socket(raw, server_hostname=config.host)
+
+    def _send_stream(self, message: bytes, config: SyslogConfig) -> None:
+        framed = frame_tcp(message)
+        target = (config.host, config.port, config.protocol)
         with self._lock:
-            sock = self._tcp_sock
-            if sock is None or self._tcp_addr != addr:
-                self._close_tcp_unlocked()
-                sock = socket.create_connection(addr, timeout=config.timeout)
-                sock.settimeout(config.timeout)
-                self._tcp_sock = sock
-                self._tcp_addr = addr
+            if self._stream_sock is None or self._stream_addr != target:
+                self._close_stream_unlocked()
+                self._stream_sock = self._open_stream(config)
+                self._stream_addr = target
+            sock = self._stream_sock
+            generation = config.generation
         try:
             sock.sendall(framed)
         except OSError:
             with self._lock:
-                self._close_tcp_unlocked()
-            sock = socket.create_connection(addr, timeout=config.timeout)
-            sock.settimeout(config.timeout)
-            with self._lock:
-                self._tcp_sock = sock
-                self._tcp_addr = addr
+                current = self._config
+                if current.generation != generation or not current.enabled:
+                    self._close_stream_unlocked()
+                    return
+                if current.host != config.host or current.port != config.port or current.protocol != config.protocol:
+                    self._close_stream_unlocked()
+                    return
+                self._close_stream_unlocked()
+                sock = self._open_stream(current)
+                self._stream_sock = sock
+                self._stream_addr = (current.host, current.port, current.protocol)
             sock.sendall(framed)
 
     def _close_sockets_unlocked(self) -> None:
         self._close_udp_unlocked()
-        self._close_tcp_unlocked()
+        self._close_stream_unlocked()
 
     def _close_udp_unlocked(self) -> None:
         if self._udp_sock is not None:
@@ -456,14 +491,14 @@ class RemoteSyslogForwarder:
                 pass
             self._udp_sock = None
 
-    def _close_tcp_unlocked(self) -> None:
-        if self._tcp_sock is not None:
+    def _close_stream_unlocked(self) -> None:
+        if self._stream_sock is not None:
             try:
-                self._tcp_sock.close()
+                self._stream_sock.close()
             except OSError:
                 pass
-            self._tcp_sock = None
-            self._tcp_addr = None
+            self._stream_sock = None
+            self._stream_addr = None
 
     def _warn_rate_limited(self, message: str, *args: Any, exc_info: bool = False) -> None:
         now = time.monotonic()
@@ -484,6 +519,10 @@ __all__ = [
     "DEFAULT_PROTOCOL",
     "DEFAULT_QUEUE_SIZE",
     "DEFAULT_TIMEOUT",
+    "DEFAULT_TLS_PORT",
+    "MAX_QUEUE_SIZE",
+    "MAX_TIMEOUT_SECONDS",
+    "PLAINTEXT_PROTOCOLS",
     "REMOTE_SYSLOG",
     "RemoteSyslogForwarder",
     "SYSLOG_FACILITY",
