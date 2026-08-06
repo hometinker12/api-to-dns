@@ -64,6 +64,12 @@ def test_soa_and_apex_ns_guards() -> None:
         guard_mutation_allowed(record_name="@", record_type="SOA")
     with pytest.raises(ValueError, match="Apex NS"):
         guard_mutation_allowed(record_name="@", record_type="NS")
+    with pytest.raises(ValueError, match="Apex NS"):
+        guard_mutation_allowed(record_name="example.com", record_type="NS", dns_zone="example.com")
+    with pytest.raises(ValueError, match="Apex NS"):
+        guard_mutation_allowed(record_name="Example.COM.", record_type="NS", dns_zone="example.com")
+    # Delegation NS under a label remains allowed.
+    guard_mutation_allowed(record_name="sub", record_type="NS", dns_zone="example.com")
     with pytest.raises(ValueError, match="reverse zones"):
         guard_mutation_allowed(record_name="1", record_type="PTR", dns_zone="example.com")
     guard_mutation_allowed(record_name="1", record_type="PTR", dns_zone="2.0.192.in-addr.arpa")

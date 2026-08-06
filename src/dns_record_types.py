@@ -170,9 +170,21 @@ def is_reverse_zone(dns_zone: str) -> bool:
     return z.endswith(".in-addr.arpa") or z.endswith(".ip6.arpa")
 
 
-def is_apex_name(record_name: str) -> bool:
+def is_apex_name(record_name: str, dns_zone: str | None = None) -> bool:
+    """True for @/empty and for names that resolve to the zone apex (including the zone FQDN)."""
     name = (record_name or "").strip().rstrip(".")
-    return name in {"", "@"}
+    if not name or name == "@":
+        return True
+    if not dns_zone:
+        return False
+    zone = dns_zone.strip().rstrip(".")
+    if not zone:
+        return False
+    if name.lower() == zone.lower():
+        return True
+    # FQDN under the zone that collapses to apex (trailing zone label only).
+    suffix = "." + zone.lower()
+    return name.lower().endswith(suffix) and name.lower()[: -len(suffix)] == ""
 
 
 def guard_mutation_allowed(
@@ -184,7 +196,7 @@ def guard_mutation_allowed(
     rt = (record_type or "").strip().upper()
     if rt == "SOA":
         raise ValueError("SOA records are view-only and cannot be created, edited, or deleted.")
-    if rt == "NS" and is_apex_name(record_name):
+    if rt == "NS" and is_apex_name(record_name, dns_zone):
         raise ValueError("Apex NS records cannot be modified from the admin DNS browser.")
     if rt == "PTR" and dns_zone and not is_reverse_zone(dns_zone):
         raise ValueError("PTR records may only be managed in reverse zones (in-addr.arpa or ip6.arpa).")

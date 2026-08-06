@@ -10,7 +10,7 @@ from ..dns_browser_service import (
     mutate_admin_record,
 )
 from ..http_utils import http_exception_from_dns_error, sanitize_client_error_message
-from ..rbac import ROLE_DNS_ZONES_READ, ROLE_DNS_ZONES_UPDATE, require_role, user_has_role
+from ..rbac import ROLE_DNS_ZONES_UPDATE, require_role
 from ..web import templates
 
 router = APIRouter(tags=["dns-browser"])
@@ -20,11 +20,11 @@ router = APIRouter(tags=["dns-browser"])
 def dns_browser_page(
     request: Request,
     zone_id: int,
-    user: str = Depends(require_role(ROLE_DNS_ZONES_READ)),
+    user: str = Depends(require_role(ROLE_DNS_ZONES_UPDATE)),
 ):
+    # Live DNS browse/search returns provider record data; require update role (not mandatory read).
     with SessionLocal() as db:
-        can_update = user_has_role(db, user, ROLE_DNS_ZONES_UPDATE)
-        ctx = browser_page_context(db, zone_id, user=user, can_update=can_update)
+        ctx = browser_page_context(db, zone_id, user=user, can_update=True)
     return templates.TemplateResponse(
         request=request,
         name="dns_browser.html",
@@ -37,7 +37,7 @@ def search_records(
     zone_id: int,
     record_name: str = Query(..., min_length=1),
     record_type: str | None = Query(None),
-    user: str = Depends(require_role(ROLE_DNS_ZONES_READ)),
+    user: str = Depends(require_role(ROLE_DNS_ZONES_UPDATE)),
 ):
     try:
         return lookup_admin_records(

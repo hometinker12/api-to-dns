@@ -2,9 +2,12 @@
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlmodel import select
 from starlette.requests import Request
 
+from src.auth import create_session_cookie
 from src.db import SessionLocal, init_db
+from src.models import DnsZoneConfig
 from src.rate_limit import rate_limit_exceeded
 
 
@@ -36,6 +39,7 @@ def enable_rate_limit(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("RATE_LIMIT_LOGIN", "3:60")
     monkeypatch.setenv("RATE_LIMIT_KEYCHECK", "3:60")
     monkeypatch.setenv("RATE_LIMIT_DNS_RECORD", "3:60")
+    monkeypatch.setenv("RATE_LIMIT_DNS_BROWSER", "3:60")
     init_db()
     with SessionLocal() as db:
         db.execute(text("DELETE FROM rate_limit_bucket"))
@@ -112,3 +116,41 @@ def test_http_login_returns_429_when_limited(client: TestClient, enable_rate_lim
         assert response.status_code in {200, 429}
     response = client.post("/login", data={"username": "nobody", "password": "x"})
     assert response.status_code == 429
+
+
+def test_dns_browser_route_limit(enable_rate_limit) -> None:
+    search = _request("/zones/1/records/search")
+    page = _request("/zones/1/records")
+    assert rate_limit_exceeded(search) is False
+    assert rate_limit_exceeded(page) is False
+    assert rate_limit_exceeded(search) is False
+    assert rate_limit_exceeded(page) is True
+    # Unrelated zone admin path is not in this bucket.
+    assert rate_limit_exceeded(_request("/zones/1")) is False
+
+
+def test_http_dns_browser_returns_429_when_limited(
+    client: TestClient,
+    enable_rate_limit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import MagicMock
+
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+        zone_id = zone.id
+
+    fake = MagicMock()
+    fake.get_record.return_value = []
+    monkeypatch.setattr("src.dns_browser_service.create_dns_client_from_settings", lambda *_a, **_k: fake)
+
+    path = f"/zones/{zone_id}/records/search"
+    for _ in range(3):
+        response = client.get(path, params={"record_name": "@"})
+        assert response.status_code in {200, 429}
+    limited = client.get(path, params={"record_name": "@"})
+    assert limited.status_code == 429
+    body = limited.json()
+    assert body["detail"]["error"] == "rate_limited"

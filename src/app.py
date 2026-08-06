@@ -496,6 +496,7 @@ def admin(request: Request, user: str = Depends(get_current_user)):
             can_view_zones = user_has_role(db, user, ROLE_DNS_ZONES_READ) or user_has_role(
                 db, user, ROLE_DNS_ZONES_UPDATE
             )
+            can_update_zones = user_has_role(db, user, ROLE_DNS_ZONES_UPDATE)
             can_view_api_keys = user_has_role(db, user, ROLE_API_KEYS_READ) or user_has_role(
                 db, user, ROLE_API_KEYS_UPDATE
             )
@@ -514,6 +515,7 @@ def admin(request: Request, user: str = Depends(get_current_user)):
                 "api_keys": api_keys_view,
                 "key_zones": key_zones,
                 "can_view_zones": can_view_zones,
+                "can_update_zones": can_update_zones,
                 "can_view_api_keys": can_view_api_keys,
                 "openapi_enabled": _OPENAPI_ON,
             },

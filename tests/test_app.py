@@ -57,7 +57,7 @@ from src.models import (
 from src.plugins.bind import BindTsigDnsClient
 from src.security import hash_api_key, hash_password
 from src.time_utils import utc_now
-from src.zone_service import provider_dns_zone
+from src.zone_service import decode_zone_config, provider_dns_zone
 
 
 def test_root_redirects_to_login_without_session(client: TestClient) -> None:
@@ -3300,6 +3300,24 @@ def test_dashboard_and_zones_link_to_dns_browser(client: TestClient) -> None:
     assert f"/zones/{zone_id}/records" in zones.text
 
 
+def test_read_only_user_does_not_see_dns_browser_links(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("zonereader"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "zonereader", "x", [ROLE_DNS_ZONES_READ])
+        _create_user(db, "admin", "x", ALL_ROLES)
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+        zone_id = zone.id
+
+    admin = client.get("/admin")
+    assert admin.status_code == 200
+    assert f"/zones/{zone_id}/records" not in admin.text
+    zones = client.get("/zones")
+    assert zones.status_code == 200
+    assert f"/zones/{zone_id}/records" not in zones.text
+
+
 def test_dns_browser_search_success_and_not_found(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -3326,7 +3344,7 @@ def test_dns_browser_search_success_and_not_found(
     assert missing.json()["status"] == "not_found"
 
 
-def test_dns_browser_read_user_can_search_but_not_mutate(
+def test_dns_browser_requires_dns_zones_update(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3344,11 +3362,10 @@ def test_dns_browser_read_user_can_search_but_not_mutate(
     monkeypatch.setattr("src.dns_browser_service.create_dns_client_from_settings", lambda *_a, **_k: fake)
 
     page = client.get(f"/zones/{zone_id}/records")
-    assert page.status_code == 200
-    assert 'id="add-record-btn"' not in page.text
+    assert page.status_code == 403
 
     search = client.get(f"/zones/{zone_id}/records/search", params={"record_name": "@"})
-    assert search.status_code == 200
+    assert search.status_code == 403
 
     create = client.post(
         f"/zones/{zone_id}/records",
@@ -3405,6 +3422,7 @@ def test_dns_browser_rejects_soa_and_apex_ns(client: TestClient) -> None:
         zone = db.exec(select(DnsZoneConfig)).first()
         assert zone is not None
         zone_id = zone.id
+        dns_zone = provider_dns_zone(decode_zone_config(zone))
 
     soa = client.post(
         f"/zones/{zone_id}/records",
@@ -3423,6 +3441,13 @@ def test_dns_browser_rejects_soa_and_apex_ns(client: TestClient) -> None:
     )
     assert apex_ns.status_code == 400
     assert "Apex NS" in apex_ns.json()["detail"]["message"]
+
+    apex_fqdn = client.post(
+        f"/zones/{zone_id}/records",
+        json={"record_name": dns_zone or "example.com", "record_type": "NS", "ttl": 300, "values": ["ns1.example.com"]},
+    )
+    assert apex_fqdn.status_code == 400
+    assert "Apex NS" in apex_fqdn.json()["detail"]["message"]
 
 
 def test_dns_browser_unknown_zone(client: TestClient) -> None:
