@@ -508,13 +508,96 @@
             {% endif %}
           </section>
 
-          {% elif selected_system_section == "syslog_planned" %}
+          {% elif selected_system_section == "syslog_forwarding" %}
           <section class="form-card">
-            <h2>Syslog Server (planned)</h2>
-            <div class="placeholder-panel">
-              <p>Syslog forwarding is not implemented yet.</p>
-              <p class="help">A future release will add host, port, protocol, facility, and minimum-level fields here.</p>
-            </div>
+            <h2>Remote Syslog</h2>
+            <p class="help">
+              Optionally forward stored audit/activity events to a remote syslog server as RFC&nbsp;5424
+              messages with a JSON payload. Delivery is best-effort over UDP or TCP and never blocks API
+              requests. Failed or dropped deliveries are recorded only in operational logs.
+            </p>
+            <form action="/settings/system/syslog" method="post" id="remote-syslog-form">
+              <input type="hidden" name="redirect_section" value="syslog_forwarding" />
+              <label class="inline-check">
+                <input
+                  type="checkbox"
+                  name="syslog_enabled"
+                  id="syslog-enabled"
+                  {% if sys.syslog.enabled %}checked{% endif %}
+                  {% if not can_system_update %}disabled{% endif %}
+                />
+                Enable remote audit log forwarding
+              </label>
+              <label>Host
+                <input
+                  type="text"
+                  name="syslog_host"
+                  id="syslog-host"
+                  value="{{ sys.syslog.host }}"
+                  placeholder="syslog.example.com"
+                  {% if not can_system_update %}disabled{% endif %}
+                />
+              </label>
+              <label>Port
+                <input
+                  type="number"
+                  name="syslog_port"
+                  id="syslog-port"
+                  min="1"
+                  max="65535"
+                  value="{{ sys.syslog.port }}"
+                  {% if not can_system_update %}disabled{% endif %}
+                />
+              </label>
+              <label>Protocol
+                <select name="syslog_protocol" id="syslog-protocol" {% if not can_system_update %}disabled{% endif %}>
+                  {% for option in sys.syslog.protocols %}
+                    <option value="{{ option }}" {% if sys.syslog.protocol == option %}selected{% endif %}>{{ option | upper }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label>Facility
+                <select name="syslog_facility" id="syslog-facility" {% if not can_system_update %}disabled{% endif %}>
+                  {% for option in sys.syslog.facilities %}
+                    <option value="{{ option }}" {% if sys.syslog.facility == option %}selected{% endif %}>{{ option }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label>Minimum audit level to forward
+                <select name="syslog_minimum_level" id="syslog-minimum-level" {% if not can_system_update %}disabled{% endif %}>
+                  {% for level in sys.log_levels %}
+                    <option value="{{ level }}" {% if sys.syslog.minimum_level == level %}selected{% endif %}>{{ level }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label>Timeout (seconds)
+                <input
+                  type="text"
+                  name="syslog_timeout"
+                  id="syslog-timeout"
+                  value="{{ sys.syslog.timeout }}"
+                  {% if not can_system_update %}disabled{% endif %}
+                />
+              </label>
+              <label>Queue size
+                <input
+                  type="number"
+                  name="syslog_queue_size"
+                  id="syslog-queue-size"
+                  min="1"
+                  max="100000"
+                  value="{{ sys.syslog.queue_size }}"
+                  {% if not can_system_update %}disabled{% endif %}
+                />
+              </label>
+              <p class="help">
+                The in-process queue is non-durable. When the queue is full or the remote server is
+                unavailable, events are dropped and a rate-limited warning is written to operational logs.
+              </p>
+              {% if can_system_update %}
+                <button type="submit">Save</button>
+              {% endif %}
+            </form>
           </section>
 
           {% elif selected_system_section == "ssl_certificate" %}
@@ -1572,6 +1655,39 @@
       }
       smtpAnonymous?.addEventListener("change", syncSmtpAnonymous);
       syncSmtpAnonymous();
+
+      const syslogEnabled = document.getElementById("syslog-enabled");
+      const syslogFieldIds = [
+        "syslog-host",
+        "syslog-port",
+        "syslog-protocol",
+        "syslog-facility",
+        "syslog-minimum-level",
+        "syslog-timeout",
+        "syslog-queue-size",
+      ];
+      function syncSyslogEnabled() {
+        if (!syslogEnabled || syslogEnabled.disabled) {
+          return;
+        }
+        const enabled = syslogEnabled.checked;
+        for (const id of syslogFieldIds) {
+          const field = document.getElementById(id);
+          if (field) {
+            field.disabled = !enabled;
+          }
+        }
+      }
+      syslogEnabled?.addEventListener("change", syncSyslogEnabled);
+      syncSyslogEnabled();
+      document.getElementById("remote-syslog-form")?.addEventListener("submit", () => {
+        for (const id of syslogFieldIds) {
+          const field = document.getElementById(id);
+          if (field) {
+            field.disabled = false;
+          }
+        }
+      });
 
       const backupEncrypt = document.getElementById("backup-encrypt");
       const backupEncryptFields = document.getElementById("backup-encrypt-fields");

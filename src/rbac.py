@@ -114,6 +114,7 @@ SYSTEM_SETTINGS_SECTIONS: list[dict[str, str]] = [
     {"key": "logging_configuration", "label": "Logging Level"},
     {"key": "audit_log_retention", "label": "Audit Log Retention"},
     {"key": "operational_log_rotation", "label": "Operational Log Rotation"},
+    {"key": "syslog_forwarding", "label": "Remote Syslog"},
 ]
 
 BACKUP_SECTIONS: list[dict[str, str]] = [
