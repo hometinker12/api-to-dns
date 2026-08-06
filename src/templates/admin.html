@@ -34,7 +34,12 @@
         <ul class="summary-list">
           {% for z in zones %}
             <li>
-              <code>{{ z.zone_name }}</code> <span class="help">({{ z.dns_zone }})</span>
+              {% if can_update_zones %}
+                <a href="/zones/{{ z.id }}/records"><code>{{ z.zone_name }}</code></a>
+              {% else %}
+                <code>{{ z.zone_name }}</code>
+              {% endif %}
+              <span class="help">({{ z.dns_zone }})</span>
             </li>
           {% endfor %}
         </ul>

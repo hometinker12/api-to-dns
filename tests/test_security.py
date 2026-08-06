@@ -7,6 +7,7 @@ from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 
 from src.auth import create_session_cookie
+from src.db import SessionLocal
 
 
 def test_get_app_version_matches_version_file() -> None:
@@ -183,6 +184,33 @@ def test_csrf_rejects_cross_origin_post(client: TestClient, monkeypatch: pytest.
         headers={"Origin": "https://evil.example", "Host": "localhost"},
     )
     assert response.status_code == 403
+
+
+def test_csrf_rejects_dns_browser_mutations(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.csrf.relax_csrf_for_tests", lambda: False)
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        from sqlmodel import select
+
+        from src.models import DnsZoneConfig
+
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+        zone_id = zone.id
+
+    payload = {"record_name": "www", "record_type": "A", "ttl": 300, "values": ["192.0.2.10"]}
+    headers = {"Origin": "https://evil.example", "Host": "localhost"}
+    assert client.post(f"/zones/{zone_id}/records", json=payload, headers=headers).status_code == 403
+    assert client.put(f"/zones/{zone_id}/records", json=payload, headers=headers).status_code == 403
+    assert (
+        client.request(
+            "DELETE",
+            f"/zones/{zone_id}/records",
+            json={"record_name": "www", "record_type": "A"},
+            headers=headers,
+        ).status_code
+        == 403
+    )
 
 
 def test_csrf_allows_same_origin_login_post(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

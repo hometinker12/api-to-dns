@@ -148,6 +148,7 @@ The web interface allows you to:
 
 - Sign in with admin credentials
 - Add and edit **DNS zones** (each configuration name is unique; each has its own provider type, DNS domain, server, and credentials). Use the **Test Configuration** button on a zone form to verify credentials and zone access by looking up a known record before saving.
+- Open the **DNS browser** from a zone name on the Dashboard (or the DNS Zones list). Zone name links appear only for accounts with `dns_zones.update`. The page loads blank with a search bar and type filter (All records, A, AAAA, CNAME, TXT, MX, NS, SRV, CAA, PTR, SOA). Enter an exact relative name such as `@` or `www` to look up records. Browse, search, and mutations all require `dns_zones.update` (mandatory `dns_zones.read` alone is not enough, because lookups return live provider data). Edits replace the whole RRset for that name and type. SOA is view-only; apex NS (including the zone FQDN) cannot be modified. PTR mutations are limited to reverse zones (`in-addr.arpa` / `ip6.arpa`). Canonical value formats: MX `priority exchange`, SRV `priority weight port target`, CAA `flags tag value`. Credentials stay server-side (session auth, not API keys). Browser routes share the `RATE_LIMIT_DNS_BROWSER` bucket (default `60:60`).
 - Create and revoke **API keys**, and **edit** keys to change their label or **allowed zones**
 - Review and search activity logs under **Settings → Log Viewing / Searching**
 - Export and restore configuration under **Settings → Backup** (global admin only): password-encrypted archives include settings, users, DNS zones, API key hashes, alert rules, SSL files, and `SECRET_KEY` / `ENCRYPTION_KEY` (application secrets require encryption). Audit logs are optional. Restore is destructive for selected categories and shows an inline progress dialog; restoring application secrets writes durable secrets and restarts the app.
@@ -158,7 +159,7 @@ The web interface allows you to:
 
 The app uses two separate logging paths:
 
-- **Activity logs** are database rows intended for admin review, filtering, retention cleanup, and email alerting. They capture audit events such as login success/failure, logout, API key create/update/revoke, DNS zone changes, plugin enable/disable, user management changes, DNS record create/update/delete/not-found events, invalid requests, access denied events, DNS provider failures, and alert delivery success/failure.
+- **Activity logs** are database rows intended for admin review, filtering, retention cleanup, and email alerting. They capture audit events such as login success/failure, logout, API key create/update/revoke, DNS zone changes, plugin enable/disable, user management changes, DNS record create/update/delete/not-found events, admin DNS browser lookups and mutations (`dns.browser_*`), invalid requests, access denied events, DNS provider failures, and alert delivery success/failure.
 - **Operational logs** are Python/Docker runtime diagnostics intended for container and process troubleshooting. Docker Compose rotates stdout/stderr with the `json-file` driver (`max-size: 10m`, `max-file: 5`). When `LOG_FILE` is configured, the Python logger also writes to a rotating file handler; the provided Compose file stores that file under a separate `api-to-dns-logs` volume mounted at `/app/logs`.
 
 ### Logging Level And Retention

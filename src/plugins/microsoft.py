@@ -2,6 +2,17 @@ import json
 import time
 from typing import Any
 
+from ..dns_record_types import (
+    MUTABLE_RECORD_TYPES,
+    format_caa,
+    format_mx,
+    format_srv,
+    normalize_hostname,
+    normalize_record_values,
+    parse_caa,
+    parse_mx,
+    parse_srv,
+)
 from ..models import DnsRecordInfo, DnsRecordRequest
 from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
 from .utils import dns_relative_name, lookup_record_types_to_query, ps_single_quoted, winrm_rr_type
@@ -109,13 +120,12 @@ class MicrosoftWinRmDnsClient:
         record_type = payload.record_type.upper()
         ttl = int(payload.ttl or 300)
         name = dns_relative_name(zone, payload.record_name)
-        if name == "@":
-            name_at = "@"
-        else:
-            name_at = name
+        name_at = "@" if name == "@" else name
 
         if record_type == "DELETE":
             inner = payload.values[0].strip().upper()
+            if inner not in MUTABLE_RECORD_TYPES:
+                raise ValueError(f"Unsupported record type for Microsoft WinRM: {inner}")
             ps_rr = winrm_rr_type(inner)
             existed = self._record_exists(dns_server, zone, name_at, ps_rr)
             if not existed:
@@ -136,6 +146,10 @@ class MicrosoftWinRmDnsClient:
             self._run_ps_with_retry(dns_server, script)
             return True
 
+        if record_type not in MUTABLE_RECORD_TYPES:
+            raise ValueError(f"Unsupported record type for Microsoft WinRM: {record_type}")
+
+        values = normalize_record_values(record_type, list(payload.values))
         existed = self._record_exists(dns_server, zone, name_at, winrm_rr_type(record_type))
 
         lines: list[str] = [
@@ -146,64 +160,94 @@ class MicrosoftWinRmDnsClient:
             f"$TtlSeconds = {ttl}",
             "Import-Module DnsServer -ErrorAction Stop",
         ]
+        lines.append(
+            f"Get-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName "
+            f"-Name $Name -RRType {ps_single_quoted(winrm_rr_type(record_type))} -ErrorAction SilentlyContinue | "
+            "Remove-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName -Force"
+        )
+        lines.extend(self._add_record_lines(record_type, values))
 
+        script = "\n".join(lines)
+        self._run_ps_with_retry(dns_server, script)
+
+        return existed
+
+    @staticmethod
+    def _add_record_lines(record_type: str, values: list[str]) -> list[str]:
+        lines: list[str] = []
         if record_type == "A":
-            lines.append(
-                "Get-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName "
-                "-Name $Name -RRType A -ErrorAction SilentlyContinue | "
-                "Remove-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName -Force"
-            )
-            for v in payload.values:
+            for v in values:
                 lines.append(
                     "Add-DnsServerResourceRecordA -ComputerName $ComputerName -ZoneName $ZoneName "
                     f"-Name $Name -IPv4Address {ps_single_quoted(v)} "
                     "-TimeToLive (New-TimeSpan -Seconds $TtlSeconds)"
                 )
         elif record_type == "AAAA":
-            lines.append(
-                "Get-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName "
-                "-Name $Name -RRType AAAA -ErrorAction SilentlyContinue | "
-                "Remove-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName -Force"
-            )
-            for v in payload.values:
+            for v in values:
                 lines.append(
                     "Add-DnsServerResourceRecordAAAA -ComputerName $ComputerName -ZoneName $ZoneName "
                     f"-Name $Name -IPv6Address {ps_single_quoted(v)} "
                     "-TimeToLive (New-TimeSpan -Seconds $TtlSeconds)"
                 )
         elif record_type == "CNAME":
-            if len(payload.values) != 1:
-                raise ValueError("CNAME requires exactly one value.")
-            target = payload.values[0]
-            lines.append(
-                "Get-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName "
-                "-Name $Name -RRType CNAME -ErrorAction SilentlyContinue | "
-                "Remove-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName -Force"
-            )
             lines.append(
                 "Add-DnsServerResourceRecordCName -ComputerName $ComputerName -ZoneName $ZoneName "
-                f"-Name $Name -HostNameAlias {ps_single_quoted(target)} "
+                f"-Name $Name -HostNameAlias {ps_single_quoted(values[0])} "
                 "-TimeToLive (New-TimeSpan -Seconds $TtlSeconds)"
             )
         elif record_type == "TXT":
-            lines.append(
-                f"Get-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName "
-                f"-Name $Name -RRType {ps_single_quoted(winrm_rr_type('TXT'))} -ErrorAction SilentlyContinue | "
-                "Remove-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName -Force"
-            )
-            for v in payload.values:
+            for v in values:
                 lines.append(
                     "Add-DnsServerResourceRecordTxt -ComputerName $ComputerName -ZoneName $ZoneName "
                     f"-Name $Name -DescriptiveText {ps_single_quoted(v)} "
                     "-TimeToLive (New-TimeSpan -Seconds $TtlSeconds)"
                 )
+        elif record_type == "MX":
+            for v in values:
+                priority, exchange = parse_mx(v)
+                lines.append(
+                    "Add-DnsServerResourceRecordMX -ComputerName $ComputerName -ZoneName $ZoneName "
+                    f"-Name $Name -MailExchange {ps_single_quoted(exchange)} -Preference {priority} "
+                    "-TimeToLive (New-TimeSpan -Seconds $TtlSeconds)"
+                )
+        elif record_type == "NS":
+            for v in values:
+                lines.append(
+                    "Add-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName "
+                    f"-Name $Name -NS -NameServer {ps_single_quoted(v)} "
+                    "-TimeToLive (New-TimeSpan -Seconds $TtlSeconds)"
+                )
+        elif record_type == "SRV":
+            for v in values:
+                priority, weight, port, target = parse_srv(v)
+                lines.append(
+                    "Add-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName "
+                    f"-Name $Name -Srv -DomainName {ps_single_quoted(target)} "
+                    f"-Priority {priority} -Weight {weight} -Port {port} "
+                    "-TimeToLive (New-TimeSpan -Seconds $TtlSeconds)"
+                )
+        elif record_type == "CAA":
+            for v in values:
+                flags, tag, caa_value = parse_caa(v)
+                if caa_value.startswith('"') and caa_value.endswith('"') and len(caa_value) >= 2:
+                    caa_value = caa_value[1:-1]
+                # Windows Server 2022+ supports CAA via Add-DnsServerResourceRecord with -Caa.
+                lines.append(
+                    "Add-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName "
+                    f"-Name $Name -Caa -CaaFlags {flags} -CaaTag {ps_single_quoted(tag)} "
+                    f"-CaaValue {ps_single_quoted(caa_value)} "
+                    "-TimeToLive (New-TimeSpan -Seconds $TtlSeconds)"
+                )
+        elif record_type == "PTR":
+            for v in values:
+                lines.append(
+                    "Add-DnsServerResourceRecordPtr -ComputerName $ComputerName -ZoneName $ZoneName "
+                    f"-Name $Name -PtrDomainName {ps_single_quoted(v)} "
+                    "-TimeToLive (New-TimeSpan -Seconds $TtlSeconds)"
+                )
         else:
             raise ValueError(f"Unsupported record type for Microsoft WinRM: {record_type}")
-
-        script = "\n".join(lines)
-        self._run_ps_with_retry(dns_server, script)
-
-        return existed
+        return lines
 
     def get_record(
         self,
@@ -259,6 +303,33 @@ class MicrosoftWinRmDnsClient:
             "      else { $values += [string]$text }\n"
             "    }\n"
             "  }\n"
+            "  'MX' {\n"
+            "    foreach ($rec in $records) {\n"
+            "      $values += ('{0} {1}' -f [int]$rec.RecordData.Preference, [string]$rec.RecordData.MailExchange)\n"
+            "    }\n"
+            "  }\n"
+            "  'NS' { $values = @($records | ForEach-Object { [string]$_.RecordData.NameServer }) }\n"
+            "  'SRV' {\n"
+            "    foreach ($rec in $records) {\n"
+            "      $values += ('{0} {1} {2} {3}' -f [int]$rec.RecordData.Priority, "
+            "[int]$rec.RecordData.Weight, [int]$rec.RecordData.Port, [string]$rec.RecordData.DomainName)\n"
+            "    }\n"
+            "  }\n"
+            "  'CAA' {\n"
+            "    foreach ($rec in $records) {\n"
+            "      $values += ('{0} {1} {2}' -f [int]$rec.RecordData.Flags, "
+            "[string]$rec.RecordData.Tag, [string]$rec.RecordData.Value)\n"
+            "    }\n"
+            "  }\n"
+            "  'PTR' { $values = @($records | ForEach-Object { [string]$_.RecordData.PtrDomainName }) }\n"
+            "  'SOA' {\n"
+            "    $soa = $records[0].RecordData\n"
+            "    $values = @(('{0} {1} {2} {3} {4} {5} {6}' -f "
+            "[string]$soa.PrimaryServer, [string]$soa.ResponsiblePerson, "
+            "[uint64]$soa.SerialNumber, [int]$soa.RefreshInterval.TotalSeconds, "
+            "[int]$soa.RetryDelay.TotalSeconds, [int]$soa.ExpireLimit.TotalSeconds, "
+            "[int]$soa.MinimumTimeToLive.TotalSeconds))\n"
+            "  }\n"
             "}\n"
             "@{ ttl = $ttl; values = @($values) } | ConvertTo-Json -Compress\n"
         )
@@ -270,11 +341,29 @@ class MicrosoftWinRmDnsClient:
         values = data.get("values") or []
         if isinstance(values, str):
             values = [values]
+        canonical: list[str] = []
+        for raw in values:
+            text = str(raw).strip()
+            if not text:
+                continue
+            if api_rr_type == "MX":
+                priority, exchange = parse_mx(text)
+                canonical.append(format_mx(priority, exchange))
+            elif api_rr_type == "SRV":
+                priority, weight, port, target = parse_srv(text)
+                canonical.append(format_srv(priority, weight, port, target))
+            elif api_rr_type == "CAA":
+                flags, tag, caa_value = parse_caa(text)
+                canonical.append(format_caa(flags, tag, caa_value))
+            elif api_rr_type in {"CNAME", "NS", "PTR"}:
+                canonical.append(normalize_hostname(text))
+            else:
+                canonical.append(text)
         return DnsRecordInfo(
             record_name=name,
             record_type=api_rr_type,
             ttl=int(data["ttl"]),
-            values=[str(v) for v in values],
+            values=canonical,
         )
 
     def _record_exists(self, computer: str, zone: str, name: str, rr_type: str) -> bool:

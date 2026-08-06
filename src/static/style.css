@@ -696,6 +696,42 @@ dialog::backdrop {
     position: static;
   }
 }
+.dns-browser-meta p {
+  margin: 0.25rem 0;
+}
+.dns-browser-search {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(8rem, 1fr) auto;
+  gap: 0.75rem 1rem;
+  align-items: end;
+}
+.dns-browser-search-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.dns-browser-value-list {
+  margin: 0;
+  padding-left: 1.1rem;
+}
+.dns-browser-value-list li {
+  margin: 0.15rem 0;
+}
+.dns-browser-values {
+  display: grid;
+  gap: 0.75rem;
+  margin: 0.75rem 0;
+}
+.dns-browser-value-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr)) auto;
+  gap: 0.5rem;
+  align-items: end;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-surface);
+}
 @media (max-width: 640px) {
   header,
   .page-header {
@@ -720,5 +756,11 @@ dialog::backdrop {
     min-width: 35px;
     max-width: 35px;
     align-self: flex-start;
+  }
+  .dns-browser-search {
+    grid-template-columns: 1fr;
+  }
+  .dns-browser-search-actions {
+    flex-direction: column;
   }
 }

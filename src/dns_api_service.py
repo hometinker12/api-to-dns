@@ -9,6 +9,7 @@ from starlette.status import HTTP_404_NOT_FOUND, HTTP_409_CONFLICT
 
 from .activity_logging import emit_activity_event
 from .db import SessionLocal
+from .dns_mutation import apply_rrset_mutation, record_exists_at_type
 from .http_utils import api_key_fingerprint, http_exception_from_dns_error, sanitize_client_error_message
 from .models import (
     LOG_LEVEL_ERROR,
@@ -187,14 +188,12 @@ def _record_exists_at_type(
     record_type: str,
 ) -> bool:
     """Return True if the DNS provider reports any record of *record_type* at *record_name*."""
-
-    records = client.get_record(
+    return record_exists_at_type(
+        client,
+        settings=settings,
         record_name=record_name,
         record_type=record_type,
-        dns_server=settings.get("dns_server"),
-        dns_zone=provider_dns_zone(settings),
     )
-    return bool(records)
 
 
 def _apply_dns_mutation(
@@ -325,23 +324,26 @@ def _apply_dns_mutation(
                 )
                 return body
 
-            exists = _record_exists_at_type(
+            outcome = apply_rrset_mutation(
                 client,
                 settings=settings,
+                zone_name=zone_row.zone_name,
                 record_name=record_name,
                 record_type=rt_upper,
+                ttl=ttl,
+                values=list(values),
+                mode=mode,  # type: ignore[arg-type]
             )
-
-            if mode == "create" and exists:
-                body = DnsRecordResponse(
-                    status="error",
-                    action="record_already_exists",
-                    zone_name=zone_row.zone_name,
-                    dns_zone=provider_domain,
-                    record_name=record_name,
-                    record_type=rt_upper,
-                    values=list(values),
-                )
+            body = DnsRecordResponse(
+                status=outcome.status,
+                action=outcome.action,
+                zone_name=zone_row.zone_name,
+                dns_zone=outcome.dns_zone,
+                record_name=outcome.record_name,
+                record_type=outcome.record_type,
+                values=outcome.values,
+            )
+            if outcome.http_status == HTTP_409_CONFLICT:
                 emit_activity_event(
                     db,
                     event_type="dns.record_already_exists",
@@ -356,17 +358,7 @@ def _apply_dns_mutation(
                     details={"record_type": rt_upper, "provider": provider},
                 )
                 return JSONResponse(status_code=HTTP_409_CONFLICT, content=body.model_dump())
-
-            if mode in ("replace", "delete") and not exists:
-                body = DnsRecordResponse(
-                    status="error",
-                    action="not_found",
-                    zone_name=zone_row.zone_name,
-                    dns_zone=provider_domain,
-                    record_name=record_name,
-                    record_type=rt_upper,
-                    values=[] if mode == "delete" else list(values),
-                )
+            if outcome.http_status == HTTP_404_NOT_FOUND:
                 emit_activity_event(
                     db,
                     event_type="dns.record_not_found",
@@ -382,48 +374,9 @@ def _apply_dns_mutation(
                 )
                 return JSONResponse(status_code=HTTP_404_NOT_FOUND, content=body.model_dump())
 
-            if mode == "delete":
-                internal = DnsRecordRequest(
-                    zone_name=zone_row.zone_name,
-                    record_type="DELETE",
-                    record_name=record_name,
-                    ttl=ttl or 300,
-                    values=[rt_upper],
-                )
-            else:
-                internal = DnsRecordRequest(
-                    zone_name=zone_row.zone_name,
-                    record_type=rt_upper,
-                    record_name=record_name,
-                    ttl=ttl if ttl is not None else 300,
-                    values=list(values),
-                )
-
-            client.create_or_update_record(
-                internal,
-                dns_server=settings.get("dns_server"),
-                dns_zone=provider_domain,
-            )
-
-            action = {
-                "create": "created",
-                "replace": "updated",
-                "patch": "updated",
-                "delete": "deleted",
-            }[mode]
-            response_values: list[str] = [] if mode == "delete" else list(values)
-            body = DnsRecordResponse(
-                status="success",
-                action=action,
-                zone_name=zone_row.zone_name,
-                dns_zone=provider_domain,
-                record_name=record_name,
-                record_type=rt_upper,
-                values=response_values,
-            )
             emit_activity_event(
                 db,
-                event_type=f"dns.record_{action}",
+                event_type=f"dns.record_{outcome.action}",
                 level=LOG_LEVEL_INFORMATIONAL,
                 status="success",
                 actor_type="api_key",
@@ -431,7 +384,7 @@ def _apply_dns_mutation(
                 actor_label=actor_label,
                 zone_name=zone_row.zone_name,
                 record_name=record_name,
-                message=f"DNS record {record_name}.{provider_domain} {action}",
+                message=f"DNS record {record_name}.{provider_domain} {outcome.action}",
                 details={
                     "record_type": rt_upper,
                     "values_count": len(values),

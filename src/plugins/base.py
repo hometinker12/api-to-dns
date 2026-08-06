@@ -25,6 +25,19 @@ DNS_ZONE_DOMAIN_FIELD = PluginField(
 
 @dataclass(frozen=True)
 class DnsProviderPlugin:
+    """Provider registration entry.
+
+    Clients created by ``create_client`` must implement:
+
+    - ``get_record(record_name=..., record_type=None, dns_server=None, dns_zone=None)``
+      returning ``list[DnsRecordInfo]`` using canonical value formats from
+      ``src.dns_record_types`` (MX ``priority exchange``, SRV ``priority weight port target``,
+      CAA ``flags tag value``, etc.).
+    - ``create_or_update_record(payload, dns_server=None, dns_zone=None)`` accepting
+      ``DnsRecordRequest`` including synthetic ``DELETE`` (values[0] = RR type).
+      SOA must be view-only; apex NS mutations must be rejected by callers.
+    """
+
     key: str
     label: str
     heading: str

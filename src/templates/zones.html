@@ -31,7 +31,13 @@
             <tbody>
               {% for z in zones %}
                 <tr>
-                  <td><code>{{ z.zone_name }}</code></td>
+                  <td>
+                    {% if can_update_zones %}
+                      <a href="/zones/{{ z.id }}/records"><code>{{ z.zone_name }}</code></a>
+                    {% else %}
+                      <code>{{ z.zone_name }}</code>
+                    {% endif %}
+                  </td>
                   <td>{% if z.dns_zone %}<code>{{ z.dns_zone }}</code>{% else %}&mdash;{% endif %}</td>
                   <td>{{ z.dns_provider_label }}</td>
                   <td>{% if z.dns_server %}<code>{{ z.dns_server }}</code>{% else %}&mdash;{% endif %}</td>

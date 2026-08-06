@@ -1,3 +1,13 @@
+from ..dns_record_types import (
+    format_caa,
+    format_mx,
+    format_srv,
+    normalize_hostname,
+    normalize_record_values,
+    parse_caa,
+    parse_mx,
+    parse_srv,
+)
 from ..models import DnsRecordInfo, DnsRecordRequest
 from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
 from .utils import lookup_record_types_to_query
@@ -51,6 +61,8 @@ class AzureDnsClient:
 
         if record_type == "DELETE":
             inner = payload.values[0].strip().upper()
+            if inner == "SOA":
+                raise ValueError("SOA records are view-only and cannot be deleted.")
             existing = self._get_existing_record_set(
                 client,
                 self.resource_group,
@@ -71,6 +83,9 @@ class AzureDnsClient:
                 return False
             return True
 
+        if record_type == "SOA":
+            raise ValueError("SOA records are view-only and cannot be created or updated.")
+
         existing = self._get_existing_record_set(
             client,
             self.resource_group,
@@ -78,7 +93,8 @@ class AzureDnsClient:
             record_set_name,
             record_type,
         )
-        record_set = self._build_record_set(record_type, payload.values, payload.ttl or 300)
+        values = normalize_record_values(record_type, list(payload.values))
+        record_set = self._build_record_set(record_type, values, payload.ttl or 300)
 
         client.record_sets.create_or_update(
             self.resource_group,
@@ -137,6 +153,31 @@ class AzureDnsClient:
                 if txt.value:
                     for part in txt.value:
                         values.append(part)
+        elif rt == "MX":
+            for mx in record_set.mx_records or []:
+                values.append(format_mx(int(mx.preference), str(mx.exchange)))
+        elif rt == "NS":
+            for ns in record_set.ns_records or []:
+                values.append(normalize_hostname(str(ns.nsdname)))
+        elif rt == "SRV":
+            for srv in record_set.srv_records or []:
+                values.append(format_srv(int(srv.priority), int(srv.weight), int(srv.port), str(srv.target)))
+        elif rt == "CAA":
+            for caa in record_set.caa_records or []:
+                values.append(format_caa(int(caa.flags), str(caa.tag), str(caa.value)))
+        elif rt == "PTR":
+            for ptr in record_set.ptr_records or []:
+                values.append(normalize_hostname(str(ptr.ptrdname)))
+        elif rt == "SOA":
+            soa = record_set.soa_record
+            if soa:
+                values = [
+                    (
+                        f"{normalize_hostname(str(soa.host))} {str(soa.email).rstrip('.')} "
+                        f"{int(soa.serial_number)} {int(soa.refresh_time)} "
+                        f"{int(soa.retry_time)} {int(soa.expire_time)} {int(soa.minimum_ttl)}"
+                    )
+                ]
         return DnsRecordInfo(
             record_name=display_name,
             record_type=rt,
@@ -166,6 +207,37 @@ class AzureDnsClient:
             return self.RecordSet(ttl=ttl, cname_record={"cname": values[0]})
         if record_type == "TXT":
             return self.RecordSet(ttl=ttl, txt_records=[{"value": [value]} for value in values])
+        if record_type == "MX":
+            mx_records = []
+            for value in values:
+                priority, exchange = parse_mx(value)
+                mx_records.append({"preference": priority, "exchange": exchange})
+            return self.RecordSet(ttl=ttl, mx_records=mx_records)
+        if record_type == "NS":
+            return self.RecordSet(ttl=ttl, ns_records=[{"nsdname": value} for value in values])
+        if record_type == "SRV":
+            srv_records = []
+            for value in values:
+                priority, weight, port, target = parse_srv(value)
+                srv_records.append(
+                    {
+                        "priority": priority,
+                        "weight": weight,
+                        "port": port,
+                        "target": target,
+                    }
+                )
+            return self.RecordSet(ttl=ttl, srv_records=srv_records)
+        if record_type == "CAA":
+            caa_records = []
+            for value in values:
+                flags, tag, caa_value = parse_caa(value)
+                if caa_value.startswith('"') and caa_value.endswith('"') and len(caa_value) >= 2:
+                    caa_value = caa_value[1:-1]
+                caa_records.append({"flags": flags, "tag": tag, "value": caa_value})
+            return self.RecordSet(ttl=ttl, caa_records=caa_records)
+        if record_type == "PTR":
+            return self.RecordSet(ttl=ttl, ptr_records=[{"ptrdname": value} for value in values])
         raise ValueError(f"Unsupported record type: {record_type}")
 
 
