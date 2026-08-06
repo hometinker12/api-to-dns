@@ -19,6 +19,30 @@
         data-reason="{{ restart_reason }}"
       >Restart Application</button>
     {% endif %}
+    <button
+      type="button"
+      class="theme-toggle"
+      id="theme-toggle"
+      aria-label="Toggle dark mode"
+      title="Toggle dark mode"
+    >
+      <svg class="theme-icon theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path
+          fill="currentColor"
+          d="M20.5 14.2A8.2 8.2 0 0 1 9.8 3.5 8.7 8.7 0 1 0 20.5 14.2z"
+        />
+      </svg>
+      <svg class="theme-icon theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2" />
+        <path
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"
+        />
+      </svg>
+    </button>
     {% for link in page_links or [] %}
       <a class="button{% if link.class %} {{ link.class }}{% endif %}" href="{{ link.href }}">{{ link.label }}</a>
     {% endfor %}
@@ -30,6 +54,31 @@
     </form>
   </nav>
 </header>
+<script>
+  (() => {
+    const KEY = "api-to-dns-theme";
+    const toggle = document.getElementById("theme-toggle");
+    if (!toggle) {
+      return;
+    }
+
+    const currentTheme = () =>
+      document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
+
+    const applyTheme = (theme) => {
+      document.documentElement.setAttribute("data-theme", theme);
+      localStorage.setItem(KEY, theme);
+      const next = theme === "dark" ? "light" : "dark";
+      toggle.setAttribute("aria-label", `Switch to ${next} mode`);
+      toggle.setAttribute("title", `Switch to ${next} mode`);
+    };
+
+    applyTheme(currentTheme());
+    toggle.addEventListener("click", () => {
+      applyTheme(currentTheme() === "dark" ? "light" : "dark");
+    });
+  })();
+</script>
 
 {% if restart_required and can_system_update %}
   <dialog id="restart-app-dialog">
