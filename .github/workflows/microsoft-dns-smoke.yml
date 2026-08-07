@@ -18,6 +18,7 @@ on:
     branches:
       - develop
       - release
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -25,7 +26,7 @@ permissions:
 jobs:
   pytest:
     name: pytest (ubuntu)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: github.ref == 'refs/heads/develop'
     steps:
       - uses: actions/checkout@v6
@@ -396,8 +397,24 @@ jobs:
           assert cookie_lines, headers
           assert all("secure" not in line.lower() for line in cookie_lines), cookie_lines
           PY
-          echo "[bind] Verify admin page"
-          curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/admin | python3 -c "import sys; assert 'api-to-dns App Dashboard' in sys.stdin.read()"
+          echo "[bind] Verify admin page, shared nav, and version metadata"
+          curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/admin -o /tmp/admin.html
+          python3 - <<'PY'
+          from pathlib import Path
+
+          html = Path("/tmp/admin.html").read_text(encoding="utf-8", errors="replace")
+          assert "api-to-dns Dashboard" in html, html[:800]
+          assert "Configured zones" in html, html[:800]
+          nav = html.split('<nav class="nav-links">', 1)[1].split("</nav>", 1)[0]
+          assert nav.index('href="/api-keys"') < nav.index('href="/admin"') < nav.index('href="/settings"') < nav.index('action="/logout"'), nav
+          version = Path("VERSION").read_text(encoding="utf-8").strip()
+          assert version == "0.8.0", version
+          assert f"api-to-dns v{version}" in html, html[-400:]
+          assert 'version = "0.8.0"' in Path("pyproject.toml").read_text(encoding="utf-8")
+          assert "ARG VERSION=0.8.0" in Path("Dockerfile").read_text(encoding="utf-8")
+          assert "hometinker12/api-to-dns:0.8.0" in Path("docker-compose.yml").read_text(encoding="utf-8")
+          print("admin nav + 0.8.0 metadata assertions passed")
+          PY
 
           echo "[bind] POST logout clears session"
           curl --fail --silent -b /tmp/cookies -c /tmp/cookies -X POST http://127.0.0.1:8000/logout \
@@ -481,7 +498,7 @@ jobs:
               -w "%{http_code}" \
               -H "Content-Type: application/x-www-form-urlencoded" \
               -H "Origin: http://127.0.0.1:8000" \
-              -H "Referer: http://127.0.0.1:8000/zones" \
+              -H "Referer: http://127.0.0.1:8000/admin" \
               --data-urlencode "zone_name=${zone}" \
               --data-urlencode "dns_zone=${zone}" \
               --data-urlencode "dns_provider_type=bind" \
@@ -495,12 +512,59 @@ jobs:
               python3 -c 'import sys; from pathlib import Path; print(Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")[:1200])' "${zone_body}"
               exit 1
             fi
+            if ! grep -q "Configured zones" "${zone_body}" || ! grep -q "Add DNS zone" "${zone_body}"; then
+              echo "[bind] Zone create response did not render Dashboard configured-zones controls"
+              python3 -c 'import sys; from pathlib import Path; print(Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")[:1200])' "${zone_body}"
+              exit 1
+            fi
           done
 
           echo "[bind] Fetch API key management page"
           curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/api-keys -o /tmp/api-keys.html
           SMOKE_ZONE_ID="$(python3 -c 'import re; html=open("/tmp/api-keys.html", encoding="utf-8").read(); match=re.search(r"name=\"zone_ids\" value=\"(\d+)\"\s*/>\s*<code>smoke\.test</code>", html, re.DOTALL); assert match, "Could not find smoke.test zone ID"; print(match.group(1))')"
           : "${SMOKE_ZONE_ID:?Could not extract smoke.test zone ID}"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          html = Path("/tmp/api-keys.html").read_text(encoding="utf-8", errors="replace")
+          nav = html.split('<nav class="nav-links">', 1)[1].split("</nav>", 1)[0]
+          assert nav.index('href="/api-keys"') < nav.index('href="/admin"') < nav.index('href="/settings"') < nav.index('action="/logout"'), nav
+          assert "Generate named API keys, scope them to DNS zones, and copy each key when created - it is shown only once." in html
+          print("api-keys nav + helper text assertions passed")
+          PY
+
+          echo "[bind] Dashboard links to DNS browser and /zones redirects"
+          curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/admin -o /tmp/admin-after-zones.html
+          SMOKE_ZONE_ID="${SMOKE_ZONE_ID}" python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          html = Path("/tmp/admin-after-zones.html").read_text(encoding="utf-8", errors="replace")
+          zone_id = os.environ["SMOKE_ZONE_ID"]
+          assert f"/zones/{zone_id}/records" in html, html[:800]
+          assert "Configured zones" in html
+          assert 'href="/zones/new"' in html
+          assert f'href="/zones/{zone_id}/edit"' in html
+          assert "data-open-delete-zone" in html
+          print("dashboard configured-zones controls assertions passed")
+          PY
+          zones_redirect="$(curl --silent --show-error -D /tmp/zones-redirect-headers -o /dev/null -w "%{http_code}" -b /tmp/cookies http://127.0.0.1:8000/zones)"
+          if [ "${zones_redirect}" != "303" ]; then
+            echo "Expected /zones to redirect to /admin; got ${zones_redirect}"
+            exit 1
+          fi
+          python3 - <<'PY'
+          from pathlib import Path
+
+          headers = Path("/tmp/zones-redirect-headers").read_text(encoding="utf-8", errors="replace").lower()
+          assert "\nlocation: /admin\n" in f"\n{headers}", headers
+          PY
+          unauth_browser="$(curl --silent --show-error -o /dev/null -w "%{http_code}" "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records")"
+          if [ "${unauth_browser}" != "303" ] && [ "${unauth_browser}" != "401" ]; then
+            # Cookie-less request should not render the authenticated browser page.
+            echo "Expected unauthenticated DNS browser to redirect/deny; got ${unauth_browser}"
+            exit 1
+          fi
 
           echo "[bind] Create API key for smoke.test"
           curl --fail --silent -L -b /tmp/cookies -X POST http://127.0.0.1:8000/api-keys \
@@ -517,6 +581,15 @@ jobs:
           echo "[bind] Validate API key with /keycheck"
           curl --fail --silent -H "X-API-Key: $API_KEY" http://127.0.0.1:8000/keycheck \
             | python3 -c "import json, sys; assert json.load(sys.stdin)['status'] == 'success'"
+
+          echo "[bind] JSON GET /zones still works for API keys"
+          curl --fail --silent -H "Accept: application/json" -H "X-API-Key: $API_KEY" http://127.0.0.1:8000/zones \
+            | python3 -c "import json,sys; zones=json.load(sys.stdin); names={z.get('zone_name') for z in zones}; assert names=={'smoke.test'}, zones"
+          missing_key_code="$(curl --silent --show-error -o /tmp/zones-missing-key.json -w "%{http_code}" -H "Accept: application/json" http://127.0.0.1:8000/zones)"
+          if [ "${missing_key_code}" != "403" ]; then
+            echo "Expected JSON GET /zones without API key to return 403; got ${missing_key_code}"
+            exit 1
+          fi
 
           call_dns_api() {
             local method="$1"
@@ -597,6 +670,56 @@ jobs:
           call_dns_api PUT 404 not_found "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.40"]}'
           call_dns_api POST 403 access_denied "${DNS_RECORD_URL}" '{"zone_name":"denied.test","record_type":"A","record_name":"blocked","ttl":300,"values":["192.0.2.55"]}'
 
+          echo "[bind] Admin DNS browser session CRUD for temporary A record"
+          browser_page="$(curl --fail --silent -b /tmp/cookies "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records")"
+          echo "${browser_page}" | python3 -c "import sys; html=sys.stdin.read(); assert 'dns-browser-search' in html; assert 'dns-browser-results' in html and 'hidden' in html"
+          bind_browse_status="$(curl --silent --show-error -b /tmp/cookies -o /tmp/bind-browser-browse.json -w "%{http_code}" \
+            "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search")"
+          if [ "${bind_browse_status}" != "400" ]; then
+            echo "Expected BIND browser browse to return 400; got ${bind_browse_status}"
+            cat /tmp/bind-browser-browse.json
+            exit 1
+          fi
+          python3 -c "import json; b=json.load(open('/tmp/bind-browser-browse.json')); assert 'not supported for BIND' in b['message'], b"
+          bind_glob_status="$(curl --silent --show-error -b /tmp/cookies -o /tmp/bind-browser-glob.json -w "%{http_code}" \
+            "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search?record_name=browser*")"
+          if [ "${bind_glob_status}" != "400" ]; then
+            echo "Expected BIND browser wildcard search to return 400; got ${bind_glob_status}"
+            cat /tmp/bind-browser-glob.json
+            exit 1
+          fi
+          python3 -c "import json; b=json.load(open('/tmp/bind-browser-glob.json')); assert 'not supported for BIND' in b['message'], b"
+          curl --fail --silent -b /tmp/cookies \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -X POST "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
+            -d '{"record_name":"browser","record_type":"A","ttl":300,"values":["192.0.2.77"]}' \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['action']=='created', b"
+          wait_for_record_value browser.smoke.test 192.0.2.77
+          curl --fail --silent -b /tmp/cookies \
+            "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search?record_name=browser&record_type=A" \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['status']=='success'; assert b['records'][0]['values']==['192.0.2.77'], b"
+          curl --fail --silent -b /tmp/cookies \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -X PUT "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
+            -d '{"record_name":"browser","record_type":"A","ttl":300,"values":["192.0.2.78"]}' \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['action']=='updated', b"
+          wait_for_record_value browser.smoke.test 192.0.2.78
+          curl --fail --silent -b /tmp/cookies \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -X DELETE "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
+            -d '{"record_name":"browser","record_type":"A"}' \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['action']=='deleted', b"
+          wait_for_record_absent browser.smoke.test
+
           echo "[compose] Validate hardened Compose config and startup against the smoke image"
           APP_VERSION="$(tr -d '\r\n' < VERSION)"
           docker tag "${IMAGE_TAG}" "hometinker12/api-to-dns:${APP_VERSION}"
@@ -605,6 +728,7 @@ jobs:
           import os
           import subprocess
 
+          assert os.environ["APP_VERSION"] == "0.8.0", os.environ["APP_VERSION"]
           expected_image = f"hometinker12/api-to-dns:{os.environ['APP_VERSION']}"
           cfg = json.loads(subprocess.check_output(["docker", "compose", "config", "--format", "json"], text=True))
           svc = cfg["services"]["dns-api"]
@@ -660,7 +784,7 @@ jobs:
             -d "username=admin&password=your-admin-password" \
             -o /dev/null
           curl --fail --silent -b /tmp/compose-cookies http://127.0.0.1:8001/admin \
-            | python3 -c "import sys; assert 'api-to-dns App Dashboard' in sys.stdin.read()"
+            | python3 -c "import sys; assert 'api-to-dns Dashboard' in sys.stdin.read()"
 
           echo "[compose] Persisted app_secrets.env overrides Compose env_file on restart"
           # Distinct from .env so we prove Python env_bootstrap (not shell source) wins over env_file.
@@ -736,7 +860,7 @@ jobs:
             -d "username=admin&password=your-admin-password" \
             -o /dev/null
           curl --fail --silent -b /tmp/compose-cookies-restored http://127.0.0.1:8001/admin \
-            | python3 -c "import sys; assert 'api-to-dns App Dashboard' in sys.stdin.read()"
+            | python3 -c "import sys; assert 'api-to-dns Dashboard' in sys.stdin.read()"
           docker compose down -v --remove-orphans
 
           echo "BIND smoke on Linux completed successfully."
@@ -1056,8 +1180,22 @@ jobs:
 
             Write-Host '[microsoft] GET /admin'
             $admin = Invoke-WebRequest -Uri "$base/admin" -WebSession $WebSession -UseBasicParsing
-            if ($admin.Content -notmatch 'api-to-dns App Dashboard') {
+            if ($admin.Content -notmatch 'api-to-dns Dashboard') {
               throw 'Admin page did not contain expected title (session or credentials).'
+            }
+            if ($admin.Content -notmatch 'Configured zones') {
+              throw 'Admin page missing Configured zones section'
+            }
+            $nav = ($admin.Content -split '<nav class="nav-links">', 2)[1] -split '</nav>', 2 | Select-Object -First 1
+            if ($nav.IndexOf('href="/api-keys"') -ge $nav.IndexOf('href="/admin"') -or
+                $nav.IndexOf('href="/admin"') -ge $nav.IndexOf('href="/settings"') -or
+                $nav.IndexOf('href="/settings"') -ge $nav.IndexOf('action="/logout"')) {
+              throw 'Admin header navigation order is not API Keys, Dashboard, Settings, Logout'
+            }
+            $appVersion = (Get-Content -Raw VERSION).Trim()
+            if ($appVersion -ne '0.8.0') { throw "Expected VERSION 0.8.0; got $appVersion" }
+            if ($admin.Content -notmatch [regex]::Escape("api-to-dns v$appVersion")) {
+              throw 'Admin page missing version footer'
             }
 
             # PowerShell does not treat \ as an escape, so ".\\$user" produced a literal
@@ -1117,6 +1255,29 @@ jobs:
             $kc = Invoke-RestMethod -Uri "$base/keycheck" -Headers @{ 'X-API-Key' = $msLocalKey }
             if ($kc.status -ne 'success') { throw 'keycheck failed' }
 
+            Write-Host '[microsoft-local] JSON GET /zones'
+            $zonesJson = Invoke-RestMethod -Uri "$base/zones" -Headers @{
+              'Accept'   = 'application/json'
+              'X-API-Key' = $msLocalKey
+            }
+            $zoneNames = @(@($zonesJson) | ForEach-Object { $_.zone_name })
+            if ($zoneNames -notcontains $la) {
+              throw "JSON GET /zones missing allowed zone $la"
+            }
+            if ($zoneNames -contains $ld) {
+              throw "JSON GET /zones leaked denied zone ${ld}: $($zoneNames -join ', ')"
+            }
+            if (@($zoneNames).Count -ne 1 -or $zoneNames[0] -ne $la) {
+              throw "JSON GET /zones expected exactly [$la]; got [$($zoneNames -join ', ')]"
+            }
+            try {
+              Invoke-WebRequest -Uri "$base/zones" -Headers @{ Accept = 'application/json' } -UseBasicParsing -ErrorAction Stop | Out-Null
+              throw 'JSON GET /zones without API key should fail'
+            } catch {
+              $code = $_.Exception.Response.StatusCode.value__
+              if ($code -ne 403) { throw "Expected JSON GET /zones without key to return 403; got $code" }
+            }
+
             $www = "www.$la"
             $jCreate  = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.10') }
             $jReplace = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; ttl = 300; values = @('192.0.2.20') }
@@ -1156,6 +1317,65 @@ jobs:
 
             $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 403 -Method POST -JsonBody $jDenied
             Assert-DnsRecordAction -Json $x -ExpectedAction 'access_denied'
+
+            Write-Host '[microsoft-local] Dashboard links to DNS browser and /zones redirects'
+            $adminHtml = (Invoke-WebRequest -Uri "$base/admin" -WebSession $WebSession -UseBasicParsing).Content
+            if ($adminHtml -notmatch [regex]::Escape("/zones/$zoneId/records")) { throw 'Dashboard missing DNS browser link' }
+            try {
+              Invoke-WebRequest -Uri "$base/zones" -WebSession $WebSession -UseBasicParsing -MaximumRedirection 0 -ErrorAction Stop | Out-Null
+              throw 'Zones page should redirect to the dashboard'
+            } catch {
+              $code = $_.Exception.Response.StatusCode.value__
+              $location = $_.Exception.Response.Headers.Location.OriginalString
+              if ($code -ne 303 -or $location -ne '/admin') {
+                throw "Expected /zones redirect to /admin; got $code $location"
+              }
+            }
+            try {
+              Invoke-WebRequest -Uri "$base/zones/$zoneId/records" -UseBasicParsing -MaximumRedirection 0 -ErrorAction Stop | Out-Null
+              throw 'Unauthenticated DNS browser request should not succeed'
+            } catch {
+              $code = $_.Exception.Response.StatusCode.value__
+              if ($code -notin 303, 401, 302) { throw "Expected unauthenticated DNS browser redirect/deny; got $code" }
+            }
+
+            Write-Host '[microsoft-local] Admin DNS browser session CRUD'
+            $browserPage = (Invoke-WebRequest -Uri "$base/zones/$zoneId/records" -WebSession $WebSession -UseBasicParsing).Content
+            if ($browserPage -notmatch 'dns-browser-search') { throw 'DNS browser page missing search form' }
+            $browserHeaders = @{
+              'Content-Type' = 'application/json'
+              'Accept'       = 'application/json'
+              'Origin'       = $base
+              'Referer'      = "$base/zones/$zoneId/records"
+            }
+            $browserCreate = Invoke-WebRequest -Uri "$base/zones/$zoneId/records" -WebSession $WebSession -Method POST -Headers $browserHeaders -Body '{"record_name":"browser","record_type":"A","ttl":300,"values":["192.0.2.77"]}' -UseBasicParsing
+            $bc = $browserCreate.Content | ConvertFrom-Json
+            if ($bc.action -ne 'created') { throw "browser create failed: $($browserCreate.Content)" }
+            Wait-LocalA -Fqdn "browser.$la" -ExpectedIp '192.0.2.77'
+            $browserBrowse = Invoke-RestMethod -Uri "$base/zones/$zoneId/records/search" -WebSession $WebSession
+            if ($browserBrowse.match_mode -ne 'browse' -or -not ($browserBrowse.records | Where-Object { $_.record_name -eq 'browser' -and $_.record_type -eq 'A' })) {
+              throw "browser empty browse failed: $($browserBrowse | ConvertTo-Json -Compress -Depth 6)"
+            }
+            $browserGlob = Invoke-RestMethod -Uri "$base/zones/$zoneId/records/search?record_name=browser*&record_type=A" -WebSession $WebSession
+            if ($browserGlob.match_mode -ne 'glob' -or $browserGlob.records[0].values[0] -ne '192.0.2.77') {
+              throw "browser wildcard search failed: $($browserGlob | ConvertTo-Json -Compress -Depth 6)"
+            }
+            $browserQGlob = Invoke-RestMethod -Uri "$base/zones/$zoneId/records/search?record_name=BROW?ER&record_type=A" -WebSession $WebSession
+            if ($browserQGlob.match_mode -ne 'glob' -or $browserQGlob.records[0].values[0] -ne '192.0.2.77') {
+              throw "browser case-insensitive ? glob failed: $($browserQGlob | ConvertTo-Json -Compress -Depth 6)"
+            }
+            $browserSearch = Invoke-RestMethod -Uri "$base/zones/$zoneId/records/search?record_name=browser&record_type=A" -WebSession $WebSession
+            if ($browserSearch.status -ne 'success' -or $browserSearch.records[0].values[0] -ne '192.0.2.77') {
+              throw "browser search failed: $($browserSearch | ConvertTo-Json -Compress)"
+            }
+            $browserReplace = Invoke-WebRequest -Uri "$base/zones/$zoneId/records" -WebSession $WebSession -Method PUT -Headers $browserHeaders -Body '{"record_name":"browser","record_type":"A","ttl":300,"values":["192.0.2.78"]}' -UseBasicParsing
+            $br = $browserReplace.Content | ConvertFrom-Json
+            if ($br.action -ne 'updated') { throw "browser replace failed: $($browserReplace.Content)" }
+            Wait-LocalA -Fqdn "browser.$la" -ExpectedIp '192.0.2.78'
+            $browserDelete = Invoke-WebRequest -Uri "$base/zones/$zoneId/records" -WebSession $WebSession -Method DELETE -Headers $browserHeaders -Body '{"record_name":"browser","record_type":"A"}' -UseBasicParsing
+            $bd = $browserDelete.Content | ConvertFrom-Json
+            if ($bd.action -ne 'deleted') { throw "browser delete failed: $($browserDelete.Content)" }
+            Wait-LocalAbsent -Fqdn "browser.$la"
 
             if ($env:REMOTE_WINRM_HOST -and $env:REMOTE_WINRM_USER -and $env:REMOTE_WINRM_PASSWORD) {
               Write-Host '=== Remote Microsoft DNS (secrets) ==='

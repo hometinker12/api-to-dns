@@ -2,15 +2,34 @@
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-07
+
+### Added
+
+- Admin **DNS browser**: open a zone from the Dashboard; filter by type (A/AAAA/CNAME/TXT/MX/NS/SRV/CAA/PTR/SOA); and add/edit/delete RRsets. Requires `dns_zones.update` for page, search, and mutations (links hidden without it). SOA is view-only; apex NS is blocked for `@` and the zone FQDN; PTR is limited to reverse zones. Rate-limited via `RATE_LIMIT_DNS_BROWSER` (default `60:60`; session identity, ignoring unvalidated API-key headers). Providers share canonical value formats via `src/dns_record_types.py`.
+- DNS browser UX and search: configuration name under the page header; aligned Search/Add actions; IP Address labels with browser-side IPv4/IPv6 validation; submission locking/status; unified multi-value editor with red `X` removal; provider name in `<code>`. Cloudflare's zone-controlled **Proxied (orange cloud)** setting is shown for eligible A/AAAA/CNAME writes. Empty browse and case-insensitive relative-name `*`/`?` globs work for Cloudflare, Azure, and Microsoft DNS (capped at 100 complete RRsets with truncation status; Cloudflare pages at 100 rows; Microsoft streams/groups with optional `-RRType`). BIND / TSIG returns a clear exact-name-only message (no AXFR enumeration). Release smoke covers BIND blank-browse and wildcard `400` responses plus Microsoft browse, `*`, and `?` glob paths.
+- **Remote Syslog** under **Settings → System Settings** (last entry): optional best-effort forwarding of stored audit/activity events as RFC 5424 messages with JSON payloads over TLS (preferred), UDP, or TCP. Plaintext UDP/TCP require an explicit insecure opt-in. Configurable host, port, protocol, facility, minimum level, timeout, and bounded queue size (max 5000). Delivery is asynchronous and non-durable; failures are rate-limited to operational logs. Saving settings emits `system.syslog_updated`.
+- Release BIND/Docker smoke installs `rsyslog`, enables remote syslog via System Settings (UDP with plaintext opt-in), and asserts an end-to-end delivery of a forwarded audit event.
+- Admin UI branding: SVG favicon and logo mark on pages (including login), brand wordmark above page titles, and a bottom-right version footer (`<code>api-to-dns vX.Y.Z</code>` linking to the GitHub repository).
+- Admin UI dark mode: moon/sun toggle in the page header before API Keys, Dashboard, Settings, and Logout with preference stored in the browser; defaults to system color scheme when unset.
+
+### Fixed
+
+- Microsoft DNS browser browse/search no longer fails with WinRM "command line is too long": long PowerShell payloads are staged to a remote tempfile in short base64 chunks (EncodedCommand-safe), and browse grouping uses `ArrayList` instead of `Generic.List` under WinRM.
+
+### Changed
+
+- Application version metadata aligned to **0.8.0** (`VERSION`, OpenAPI, `pyproject.toml`, Docker label, Compose pin).
+- The Dashboard is the single configured-zone management view. Browser `GET /zones` requests redirect to `/admin`, while the JSON `GET /zones` API and all zone-management routes remain available.
+- Shared top navigation order is API Keys, Dashboard, Settings, Logout on every authenticated page; API Docs appears on the API Keys page next to Create API Key.
+- Authentication role catalog labels wrap in `<code>`; `dns_zones.update` notes admin DNS browser access.
+- API Keys page helper text focuses on generating named keys, scoping zones, and copying the key once at creation.
+
 ## [0.7.0] - 2026-08-05
 
 ### Added
 
 - **Settings → Backup** (global admin): export/import configuration archives (`.atdb`). Outer password encryption is on by default; at-rest Fernet ciphertext is copied as-is with `SECRET_KEY` / `ENCRYPTION_KEY` so restores remain decryptable. Optional audit-log inclusion; destructive restore with Let's Encrypt–style progress dialog; application-secrets restore persists keys and auto-restarts.
-- Admin UI dark mode: moon/sun toggle in the page header (left of Settings/Dashboard) with preference stored in the browser; defaults to system color scheme when unset.
-- **Remote Syslog** under **Settings → System Settings** (last entry): optional best-effort forwarding of stored audit/activity events as RFC 5424 messages with JSON payloads over TLS (preferred), UDP, or TCP. Plaintext UDP/TCP require an explicit insecure opt-in. Configurable host, port, protocol, facility, minimum level, timeout, and bounded queue size (max 5000). Delivery is asynchronous and non-durable; failures are rate-limited to operational logs. Saving settings emits `system.syslog_updated`.
-- Release BIND/Docker smoke installs `rsyslog`, enables remote syslog via System Settings (UDP with plaintext opt-in), and asserts an end-to-end delivery of a forwarded audit event.
-- `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, and GitHub issue/PR templates.
 
 ### Security
 

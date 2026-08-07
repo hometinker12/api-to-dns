@@ -7,6 +7,7 @@ from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 
 from src.auth import create_session_cookie
+from src.db import SessionLocal
 
 
 def test_get_app_version_matches_version_file() -> None:
@@ -15,7 +16,7 @@ def test_get_app_version_matches_version_file() -> None:
     get_app_version.cache_clear()
     expected = (Path(__file__).resolve().parents[1] / "VERSION").read_text(encoding="utf-8").strip()
     assert get_app_version() == expected
-    assert expected == "0.7.0"
+    assert expected == "0.8.0"
 
 
 def test_fastapi_app_version_matches_version_file() -> None:
@@ -24,6 +25,18 @@ def test_fastapi_app_version_matches_version_file() -> None:
 
     get_app_version.cache_clear()
     assert app.version == get_app_version()
+
+
+def test_login_page_shows_version_footer_link(client: TestClient) -> None:
+    from src.version import get_app_version
+
+    get_app_version.cache_clear()
+    version = get_app_version()
+    response = client.get("/login")
+    assert response.status_code == 200
+    assert 'class="app-version-footer"' in response.text
+    assert 'href="https://github.com/hometinker12/api-to-dns"' in response.text
+    assert f"<code>api-to-dns v{version}</code>" in response.text
 
 
 def test_encryption_key_rejected_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -185,6 +198,33 @@ def test_csrf_rejects_cross_origin_post(client: TestClient, monkeypatch: pytest.
     assert response.status_code == 403
 
 
+def test_csrf_rejects_dns_browser_mutations(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.csrf.relax_csrf_for_tests", lambda: False)
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        from sqlmodel import select
+
+        from src.models import DnsZoneConfig
+
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+        zone_id = zone.id
+
+    payload = {"record_name": "www", "record_type": "A", "ttl": 300, "values": ["192.0.2.10"]}
+    headers = {"Origin": "https://evil.example", "Host": "localhost"}
+    assert client.post(f"/zones/{zone_id}/records", json=payload, headers=headers).status_code == 403
+    assert client.put(f"/zones/{zone_id}/records", json=payload, headers=headers).status_code == 403
+    assert (
+        client.request(
+            "DELETE",
+            f"/zones/{zone_id}/records",
+            json={"record_name": "www", "record_type": "A"},
+            headers=headers,
+        ).status_code
+        == 403
+    )
+
+
 def test_csrf_allows_same_origin_login_post(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("src.csrf.relax_csrf_for_tests", lambda: False)
     response = client.post(
@@ -309,15 +349,16 @@ def test_openapi_disabled_by_default_outside_tests(monkeypatch: pytest.MonkeyPat
     assert app_module._openapi_enabled() is False
 
 
-def test_admin_shows_api_docs_link_when_openapi_enabled(client: TestClient) -> None:
+def test_api_keys_shows_api_docs_link_when_openapi_enabled(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
-    response = client.get("/admin")
+    response = client.get("/api-keys")
     assert response.status_code == 200
     assert "API Docs" in response.text
     assert 'href="/docs#/"' in response.text
+    assert response.text.index('href="/docs#/"') < response.text.index('id="open-create-key"')
 
 
-def test_admin_hides_api_docs_link_when_openapi_disabled(
+def test_api_keys_hides_api_docs_link_when_openapi_disabled(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -325,7 +366,7 @@ def test_admin_hides_api_docs_link_when_openapi_disabled(
 
     monkeypatch.setattr(app_module, "_OPENAPI_ON", False)
     client.cookies.set("session", create_session_cookie("admin"))
-    response = client.get("/admin")
+    response = client.get("/api-keys")
     assert response.status_code == 200
     assert "API Docs" not in response.text
     assert 'href="/docs#/"' not in response.text

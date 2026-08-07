@@ -5,10 +5,11 @@ from sqlalchemy import Index, UniqueConstraint
 from sqlmodel import Field as SQLField
 from sqlmodel import SQLModel
 
+from .dns_record_types import MUTABLE_RECORD_TYPES, PUBLIC_RECORD_TYPES, normalize_public_record_type
 from .time_utils import utc_now
 
-_ALLOWED_DELETE_RR = frozenset({"A", "AAAA", "CNAME", "TXT"})
-_ALLOWED_PUBLIC_RECORD_TYPES = frozenset({"A", "AAAA", "CNAME", "TXT"})
+_ALLOWED_DELETE_RR = MUTABLE_RECORD_TYPES
+_ALLOWED_PUBLIC_RECORD_TYPES = PUBLIC_RECORD_TYPES
 
 LOG_LEVEL_VERBOSE = "VERBOSE"
 LOG_LEVEL_INFORMATIONAL = "INFORMATIONAL"
@@ -88,12 +89,7 @@ class DnsRecordRequest(BaseModel):
 
 
 def _validate_public_record_type(record_type: str) -> str:
-    rt = (record_type or "").strip().upper()
-    if rt not in _ALLOWED_PUBLIC_RECORD_TYPES:
-        raise ValueError(
-            f"record_type must be one of {', '.join(sorted(_ALLOWED_PUBLIC_RECORD_TYPES))}; got {record_type!r}."
-        )
-    return rt
+    return normalize_public_record_type(record_type)
 
 
 class DnsRecordCreateRequest(BaseModel):
@@ -187,6 +183,13 @@ class DnsRecordInfo(BaseModel):
         None,
         description="Record rdata values in the same format as POST/PUT when available from the provider.",
     )
+
+
+class DnsRecordListResult(BaseModel):
+    """Internal provider result for bounded DNS browser browse/pattern searches."""
+
+    records: list[DnsRecordInfo] = Field(default_factory=list)
+    truncated: bool = False
 
 
 class DnsRecordGetResponse(BaseModel):

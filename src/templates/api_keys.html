@@ -4,11 +4,12 @@
   <meta charset="UTF-8" />
   <title>api-to-dns API Keys</title>
   {% include "_theme_init.html" %}
+  {% include "_brand_head.html" %}
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <div class="page">
-    {% set page_title = "api-to-dns API Keys" %}
+    {% set page_title = "API Keys" %}
     {% set page_help = "" %}
     {% set page_links = [] %}
     {% include "_page_header.html" %}
@@ -20,14 +21,14 @@
     <section>
       <div class="section-title-row">
         <h2>Existing API keys</h2>
-        <button type="button" id="open-create-key" {% if not all_zones %}disabled{% endif %}>Create API Key</button>
+        <div class="section-title-actions">
+          {% if openapi_enabled %}
+            <a class="button neutral" href="/docs#/">API Docs</a>
+          {% endif %}
+          <button type="button" id="open-create-key" {% if not all_zones %}disabled{% endif %}>Create API Key</button>
+        </div>
       </div>
-      <p class="help">
-        API keys authenticate calls to <code>/dns-record</code>. The endpoint is a REST resource that supports
-        <code>GET</code> (lookup), <code>POST</code> (create &mdash; <code>409</code> if the record type already exists),
-        <code>PUT</code> (full replace &mdash; <code>404</code> if missing), <code>PATCH</code> (update values and/or TTL &mdash;
-        <code>404</code> if missing), and <code>DELETE</code> (remove by query string &mdash; <code>404</code> if missing).
-      </p>
+      <p class="help">Generate named API keys, scope them to DNS zones, and copy each key when created - it is shown only once.</p>
       {% if not all_zones %}
         <p class="help">No zones configured. Add a DNS zone first.</p>
       {% endif %}
@@ -229,5 +230,6 @@
       })();
     </script>
   </div>
+  {% include "_page_footer.html" %}
 </body>
 </html>

@@ -23,6 +23,8 @@ _DEFAULT_LIMITS = {
     "/login": (20, 60),
     "/keycheck": (60, 60),
     "/dns-record": (180, 60),
+    # Synthetic prefix for /zones/{id}/records[+ /search] (matched specially below).
+    "/zones/*/records": (60, 60),
 }
 
 
@@ -33,6 +35,7 @@ def _limits() -> dict[str, tuple[int, int]]:
         "RATE_LIMIT_LOGIN": "/login",
         "RATE_LIMIT_KEYCHECK": "/keycheck",
         "RATE_LIMIT_DNS_RECORD": "/dns-record",
+        "RATE_LIMIT_DNS_BROWSER": "/zones/*/records",
     }
     for env_name, path in mapping.items():
         raw = os.getenv(env_name, "").strip()
@@ -46,14 +49,44 @@ def _limits() -> dict[str, tuple[int, int]]:
     return limits
 
 
+def _is_dns_browser_path(path: str) -> bool:
+    parts = [part for part in (path or "").split("/") if part]
+    if len(parts) < 3 or parts[0] != "zones" or parts[2] != "records":
+        return False
+    if len(parts) == 3:
+        return True
+    return len(parts) == 4 and parts[3] == "search"
+
+
 def _match_route(path: str, limits: dict[str, tuple[int, int]]) -> tuple[str, tuple[int, int]] | None:
+    if _is_dns_browser_path(path) and "/zones/*/records" in limits:
+        return "/zones/*/records", limits["/zones/*/records"]
     for prefix, rule in limits.items():
+        if prefix == "/zones/*/records":
+            continue
         if path == prefix or path.startswith(prefix + "/"):
             return prefix, rule
     return None
 
 
 def _identity_hash(request: Request) -> str:
+    path = request.url.path or ""
+    # Session-only browser routes ignore unvalidated API-key headers so clients
+    # cannot rotate X-API-Key / Bearer values to mint a fresh bucket per request.
+    if _is_dns_browser_path(path):
+        session_token = request.cookies.get("session")
+        if session_token:
+            try:
+                from .auth import verify_session_cookie
+
+                username, _version = verify_session_cookie(session_token)
+                return f"session:{username.strip().lower()}"
+            except Exception:
+                pass
+        client = getattr(request, "client", None)
+        host = client.host if client else "unknown"
+        return f"ip:{host}"
+
     api_key = api_key_from_headers(
         request.headers.get("x-api-key"),
         request.headers.get("authorization"),
@@ -137,7 +170,13 @@ def rate_limit_exceeded(request: Request) -> bool:
 def rate_limit_rejection_response(request: Request):
     message = "Rate limit exceeded. Try again later."
     headers = {"Retry-After": "60"}
-    if wants_json_response(request) or request.url.path.startswith("/dns-record") or request.url.path == "/keycheck":
+    path = request.url.path or ""
+    if (
+        wants_json_response(request)
+        or path.startswith("/dns-record")
+        or path == "/keycheck"
+        or _is_dns_browser_path(path)
+    ):
         return JSONResponse(
             status_code=429,
             content={"detail": {"error": "rate_limited", "message": message}},

@@ -109,7 +109,10 @@ def get_dns_record(
     record_name: str = Query(..., description="Record name relative to the zone, e.g. www or @"),
     record_type: str | None = Query(
         None,
-        description="Optional DNS record type: A, AAAA, CNAME, or TXT. Omit to return all supported types at the name.",
+        description=(
+            "Optional DNS record type: A, AAAA, CNAME, TXT, MX, NS, SRV, CAA, PTR, or SOA. "
+            "Omit to return all supported types at the name."
+        ),
     ),
     x_api_key: str | None = Header(None, alias="X-API-Key"),
     authorization: str | None = Header(None, alias="Authorization"),
@@ -192,7 +195,7 @@ def get_dns_record(
             else (
                 f"No {lookup_type} record found at {record_name!r} in zone {provider_domain!r}."
                 if lookup_type
-                else f"No A, AAAA, CNAME, or TXT records found at {record_name!r} in zone {provider_domain!r}."
+                else f"No supported records found at {record_name!r} in zone {provider_domain!r}."
             )
         )
         emit_activity_event(
@@ -355,11 +358,9 @@ def delete_dns_record(
 ):
     api_key = api_key_from_headers(x_api_key, authorization)
     try:
-        from ..plugins.utils import normalize_lookup_record_type as _normalize
+        from ..dns_record_types import normalize_public_record_type
 
-        normalized_type = _normalize(record_type)
-        if normalized_type is None:
-            raise ValueError("record_type is required.")
+        normalized_type = normalize_public_record_type(record_type)
     except ValueError as exc:
         raise HTTPException(
             status_code=400,

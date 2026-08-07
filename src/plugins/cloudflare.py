@@ -2,13 +2,25 @@ from typing import Any
 
 import httpx
 
-from ..models import DnsRecordInfo, DnsRecordRequest
+from ..dns_record_types import (
+    LOOKUP_RECORD_TYPES,
+    MUTABLE_RECORD_TYPES,
+    format_caa,
+    format_mx,
+    format_srv,
+    normalize_hostname,
+    normalize_record_values,
+    parse_caa,
+    parse_mx,
+    parse_srv,
+)
+from ..models import DnsRecordInfo, DnsRecordListResult, DnsRecordRequest
 from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
-from .utils import lookup_record_types_to_query
+from .utils import lookup_record_types_to_query, record_name_matches
 
 CLOUDFLARE_API_BASE_URL = "https://api.cloudflare.com/client/v4"
 DEFAULT_TIMEOUT_SECONDS = 30.0
-SUPPORTED_RECORD_TYPES = ("A", "AAAA", "CNAME", "TXT")
+SUPPORTED_RECORD_TYPES = LOOKUP_RECORD_TYPES
 
 
 def _truthy(value: str | None) -> bool:
@@ -48,6 +60,32 @@ def _normalize_txt_value(value: str) -> str:
 
 def _cloudflare_txt_content(value: str) -> str:
     return f'"{_normalize_txt_value(value)}"'
+
+
+def _canonical_from_row(record_type: str, row: dict[str, Any]) -> str:
+    rt = record_type.upper()
+    if rt == "MX":
+        return format_mx(int(row.get("priority") or 0), str(row.get("content") or ""))
+    if rt == "SRV":
+        data = row.get("data") or {}
+        return format_srv(
+            int(data.get("priority") if data.get("priority") is not None else row.get("priority") or 0),
+            int(data.get("weight") or 0),
+            int(data.get("port") or 0),
+            str(data.get("target") or row.get("content") or ""),
+        )
+    if rt == "CAA":
+        data = row.get("data") or {}
+        if data:
+            return format_caa(int(data.get("flags") or 0), str(data.get("tag") or ""), str(data.get("value") or ""))
+        return normalize_record_values("CAA", [str(row.get("content") or "")])[0]
+    if rt == "TXT":
+        return _normalize_txt_value(str(row.get("content") or ""))
+    if rt in {"CNAME", "NS", "PTR"}:
+        return normalize_hostname(str(row.get("content") or ""))
+    if rt == "SOA":
+        return str(row.get("content") or "")
+    return str(row.get("content") or "")
 
 
 class CloudflareDnsClient:
@@ -90,7 +128,7 @@ class CloudflareDnsClient:
 
             if record_type == "DELETE":
                 inner = payload.values[0].strip().upper()
-                if inner not in SUPPORTED_RECORD_TYPES:
+                if inner not in MUTABLE_RECORD_TYPES:
                     raise ValueError(f"Unsupported record type for Cloudflare: {inner}")
                 existing = self._list_records(client, zone_id, fqdn, inner)
                 if not existing:
@@ -99,12 +137,12 @@ class CloudflareDnsClient:
                     self._delete_record(client, zone_id, row["id"])
                 return True
 
-            if record_type not in SUPPORTED_RECORD_TYPES:
+            if record_type not in MUTABLE_RECORD_TYPES:
                 raise ValueError(f"Unsupported record type for Cloudflare: {record_type}")
 
             existing = self._list_records(client, zone_id, fqdn, record_type)
             existed = bool(existing)
-            desired_values = self._desired_values(record_type, payload.values)
+            desired_values = normalize_record_values(record_type, list(payload.values))
             self._sync_records(
                 client,
                 zone_id=zone_id,
@@ -140,11 +178,88 @@ class CloudflareDnsClient:
         with self._client() as client:
             zone_id = self._resolve_zone_id(client, zone_name)
             for rt in types_to_query:
+                if rt not in SUPPORTED_RECORD_TYPES:
+                    continue
                 rows = self._list_records(client, zone_id, fqdn, rt)
                 if not rows:
                     continue
                 results.append(self._rows_to_info(display_name, rt, rows))
         return results
+
+    def list_records(
+        self,
+        *,
+        name_pattern: str | None = None,
+        record_type: str | None = None,
+        limit: int = 100,
+        dns_server: str | None = None,
+        dns_zone: str | None = None,
+    ) -> DnsRecordListResult:
+        if dns_server:
+            raise ValueError(
+                "Cloudflare DNS ignores per-server host settings; use the Cloudflare fields on the zone configuration."
+            )
+        if not dns_zone:
+            raise ValueError("DNS zone (domain) is required in the zone configuration.")
+
+        zone_name = dns_zone.strip().rstrip(".")
+        result_limit = max(1, int(limit))
+        requested_type = record_type.upper() if record_type else None
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        page = 1
+        truncated = False
+
+        with self._client() as client:
+            zone_id = self._resolve_zone_id(client, zone_name)
+            while True:
+                params: dict[str, Any] = {
+                    "page": page,
+                    "per_page": 100,
+                    "order": "name",
+                    "direction": "asc",
+                }
+                if requested_type:
+                    params["type"] = requested_type
+                body = self._request(client, "GET", f"/zones/{zone_id}/dns_records", params=params)
+                rows = [row for row in (body.get("result") or []) if isinstance(row, dict)]
+                appended_existing = False
+
+                for row in rows:
+                    row_type = str(row.get("type") or "").upper()
+                    if row_type not in SUPPORTED_RECORD_TYPES or (requested_type and row_type != requested_type):
+                        continue
+                    display_name = _relative_name(zone_name, str(row.get("name") or ""))
+                    if not record_name_matches(name_pattern, display_name):
+                        continue
+                    key = (display_name, row_type)
+                    if key in grouped:
+                        grouped[key].append(row)
+                        appended_existing = True
+                        continue
+                    if len(grouped) >= result_limit:
+                        # Keep paging only long enough to finish already-open RRsets.
+                        # Cloudflare pages are ordered by name, so same-name values may
+                        # continue across page boundaries after later types appear.
+                        truncated = True
+                        continue
+                    grouped[key] = [row]
+                    appended_existing = True
+
+                info = body.get("result_info") or {}
+                total_pages = int(info.get("total_pages") or 0)
+                if truncated and not appended_existing:
+                    break
+                if not rows or (total_pages and page >= total_pages) or (not total_pages and len(rows) < 100):
+                    break
+                page += 1
+
+        return DnsRecordListResult(
+            records=[
+                self._rows_to_info(display_name, rr_type, record_rows)
+                for (display_name, rr_type), record_rows in grouped.items()
+            ],
+            truncated=truncated,
+        )
 
     def _client(self) -> httpx.Client:
         headers = {
@@ -224,14 +339,14 @@ class CloudflareDnsClient:
         *,
         fqdn: str,
         record_type: str,
-        content: str,
+        value: str,
         ttl: int,
     ) -> None:
         self._request(
             client,
             "POST",
             f"/zones/{zone_id}/dns_records",
-            json_body=self._record_body(fqdn, record_type, content, ttl),
+            json_body=self._record_body(fqdn, record_type, value, ttl),
         )
 
     def _update_record(
@@ -242,42 +357,61 @@ class CloudflareDnsClient:
         *,
         fqdn: str,
         record_type: str,
-        content: str,
+        value: str,
         ttl: int,
     ) -> None:
         self._request(
             client,
             "PUT",
             f"/zones/{zone_id}/dns_records/{record_id}",
-            json_body=self._record_body(fqdn, record_type, content, ttl),
+            json_body=self._record_body(fqdn, record_type, value, ttl),
         )
 
     def _delete_record(self, client: httpx.Client, zone_id: str, record_id: str) -> None:
         self._request(client, "DELETE", f"/zones/{zone_id}/dns_records/{record_id}")
 
-    def _record_body(self, fqdn: str, record_type: str, content: str, ttl: int) -> dict[str, Any]:
-        api_content = _cloudflare_txt_content(content) if record_type == "TXT" else content
+    @staticmethod
+    def _srv_parts(fqdn: str) -> tuple[str, str, str]:
+        labels = fqdn.strip(".").split(".")
+        if len(labels) >= 3 and labels[0].startswith("_") and labels[1].startswith("_"):
+            return labels[0], labels[1], ".".join(labels[2:])
+        return "_service", "_tcp", fqdn
+
+    def _record_body(self, fqdn: str, record_type: str, value: str, ttl: int) -> dict[str, Any]:
         body: dict[str, Any] = {
             "type": record_type,
             "name": fqdn,
-            "content": api_content,
             "ttl": ttl,
         }
+        if record_type == "TXT":
+            body["content"] = _cloudflare_txt_content(value)
+        elif record_type == "MX":
+            priority, exchange = parse_mx(value)
+            body["content"] = exchange
+            body["priority"] = priority
+        elif record_type == "SRV":
+            priority, weight, port, target = parse_srv(value)
+            service, proto, name = self._srv_parts(fqdn)
+            body["data"] = {
+                "priority": priority,
+                "weight": weight,
+                "port": port,
+                "target": target,
+                "service": service,
+                "proto": proto,
+                "name": name,
+            }
+        elif record_type == "CAA":
+            flags, tag, caa_value = parse_caa(value)
+            if caa_value.startswith('"') and caa_value.endswith('"') and len(caa_value) >= 2:
+                caa_value = caa_value[1:-1]
+            body["data"] = {"flags": flags, "tag": tag, "value": caa_value}
+        else:
+            body["content"] = value
+
         if record_type in {"A", "AAAA", "CNAME"}:
             body["proxied"] = self._proxied
         return body
-
-    @staticmethod
-    def _desired_values(record_type: str, values: list[str]) -> list[str]:
-        if record_type == "CNAME":
-            if len(values) != 1:
-                raise ValueError("CNAME requires exactly one value.")
-            return [values[0].strip().rstrip(".")]
-        if not values:
-            raise ValueError("values is required and must contain at least one entry.")
-        if record_type == "TXT":
-            return [_normalize_txt_value(v) for v in values]
-        return [v for v in values]
 
     def _sync_records(
         self,
@@ -293,7 +427,6 @@ class CloudflareDnsClient:
         if record_type == "CNAME":
             content = desired_values[0]
             if existing:
-                # CNAME is single-valued; update the first row, delete extras.
                 first = existing[0]
                 self._update_record(
                     client,
@@ -301,7 +434,7 @@ class CloudflareDnsClient:
                     str(first["id"]),
                     fqdn=fqdn,
                     record_type=record_type,
-                    content=content,
+                    value=content,
                     ttl=ttl,
                 )
                 for row in existing[1:]:
@@ -312,7 +445,7 @@ class CloudflareDnsClient:
                     zone_id,
                     fqdn=fqdn,
                     record_type=record_type,
-                    content=content,
+                    value=content,
                     ttl=ttl,
                 )
             return
@@ -320,9 +453,8 @@ class CloudflareDnsClient:
         desired_set = set(desired_values)
         existing_by_content: dict[str, dict[str, Any]] = {}
         stale: list[dict[str, Any]] = []
-        normalize_content = _normalize_txt_value if record_type == "TXT" else str
         for row in existing:
-            content = normalize_content(str(row.get("content", "")))
+            content = _canonical_from_row(record_type, row)
             if content in desired_set and content not in existing_by_content:
                 existing_by_content[content] = row
             else:
@@ -340,7 +472,7 @@ class CloudflareDnsClient:
                     str(row["id"]),
                     fqdn=fqdn,
                     record_type=record_type,
-                    content=content,
+                    value=content,
                     ttl=ttl,
                 )
             else:
@@ -349,21 +481,15 @@ class CloudflareDnsClient:
                     zone_id,
                     fqdn=fqdn,
                     record_type=record_type,
-                    content=content,
+                    value=content,
                     ttl=ttl,
                 )
 
     @staticmethod
     def _rows_to_info(display_name: str, record_type: str, rows: list[dict[str, Any]]) -> DnsRecordInfo:
         ttls = [int(row["ttl"]) for row in rows if isinstance(row.get("ttl"), (int, float))]
-        # Use the minimum TTL when multiple Cloudflare rows back one logical RRset;
-        # this matches how recursive resolvers cap the effective TTL.
         ttl = min(ttls) if ttls else None
-        values = [str(row.get("content", "")) for row in rows if row.get("content") is not None]
-        if record_type == "CNAME":
-            values = [v.rstrip(".") for v in values]
-        elif record_type == "TXT":
-            values = [_normalize_txt_value(v) for v in values]
+        values = [_canonical_from_row(record_type, row) for row in rows]
         return DnsRecordInfo(
             record_name=display_name,
             record_type=record_type,
