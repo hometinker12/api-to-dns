@@ -2,17 +2,15 @@
 
 ## [Unreleased]
 
-### Added
-
-- Admin UI dark mode: moon/sun toggle in the page header (left of Settings/Dashboard) with preference stored in the browser; defaults to system color scheme when unset.
-- **Remote Syslog** under **Settings → System Settings** (last entry): optional best-effort forwarding of stored audit/activity events as RFC 5424 messages with JSON payloads over TLS (preferred), UDP, or TCP. Plaintext UDP/TCP require an explicit insecure opt-in. Configurable host, port, protocol, facility, minimum level, timeout, and bounded queue size (max 5000). Delivery is asynchronous and non-durable; failures are rate-limited to operational logs. Saving settings emits `system.syslog_updated`.
-- Release BIND/Docker smoke installs `rsyslog`, enables remote syslog via System Settings (UDP with plaintext opt-in), and asserts an end-to-end delivery of a forwarded audit event.
-
 ## [0.7.0] - 2026-08-05
 
 ### Added
 
 - **Settings → Backup** (global admin): export/import configuration archives (`.atdb`). Outer password encryption is on by default; at-rest Fernet ciphertext is copied as-is with `SECRET_KEY` / `ENCRYPTION_KEY` so restores remain decryptable. Optional audit-log inclusion; destructive restore with Let's Encrypt–style progress dialog; application-secrets restore persists keys and auto-restarts.
+- Admin UI dark mode: moon/sun toggle in the page header (left of Settings/Dashboard) with preference stored in the browser; defaults to system color scheme when unset.
+- **Remote Syslog** under **Settings → System Settings** (last entry): optional best-effort forwarding of stored audit/activity events as RFC 5424 messages with JSON payloads over TLS (preferred), UDP, or TCP. Plaintext UDP/TCP require an explicit insecure opt-in. Configurable host, port, protocol, facility, minimum level, timeout, and bounded queue size (max 5000). Delivery is asynchronous and non-durable; failures are rate-limited to operational logs. Saving settings emits `system.syslog_updated`.
+- Release BIND/Docker smoke installs `rsyslog`, enables remote syslog via System Settings (UDP with plaintext opt-in), and asserts an end-to-end delivery of a forwarded audit event.
+- `CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, and GitHub issue/PR templates.
 
 ### Security
 
