@@ -4,12 +4,13 @@
   <meta charset="UTF-8" />
   <title>{{ page_title }}</title>
   {% include "_theme_init.html" %}
+  {% include "_brand_head.html" %}
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <div class="page">
     {% set page_help = "Browse the zone, use an exact name, or use * and ? wildcards. Results are limited to 100 record sets." %}
-    {% set page_links = [{"href": "/zones", "label": "All zones"}] %}
+    {% set page_links = [] %}
     {% include "_page_header.html" %}
 
     <section class="form-card dns-browser-meta">
@@ -407,15 +408,15 @@
               let actions = "—";
               if (canUpdate && mutable) {
                 actions =
-                  `<div class="action-cell">` +
-                  `<button type="button" class="secondary" data-edit>Edit</button>` +
-                  `<button type="button" class="danger" data-delete>Delete</button>` +
+                  `<div class="action-cell dns-browser-action-cell">` +
+                  `<button type="button" class="secondary dns-browser-row-action" data-edit>Edit</button>` +
+                  `<button type="button" class="danger dns-browser-row-action" data-delete>Delete</button>` +
                   `</div>`;
               }
               tr.innerHTML =
                 `<td><code>${escapeHtml(rec.record_name)}</code></td>` +
-                `<td>${escapeHtml(rec.record_type)}</td>` +
-                `<td>${rec.ttl != null ? escapeHtml(rec.ttl) : "—"}</td>` +
+                `<td><code>${escapeHtml(rec.record_type)}</code></td>` +
+                `<td>${rec.ttl != null ? `<code>${escapeHtml(rec.ttl)}</code>` : "—"}</td>` +
                 `<td><ul class="dns-browser-value-list">${valuesHtml}</ul></td>` +
                 `<td class="actions-column">${actions}</td>`;
               tr.querySelector("[data-edit]")?.addEventListener("click", () => openRecordDialog("replace", rec));
@@ -522,5 +523,6 @@
       })();
     </script>
   </div>
+  {% include "_page_footer.html" %}
 </body>
 </html>

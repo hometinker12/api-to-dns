@@ -2,51 +2,26 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>api-to-dns App Dashboard</title>
+  <title>api-to-dns Dashboard</title>
   {% include "_theme_init.html" %}
+  {% include "_brand_head.html" %}
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <div class="page">
-    {% set page_title = "api-to-dns App Dashboard" %}
+    {% set page_title = "Dashboard" %}
     {% set page_help = "Signed in as " ~ user %}
-    {% set page_links = [{"href": "/settings", "label": "Settings"}] %}
-    {% set show_dashboard_link = false %}
+    {% set page_links = [] %}
     {% include "_page_header.html" %}
-    <nav class="nav-links">
-      {% if can_view_zones %}
-        <a class="button" href="/zones">DNS Zones</a>
-      {% else %}
-        <span class="button disabled" aria-disabled="true">DNS Zones</span>
-      {% endif %}
-      {% if can_view_api_keys %}
-        <a class="button" href="/api-keys">API Keys</a>
-      {% else %}
-        <span class="button disabled" aria-disabled="true">API Keys</span>
-      {% endif %}
-      {% if openapi_enabled %}
-        <a class="button neutral" href="/docs#/">API Docs</a>
-      {% endif %}
-    </nav>
-    <section>
-      <h2>DNS zones</h2>
-      {% if zones %}
-        <ul class="summary-list">
-          {% for z in zones %}
-            <li>
-              {% if can_update_zones %}
-                <a href="/zones/{{ z.id }}/records"><code>{{ z.zone_name }}</code></a>
-              {% else %}
-                <code>{{ z.zone_name }}</code>
-              {% endif %}
-              <span class="help">({{ z.dns_zone }})</span>
-            </li>
-          {% endfor %}
-        </ul>
-      {% else %}
-        <p>No zones configured.</p>
-      {% endif %}
-    </section>
+    {% if message %}
+      <div class="alert success">{{ message }}</div>
+    {% endif %}
+    {% if can_view_zones %}
+      {% include "_configured_zones.html" %}
+    {% else %}
+      <div class="alert warning">DNS zone access is not assigned to this account.</div>
+    {% endif %}
   </div>
+  {% include "_page_footer.html" %}
 </body>
 </html>

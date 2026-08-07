@@ -1,5 +1,7 @@
+import base64
 import json
 import time
+import uuid
 from typing import Any
 
 from ..dns_record_types import (
@@ -30,6 +32,12 @@ class MicrosoftWinRmDnsClient:
 
     _WINRM_MAX_ATTEMPTS = 3
     _WINRM_RETRY_DELAY_SEC = 5
+    # pywinrm encodes scripts as `powershell -encodedcommand …`; stay under CreateProcess ~8191.
+    # Encoded length ≈ script_len * 8/3 (UTF-16-LE then base64), so keep source scripts short.
+    _WINRM_ENCODED_SOFT_LIMIT = 6000
+    # Staging chunks are themselves sent via EncodedCommand; ~1800 raw chars keeps
+    # `Set-Content ... -Value '<chunk>'` under the soft limit.
+    _WINRM_B64_CHUNK_SIZE = 1800
     _ACCESS_DENIED_MARKERS = (
         "access is denied",
         "access denied",
@@ -76,12 +84,63 @@ class MicrosoftWinRmDnsClient:
             kwargs["server_cert_validation"] = "ignore" if self.insecure_tls else "validate"
         return winrm.Session(server, (self.username, self.password), **kwargs)
 
+    def _run_ps_payload(self, session, script: str):
+        """Execute PowerShell, staging via a remote tempfile when EncodedCommand would be too long."""
+        encoded = base64.b64encode(script.encode("utf_16_le")).decode("ascii")
+        if len(encoded) <= self._WINRM_ENCODED_SOFT_LIMIT:
+            return session.run_ps(script)
+
+        token = uuid.uuid4().hex
+        payload_b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        chunks = [
+            payload_b64[i : i + self._WINRM_B64_CHUNK_SIZE]
+            for i in range(0, len(payload_b64), self._WINRM_B64_CHUNK_SIZE)
+        ]
+        if not chunks:
+            chunks = [""]
+
+        # Base64 alphabet is single-quote safe, so chunks can be embedded in '…' literals.
+        first = (
+            f"$ErrorActionPreference='Stop'; "
+            f"$p=Join-Path $env:TEMP 'atd-{token}.b64'; "
+            f"Set-Content -LiteralPath $p -Value '{chunks[0]}' -Encoding Ascii"
+        )
+        staged = session.run_ps(first)
+        if staged.status_code != 0:
+            return staged
+        for chunk in chunks[1:]:
+            append = (
+                f"$ErrorActionPreference='Stop'; "
+                f"$p=Join-Path $env:TEMP 'atd-{token}.b64'; "
+                f"Add-Content -LiteralPath $p -Value '{chunk}' -Encoding Ascii"
+            )
+            staged = session.run_ps(append)
+            if staged.status_code != 0:
+                return staged
+
+        runner = "\n".join(
+            [
+                "$ErrorActionPreference = 'Stop'",
+                f"$b64p = Join-Path $env:TEMP 'atd-{token}.b64'",
+                f"$ps1 = Join-Path $env:TEMP 'atd-{token}.ps1'",
+                "try {",
+                "  $text = [Text.Encoding]::UTF8.GetString("
+                "[Convert]::FromBase64String((Get-Content -LiteralPath $b64p -Raw)))",
+                "  [IO.File]::WriteAllText($ps1, $text)",
+                "  & $ps1",
+                "} finally {",
+                "  Remove-Item -LiteralPath $b64p,$ps1 -Force -ErrorAction SilentlyContinue",
+                "}",
+            ]
+        )
+        return session.run_ps(runner)
+
     def _run_ps_with_retry(self, server: str, script: str):
         """Run PowerShell on the WinRM target; retry on transient failures (not access denied)."""
         for attempt in range(self._WINRM_MAX_ATTEMPTS):
             try:
                 session = self._session(server)
-                result = session.run_ps(script)
+                result = self._run_ps_payload(session, script)
                 stderr = (result.std_err or b"").decode(errors="replace")
                 stdout = (result.std_out or b"").decode(errors="replace")
                 combined = f"{stderr}\n{stdout}"
@@ -318,7 +377,7 @@ class MicrosoftWinRmDnsClient:
                 # WinRM/Get-DnsServerResourceRecord has no native result limit. Stream records,
                 # retain at most $Limit RRsets (still append to open ones), and pass -RRType when typed.
                 "$bucket = @{}",
-                "$order = New-Object 'System.Collections.Generic.List[string]'",
+                "$order = New-Object System.Collections.ArrayList",
                 "$truncated = $false",
                 f"Get-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName"
                 f"{rr_type_arg} -ErrorAction Stop | ForEach-Object {{",
@@ -339,13 +398,13 @@ class MicrosoftWinRmDnsClient:
                 "  if (-not $bucket.ContainsKey($key)) {",
                 "    if ($order.Count -ge $Limit) { $truncated = $true; return }",
                 "    [void]$order.Add($key)",
-                "    $bucket[$key] = New-Object 'System.Collections.Generic.List[object]'",
+                "    $bucket[$key] = New-Object System.Collections.ArrayList",
                 "  }",
                 "  [void]$bucket[$key].Add($rec)",
                 "}",
-                "$keys = @($order)",
+                "$keys = @($order.ToArray())",
                 "$output = @(foreach ($key in $keys) {",
-                "  $group = @($bucket[$key])",
+                "  $group = @($bucket[$key].ToArray())",
                 "  $first = $group[0]",
                 "  $relative = ($key -split '\\|', 2)[0]",
                 "  $values = @()",

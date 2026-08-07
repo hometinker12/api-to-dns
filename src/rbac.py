@@ -64,7 +64,11 @@ ROLE_LABELS: list[dict[str, str]] = [
     {"key": ROLE_API_KEYS_READ, "label": "API keys: read"},
     {"key": ROLE_API_KEYS_UPDATE, "label": "API keys: update", "requires_role": ROLE_API_KEYS_READ},
     {"key": ROLE_DNS_ZONES_READ, "label": "DNS zones: read", "mandatory": True},
-    {"key": ROLE_DNS_ZONES_UPDATE, "label": "DNS zones: update", "requires_role": ROLE_DNS_ZONES_READ},
+    {
+        "key": ROLE_DNS_ZONES_UPDATE,
+        "label": "DNS zones: update and admin DNS browser access",
+        "requires_role": ROLE_DNS_ZONES_READ,
+    },
     {"key": ROLE_PLUGIN_UPDATE, "label": "Plugin management"},
     {"key": ROLE_SYSTEM_UPDATE, "label": "System: update"},
 ]

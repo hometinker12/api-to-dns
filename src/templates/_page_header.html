@@ -1,11 +1,11 @@
-{% set _show_dashboard = show_dashboard_link|default(true) %}
-{% set _nav = page_nav(user, _show_dashboard) if user is defined else {} %}
+{% set _nav = page_nav(user) if user is defined else {} %}
 {% set restart_required = restart_required|default(_nav.restart_required|default(false)) %}
 {% set can_system_update = can_system_update|default(_nav.can_system_update|default(false)) %}
 {% set restart_reason = restart_reason|default(_nav.restart_reason|default("")) %}
 {% set restart_preview = restart_preview|default(_nav.restart_preview|default({})) %}
 <header class="page-header">
-  <div>
+  <div class="page-header-content">
+    {% include "_app_brand.html" %}
     <h1>{{ page_title }}</h1>
     {% if page_subtitle %}<p class="page-subtitle">{{ page_subtitle }}</p>{% endif %}
     {% if page_help %}<p class="help">{{ page_help }}</p>{% endif %}
@@ -44,12 +44,16 @@
         />
       </svg>
     </button>
+    {% if _nav.can_view_api_keys|default(false) %}
+      <a class="button" href="/api-keys">API Keys</a>
+    {% else %}
+      <span class="button disabled" aria-disabled="true">API Keys</span>
+    {% endif %}
+    <a class="button" href="/admin">Dashboard</a>
+    <a class="button" href="/settings">Settings</a>
     {% for link in page_links or [] %}
       <a class="button{% if link.class %} {{ link.class }}{% endif %}" href="{{ link.href }}">{{ link.label }}</a>
     {% endfor %}
-    {% if _show_dashboard %}
-      <a class="button" href="/admin">Dashboard</a>
-    {% endif %}
     <form action="/logout" method="post" class="inline-form">
       <button type="submit" class="button danger">Logout</button>
     </form>

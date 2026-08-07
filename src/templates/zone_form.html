@@ -4,13 +4,14 @@
   <meta charset="UTF-8" />
   <title>api-to-dns Add DNS Zone</title>
   {% include "_theme_init.html" %}
+  {% include "_brand_head.html" %}
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <div class="page">
-    {% set page_title = "api-to-dns Add DNS Zone" %}
+    {% set page_title = "Add DNS Zone" %}
     {% set page_help = "" %}
-    {% set page_links = [{"href": "/zones", "label": "All zones"}] %}
+    {% set page_links = [] %}
     {% include "_page_header.html" %}
 
     {% if message %}
@@ -171,5 +172,6 @@
       syncProviderPanels();
     </script>
   </div>
+  {% include "_page_footer.html" %}
 </body>
 </html>
