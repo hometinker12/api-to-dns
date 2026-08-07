@@ -16,7 +16,7 @@ def test_get_app_version_matches_version_file() -> None:
     get_app_version.cache_clear()
     expected = (Path(__file__).resolve().parents[1] / "VERSION").read_text(encoding="utf-8").strip()
     assert get_app_version() == expected
-    assert expected == "0.7.0"
+    assert expected == "0.8.0"
 
 
 def test_fastapi_app_version_matches_version_file() -> None:
@@ -349,15 +349,16 @@ def test_openapi_disabled_by_default_outside_tests(monkeypatch: pytest.MonkeyPat
     assert app_module._openapi_enabled() is False
 
 
-def test_admin_shows_api_docs_link_when_openapi_enabled(client: TestClient) -> None:
+def test_api_keys_shows_api_docs_link_when_openapi_enabled(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
-    response = client.get("/admin")
+    response = client.get("/api-keys")
     assert response.status_code == 200
     assert "API Docs" in response.text
     assert 'href="/docs#/"' in response.text
+    assert response.text.index('href="/docs#/"') < response.text.index('id="open-create-key"')
 
 
-def test_admin_hides_api_docs_link_when_openapi_disabled(
+def test_api_keys_hides_api_docs_link_when_openapi_disabled(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -365,7 +366,7 @@ def test_admin_hides_api_docs_link_when_openapi_disabled(
 
     monkeypatch.setattr(app_module, "_OPENAPI_ON", False)
     client.cookies.set("session", create_session_cookie("admin"))
-    response = client.get("/admin")
+    response = client.get("/api-keys")
     assert response.status_code == 200
     assert "API Docs" not in response.text
     assert 'href="/docs#/"' not in response.text

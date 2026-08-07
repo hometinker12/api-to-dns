@@ -208,7 +208,7 @@
                           {% if role.key in auth_form_selected_roles or role.mandatory %}checked{% endif %}
                           {% if role.mandatory or not role.grantable %}disabled{% endif %}
                         />
-                        <code>{{ role.key }}</code> &mdash; {{ role.label }}{% if role.sensitive and not role.grantable %} (global admin only){% endif %}
+                        <code>{{ role.key }} &mdash; {{ role.label }}{% if role.sensitive and not role.grantable %} (global admin only){% endif %}</code>
                       </label>
                     {% endfor %}
                   </fieldset>
@@ -241,7 +241,7 @@
                             {% if role.key in u.stored_roles %}checked{% endif %}
                             disabled
                           />
-                          <code>{{ role.key }}</code> &mdash; {{ role.label }}
+                          <code>{{ role.key }} &mdash; {{ role.label }}</code>
                         </label>
                       {% endfor %}
                     </fieldset>
@@ -275,7 +275,7 @@
                             {% if role.key in u.stored_roles or role.mandatory %}checked{% endif %}
                             {% if role.mandatory or not role.grantable %}disabled{% endif %}
                             />
-                            <code>{{ role.key }}</code> &mdash; {{ role.label }}{% if role.sensitive and not role.grantable %} (global admin only){% endif %}
+                            <code>{{ role.key }} &mdash; {{ role.label }}{% if role.sensitive and not role.grantable %} (global admin only){% endif %}</code>
                           </label>
                         {% endfor %}
                       </fieldset>

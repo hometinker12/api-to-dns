@@ -266,6 +266,10 @@ html[data-theme="dark"] .theme-toggle .theme-icon-sun {
 .page-header {
   align-items: flex-start;
 }
+.page-header > .nav-links {
+  align-self: flex-start;
+  margin: 0;
+}
 .page-header-content {
   min-width: 0;
 }
@@ -315,6 +319,11 @@ html[data-theme="dark"] .theme-toggle .theme-icon-sun {
 }
 .section-title-row h2 {
   margin: 0;
+}
+.section-title-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
 }
 .summary-list {
   list-style: none;
@@ -864,9 +873,18 @@ dialog::backdrop {
     align-items: flex-start;
     flex-direction: column;
   }
+  .page-header > .nav-links {
+    flex-direction: column;
+    flex-wrap: nowrap;
+    width: 100%;
+  }
   .section-title-row {
     align-items: flex-start;
     flex-direction: column;
+  }
+  .section-title-actions {
+    flex-direction: column;
+    width: 100%;
   }
   .summary-list li {
     align-items: flex-start;

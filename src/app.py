@@ -159,26 +159,31 @@ from .zone_service import (
 
 
 def _zones_html_context(db, *, message: str | None = None, user: str | None = None) -> dict[str, Any]:
-    zones = list_dns_zones(db)
+    can_view_zones = user is not None and (
+        user_has_role(db, user, ROLE_DNS_ZONES_READ) or user_has_role(db, user, ROLE_DNS_ZONES_UPDATE)
+    )
     ctx: dict[str, Any] = {
-        "zones": [dns_zone_admin_dict(db, z) for z in zones],
+        "zones": [dns_zone_admin_dict(db, z) for z in list_dns_zones(db)] if can_view_zones else [],
         "message": message,
+        "can_view_zones": can_view_zones,
+        "can_update_zones": user is not None and user_has_role(db, user, ROLE_DNS_ZONES_UPDATE),
     }
     if user is not None:
         ctx["user"] = user
-        ctx["can_update_zones"] = user_has_role(db, user, ROLE_DNS_ZONES_UPDATE)
     return ctx
 
 
-def _api_keys_html_context(db, *, message: str | None = None, **extra: Any) -> dict[str, Any]:
+def _api_keys_html_context(db, *, user: str, message: str | None = None, **extra: Any) -> dict[str, Any]:
     api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda key: key.created_at, reverse=True)
     key_zones = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
     all_zones = list_dns_zones(db)
     return {
+        "user": user,
         "api_keys": [api_key_admin_dict(db, k) for k in api_keys],
         "key_zones": key_zones,
         "all_zones": [dns_zone_public_dict(z) for z in all_zones],
         "message": message,
+        "openapi_enabled": _OPENAPI_ON,
         **extra,
     }
 
@@ -493,32 +498,11 @@ def root(request: Request) -> RedirectResponse:
 def admin(request: Request, user: str = Depends(get_current_user)):
     try:
         with SessionLocal() as db:
-            can_view_zones = user_has_role(db, user, ROLE_DNS_ZONES_READ) or user_has_role(
-                db, user, ROLE_DNS_ZONES_UPDATE
-            )
-            can_update_zones = user_has_role(db, user, ROLE_DNS_ZONES_UPDATE)
-            can_view_api_keys = user_has_role(db, user, ROLE_API_KEYS_READ) or user_has_role(
-                db, user, ROLE_API_KEYS_UPDATE
-            )
-            zones = list_dns_zones(db)
-            api_keys = sorted(db.exec(select(ApiKey)).all(), key=lambda key: key.created_at, reverse=True)
-            key_zones: dict[int, list[str]] = {k.id: api_key_allowed_zone_names(db, k.id) for k in api_keys}
-            api_keys_view = [api_key_public_dict(k) for k in api_keys]
-            zones_view = [dns_zone_public_dict(z) for z in zones]
+            ctx = _zones_html_context(db, user=user)
         return templates.TemplateResponse(
             request=request,
             name="admin.html",
-            context={
-                "request": request,
-                "user": user,
-                "zones": zones_view,
-                "api_keys": api_keys_view,
-                "key_zones": key_zones,
-                "can_view_zones": can_view_zones,
-                "can_update_zones": can_update_zones,
-                "can_view_api_keys": can_view_api_keys,
-                "openapi_enabled": _OPENAPI_ON,
-            },
+            context={"request": request, **ctx},
         )
     except Exception as exc:
         return render_error_response(request, exc)
@@ -529,11 +513,9 @@ def admin(request: Request, user: str = Depends(get_current_user)):
     response_model=list[DnsZoneSummary],
     responses={
         200: {
-            "description": "HTML DNS zones page, or JSON zone summaries when requested with application/json.",
-            "content": {
-                "text/html": {"schema": {"type": "string"}},
-            },
-        }
+            "description": "JSON zone summaries when requested with application/json.",
+        },
+        303: {"description": "Authenticated browser requests redirect to the dashboard."},
     },
 )
 def zones_page(
@@ -586,15 +568,8 @@ def zones_page(
             )
             return [DnsZoneSummary(**dns_zone_summary_dict(z)) for z in zones]
 
-        user = get_current_user(request)
-        if not user_has_role(db, user, ROLE_DNS_ZONES_READ):
-            raise HTTPException(status_code=403, detail=ROLE_FORBIDDEN_DETAIL)
-        ctx = _zones_html_context(db, user=user)
-    return templates.TemplateResponse(
-        request=request,
-        name="zones.html",
-        context={"request": request, **ctx},
-    )
+    get_current_user(request)
+    return RedirectResponse(url="/admin", status_code=HTTP_303_SEE_OTHER)
 
 
 @app.get("/zones/new", response_class=HTMLResponse, include_in_schema=False)
@@ -606,6 +581,7 @@ def zone_new_form(request: Request, user: str = Depends(require_role(ROLE_DNS_ZO
         name="zone_form.html",
         context={
             "request": request,
+            "user": user,
             "zone": None,
             "settings": {},
             "provider_plugins": provider_plugins,
@@ -627,7 +603,7 @@ async def zone_create(request: Request, user: str = Depends(require_role(ROLE_DN
             ctx = _zones_html_context(db, message="Zone name is required.", user=user)
         return templates.TemplateResponse(
             request=request,
-            name="zones.html",
+            name="admin.html",
             context={"request": request, **ctx},
         )
     with SessionLocal() as db:
@@ -636,7 +612,7 @@ async def zone_create(request: Request, user: str = Depends(require_role(ROLE_DN
             ctx = _zones_html_context(db, message=f"A zone named {canonical!r} already exists.", user=user)
             return templates.TemplateResponse(
                 request=request,
-                name="zones.html",
+                name="admin.html",
                 context={"request": request, **ctx},
             )
         try:
@@ -647,6 +623,7 @@ async def zone_create(request: Request, user: str = Depends(require_role(ROLE_DN
                 name="zone_form.html",
                 context={
                     "request": request,
+                    "user": user,
                     "zone": None,
                     "settings": {"dns_provider_type": (form.get("dns_provider_type") or "").strip().lower()},
                     "provider_plugins": provider_plugins,
@@ -671,7 +648,7 @@ async def zone_create(request: Request, user: str = Depends(require_role(ROLE_DN
         ctx = _zones_html_context(db, message=f"Zone {canonical!r} added.", user=user)
     return templates.TemplateResponse(
         request=request,
-        name="zones.html",
+        name="admin.html",
         context={"request": request, **ctx},
     )
 
@@ -811,7 +788,7 @@ def zone_edit_form(request: Request, zone_id: int, user: str = Depends(require_r
     with SessionLocal() as db:
         row = db.get(DnsZoneConfig, zone_id)
         if not row:
-            return RedirectResponse(url="/zones", status_code=HTTP_303_SEE_OTHER)
+            return RedirectResponse(url="/admin", status_code=HTTP_303_SEE_OTHER)
         settings = decode_zone_config(row)
         zone_view = dns_zone_public_dict(row)
         provider_plugins = enabled_dns_provider_options(db)
@@ -821,6 +798,7 @@ def zone_edit_form(request: Request, zone_id: int, user: str = Depends(require_r
         name="zone_form.html",
         context={
             "request": request,
+            "user": user,
             "zone": zone_view,
             "settings": settings,
             "provider_plugins": provider_plugins,
@@ -836,7 +814,7 @@ async def zone_update(request: Request, zone_id: int, user: str = Depends(requir
     with SessionLocal() as db:
         row = db.get(DnsZoneConfig, zone_id)
         if not row:
-            return RedirectResponse(url="/zones", status_code=HTTP_303_SEE_OTHER)
+            return RedirectResponse(url="/admin", status_code=HTTP_303_SEE_OTHER)
         existing = decode_zone_config(row)
         provider_plugins = enabled_dns_provider_options(db)
         try:
@@ -847,6 +825,7 @@ async def zone_update(request: Request, zone_id: int, user: str = Depends(requir
                 name="zone_form.html",
                 context={
                     "request": request,
+                    "user": user,
                     "zone": dns_zone_public_dict(row),
                     "settings": existing,
                     "provider_plugins": provider_plugins,
@@ -877,6 +856,7 @@ async def zone_update(request: Request, zone_id: int, user: str = Depends(requir
         name="zone_form.html",
         context={
             "request": request,
+            "user": user,
             "zone": zone_view,
             "settings": settings,
             "provider_plugins": provider_plugins,
@@ -912,7 +892,7 @@ def zone_delete(request: Request, zone_id: int, user: str = Depends(require_role
         ctx = _zones_html_context(db, message="Zone removed.", user=user)
     return templates.TemplateResponse(
         request=request,
-        name="zones.html",
+        name="admin.html",
         context={"request": request, **ctx},
     )
 
@@ -921,7 +901,7 @@ def zone_delete(request: Request, zone_id: int, user: str = Depends(require_role
 def api_keys_page(request: Request, user: str = Depends(require_role(ROLE_API_KEYS_READ))):
     try:
         with SessionLocal() as db:
-            ctx = _api_keys_html_context(db)
+            ctx = _api_keys_html_context(db, user=user)
         return templates.TemplateResponse(
             request=request,
             name="api_keys.html",
@@ -950,7 +930,7 @@ def revoke_api_key(request: Request, key_id: int = Form(...), user: str = Depend
                     message=f"API key {api_key.label!r} revoked",
                     details={"api_key_id": api_key.id, "api_key_label": api_key.label},
                 )
-            ctx = _api_keys_html_context(db, message="API key revoked.")
+            ctx = _api_keys_html_context(db, user=user, message="API key revoked.")
 
         return templates.TemplateResponse(
             request=request,
@@ -978,6 +958,7 @@ def create_api_key_route(
                 if not zone_ids:
                     ctx = _api_keys_html_context(
                         db,
+                        user=user,
                         edit_key_error_id=key_id,
                         edit_key_error="Select at least one DNS zone.",
                         edit_key_label=label,
@@ -1007,7 +988,7 @@ def create_api_key_route(
                     message=f"API key {label!r} updated",
                     details={"api_key_id": key_id, "api_key_label": label, "allowed_zone_ids": list(zone_ids)},
                 )
-                ctx = _api_keys_html_context(db, message="API key updated.")
+                ctx = _api_keys_html_context(db, user=user, message="API key updated.")
             return templates.TemplateResponse(
                 request=request,
                 name="api_keys.html",
@@ -1017,6 +998,7 @@ def create_api_key_route(
             with SessionLocal() as db:
                 ctx = _api_keys_html_context(
                     db,
+                    user=user,
                     create_key_error="Select at least one DNS zone for this API key.",
                     create_key_label=label,
                 )
@@ -1052,6 +1034,7 @@ def create_api_key_route(
             )
             ctx = _api_keys_html_context(
                 db,
+                user=user,
                 message=f"API key created: {new_key} (copy now; it will not be shown again)",
                 created_api_key=new_key,
             )
@@ -1083,6 +1066,7 @@ def api_key_edit_form(request: Request, key_id: int, user: str = Depends(require
         name="api_key_edit.html",
         context={
             "request": request,
+            "user": user,
             "api_key_row": api_key_row,
             "all_zones": all_zones_view,
             "allowed_ids": allowed_ids,
@@ -1114,6 +1098,7 @@ def api_key_update(
                 name="api_key_edit.html",
                 context={
                     "request": request,
+                    "user": user,
                     "api_key_row": api_key_public_dict(row),
                     "all_zones": [dns_zone_public_dict(z) for z in all_zones],
                     "allowed_ids": allowed_ids,
@@ -1154,6 +1139,7 @@ def api_key_update(
         name="api_key_edit.html",
         context={
             "request": request,
+            "user": user,
             "api_key_row": api_key_row,
             "all_zones": all_zones_view,
             "allowed_ids": allowed_ids,

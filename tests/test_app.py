@@ -196,7 +196,6 @@ def test_authenticated_web_pages_render(client: TestClient) -> None:
         assert api_key is not None
     for path in (
         "/admin",
-        "/zones",
         "/api-keys",
         "/zones/new",
         f"/zones/{zone.id}/edit",
@@ -207,9 +206,9 @@ def test_authenticated_web_pages_render(client: TestClient) -> None:
         assert response.status_code == 200
 
 
-def test_zones_page_displays_zone_provider_metadata(client: TestClient) -> None:
+def test_dashboard_displays_zone_provider_metadata(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
-    response = client.get("/zones")
+    response = client.get("/admin")
     assert response.status_code == 200
     assert "Type" in response.text
     assert "Target DNS Server" in response.text
@@ -217,9 +216,9 @@ def test_zones_page_displays_zone_provider_metadata(client: TestClient) -> None:
     assert "&mdash;" in response.text
 
 
-def test_zones_page_has_delete_confirmation_dialog(client: TestClient) -> None:
+def test_dashboard_has_delete_confirmation_dialog(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
-    response = client.get("/zones")
+    response = client.get("/admin")
     assert response.status_code == 200
     assert 'id="delete-zone-dialog"' in response.text
     assert "data-open-delete-zone" in response.text
@@ -231,6 +230,10 @@ def test_api_keys_page_has_revoke_confirmation_dialog(client: TestClient) -> Non
     assert response.status_code == 200
     assert 'id="revoke-api-key-dialog"' in response.text
     assert "data-open-revoke-key" in response.text
+    assert (
+        "Generate named API keys, scope them to DNS zones, and copy each key when created - it is shown only once."
+        in response.text
+    )
 
 
 def test_builtin_dns_plugins_are_discovered() -> None:
@@ -1370,17 +1373,20 @@ def test_settings_route_hidden_from_openapi(client: TestClient) -> None:
     assert not any(path.startswith("/settings") for path in schema["paths"])
 
 
-def test_admin_page_links_to_settings(client: TestClient) -> None:
+def test_admin_header_links_to_api_keys_and_settings(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
     response = client.get("/admin")
     assert response.status_code == 200
+    assert "<title>api-to-dns Dashboard</title>" in response.text
+    assert "<h1>Dashboard</h1>" in response.text
+    assert 'href="/api-keys"' in response.text
     assert 'href="/settings"' in response.text
     assert 'href="/zones/' in response.text
     assert "<code>example.com</code>" in response.text
-    assert '<span class="help">(example.com)</span>' in response.text
+    assert response.text.index('href="/api-keys"') < response.text.index('href="/settings"')
 
 
-def test_dashboard_disables_zone_and_api_key_buttons_without_roles(client: TestClient) -> None:
+def test_dashboard_hides_zone_update_controls_and_disables_api_key_button_without_roles(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("limited"))
     with SessionLocal() as db:
         _delete_users(db)
@@ -1389,12 +1395,13 @@ def test_dashboard_disables_zone_and_api_key_buttons_without_roles(client: TestC
 
     response = client.get("/admin")
     assert response.status_code == 200
-    assert '<a class="button" href="/zones">DNS Zones</a>' in response.text
+    assert "Configured zones" in response.text
+    assert 'href="/zones/new"' not in response.text
     assert '<span class="button disabled" aria-disabled="true">API Keys</span>' in response.text
     assert 'href="/api-keys"' not in response.text
 
 
-def test_dashboard_enables_role_allowed_buttons(client: TestClient) -> None:
+def test_dashboard_header_enables_api_key_button_for_role_allowed_user(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("reader"))
     with SessionLocal() as db:
         _delete_users(db)
@@ -1403,8 +1410,23 @@ def test_dashboard_enables_role_allowed_buttons(client: TestClient) -> None:
 
     response = client.get("/admin")
     assert response.status_code == 200
-    assert '<a class="button" href="/zones">DNS Zones</a>' in response.text
     assert '<a class="button" href="/api-keys">API Keys</a>' in response.text
+
+
+def test_authenticated_header_uses_consistent_navigation_order(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+
+    for path in ("/admin", "/settings", "/api-keys", f"/zones/{zone.id}/edit"):
+        response = client.get(path)
+        assert response.status_code == 200
+        assert '<meta name="viewport" content="width=device-width, initial-scale=1" />' in response.text
+        header_nav = response.text.split('<nav class="nav-links">', 1)[1].split("</nav>", 1)[0]
+        assert header_nav.index('href="/api-keys"') < header_nav.index('href="/admin"')
+        assert header_nav.index('href="/admin"') < header_nav.index('href="/settings"')
+        assert header_nav.index('href="/settings"') < header_nav.index('action="/logout"')
 
 
 def test_create_user_form_defaults_to_required_dns_zones_read_only(client: TestClient) -> None:
@@ -1421,6 +1443,8 @@ def test_create_user_form_defaults_to_required_dns_zones_read_only(client: TestC
     assert "global.read" in create_dialog
     assert "api_keys.read" in create_dialog
     assert "dns_zones.read" in create_dialog
+    assert create_dialog.count("<code>") == len(ALL_ROLES)
+    assert "<code>dns_zones.update &mdash; DNS zones: update and admin DNS browser access</code>" in create_dialog
     assert create_dialog.count("checked") == 1
     assert "account.read" not in create_dialog
     assert "system.read" not in create_dialog
@@ -2336,7 +2360,7 @@ def test_global_read_can_view_read_only_pages(client: TestClient) -> None:
         ("/settings?area=logging", "View Logs"),
         ("/settings?area=system_settings", "System Settings"),
         ("/settings?area=email_alerting", "Email Alerting"),
-        ("/zones", "Configured zones"),
+        ("/admin", "Configured zones"),
         ("/api-keys", "Existing API keys"),
     ):
         response = client.get(path)
@@ -3203,28 +3227,37 @@ def test_settings_remote_syslog_can_be_disabled(client: TestClient) -> None:
         REMOTE_SYSLOG.configure(SyslogConfig(enabled=False))
 
 
-def test_dns_zones_read_is_required_on_all_user_accounts(client: TestClient) -> None:
+def test_mandatory_dns_zones_read_allows_dashboard_zone_view(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("noreader"))
     with SessionLocal() as db:
         _delete_users(db)
         _create_user(db, "noreader", "x", [ROLE_API_KEYS_READ])
         _create_user(db, "admin", "x", ALL_ROLES)
 
-    response = client.get("/zones", follow_redirects=False)
+    response = client.get("/admin")
     assert response.status_code == 200
     assert "Configured zones" in response.text
 
 
-def test_dns_zones_read_can_view_zones_without_global_read(client: TestClient) -> None:
+def test_dns_zones_read_can_view_dashboard_zones_without_global_read(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("zone-reader"))
     with SessionLocal() as db:
         _delete_users(db)
         _create_user(db, "zone-reader", "x", [ROLE_DNS_ZONES_READ])
         _create_user(db, "admin", "x", ALL_ROLES)
 
-    response = client.get("/zones")
+    response = client.get("/admin")
     assert response.status_code == 200
     assert "Configured zones" in response.text
+
+
+def test_zones_html_request_redirects_to_dashboard(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+
+    response = client.get("/zones", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin"
 
 
 def test_api_keys_page_requires_api_keys_read(client: TestClient) -> None:
@@ -3317,7 +3350,7 @@ def test_dns_browser_page_shows_cloudflare_zone_proxy_indicator(client: TestClie
     assert 'id="cloudflare-proxy-indicator"' in response.text
 
 
-def test_dashboard_and_zones_link_to_dns_browser(client: TestClient) -> None:
+def test_dashboard_links_to_dns_browser_and_zones_redirects(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
     with SessionLocal() as db:
         zone = db.exec(select(DnsZoneConfig)).first()
@@ -3326,9 +3359,9 @@ def test_dashboard_and_zones_link_to_dns_browser(client: TestClient) -> None:
     admin = client.get("/admin")
     assert admin.status_code == 200
     assert f"/zones/{zone_id}/records" in admin.text
-    zones = client.get("/zones")
-    assert zones.status_code == 200
-    assert f"/zones/{zone_id}/records" in zones.text
+    zones = client.get("/zones", follow_redirects=False)
+    assert zones.status_code == 303
+    assert zones.headers["location"] == "/admin"
 
 
 def test_read_only_user_does_not_see_dns_browser_links(client: TestClient) -> None:
@@ -3344,9 +3377,6 @@ def test_read_only_user_does_not_see_dns_browser_links(client: TestClient) -> No
     admin = client.get("/admin")
     assert admin.status_code == 200
     assert f"/zones/{zone_id}/records" not in admin.text
-    zones = client.get("/zones")
-    assert zones.status_code == 200
-    assert f"/zones/{zone_id}/records" not in zones.text
 
 
 def test_dns_browser_search_success_and_not_found(
