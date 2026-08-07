@@ -4,10 +4,11 @@
 
 ### Fixed
 
-- Microsoft DNS browser browse/search no longer fails with WinRM "command line is too long": long PowerShell payloads are staged to a remote tempfile in base64 chunks before execution.
+- Microsoft DNS browser browse/search no longer fails with WinRM "command line is too long": long PowerShell payloads are staged to a remote tempfile in short base64 chunks (EncodedCommand-safe), and browse grouping uses `ArrayList` instead of `Generic.List` under WinRM.
 
 ### Added
 
+- Admin UI branding: SVG favicon and logo mark on pages (including login), brand wordmark above page titles, and a bottom-right version footer (`<code>api-to-dns vX.Y.Z</code>` linking to the GitHub repository).
 - Admin **DNS browser**: open a zone from the Dashboard or DNS Zones list; filter by type (A/AAAA/CNAME/TXT/MX/NS/SRV/CAA/PTR/SOA); and add/edit/delete RRsets. Requires `dns_zones.update` for page, search, and mutations (links hidden without it). SOA is view-only; apex NS is blocked for `@` and the zone FQDN; PTR is limited to reverse zones. Rate-limited via `RATE_LIMIT_DNS_BROWSER` (default `60:60`; session identity, ignoring unvalidated API-key headers). Providers share canonical value formats via `src/dns_record_types.py`.
 - DNS browser UX and search: configuration name under the page header; aligned Search/Add actions; IP Address labels with browser-side IPv4/IPv6 validation; submission locking/status; unified multi-value editor with red `X` removal; provider name in `<code>`. Cloudflare's zone-controlled **Proxied (orange cloud)** setting is shown for eligible A/AAAA/CNAME writes. Empty browse and case-insensitive relative-name `*`/`?` globs work for Cloudflare, Azure, and Microsoft DNS (capped at 100 complete RRsets with truncation status; Cloudflare pages at 100 rows; Microsoft streams/groups with optional `-RRType`). BIND / TSIG returns a clear exact-name-only message (no AXFR enumeration). Release smoke covers BIND blank-browse and wildcard `400` responses plus Microsoft browse, `*`, and `?` glob paths.
 - Admin UI dark mode: moon/sun toggle in the page header (left of Settings/Dashboard) with preference stored in the browser; defaults to system color scheme when unset.

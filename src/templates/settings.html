@@ -4,11 +4,12 @@
   <meta charset="UTF-8" />
   <title>api-to-dns App Settings</title>
   {% include "_theme_init.html" %}
+  {% include "_brand_head.html" %}
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <div class="page page-wide">
-    {% set page_title = "api-to-dns App Settings" %}
+    {% set page_title = "App Settings" %}
     {% set page_help = "Signed in as " ~ user %}
     {% set page_links = [] %}
     {% include "_page_header.html" %}
@@ -1868,5 +1869,6 @@
       });
     </script>
   </div>
+  {% include "_page_footer.html" %}
 </body>
 </html>

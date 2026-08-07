@@ -4,11 +4,12 @@
   <meta charset="UTF-8" />
   <title>api-to-dns Edit API key</title>
   {% include "_theme_init.html" %}
+  {% include "_brand_head.html" %}
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <div class="page">
-    {% set page_title = "api-to-dns Edit API key" %}
+    {% set page_title = "Edit API Key" %}
     {% set page_help = "" %}
     {% set page_links = [{"href": "/api-keys", "label": "Back to API keys"}, {"href": "/zones", "label": "DNS Zones"}] %}
     {% include "_page_header.html" %}
@@ -39,5 +40,6 @@
       <button type="submit" {% if not all_zones %}disabled{% endif %}>Save</button>
     </form>
   </div>
+  {% include "_page_footer.html" %}
 </body>
 </html>

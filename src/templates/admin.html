@@ -4,11 +4,12 @@
   <meta charset="UTF-8" />
   <title>api-to-dns App Dashboard</title>
   {% include "_theme_init.html" %}
+  {% include "_brand_head.html" %}
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <div class="page">
-    {% set page_title = "api-to-dns App Dashboard" %}
+    {% set page_title = "App Dashboard" %}
     {% set page_help = "Signed in as " ~ user %}
     {% set page_links = [{"href": "/settings", "label": "Settings"}] %}
     {% set show_dashboard_link = false %}
@@ -48,5 +49,6 @@
       {% endif %}
     </section>
   </div>
+  {% include "_page_footer.html" %}
 </body>
 </html>

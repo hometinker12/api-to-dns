@@ -4,11 +4,13 @@
   <meta charset="UTF-8" />
   <title>Login - api-to-dns App Dashboard</title>
   {% include "_theme_init.html" %}
+  {% include "_brand_head.html" %}
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <div class="page">
-    <h1>api-to-dns App Dashboard Login</h1>
+    {% include "_app_brand.html" %}
+    <h1>Sign In</h1>
     {% if error %}
       <div class="alert">{{ error }}</div>
     {% endif %}
@@ -22,5 +24,6 @@
       <button type="submit">Sign In</button>
     </form>
   </div>
+  {% include "_page_footer.html" %}
 </body>
 </html>

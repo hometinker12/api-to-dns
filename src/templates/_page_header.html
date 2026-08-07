@@ -5,7 +5,8 @@
 {% set restart_reason = restart_reason|default(_nav.restart_reason|default("")) %}
 {% set restart_preview = restart_preview|default(_nav.restart_preview|default({})) %}
 <header class="page-header">
-  <div>
+  <div class="page-header-content">
+    {% include "_app_brand.html" %}
     <h1>{{ page_title }}</h1>
     {% if page_subtitle %}<p class="page-subtitle">{{ page_subtitle }}</p>{% endif %}
     {% if page_help %}<p class="help">{{ page_help }}</p>{% endif %}

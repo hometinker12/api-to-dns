@@ -127,9 +127,25 @@ body {
   width: min(900px, calc(100% - 32px));
   margin: 32px auto;
   padding: 24px;
+  padding-bottom: 3rem;
   background: var(--bg-page);
   border-radius: 12px;
   box-shadow: var(--shadow);
+}
+.app-version-footer {
+  position: fixed;
+  right: 0.85rem;
+  bottom: 0.65rem;
+  z-index: 50;
+  margin: 0;
+}
+.app-version-footer a {
+  color: inherit;
+  text-decoration: none;
+}
+.app-version-footer a:hover code,
+.app-version-footer a:focus-visible code {
+  text-decoration: underline;
 }
 header {
   display: flex;
@@ -250,7 +266,37 @@ html[data-theme="dark"] .theme-toggle .theme-icon-sun {
 .page-header {
   align-items: flex-start;
 }
-.page-header h1,
+.page-header-content {
+  min-width: 0;
+}
+.app-brand {
+  align-items: center;
+  color: var(--text);
+  display: inline-flex;
+  gap: 0.5rem;
+  height: 2.25rem;
+  text-decoration: none;
+}
+.app-brand:hover,
+.app-brand:focus-visible {
+  color: var(--btn-primary);
+}
+.app-brand-mark {
+  display: block;
+  flex: 0 0 2.25rem;
+  height: 2.25rem;
+  width: 2.25rem;
+}
+.app-brand-name {
+  font-size: 2.25rem;
+  font-weight: 700;
+  letter-spacing: -0.045em;
+  line-height: 1;
+  white-space: nowrap;
+}
+.page-header h1 {
+  margin: 0.75rem 0 0;
+}
 .header-stack h1 {
   margin-bottom: 0;
 }
@@ -709,6 +755,7 @@ dialog::backdrop {
   white-space: normal;
 }
 .dns-browser-search {
+  --dns-browser-control-height: 35px;
   display: grid;
   grid-template-columns: minmax(0, 2fr) minmax(8rem, 1fr) auto;
   gap: 0.75rem 1rem;
@@ -717,10 +764,43 @@ dialog::backdrop {
 .dns-browser-search label {
   margin-bottom: 0;
 }
+.dns-browser-search input[type="text"],
+.dns-browser-search select,
+.dns-browser-search-actions button {
+  box-sizing: border-box;
+  height: var(--dns-browser-control-height);
+  min-height: var(--dns-browser-control-height);
+  max-height: var(--dns-browser-control-height);
+  padding-top: 0;
+  padding-bottom: 0;
+  font-size: 0.8em;
+  line-height: 1.1;
+}
+.dns-browser-search input[type="text"],
+.dns-browser-search select {
+  padding-left: 0.9rem;
+  padding-right: 0.9rem;
+}
+.dns-browser-search select {
+  /* Keep native arrow but force the same outer box as text/button controls. */
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position: calc(100% - 14px) calc(50% - 3px), calc(100% - 9px) calc(50% - 3px);
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 1.75rem;
+}
 .dns-browser-search-actions {
   display: flex;
   gap: 0.5rem;
   flex-wrap: wrap;
+  align-items: center;
+}
+.dns-browser-search-actions button {
+  padding-left: 1.04rem;
+  padding-right: 1.04rem;
 }
 .dns-browser-value-list {
   margin: 0;
@@ -759,6 +839,15 @@ dialog::backdrop {
 }
 .dns-browser-remove-value {
   min-width: 2.75rem;
+}
+.dns-browser-action-cell {
+  flex-wrap: nowrap;
+  white-space: nowrap;
+}
+.dns-browser-results .dns-browser-row-action {
+  min-height: 25px;
+  padding: 0.48rem 0.73rem;
+  flex-shrink: 0;
 }
 .dns-browser-proxy-indicator {
   margin: 0.75rem 0 1rem;
@@ -801,6 +890,9 @@ dialog::backdrop {
     flex-direction: column;
   }
   .dns-browser-remove-value {
+    width: auto;
+  }
+  .dns-browser-results .dns-browser-row-action {
     width: auto;
   }
 }

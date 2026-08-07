@@ -33,8 +33,11 @@ class MicrosoftWinRmDnsClient:
     _WINRM_MAX_ATTEMPTS = 3
     _WINRM_RETRY_DELAY_SEC = 5
     # pywinrm encodes scripts as `powershell -encodedcommand …`; stay under CreateProcess ~8191.
+    # Encoded length ≈ script_len * 8/3 (UTF-16-LE then base64), so keep source scripts short.
     _WINRM_ENCODED_SOFT_LIMIT = 6000
-    _WINRM_B64_CHUNK_SIZE = 3500
+    # Staging chunks are themselves sent via EncodedCommand; ~1800 raw chars keeps
+    # `Set-Content ... -Value '<chunk>'` under the soft limit.
+    _WINRM_B64_CHUNK_SIZE = 1800
     _ACCESS_DENIED_MARKERS = (
         "access is denied",
         "access denied",
@@ -374,7 +377,7 @@ class MicrosoftWinRmDnsClient:
                 # WinRM/Get-DnsServerResourceRecord has no native result limit. Stream records,
                 # retain at most $Limit RRsets (still append to open ones), and pass -RRType when typed.
                 "$bucket = @{}",
-                "$order = New-Object 'System.Collections.Generic.List[string]'",
+                "$order = New-Object System.Collections.ArrayList",
                 "$truncated = $false",
                 f"Get-DnsServerResourceRecord -ComputerName $ComputerName -ZoneName $ZoneName"
                 f"{rr_type_arg} -ErrorAction Stop | ForEach-Object {{",
@@ -395,13 +398,13 @@ class MicrosoftWinRmDnsClient:
                 "  if (-not $bucket.ContainsKey($key)) {",
                 "    if ($order.Count -ge $Limit) { $truncated = $true; return }",
                 "    [void]$order.Add($key)",
-                "    $bucket[$key] = New-Object 'System.Collections.Generic.List[object]'",
+                "    $bucket[$key] = New-Object System.Collections.ArrayList",
                 "  }",
                 "  [void]$bucket[$key].Add($rec)",
                 "}",
-                "$keys = @($order)",
+                "$keys = @($order.ToArray())",
                 "$output = @(foreach ($key in $keys) {",
-                "  $group = @($bucket[$key])",
+                "  $group = @($bucket[$key].ToArray())",
                 "  $first = $group[0]",
                 "  $relative = ($key -split '\\|', 2)[0]",
                 "  $values = @()",

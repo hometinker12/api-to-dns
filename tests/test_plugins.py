@@ -289,6 +289,7 @@ def test_microsoft_list_records_filters_remotely_and_preserves_truncation(mock_r
     assert "-RRType" in script
     assert "$relative -notlike $NamePattern" in script
     assert "ForEach-Object" in script
+    assert "New-Object System.Collections.ArrayList" in script
     assert "$order.Count -ge $Limit" in script
     assert "Select-Object -First ($Limit + 1)" not in script
     assert "BrowserRecordName" not in script

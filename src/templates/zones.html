@@ -4,11 +4,12 @@
   <meta charset="UTF-8" />
   <title>api-to-dns DNS Zones</title>
   {% include "_theme_init.html" %}
+  {% include "_brand_head.html" %}
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <div class="page">
-    {% set page_title = "api-to-dns DNS Zones" %}
+    {% set page_title = "DNS Zones" %}
     {% set page_help = "Each row is a named zone configuration with its own provider, DNS domain, and credentials. API keys are granted access by configuration name." %}
     {% set page_links = [] %}
     {% include "_page_header.html" %}
@@ -121,5 +122,6 @@
       })();
     </script>
   </div>
+  {% include "_page_footer.html" %}
 </body>
 </html>

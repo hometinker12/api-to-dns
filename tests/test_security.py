@@ -27,6 +27,18 @@ def test_fastapi_app_version_matches_version_file() -> None:
     assert app.version == get_app_version()
 
 
+def test_login_page_shows_version_footer_link(client: TestClient) -> None:
+    from src.version import get_app_version
+
+    get_app_version.cache_clear()
+    version = get_app_version()
+    response = client.get("/login")
+    assert response.status_code == 200
+    assert 'class="app-version-footer"' in response.text
+    assert 'href="https://github.com/hometinker12/api-to-dns"' in response.text
+    assert f"<code>api-to-dns v{version}</code>" in response.text
+
+
 def test_encryption_key_rejected_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ENCRYPTION_KEY", raising=False)
     monkeypatch.setenv("API_TO_DNS_ALLOW_INSECURE_DEFAULTS", "0")

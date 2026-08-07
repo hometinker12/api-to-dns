@@ -11,8 +11,10 @@ from .db import SessionLocal
 from .paths import TEMPLATES_DIR
 from .rbac import ROLE_FORBIDDEN_DETAIL, ROLE_SYSTEM_UPDATE, get_user_roles
 from .restart import is_restart_required, preview_restart_urls, restart_reason
+from .version import get_app_version
 
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+templates.env.globals["app_version"] = get_app_version()
 
 
 def client_ip(request: Request) -> str | None:
@@ -35,12 +37,22 @@ def render_access_denied_response() -> HTMLResponse:
             "<script>(function(){var k='api-to-dns-theme';var s=localStorage.getItem(k);"
             "var t=(s==='light'||s==='dark')?s:(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');"
             "document.documentElement.setAttribute('data-theme',t);})();</script>"
+            '<link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />'
             '<link rel="stylesheet" href="/static/style.css" /></head>'
             '<body><div class="page">'
+            '<a class="app-brand" href="/admin" aria-label="api-to-dns dashboard">'
+            '<img class="app-brand-mark" src="/static/logo-mark.svg" alt="" />'
+            '<span class="app-brand-name">api-to-dns</span></a>'
             "<h1>Access denied</h1>"
             f'<div class="alert error">{html.escape(ROLE_FORBIDDEN_DETAIL)}</div>'
             '<p><a class="button" href="/admin">Back to dashboard</a></p>'
-            "</div></body></html>"
+            "</div>"
+            '<footer class="app-version-footer">'
+            '<a href="https://github.com/hometinker12/api-to-dns" target="_blank" '
+            'rel="noopener noreferrer" title="api-to-dns on GitHub">'
+            f"<code>api-to-dns v{html.escape(get_app_version())}</code></a>"
+            "</footer>"
+            "</body></html>"
         ),
         status_code=403,
     )
