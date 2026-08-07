@@ -87,6 +87,61 @@ jobs:
           severity: HIGH,CRITICAL
           trivyignores: .trivyignore
 
+      - name: Install and start rsyslog receiver
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes rsyslog
+          # apt postinst may restart the distro unit; stop it before the smoke instance.
+          sudo systemctl stop rsyslog.service 2>/dev/null || true
+          sudo systemctl disable rsyslog.service 2>/dev/null || true
+          # Ubuntu AppArmor only allows the stock /etc/rsyslog.conf path; unload for this job.
+          if [ -f /etc/apparmor.d/usr.sbin.rsyslogd ]; then
+            sudo ln -sf /etc/apparmor.d/usr.sbin.rsyslogd /etc/apparmor.d/disable/usr.sbin.rsyslogd
+            sudo apparmor_parser -R /etc/apparmor.d/usr.sbin.rsyslogd || true
+          fi
+
+          SYSLOG_OUTPUT="/var/log/api-to-dns-syslog-smoke.out"
+          SYSLOG_CONF="/etc/rsyslog-smoke.conf"
+          SYSLOG_PID_FILE="/tmp/rsyslog-smoke.pid"
+          sudo tee "${SYSLOG_CONF}" >/dev/null <<EOF
+          module(load="imudp")
+          input(type="imudp" port="5514" address="0.0.0.0")
+          template(name="SmokeFmt" type="string" string="%rawmsg%\n")
+          *.* action(type="omfile" file="${SYSLOG_OUTPUT}" template="SmokeFmt")
+          EOF
+          sudo touch "${SYSLOG_OUTPUT}"
+          sudo chown syslog:adm "${SYSLOG_OUTPUT}"
+          sudo chmod 644 "${SYSLOG_OUTPUT}"
+          sudo truncate -s 0 "${SYSLOG_OUTPUT}"
+
+          sudo rsyslogd -n -f "${SYSLOG_CONF}" -i "${SYSLOG_PID_FILE}" &
+          echo $! > /tmp/rsyslog-smoke.shell.pid
+          # Readiness: process alive and UDP 5514 listening.
+          for i in $(seq 1 30); do
+            if kill -0 "$(cat /tmp/rsyslog-smoke.shell.pid)" 2>/dev/null \
+              && ss -lun | grep -q ':5514'; then
+              break
+            fi
+            sleep 0.5
+          done
+          if ! kill -0 "$(cat /tmp/rsyslog-smoke.shell.pid)" 2>/dev/null; then
+            echo "rsyslog receiver process is not running"
+            sudo dmesg | tail -n 40 || true
+            sudo cat /var/log/syslog 2>/dev/null | tail -n 50 || true
+            exit 1
+          fi
+          if ! ss -lun | grep -q ':5514'; then
+            echo "rsyslog did not open UDP 5514"
+            exit 1
+          fi
+          echo "rsyslog receiver ready on UDP 5514"
+          {
+            echo "SYSLOG_OUTPUT=${SYSLOG_OUTPUT}"
+            echo "SYSLOG_PID_FILE=${SYSLOG_PID_FILE}"
+            echo "RSYSLOG_SHELL_PID=$(cat /tmp/rsyslog-smoke.shell.pid)"
+          } >> "$GITHUB_ENV"
+
       - name: Run BIND-backed smoke test
         env:
           IMAGE_TAG: ${{ env.IMAGE_TAG }}
@@ -97,13 +152,25 @@ jobs:
           BIND_DIR="${RUNNER_TEMP}/bind-smoke"
           TSIG_NAME="api-to-dns."
           TSIG_SECRET="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+          : "${SYSLOG_OUTPUT:?SYSLOG_OUTPUT must be set by the rsyslog prerequisite step}"
+          : "${RSYSLOG_SHELL_PID:?RSYSLOG_SHELL_PID must be set by the rsyslog prerequisite step}"
 
           cleanup() {
             echo "Collecting container logs..."
             docker logs dns-api-test 2>/dev/null || true
             docker logs bind-test 2>/dev/null || true
             docker rm -f dns-api-test bind-test 2>/dev/null || true
+            docker compose down -v --remove-orphans >/dev/null 2>&1 || true
             docker network rm "${NETWORK_NAME}" 2>/dev/null || true
+            echo "Stopping rsyslog receiver..."
+            if [ -n "${SYSLOG_PID_FILE:-}" ] && [ -f "${SYSLOG_PID_FILE}" ]; then
+              sudo kill "$(cat "${SYSLOG_PID_FILE}")" 2>/dev/null || true
+            fi
+            sudo kill "${RSYSLOG_SHELL_PID}" 2>/dev/null || true
+            if [ -f "${SYSLOG_OUTPUT:-}" ]; then
+              echo "---- syslog receiver output (tail) ----"
+              sudo tail -n 100 "${SYSLOG_OUTPUT}" || true
+            fi
           }
           trap cleanup EXIT
 
@@ -232,6 +299,7 @@ jobs:
             --read-only \
             --cap-drop ALL \
             --security-opt no-new-privileges:true \
+            --add-host=host.docker.internal:host-gateway \
             --tmpfs /tmp:size=64M,mode=1777 \
             --tmpfs /app/data:size=64M,uid=10001,gid=10001,mode=1755 \
             --tmpfs /app/logs:size=16M,uid=10001,gid=10001,mode=1755 \
@@ -348,6 +416,63 @@ jobs:
             -H "Referer: http://127.0.0.1:8000/login" \
             -d "username=admin&password=your-admin-password" \
             -o /dev/null
+
+          echo "[bind] Remote syslog end-to-end (rsyslog already installed and ready)"
+          sudo truncate -s 0 "${SYSLOG_OUTPUT}"
+          curl --fail --silent -b /tmp/cookies -X POST \
+            http://127.0.0.1:8000/settings/system/syslog \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/settings?area=system_settings&section=syslog_forwarding" \
+            --data-urlencode "syslog_enabled=on" \
+            --data-urlencode "syslog_host=host.docker.internal" \
+            --data-urlencode "syslog_port=5514" \
+            --data-urlencode "syslog_protocol=udp" \
+            --data-urlencode "syslog_facility=local0" \
+            --data-urlencode "syslog_minimum_level=INFORMATIONAL" \
+            --data-urlencode "syslog_timeout=5" \
+            --data-urlencode "syslog_queue_size=1000" \
+            --data-urlencode "syslog_allow_insecure_plaintext=on" \
+            --data-urlencode "redirect_section=syslog_forwarding" \
+            -o /tmp/syslog-settings.html
+          if ! grep -q "Remote syslog settings saved." /tmp/syslog-settings.html; then
+            echo "Expected remote syslog settings save confirmation"
+            python3 -c 'from pathlib import Path; print(Path("/tmp/syslog-settings.html").read_text(encoding="utf-8", errors="replace")[:1200])'
+            exit 1
+          fi
+          # The save itself emits system.syslog_updated; poll until the receiver sees it.
+          if ! timeout 20 bash -c \
+            "until sudo grep -q '\"event_type\":\"system.syslog_updated\"' \"${SYSLOG_OUTPUT}\"; do sleep 1; done"; then
+            echo "Timed out waiting for remote syslog delivery of system.syslog_updated"
+            echo "---- syslog output ----"
+            sudo cat "${SYSLOG_OUTPUT}" || true
+            echo "---- api logs ----"
+            docker logs dns-api-test 2>&1 | tail -n 200 || true
+            exit 1
+          fi
+          sudo cat "${SYSLOG_OUTPUT}" > /tmp/syslog-smoke-copy.out
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          text = Path("/tmp/syslog-smoke-copy.out").read_text(encoding="utf-8", errors="replace")
+          found = None
+          for line in text.splitlines():
+              if "system.syslog_updated" not in line:
+                  continue
+              # local0(16)*8 + informational(6) => <134>
+              assert re.search(r"<134>1\s+\S+\s+\S+\s+api-to-dns\s+-\s+system\.syslog_updated\s+-", line), line
+              idx = line.find("{")
+              assert idx >= 0, line
+              payload = json.loads(line[idx:])
+              if payload.get("event_type") == "system.syslog_updated":
+                  found = payload
+                  break
+          assert found is not None, f"system.syslog_updated JSON not found in: {text!r}"
+          assert found.get("level") == "INFORMATIONAL"
+          print("remote syslog smoke delivery confirmed")
+          PY
 
           for zone in smoke.test denied.test; do
             echo "[bind] Configure zone ${zone}"
@@ -535,6 +660,82 @@ jobs:
             -d "username=admin&password=your-admin-password" \
             -o /dev/null
           curl --fail --silent -b /tmp/compose-cookies http://127.0.0.1:8001/admin \
+            | python3 -c "import sys; assert 'api-to-dns App Dashboard' in sys.stdin.read()"
+
+          echo "[compose] Persisted app_secrets.env overrides Compose env_file on restart"
+          # Distinct from .env so we prove Python env_bootstrap (not shell source) wins over env_file.
+          RESTORED_KEYS="$(python3 - <<'PY'
+          import base64
+          import hashlib
+          import os
+          import secrets
+
+          enc = base64.urlsafe_b64encode(os.urandom(32)).decode()
+          secret = secrets.token_urlsafe(32)
+          print(enc)
+          print(secret)
+          print(hashlib.sha256(enc.encode()).hexdigest())
+          print(hashlib.sha256(secret.encode()).hexdigest())
+          PY
+          )"
+          RESTORED_ENC="$(printf '%s\n' "$RESTORED_KEYS" | sed -n '1p')"
+          RESTORED_SECRET="$(printf '%s\n' "$RESTORED_KEYS" | sed -n '2p')"
+          EXPECTED_ENC_HASH="$(printf '%s\n' "$RESTORED_KEYS" | sed -n '3p')"
+          EXPECTED_SECRET_HASH="$(printf '%s\n' "$RESTORED_KEYS" | sed -n '4p')"
+          # Write via stdin so restored secret values are not argv-visible in process listings.
+          {
+            printf 'SECRET_KEY=%s\n' "${RESTORED_SECRET}"
+            printf 'ENCRYPTION_KEY=%s\n' "${RESTORED_ENC}"
+          } | docker compose exec -T dns-api sh -c 'cat > /app/data/app_secrets.env && chmod 600 /app/data/app_secrets.env'
+          unset RESTORED_ENC RESTORED_SECRET RESTORED_KEYS
+          docker compose restart dns-api
+          for i in $(seq 1 60); do
+            if curl --fail --silent --max-time 5 http://127.0.0.1:8001/health >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          curl --fail --silent http://127.0.0.1:8001/health >/dev/null
+          # Read PID 1 environ (entrypoint-sourced overrides); docker exec env alone still shows Compose env_file.
+          ACTUAL_HASHES="$(
+            EXPECTED_ENC_HASH="${EXPECTED_ENC_HASH}" EXPECTED_SECRET_HASH="${EXPECTED_SECRET_HASH}" \
+            docker compose exec -T \
+              -e EXPECTED_ENC_HASH \
+              -e EXPECTED_SECRET_HASH \
+              dns-api python - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+
+          raw = Path("/proc/1/environ").read_bytes()
+          env: dict[str, str] = {}
+          for item in raw.split(b"\0"):
+              if b"=" not in item:
+                  continue
+              key, _, value = item.partition(b"=")
+              env[key.decode()] = value.decode(errors="replace")
+          enc_hash = hashlib.sha256(env.get("ENCRYPTION_KEY", "").encode()).hexdigest()
+          secret_hash = hashlib.sha256(env.get("SECRET_KEY", "").encode()).hexdigest()
+          assert enc_hash == os.environ["EXPECTED_ENC_HASH"], (enc_hash, os.environ["EXPECTED_ENC_HASH"])
+          assert secret_hash == os.environ["EXPECTED_SECRET_HASH"], (secret_hash, os.environ["EXPECTED_SECRET_HASH"])
+          print("pid1 secret hashes match restored app_secrets.env")
+          PY
+          )"
+          echo "${ACTUAL_HASHES}"
+          stale_admin="$(curl --silent --show-error -o /dev/null -w "%{http_code}" -b /tmp/compose-cookies http://127.0.0.1:8001/admin)"
+          if [ "${stale_admin}" != "303" ] && [ "${stale_admin}" != "401" ] && [ "${stale_admin}" != "302" ]; then
+            echo "Expected pre-restart session rejected after SECRET_KEY restore; got ${stale_admin}"
+            docker compose logs dns-api || true
+            docker compose down -v --remove-orphans || true
+            exit 1
+          fi
+          curl --fail --silent -c /tmp/compose-cookies-restored -X POST http://127.0.0.1:8001/login \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "Origin: http://127.0.0.1:8001" \
+            -H "Referer: http://127.0.0.1:8001/login" \
+            -d "username=admin&password=your-admin-password" \
+            -o /dev/null
+          curl --fail --silent -b /tmp/compose-cookies-restored http://127.0.0.1:8001/admin \
             | python3 -c "import sys; assert 'api-to-dns App Dashboard' in sys.stdin.read()"
           docker compose down -v --remove-orphans
 

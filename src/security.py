@@ -5,6 +5,8 @@ import sys
 from cryptography.fernet import Fernet
 from passlib.context import CryptContext
 
+from . import env_bootstrap as _env_bootstrap  # noqa: F401 — load persisted secrets first
+
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
 _INSECURE_ENCRYPTION_PLACEHOLDERS = frozenset(

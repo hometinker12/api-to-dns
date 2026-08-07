@@ -32,6 +32,9 @@ def render_access_denied_response() -> HTMLResponse:
     return HTMLResponse(
         content=(
             "<!DOCTYPE html><html><head><title>Access denied</title>"
+            "<script>(function(){var k='api-to-dns-theme';var s=localStorage.getItem(k);"
+            "var t=(s==='light'||s==='dark')?s:(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');"
+            "document.documentElement.setAttribute('data-theme',t);})();</script>"
             '<link rel="stylesheet" href="/static/style.css" /></head>'
             '<body><div class="page">'
             "<h1>Access denied</h1>"

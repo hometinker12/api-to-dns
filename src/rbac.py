@@ -91,6 +91,11 @@ SETTINGS_AREAS: list[dict[str, Any]] = [
         "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
     },
     {
+        "key": "backup",
+        "label": "Backup",
+        "required_roles": [ROLE_GLOBAL_ADMIN],
+    },
+    {
         "key": "system_settings",
         "label": "System Settings",
         "required_roles": [ROLE_GLOBAL_READ, ROLE_SYSTEM_UPDATE],
@@ -109,9 +114,16 @@ SYSTEM_SETTINGS_SECTIONS: list[dict[str, str]] = [
     {"key": "logging_configuration", "label": "Logging Level"},
     {"key": "audit_log_retention", "label": "Audit Log Retention"},
     {"key": "operational_log_rotation", "label": "Operational Log Rotation"},
+    {"key": "syslog_forwarding", "label": "Remote Syslog"},
+]
+
+BACKUP_SECTIONS: list[dict[str, str]] = [
+    {"key": "export", "label": "Export"},
+    {"key": "import", "label": "Import"},
 ]
 
 _SYSTEM_SETTINGS_SECTION_KEYS = {section["key"] for section in SYSTEM_SETTINGS_SECTIONS}
+_BACKUP_SECTION_KEYS = {section["key"] for section in BACKUP_SECTIONS}
 
 _LEGACY_SYSTEM_SETTINGS_SECTION_ALIASES: dict[str, str] = {
     "ssl_planned": "ssl_certificate",
@@ -128,6 +140,17 @@ def normalize_system_settings_section(section: str | None) -> str:
     if key in _SYSTEM_SETTINGS_SECTION_KEYS:
         return key
     return default_system_settings_section()
+
+
+def default_backup_section() -> str:
+    return BACKUP_SECTIONS[0]["key"]
+
+
+def normalize_backup_section(section: str | None) -> str:
+    key = (section or "").strip().lower()
+    if key in _BACKUP_SECTION_KEYS:
+        return key
+    return default_backup_section()
 
 
 ROLE_FORBIDDEN_DETAIL = "You do not have permission to access this resource."

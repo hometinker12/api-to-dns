@@ -1,6 +1,6 @@
 # DNS REST Service
 
-[![License: MIT + Commons Clause](https://img.shields.io/badge/License-MIT%20+%20Commons%20Clause-orange)](LICENSE.md) [![Release](https://img.shields.io/badge/release-0.6.3-blue)](VERSION) [![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/) [![Python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/) [![AI Assisted](https://img.shields.io/badge/AI%20Assisted-yes-blue)](https://cursor.com)
+[![License: MIT + Commons Clause](https://img.shields.io/badge/License-MIT%20+%20Commons%20Clause-orange)](LICENSE.md) [![Release](https://img.shields.io/badge/release-0.7.0-blue)](VERSION) [![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/) [![Python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/) [![AI Assisted](https://img.shields.io/badge/AI%20Assisted-yes-blue)](https://cursor.com)
 
 
 A Dockerized FastAPI service to manage DNS records through a protected admin web UI and secure API key authentication.
@@ -76,7 +76,7 @@ http://127.0.0.1:8001/login
 
 > SSL is **off by default**; the container listens on plain HTTP on port `8000` (mapped to host `127.0.0.1:8001`). See **Optional: HTTPS with self-signed or uploaded certificates** below for the enable workflow.
 >
-> The image runs as non-root uid/gid **10001**. Compose pins `hometinker12/api-to-dns:0.6.3`, enables `read_only`, drops capabilities, and binds published ports to localhost. If you upgrade from a root-owned named volume, fix ownership once (do not start the app as root):
+> The image runs as non-root uid/gid **10001**. Compose pins `hometinker12/api-to-dns:0.7.0`, enables `read_only`, drops capabilities, and binds published ports to localhost. If you upgrade from a root-owned named volume, fix ownership once (do not start the app as root):
 >
 > ```bash
 > docker run --rm -v api-to-dns_api-to-dns-data:/vol alpine chown -R 10001:10001 /vol
@@ -150,7 +150,8 @@ The web interface allows you to:
 - Add and edit **DNS zones** (each configuration name is unique; each has its own provider type, DNS domain, server, and credentials). Use the **Test Configuration** button on a zone form to verify credentials and zone access by looking up a known record before saving.
 - Create and revoke **API keys**, and **edit** keys to change their label or **allowed zones**
 - Review and search activity logs under **Settings → Log Viewing / Searching**
-- Configure logging level, retention, SMTP delivery, and operational log rotation under **Settings → System Settings**
+- Export and restore configuration under **Settings → Backup** (global admin only): password-encrypted archives include settings, users, DNS zones, API key hashes, alert rules, SSL files, and `SECRET_KEY` / `ENCRYPTION_KEY` (application secrets require encryption). Audit logs are optional. Restore is destructive for selected categories and shows an inline progress dialog; restoring application secrets writes durable secrets and restarts the app.
+- Configure logging level, retention, SMTP delivery, operational log rotation, and remote syslog under **Settings → System Settings**
 - Create email alert rules under **Settings → Email Alerting**
 
 ## Activity Logs, Operational Logs, And Alerts
@@ -178,6 +179,19 @@ Activity log retention is configured under **System Settings** with presets such
 Alert rules match stored activity events by event type, category, minimum level, optional text search, recipients, and cooldown. Alert subjects and bodies can use placeholders such as `{event_type}`, `{level}`, `{category}`, `{timestamp}`, `{message}`, `{status}`, `{actor_type}`, `{actor_label}`, `{zone_name}`, `{record_name}`, `{details}`, `{system_dns_name}`, and `{system_ip_address}`.
 
 SMTP delivery settings live under **System Settings**. The SMTP server field accepts an ordered CSV list such as `smtp1.example.com,192.0.2.25,smtp-backup.example.com`; delivery tries each server in order until one succeeds. Anonymous SMTP skips authentication. Successful delivery writes an informational `alert.email_sent` event. If delivery fails for every server, the app writes an `alert.email_failed` activity event without blocking the original action.
+
+### Remote Syslog
+
+Remote syslog forwarding is optional and off by default. When enabled under **Settings → System Settings → Remote Syslog** (last System Settings entry), the app forwards **stored audit/activity events** to a remote syslog server. Operational Python/Docker logs are not forwarded by this feature.
+
+- **Transport:** TLS (RFC 5425, preferred), or plaintext UDP/TCP with an explicit admin opt-in. TCP/TLS use RFC 6587 octet-count framing.
+- **Message format:** RFC 5424 header with a JSON payload containing non-null audit fields (`event_type`, `level`, `message`, redacted `details`, actors, request metadata, and so on).
+- **Defaults:** disabled; TLS port `6514`; facility `local0`; minimum forward level `INFORMATIONAL`.
+- **Delivery model:** a bounded in-process queue (max 5000) drains asynchronously so API requests never wait on the network. The queue is non-durable; when it is full or the remote server is unavailable, events are dropped and a rate-limited warning is written to operational logs (no recursive audit event).
+- **Filtering:** the remote minimum level is independent of the activity-log storage level. Security events are always stored in the database, but they still obey the configured remote minimum level when forwarding.
+- **Firewall:** the container or host must be allowed to send outbound TLS/UDP/TCP to the configured syslog host/port.
+
+Saving the Remote Syslog settings writes a `system.syslog_updated` activity event. When forwarding is enabled, that event is also a convenient end-to-end confirmation that the destination is reachable.
 
 ### Optional: HTTPS with self-signed, uploaded, or Let's Encrypt certificates
 

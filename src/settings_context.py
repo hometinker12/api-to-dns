@@ -8,6 +8,7 @@ from .activity_logging import (
     DEFAULT_BODY_TEMPLATE,
     DEFAULT_SUBJECT_TEMPLATE,
     get_log_level,
+    get_remote_syslog_config,
     get_retention_days,
     get_smtp_config,
     is_running_in_docker,
@@ -18,6 +19,7 @@ from .db import SessionLocal
 from .letsencrypt import config_view as letsencrypt_config_view
 from .models import LOG_CATEGORY_VALUES, LOG_LEVEL_VALUES, AlertRule, User
 from .rbac import (
+    BACKUP_SECTIONS,
     ROLE_ACCOUNT_RESET_PASSWORD,
     ROLE_ACCOUNT_UPDATE,
     ROLE_GLOBAL_ADMIN,
@@ -26,8 +28,10 @@ from .rbac import (
     ROLE_SYSTEM_UPDATE,
     SYSTEM_SETTINGS_SECTIONS,
     accessible_settings_areas,
+    default_backup_section,
     default_system_settings_section,
     get_user_roles,
+    normalize_backup_section,
     normalize_system_settings_section,
     role_catalog_for_actor,
     user_public_dict,
@@ -111,6 +115,14 @@ def settings_context(
         )
         system_settings_sections = list(SYSTEM_SETTINGS_SECTIONS) if can_access_system_settings else []
 
+        can_access_backup = "backup" in accessible_keys
+        selected_backup_section = (
+            normalize_backup_section(section)
+            if requested_area == "backup" and can_access_backup
+            else default_backup_section()
+        )
+        backup_sections = list(BACKUP_SECTIONS) if can_access_backup else []
+
         system_settings_view: dict[str, Any] | None = None
         log_view: dict[str, Any] | None = None
         alert_view: dict[str, Any] | None = None
@@ -120,6 +132,7 @@ def settings_context(
         ):
             identity = system_identity(db)
             smtp = get_smtp_config(db)
+            syslog = get_remote_syslog_config(db)
             current_level = get_log_level(db)
             retention_days = get_retention_days(db)
             ssl_enabled_flag = is_ssl_enabled(db)
@@ -171,6 +184,19 @@ def settings_context(
                     "timeout": smtp.get("timeout"),
                     "allow_insecure_auth": bool(smtp.get("allow_insecure_auth")),
                     "password_set": bool(smtp.get("password_set") or smtp.get("password")),
+                },
+                "syslog": {
+                    "enabled": bool(syslog.get("enabled")),
+                    "host": syslog.get("host") or "",
+                    "port": syslog.get("port"),
+                    "protocol": syslog.get("protocol") or "tls",
+                    "facility": syslog.get("facility") or "local0",
+                    "minimum_level": syslog.get("minimum_level") or "INFORMATIONAL",
+                    "timeout": syslog.get("timeout"),
+                    "queue_size": syslog.get("queue_size"),
+                    "allow_insecure_plaintext": bool(syslog.get("allow_insecure_plaintext")),
+                    "facilities": syslog.get("facilities") or [],
+                    "protocols": syslog.get("protocols") or ["tls", "udp", "tcp"],
                 },
                 "ssl": ssl_status,
                 "operational_log": {
@@ -285,6 +311,9 @@ def settings_context(
         "system_settings_view": system_settings_view,
         "system_settings_sections": system_settings_sections,
         "selected_system_section": selected_system_section,
+        "backup_sections": backup_sections,
+        "selected_backup_section": selected_backup_section,
+        "can_backup": can_access_backup,
         "log_view": log_view,
         "alert_view": alert_view,
         **nav,
