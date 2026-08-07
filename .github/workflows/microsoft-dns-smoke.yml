@@ -1265,7 +1265,7 @@ jobs:
               throw "JSON GET /zones missing allowed zone $la"
             }
             if ($zoneNames -contains $ld) {
-              throw "JSON GET /zones leaked denied zone $ld: $($zoneNames -join ', ')"
+              throw "JSON GET /zones leaked denied zone ${ld}: $($zoneNames -join ', ')"
             }
             if (@($zoneNames).Count -ne 1 -or $zoneNames[0] -ne $la) {
               throw "JSON GET /zones expected exactly [$la]; got [$($zoneNames -join ', ')]"
