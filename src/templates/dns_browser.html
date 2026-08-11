@@ -37,7 +37,7 @@
           {% endif %}
         </div>
       </form>
-      <p class="help">Leave the name blank to browse up to 100 record sets. Use <code>*</code> for any sequence or <code>?</code> for one character; filtering by type is optional.</p>
+      <p class="help">Leave the name blank to browse up to 100 record sets. Use <code>*</code> for any sequence or <code>?</code> for one character; filtering by type is optional. BIND / TSIG browse uses a TSIG-signed zone transfer (AXFR) and needs <code>allow-transfer</code> on the server.</p>
       <div id="dns-browser-status" class="alert" hidden></div>
     </section>
 

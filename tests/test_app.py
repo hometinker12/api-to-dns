@@ -3448,7 +3448,7 @@ def test_dns_browser_browse_and_glob_search(
     assert glob.json()["records"][0]["record_name"] == "api-v2"
 
 
-def test_dns_browser_browse_reports_bind_enumeration_limitation(
+def test_dns_browser_browse_reports_bind_transfer_refused(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3460,13 +3460,14 @@ def test_dns_browser_browse_reports_bind_enumeration_limitation(
 
     fake = MagicMock()
     fake.list_records.side_effect = ValueError(
-        "Browse and wildcard search are not supported for BIND / TSIG. Enter an exact record name instead."
+        "Zone transfer (AXFR) was refused (REFUSED). Browse and wildcard search require "
+        'allow-transfer { key "api-to-dns"; }; on the BIND zone — see BINDCONFIG.md.'
     )
     monkeypatch.setattr("src.dns_browser_service.create_dns_client_from_settings", lambda *_a, **_k: fake)
 
     response = client.get(f"/zones/{zone_id}/records/search")
     assert response.status_code == 400
-    assert "not supported for BIND" in response.json()["message"]
+    assert "allow-transfer" in response.json()["message"]
 
 
 def test_dns_browser_requires_dns_zones_update(

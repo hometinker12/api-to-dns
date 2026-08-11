@@ -3,10 +3,14 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import dns.name
+import dns.rcode
 import dns.rdata
 import dns.rdataclass
 import dns.rdataset
 import dns.rrset
+import dns.xfr
+import dns.zone
 import httpx
 import pytest
 
@@ -310,11 +314,63 @@ def test_bind_get_record_delegates(mock_query) -> None:
     mock_query.assert_called_once_with("127.0.0.1", "example.com", "@", None)
 
 
+def _fake_bind_zone() -> dns.zone.Zone:
+    return dns.zone.from_text(
+        "$TTL 300\n"
+        "@      IN SOA ns.example.com. hostmaster.example.com. (1 3600 600 86400 300)\n"
+        "@      IN NS  ns.example.com.\n"
+        "www    IN A   192.0.2.10\n"
+        "api-v1 IN A   192.0.2.11\n"
+        "api-v2 IN A   192.0.2.12\n"
+        "mail   IN MX  10 mail.example.com.\n",
+        origin="example.com",
+        relativize=True,
+    )
+
+
 @patch.object(BindTsigDnsClient, "__init__", lambda self, *args, **kwargs: None)
-def test_bind_list_records_explains_enumeration_limitation() -> None:
+def test_bind_list_records_blank_browse_returns_all_rrsets() -> None:
     client = BindTsigDnsClient.__new__(BindTsigDnsClient)
-    with pytest.raises(ValueError, match="not supported for BIND"):
-        client.list_records(name_pattern="*", dns_server="127.0.0.1", dns_zone="example.com")
+    with patch.object(client, "_transfer_zone", return_value=_fake_bind_zone()):
+        result = client.list_records(dns_server="127.0.0.1", dns_zone="example.com")
+    names = {(r.record_name, r.record_type) for r in result.records}
+    assert ("www", "A") in names
+    assert ("@", "SOA") in names
+    assert result.truncated is False
+
+
+@patch.object(BindTsigDnsClient, "__init__", lambda self, *args, **kwargs: None)
+def test_bind_list_records_glob_and_type_filter() -> None:
+    client = BindTsigDnsClient.__new__(BindTsigDnsClient)
+    with patch.object(client, "_transfer_zone", return_value=_fake_bind_zone()):
+        result = client.list_records(
+            name_pattern="API-*",
+            record_type="A",
+            dns_server="127.0.0.1",
+            dns_zone="example.com",
+        )
+    assert [r.record_name for r in result.records] == ["api-v1", "api-v2"]
+
+
+@patch.object(BindTsigDnsClient, "__init__", lambda self, *args, **kwargs: None)
+def test_bind_list_records_caps_at_limit_and_flags_truncated() -> None:
+    client = BindTsigDnsClient.__new__(BindTsigDnsClient)
+    with patch.object(client, "_transfer_zone", return_value=_fake_bind_zone()):
+        result = client.list_records(limit=2, dns_server="127.0.0.1", dns_zone="example.com")
+    assert len(result.records) == 2
+    assert result.truncated is True
+
+
+@patch.object(BindTsigDnsClient, "__init__", lambda self, *args, **kwargs: None)
+def test_bind_list_records_refused_axfr_maps_to_value_error() -> None:
+    client = BindTsigDnsClient.__new__(BindTsigDnsClient)
+    client._keyring = {}
+    client._keyname = dns.name.from_text("api-to-dns.")
+    with (
+        patch("src.plugins.bind.dns.query.xfr", side_effect=dns.xfr.TransferError(dns.rcode.REFUSED)),
+        pytest.raises(ValueError, match="allow-transfer"),
+    ):
+        client.list_records(dns_server="127.0.0.1", dns_zone="example.com")
 
 
 class _CloudflareFake:

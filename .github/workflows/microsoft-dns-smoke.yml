@@ -203,6 +203,7 @@ jobs:
               "  type master;\n"
               '  file "/bind/db.smoke.test";\n'
               '  allow-update { key "' + tsig_name + '"; };\n'
+              '  allow-transfer { key "' + tsig_name + '"; };\n'
               "};\n"
               "\n"
               'zone "denied.test" {\n'
@@ -673,22 +674,6 @@ jobs:
           echo "[bind] Admin DNS browser session CRUD for temporary A record"
           browser_page="$(curl --fail --silent -b /tmp/cookies "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records")"
           echo "${browser_page}" | python3 -c "import sys; html=sys.stdin.read(); assert 'dns-browser-search' in html; assert 'dns-browser-results' in html and 'hidden' in html"
-          bind_browse_status="$(curl --silent --show-error -b /tmp/cookies -o /tmp/bind-browser-browse.json -w "%{http_code}" \
-            "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search")"
-          if [ "${bind_browse_status}" != "400" ]; then
-            echo "Expected BIND browser browse to return 400; got ${bind_browse_status}"
-            cat /tmp/bind-browser-browse.json
-            exit 1
-          fi
-          python3 -c "import json; b=json.load(open('/tmp/bind-browser-browse.json')); assert 'not supported for BIND' in b['message'], b"
-          bind_glob_status="$(curl --silent --show-error -b /tmp/cookies -o /tmp/bind-browser-glob.json -w "%{http_code}" \
-            "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search?record_name=browser*")"
-          if [ "${bind_glob_status}" != "400" ]; then
-            echo "Expected BIND browser wildcard search to return 400; got ${bind_glob_status}"
-            cat /tmp/bind-browser-glob.json
-            exit 1
-          fi
-          python3 -c "import json; b=json.load(open('/tmp/bind-browser-glob.json')); assert 'not supported for BIND' in b['message'], b"
           curl --fail --silent -b /tmp/cookies \
             -H "Origin: http://127.0.0.1:8000" \
             -H "Referer: http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
@@ -698,6 +683,14 @@ jobs:
             -d '{"record_name":"browser","record_type":"A","ttl":300,"values":["192.0.2.77"]}' \
             | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['action']=='created', b"
           wait_for_record_value browser.smoke.test 192.0.2.77
+          echo "[bind] DNS browser blank browse returns zone RRsets (AXFR)"
+          curl --fail --silent -b /tmp/cookies \
+            "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search" \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['match_mode']=='browse'; assert any(r['record_name']=='browser' and r['record_type']=='A' for r in b['records']), b"
+          echo "[bind] DNS browser wildcard search matches browser record"
+          curl --fail --silent -b /tmp/cookies \
+            "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search?record_name=brow?er*&record_type=A" \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['match_mode']=='glob'; assert b['records'][0]['values']==['192.0.2.77'], b"
           curl --fail --silent -b /tmp/cookies \
             "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search?record_name=browser&record_type=A" \
             | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['status']=='success'; assert b['records'][0]['values']==['192.0.2.77'], b"

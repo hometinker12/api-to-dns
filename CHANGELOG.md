@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- BIND / TSIG DNS browser blank browse and `*` / `?` wildcard search via TSIG-signed zone transfer (AXFR). Requires `allow-transfer { key ...; };` on the BIND zone (see `BINDCONFIG.md`); refused transfers return HTTP 400 with that remediation. Exact-name lookup is unchanged. Release BIND smoke grants AXFR and asserts browse/glob success.
+
 ## [0.8.0] - 2026-08-07
 
 ### Added
