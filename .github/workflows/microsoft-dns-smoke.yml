@@ -210,6 +210,7 @@ jobs:
               "  type master;\n"
               '  file "/bind/db.denied.test";\n'
               '  allow-update { key "' + tsig_name + '"; };\n'
+              "  allow-transfer { none; };\n"
               "};\n"
           )
 
@@ -417,6 +418,27 @@ jobs:
           print("admin nav + 0.8.0 metadata assertions passed")
           PY
 
+          echo "[bind] Static brand assets (favicon + logo mark)"
+          curl --fail --silent -D /tmp/favicon.headers -o /tmp/favicon.svg \
+            "http://127.0.0.1:8000/static/favicon.svg?v=2"
+          curl --fail --silent -D /tmp/logo-mark.headers -o /tmp/logo-mark.svg \
+            "http://127.0.0.1:8000/static/logo-mark.svg?v=2"
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          for name, headers_path, body_path in (
+              ("favicon", Path("/tmp/favicon.headers"), Path("/tmp/favicon.svg")),
+              ("logo-mark", Path("/tmp/logo-mark.headers"), Path("/tmp/logo-mark.svg")),
+          ):
+              headers = headers_path.read_text(encoding="utf-8", errors="replace").lower()
+              assert "content-type: image/svg+xml" in headers, (name, headers)
+              body = body_path.read_text(encoding="utf-8")
+              assert "<svg" in body.lower(), (name, body[:200])
+              ET.fromstring(body)
+          print("static brand asset assertions passed")
+          PY
+
           echo "[bind] POST logout clears session"
           curl --fail --silent -b /tmp/cookies -c /tmp/cookies -X POST http://127.0.0.1:8000/logout \
             -H "Origin: http://127.0.0.1:8000" \
@@ -523,7 +545,9 @@ jobs:
           echo "[bind] Fetch API key management page"
           curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/api-keys -o /tmp/api-keys.html
           SMOKE_ZONE_ID="$(python3 -c 'import re; html=open("/tmp/api-keys.html", encoding="utf-8").read(); match=re.search(r"name=\"zone_ids\" value=\"(\d+)\"\s*/>\s*<code>smoke\.test</code>", html, re.DOTALL); assert match, "Could not find smoke.test zone ID"; print(match.group(1))')"
+          DENIED_ZONE_ID="$(python3 -c 'import re; html=open("/tmp/api-keys.html", encoding="utf-8").read(); match=re.search(r"name=\"zone_ids\" value=\"(\d+)\"\s*/>\s*<code>denied\.test</code>", html, re.DOTALL); assert match, "Could not find denied.test zone ID"; print(match.group(1))')"
           : "${SMOKE_ZONE_ID:?Could not extract smoke.test zone ID}"
+          : "${DENIED_ZONE_ID:?Could not extract denied.test zone ID}"
           python3 - <<'PY'
           from pathlib import Path
 
@@ -694,6 +718,22 @@ jobs:
           curl --fail --silent -b /tmp/cookies \
             "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search?record_name=browser&record_type=A" \
             | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['status']=='success'; assert b['records'][0]['values']==['192.0.2.77'], b"
+          echo "[bind] DNS browser AXFR refused on denied.test (blank browse + glob → 400; exact lookup still works)"
+          for denied_url in \
+            "http://127.0.0.1:8000/zones/${DENIED_ZONE_ID}/records/search" \
+            "http://127.0.0.1:8000/zones/${DENIED_ZONE_ID}/records/search?record_name=ns*&record_type=A"
+          do
+            denied_code="$(curl --silent --show-error -b /tmp/cookies -o /tmp/denied-browse.json -w "%{http_code}" "${denied_url}")"
+            if [ "${denied_code}" != "400" ]; then
+              echo "Expected HTTP 400 for AXFR-refused browser search; got ${denied_code} for ${denied_url}"
+              python3 -c 'from pathlib import Path; print(Path("/tmp/denied-browse.json").read_text(encoding="utf-8", errors="replace")[:800])'
+              exit 1
+            fi
+            python3 -c 'import json; from pathlib import Path; b=json.loads(Path("/tmp/denied-browse.json").read_text(encoding="utf-8")); msg=b.get("message") or (b.get("detail") or {}).get("message",""); assert "allow-transfer" in msg, b'
+          done
+          curl --fail --silent -b /tmp/cookies \
+            "http://127.0.0.1:8000/zones/${DENIED_ZONE_ID}/records/search?record_name=ns&record_type=A" \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['status']=='success'; assert b['records'][0]['record_name']=='ns'; assert b['records'][0]['values']==['127.0.0.1'], b"
           curl --fail --silent -b /tmp/cookies \
             -H "Origin: http://127.0.0.1:8000" \
             -H "Referer: http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
@@ -1189,6 +1229,29 @@ jobs:
             if ($appVersion -ne '0.8.0') { throw "Expected VERSION 0.8.0; got $appVersion" }
             if ($admin.Content -notmatch [regex]::Escape("api-to-dns v$appVersion")) {
               throw 'Admin page missing version footer'
+            }
+
+            Write-Host '[microsoft] Static brand assets (favicon + logo mark)'
+            foreach ($asset in @(
+              @{ Name = 'favicon'; Uri = "$base/static/favicon.svg?v=2" },
+              @{ Name = 'logo-mark'; Uri = "$base/static/logo-mark.svg?v=2" }
+            )) {
+              $resp = Invoke-WebRequest -Uri $asset.Uri -WebSession $WebSession -UseBasicParsing
+              if ($resp.StatusCode -ne 200) {
+                throw "Expected 200 for $($asset.Name); got $($resp.StatusCode)"
+              }
+              $ct = [string]$resp.Headers['Content-Type']
+              if ($ct -notmatch 'image/svg\+xml') {
+                throw "Expected image/svg+xml for $($asset.Name); got '$ct'"
+              }
+              if ($resp.Content -notmatch '(?i)<svg') {
+                throw "$($asset.Name) body missing <svg>"
+              }
+              try {
+                [xml]$resp.Content | Out-Null
+              } catch {
+                throw "$($asset.Name) body is not well-formed XML: $_"
+              }
             }
 
             # PowerShell does not treat \ as an escape, so ".\\$user" produced a literal

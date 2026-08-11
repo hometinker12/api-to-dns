@@ -4,7 +4,13 @@
 
 ### Added
 
-- BIND / TSIG DNS browser blank browse and `*` / `?` wildcard search via TSIG-signed zone transfer (AXFR). Requires `allow-transfer { key ...; };` on the BIND zone (see `BINDCONFIG.md`); refused transfers return HTTP 400 with that remediation. Exact-name lookup is unchanged. Release BIND smoke grants AXFR and asserts browse/glob success.
+- BIND / TSIG DNS browser blank browse and `*` / `?` wildcard search via TSIG-signed zone transfer (AXFR). Requires `allow-transfer { key ...; };` on the BIND zone (see `BINDCONFIG.md`); refused transfers return HTTP 400 with that remediation. Exact-name lookup is unchanged. README, `BINDCONFIG.md`, and DNS browser help text updated for the AXFR requirement; unit and app tests cover browse, glob, truncation, and refused-transfer mapping.
+- Operator guide [`BINDCONFIG.md`](BINDCONFIG.md): BIND/TSIG prerequisites for dynamic updates and optional AXFR browse (`allow-update` / `allow-transfer`, key setup, dig checks, troubleshooting).
+- Release BIND smoke grants AXFR on `smoke.test` (browse/glob success), denies transfer on `denied.test` (browse/glob 400 + exact lookup still works), and asserts favicon/logo-mark static SVG delivery on BIND and Microsoft smoke jobs.
+
+### Changed
+
+- Admin UI favicon (`favicon.svg`) and logo mark (`logo-mark.svg`) redrawn as a higher-resolution 64×64 globe-and-routing SVG (replacing the earlier pulse-line mark) for clearer branding at favicon and header sizes.
 
 ## [0.8.0] - 2026-08-07
 
