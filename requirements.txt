@@ -14,7 +14,7 @@ azure-mgmt-dns==9.0.0
 passlib==1.7.4
 cryptography==50.0.0
 itsdangerous==2.2.0
-python-multipart==0.0.30
+python-multipart==0.0.31
 
 # Templating & Utilities
 jinja2==3.1.6

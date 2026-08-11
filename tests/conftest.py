@@ -38,7 +38,7 @@ from sqlmodel import select  # noqa: E402
 
 from src.app import ALL_ROLES, _serialize_roles, app  # noqa: E402
 from src.db import SessionLocal, init_db  # noqa: E402
-from src.models import ApiKey, ApiKeyAllowedZone, DnsZoneConfig, User  # noqa: E402
+from src.models import API_KEY_ACCESS_READ_WRITE, ApiKey, ApiKeyAllowedZone, DnsZoneConfig, User  # noqa: E402
 from src.security import hash_password  # noqa: E402
 from src.zone_service import encode_zone_config_dict, normalize_zone_name, set_disabled_dns_plugins  # noqa: E402
 
@@ -58,11 +58,17 @@ def _seed_example_zone_and_permission(db, api_key_value: str) -> None:
                 label="pytest",
                 key=digest,
                 key_prefix=api_key_prefix(api_key_value),
+                access_mode=API_KEY_ACCESS_READ_WRITE,
                 active=True,
             )
         )
         db.commit()
     key = db.exec(select(ApiKey).where(ApiKey.key == digest)).first()
+    assert key is not None
+    if key.access_mode != API_KEY_ACCESS_READ_WRITE:
+        key.access_mode = API_KEY_ACCESS_READ_WRITE
+        db.add(key)
+        db.commit()
     zname = normalize_zone_name("example.com")
     zone = db.exec(select(DnsZoneConfig).where(DnsZoneConfig.zone_name == zname)).first()
     if not zone:

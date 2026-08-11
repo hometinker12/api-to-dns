@@ -152,7 +152,7 @@ jobs:
           NETWORK_NAME="dns-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           BIND_DIR="${RUNNER_TEMP}/bind-smoke"
           TSIG_NAME="api-to-dns."
-          TSIG_SECRET="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+          TSIG_SECRET="$(python3 -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
           : "${SYSLOG_OUTPUT:?SYSLOG_OUTPUT must be set by the rsyslog prerequisite step}"
           : "${RSYSLOG_SHELL_PID:?RSYSLOG_SHELL_PID must be set by the rsyslog prerequisite step}"
 
@@ -203,12 +203,14 @@ jobs:
               "  type master;\n"
               '  file "/bind/db.smoke.test";\n'
               '  allow-update { key "' + tsig_name + '"; };\n'
+              '  allow-transfer { key "' + tsig_name + '"; };\n'
               "};\n"
               "\n"
               'zone "denied.test" {\n'
               "  type master;\n"
               '  file "/bind/db.denied.test";\n'
               '  allow-update { key "' + tsig_name + '"; };\n'
+              "  allow-transfer { none; };\n"
               "};\n"
           )
 
@@ -306,6 +308,7 @@ jobs:
             --tmpfs /app/logs:size=16M,uid=10001,gid=10001,mode=1755 \
             --env-file .env \
             -e RATE_LIMIT_LOGIN=3:8 \
+            -e OPENAPI_ENABLED=1 \
             -p 127.0.0.1:8000:8000 \
             "$IMAGE_TAG"
 
@@ -327,11 +330,16 @@ jobs:
             sleep 2
           done
 
-          echo "[bind] Security defaults: OpenAPI/docs off, headers, CSRF, logout method"
-          for path in /openapi.json /docs /redoc; do
+          echo "[bind] Security defaults: authenticated OpenAPI/docs, headers, CSRF, logout method"
+          schema_code="$(curl --silent --show-error -o /dev/null -w "%{http_code}" "http://127.0.0.1:8000/openapi.json")"
+          if [ "${schema_code}" != "401" ]; then
+            echo "Expected /openapi.json to return 401 without a session; got ${schema_code}"
+            exit 1
+          fi
+          for path in /docs /redoc /docs/oauth2-redirect; do
             code="$(curl --silent --show-error -o /dev/null -w "%{http_code}" "http://127.0.0.1:8000${path}")"
-            if [ "${code}" != "404" ]; then
-              echo "Expected ${path} to return 404 when OPENAPI_ENABLED is unset; got ${code}"
+            if [ "${code}" != "303" ]; then
+              echo "Expected ${path} to redirect to login without a session; got ${code}"
               exit 1
             fi
           done
@@ -343,9 +351,12 @@ jobs:
               "x-content-type-options: nosniff",
               "x-frame-options: deny",
               "referrer-policy: same-origin",
-              "content-security-policy:",
+              "content-security-policy: default-src 'self';",
+              "script-src 'self';",
+              "style-src 'self';",
           ):
               assert name in headers, f"missing security header: {name}\n{headers}"
+          assert "unsafe-inline" not in headers, headers
           PY
           logout_get_code="$(curl --silent --show-error -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/logout)"
           if [ "${logout_get_code}" != "405" ]; then
@@ -397,6 +408,30 @@ jobs:
           assert cookie_lines, headers
           assert all("secure" not in line.lower() for line in cookie_lines), cookie_lines
           PY
+          curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/openapi.json -o /tmp/openapi.json
+          docs_code="$(curl --silent --show-error -o /dev/null -w "%{http_code}" -b /tmp/cookies http://127.0.0.1:8000/docs)"
+          if [ "${docs_code}" != "200" ]; then
+            echo "Expected authenticated /docs to return 200; got ${docs_code}"
+            exit 1
+          fi
+          oauth_code="$(curl --silent --show-error -o /dev/null -w "%{http_code}" -b /tmp/cookies http://127.0.0.1:8000/docs/oauth2-redirect)"
+          if [ "${oauth_code}" != "200" ]; then
+            echo "Expected authenticated /docs/oauth2-redirect to return 200; got ${oauth_code}"
+            exit 1
+          fi
+          echo "[bind] BINDCONFIG.md uses placeholder TSIG secret only"
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          text = Path("BINDCONFIG.md").read_text(encoding="utf-8")
+          secrets = re.findall(r'secret\s+"([^"]+)"', text)
+          assert secrets, "expected at least one secret example in BINDCONFIG.md"
+          assert all(value == "<BASE64_TSIG_SECRET_FROM_tsig-keygen>" for value in secrets), secrets
+          allowlist = Path(".gitleaks.toml").read_text(encoding="utf-8")
+          assert "<BASE64_TSIG_SECRET_FROM_tsig-keygen>" in allowlist
+          print("BINDCONFIG placeholder + gitleaks allowlist assertions passed")
+          PY
           echo "[bind] Verify admin page, shared nav, and version metadata"
           curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/admin -o /tmp/admin.html
           python3 - <<'PY'
@@ -408,13 +443,44 @@ jobs:
           nav = html.split('<nav class="nav-links">', 1)[1].split("</nav>", 1)[0]
           assert nav.index('href="/api-keys"') < nav.index('href="/admin"') < nav.index('href="/settings"') < nav.index('action="/logout"'), nav
           version = Path("VERSION").read_text(encoding="utf-8").strip()
-          assert version == "0.8.0", version
+          assert version == "0.8.1", version
           assert f"api-to-dns v{version}" in html, html[-400:]
-          assert 'version = "0.8.0"' in Path("pyproject.toml").read_text(encoding="utf-8")
-          assert "ARG VERSION=0.8.0" in Path("Dockerfile").read_text(encoding="utf-8")
-          assert "hometinker12/api-to-dns:0.8.0" in Path("docker-compose.yml").read_text(encoding="utf-8")
-          print("admin nav + 0.8.0 metadata assertions passed")
+          assert 'version = "0.8.1"' in Path("pyproject.toml").read_text(encoding="utf-8")
+          assert "ARG VERSION=0.8.1" in Path("Dockerfile").read_text(encoding="utf-8")
+          assert "hometinker12/api-to-dns:0.8.1" in Path("docker-compose.yml").read_text(encoding="utf-8")
+          print("admin nav + 0.8.1 metadata assertions passed")
           PY
+
+          echo "[bind] Static brand assets (favicon + logo mark)"
+          curl --fail --silent -D /tmp/favicon.headers -o /tmp/favicon.svg \
+            "http://127.0.0.1:8000/static/favicon.svg?v=2"
+          curl --fail --silent -D /tmp/logo-mark.headers -o /tmp/logo-mark.svg \
+            "http://127.0.0.1:8000/static/logo-mark.svg?v=2"
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          for name, headers_path, body_path in (
+              ("favicon", Path("/tmp/favicon.headers"), Path("/tmp/favicon.svg")),
+              ("logo-mark", Path("/tmp/logo-mark.headers"), Path("/tmp/logo-mark.svg")),
+          ):
+              headers = headers_path.read_text(encoding="utf-8", errors="replace").lower()
+              assert "content-type: image/svg+xml" in headers, (name, headers)
+              body = body_path.read_text(encoding="utf-8")
+              assert "<svg" in body.lower(), (name, body[:200])
+              ET.fromstring(body)
+          print("static brand asset assertions passed")
+          PY
+          echo "[bind] Static JavaScript assets for CSP-hardened admin pages"
+          for asset in theme page-header configured-zones api-keys zone-form settings dns-browser; do
+            curl --fail --silent -D "/tmp/${asset}.headers" -o "/dev/null" \
+              "http://127.0.0.1:8000/static/${asset}.js"
+            if ! grep -qi '^content-type:.*javascript' "/tmp/${asset}.headers"; then
+              echo "Expected JavaScript content type for ${asset}.js"
+              cat "/tmp/${asset}.headers"
+              exit 1
+            fi
+          done
 
           echo "[bind] POST logout clears session"
           curl --fail --silent -b /tmp/cookies -c /tmp/cookies -X POST http://127.0.0.1:8000/logout \
@@ -522,15 +588,94 @@ jobs:
           echo "[bind] Fetch API key management page"
           curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/api-keys -o /tmp/api-keys.html
           SMOKE_ZONE_ID="$(python3 -c 'import re; html=open("/tmp/api-keys.html", encoding="utf-8").read(); match=re.search(r"name=\"zone_ids\" value=\"(\d+)\"\s*/>\s*<code>smoke\.test</code>", html, re.DOTALL); assert match, "Could not find smoke.test zone ID"; print(match.group(1))')"
+          DENIED_ZONE_ID="$(python3 -c 'import re; html=open("/tmp/api-keys.html", encoding="utf-8").read(); match=re.search(r"name=\"zone_ids\" value=\"(\d+)\"\s*/>\s*<code>denied\.test</code>", html, re.DOTALL); assert match, "Could not find denied.test zone ID"; print(match.group(1))')"
           : "${SMOKE_ZONE_ID:?Could not extract smoke.test zone ID}"
+          : "${DENIED_ZONE_ID:?Could not extract denied.test zone ID}"
+          echo "[bind] Browser smoke for CSP-hardened admin assets"
+          npm install --no-save playwright
+          npx playwright install --with-deps chromium
+          node - "${SMOKE_ZONE_ID}" <<'NODE'
+          const { chromium } = require("playwright");
+
+          (async () => {
+            const zoneId = process.argv[2];
+            const baseUrl = "http://127.0.0.1:8000";
+            const browser = await chromium.launch({ headless: true });
+            const page = await browser.newPage();
+            const errors = [];
+            page.on("pageerror", (error) => errors.push(`page error: ${error.message}`));
+            page.on("console", (message) => {
+              if (message.type() === "error") errors.push(`console error: ${message.text()}`);
+            });
+            try {
+            await page.goto(`${baseUrl}/login`);
+            await page.locator('input[name="username"]').fill("admin");
+            await page.locator('input[name="password"]').fill("your-admin-password");
+            await Promise.all([
+              page.waitForURL("**/admin"),
+              page.locator('button[type="submit"]').click(),
+            ]);
+
+            await page.goto(`${baseUrl}/api-keys`);
+            await page.locator("#open-create-key").click();
+            if (!(await page.locator("#create-key-dialog").evaluate((dialog) => dialog.open))) {
+              throw new Error("API key create dialog did not open");
+            }
+
+            await page.goto(`${baseUrl}/settings?area=backup&section=export`);
+            if (!(await page.locator("#backup-encrypt").isDisabled())) {
+              throw new Error("Sensitive backup categories did not force encryption");
+            }
+
+            await page.goto(`${baseUrl}/settings?area=plugins`);
+            const disablePlugin = page.locator('form[data-confirm][action*="/settings/plugins/"][action$="/disable"] button[type="submit"]').first();
+            if (!(await disablePlugin.count())) {
+              throw new Error("Expected a plugin disable form with data-confirm");
+            }
+            page.once("dialog", async (dialog) => {
+              if (!dialog.message().includes("Disable")) {
+                throw new Error(`Unexpected confirm dialog: ${dialog.message()}`);
+              }
+              await dialog.dismiss();
+            });
+            await disablePlugin.click();
+            if ((await page.locator('form[data-confirm][action*="/settings/plugins/"][action$="/disable"]').count()) < 1) {
+              throw new Error("Plugin disable submitted despite dismissed confirm dialog");
+            }
+
+            await page.goto(`${baseUrl}/zones/new`);
+            await page.locator("#dns-provider-type").selectOption("bind");
+            if (!(await page.locator('[data-provider-panel="bind"]').isVisible())) {
+              throw new Error("Zone provider panel did not synchronize");
+            }
+
+            await page.goto(`${baseUrl}/zones/${zoneId}/records`);
+            await page.locator("#record-name").fill("@");
+            await page.locator("#dns-browser-search button[type=submit]").click();
+            await page.locator("#dns-browser-results").waitFor({ state: "visible" });
+            } finally {
+              await browser.close();
+            }
+            if (errors.length) throw new Error(errors.join("\n"));
+          })().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
           python3 - <<'PY'
+          import re
           from pathlib import Path
 
           html = Path("/tmp/api-keys.html").read_text(encoding="utf-8", errors="replace")
           nav = html.split('<nav class="nav-links">', 1)[1].split("</nav>", 1)[0]
           assert nav.index('href="/api-keys"') < nav.index('href="/admin"') < nav.index('href="/settings"') < nav.index('action="/logout"'), nav
-          assert "Generate named API keys, scope them to DNS zones, and copy each key when created - it is shown only once." in html
-          print("api-keys nav + helper text assertions passed")
+          assert "Generate named API keys, scope them to DNS zones, choose read-only or read/write access" in html
+          assert "<th>Access</th>" in html, html
+          create_dialog = html.split('id="create-key-dialog"', 1)[1].split("</dialog>", 1)[0]
+          assert re.search(r'name="access_mode"\s+value="read_only"[^>]*checked', create_dialog), create_dialog
+          assert re.search(r'name="access_mode"\s+value="read_write"', create_dialog), create_dialog
+          assert not re.search(r'name="access_mode"\s+value="read_write"[^>]*checked', create_dialog), create_dialog
+          print("api-keys nav + helper text + access-mode UI assertions passed")
           PY
 
           echo "[bind] Dashboard links to DNS browser and /zones redirects"
@@ -572,11 +717,46 @@ jobs:
             -H "Origin: http://127.0.0.1:8000" \
             -H "Referer: http://127.0.0.1:8000/api-keys" \
             --data-urlencode "label=bind-smoke-test" \
+            --data-urlencode "access_mode=read_write" \
             --data-urlencode "zone_ids=${SMOKE_ZONE_ID}" \
             -o /tmp/api-key-create.html
 
           API_KEY="$(python3 -c 'import re; html=open("/tmp/api-key-create.html", encoding="utf-8").read(); match=re.search(r"data-created-api-key=\"([^\"]+)\"", html) or re.search(r"API key created:\s*([^<\s]+)", html); assert match, "Could not extract API key"; print(match.group(1))')"
           : "${API_KEY:?Could not extract API key}"
+
+          echo "[bind] Create default read-only API key for smoke.test"
+          curl --fail --silent -L -b /tmp/cookies -X POST http://127.0.0.1:8000/api-keys \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/api-keys" \
+            --data-urlencode "label=bind-smoke-read-only" \
+            --data-urlencode "zone_ids=${SMOKE_ZONE_ID}" \
+            -o /tmp/api-key-read-only-create.html
+          READ_ONLY_API_KEY="$(python3 -c 'import re; html=open("/tmp/api-key-read-only-create.html", encoding="utf-8").read(); match=re.search(r"data-created-api-key=\"([^\"]+)\"", html) or re.search(r"API key created:\s*([^<\s]+)", html); assert match, "Could not extract read-only API key"; print(match.group(1))')"
+          : "${READ_ONLY_API_KEY:?Could not extract read-only API key}"
+
+          echo "[bind] API Keys table renders Access column modes"
+          curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/api-keys -o /tmp/api-keys-modes.html
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          html = Path("/tmp/api-keys-modes.html").read_text(encoding="utf-8", errors="replace")
+          assert "<th>Access</th>" in html, html
+          write_row = re.search(
+              r"<tr>\s*<td>bind-smoke-test</td>\s*<td>[^<]+</td>\s*<td>([^<]+)</td>",
+              html,
+              re.DOTALL,
+          )
+          read_row = re.search(
+              r"<tr>\s*<td>bind-smoke-read-only</td>\s*<td>[^<]+</td>\s*<td>([^<]+)</td>",
+              html,
+              re.DOTALL,
+          )
+          assert write_row and write_row.group(1).strip() == "read/write", html
+          assert read_row and read_row.group(1).strip() == "read-only", html
+          print("api-keys Access column assertions passed")
+          PY
 
           echo "[bind] Validate API key with /keycheck"
           curl --fail --silent -H "X-API-Key: $API_KEY" http://127.0.0.1:8000/keycheck \
@@ -623,6 +803,31 @@ jobs:
             python3 -c "import json,sys;b=json.load(open(sys.argv[1],encoding='utf-8'));e=sys.argv[2];assert((e=='access_denied' and b['detail']['error']=='access_denied') or (b['action']==e)),b" "${output}" "${expected_action}"
           }
 
+          call_read_only_dns_api() {
+            local method="$1"
+            local request_uri="$2"
+            local body="$3"
+            local output="/tmp/read-only-${method}.json"
+            local status
+
+            local curl_args=(
+              --silent --show-error -o "${output}" -w "%{http_code}"
+              -X "${method}"
+              "${request_uri}"
+              -H "X-API-Key: ${READ_ONLY_API_KEY}"
+            )
+            if [ -n "${body}" ]; then
+              curl_args+=( -H "Content-Type: application/json" -d "${body}" )
+            fi
+            status="$(curl "${curl_args[@]}")"
+            if [ "${status}" != "403" ]; then
+              echo "Expected read-only ${method} to return 403, got ${status}"
+              cat "${output}"
+              exit 1
+            fi
+            python3 -c "import json; b=json.load(open('$output', encoding='utf-8')); assert b['detail']['error'] == 'access_denied', b"
+          }
+
           wait_for_record_value() {
             local fqdn="$1"
             local expected="$2"
@@ -655,6 +860,82 @@ jobs:
           DNS_RECORD_URL='http://127.0.0.1:8000/dns-record'
           DELETE_SMOKE_URL='http://127.0.0.1:8000/dns-record?zone_name=smoke.test&record_name=www&record_type=A'
 
+          echo "[bind] Read-only API key permits lookup but denies mutations"
+          curl --fail --silent -H "X-API-Key: ${READ_ONLY_API_KEY}" http://127.0.0.1:8000/keycheck \
+            | python3 -c "import json,sys; assert json.load(sys.stdin)['status'] == 'success'"
+          curl --fail --silent -H "Accept: application/json" -H "X-API-Key: ${READ_ONLY_API_KEY}" http://127.0.0.1:8000/zones \
+            | python3 -c "import json,sys; zones=json.load(sys.stdin); assert {z['zone_name'] for z in zones} == {'smoke.test'}, zones"
+          curl --fail --silent -H "X-API-Key: ${READ_ONLY_API_KEY}" \
+            "${DNS_RECORD_URL}?zone_name=smoke.test&record_name=read-only&record_type=A" \
+            | python3 -c "import json,sys; assert json.load(sys.stdin)['status'] == 'not_found'"
+          call_read_only_dns_api POST "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"read-only","ttl":300,"values":["192.0.2.50"]}'
+          call_read_only_dns_api PUT "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"read-only","ttl":300,"values":["192.0.2.50"]}'
+          call_read_only_dns_api PATCH "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"read-only","values":["192.0.2.50"]}'
+          call_read_only_dns_api DELETE "${DNS_RECORD_URL}?zone_name=smoke.test&record_name=read-only&record_type=A" ''
+
+          echo "[bind] Editing an API key changes mutation authorization"
+          curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/api-keys -o /tmp/api-keys-after-create.html
+          READ_ONLY_KEY_ID="$(python3 -c 'import re; html=open("/tmp/api-keys-after-create.html", encoding="utf-8").read(); match=re.search(r"<tr>\s*<td>bind-smoke-read-only</td>.*?data-open-edit-key=\"(\d+)\"", html, re.DOTALL); assert match, "Could not find read-only key ID"; print(match.group(1))')"
+          : "${READ_ONLY_KEY_ID:?Could not extract read-only key ID}"
+          curl --fail --silent -L -b /tmp/cookies -X POST http://127.0.0.1:8000/api-keys \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/api-keys" \
+            --data-urlencode "key_id=${READ_ONLY_KEY_ID}" \
+            --data-urlencode "label=bind-smoke-read-only" \
+            --data-urlencode "access_mode=read_write" \
+            --data-urlencode "zone_ids=${SMOKE_ZONE_ID}" \
+            -o /tmp/api-key-mode-edit.html
+          curl --fail --silent -X POST "${DNS_RECORD_URL}" \
+            -H "X-API-Key: ${READ_ONLY_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"zone_name":"smoke.test","record_type":"A","record_name":"mode-switch","ttl":300,"values":["192.0.2.51"]}' \
+            | python3 -c "import json,sys; assert json.load(sys.stdin)['action'] == 'created'"
+          curl --fail --silent -L -b /tmp/cookies -X POST http://127.0.0.1:8000/api-keys \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/api-keys" \
+            --data-urlencode "key_id=${READ_ONLY_KEY_ID}" \
+            --data-urlencode "label=bind-smoke-read-only" \
+            --data-urlencode "access_mode=read_only" \
+            --data-urlencode "zone_ids=${SMOKE_ZONE_ID}" \
+            -o /tmp/api-key-mode-edit-read-only.html
+          call_read_only_dns_api DELETE "${DNS_RECORD_URL}?zone_name=smoke.test&record_name=mode-switch&record_type=A" ''
+          call_dns_api DELETE 200 deleted "http://127.0.0.1:8000/dns-record?zone_name=smoke.test&record_name=mode-switch&record_type=A" ''
+
+          echo "[bind] Dedicated API-key edit page changes mutation authorization"
+          curl --fail --silent -b /tmp/cookies "http://127.0.0.1:8000/api-keys/${READ_ONLY_KEY_ID}/edit" -o /tmp/api-key-edit-page.html
+          python3 - <<'PY'
+          from pathlib import Path
+
+          html = Path("/tmp/api-key-edit-page.html").read_text(encoding="utf-8")
+          assert 'name="access_mode" value="read_only" checked' in html, html
+          assert 'name="access_mode" value="read_write"' in html, html
+          PY
+          curl --fail --silent -b /tmp/cookies -X POST "http://127.0.0.1:8000/api-keys/${READ_ONLY_KEY_ID}" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/api-keys/${READ_ONLY_KEY_ID}/edit" \
+            --data-urlencode "label=bind-smoke-read-only" \
+            --data-urlencode "access_mode=read_write" \
+            --data-urlencode "zone_ids=${SMOKE_ZONE_ID}" \
+            -o /tmp/api-key-dedicated-edit-write.html
+          curl --fail --silent -X POST "${DNS_RECORD_URL}" \
+            -H "X-API-Key: ${READ_ONLY_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"zone_name":"smoke.test","record_type":"A","record_name":"dedicated-edit","ttl":300,"values":["192.0.2.52"]}' \
+            | python3 -c "import json,sys; assert json.load(sys.stdin)['action'] == 'created'"
+          curl --fail --silent -b /tmp/cookies -X POST "http://127.0.0.1:8000/api-keys/${READ_ONLY_KEY_ID}" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/api-keys/${READ_ONLY_KEY_ID}/edit" \
+            --data-urlencode "label=bind-smoke-read-only" \
+            --data-urlencode "access_mode=read_only" \
+            --data-urlencode "zone_ids=${SMOKE_ZONE_ID}" \
+            -o /tmp/api-key-dedicated-edit-read-only.html
+          call_read_only_dns_api DELETE "${DNS_RECORD_URL}?zone_name=smoke.test&record_name=dedicated-edit&record_type=A" ''
+          call_dns_api DELETE 200 deleted "http://127.0.0.1:8000/dns-record?zone_name=smoke.test&record_name=dedicated-edit&record_type=A" ''
+
           call_dns_api POST 200 created "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.10"]}'
           wait_for_record_value www.smoke.test 192.0.2.10
           call_dns_api PATCH 200 updated "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":450}'
@@ -673,22 +954,6 @@ jobs:
           echo "[bind] Admin DNS browser session CRUD for temporary A record"
           browser_page="$(curl --fail --silent -b /tmp/cookies "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records")"
           echo "${browser_page}" | python3 -c "import sys; html=sys.stdin.read(); assert 'dns-browser-search' in html; assert 'dns-browser-results' in html and 'hidden' in html"
-          bind_browse_status="$(curl --silent --show-error -b /tmp/cookies -o /tmp/bind-browser-browse.json -w "%{http_code}" \
-            "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search")"
-          if [ "${bind_browse_status}" != "400" ]; then
-            echo "Expected BIND browser browse to return 400; got ${bind_browse_status}"
-            cat /tmp/bind-browser-browse.json
-            exit 1
-          fi
-          python3 -c "import json; b=json.load(open('/tmp/bind-browser-browse.json')); assert 'not supported for BIND' in b['message'], b"
-          bind_glob_status="$(curl --silent --show-error -b /tmp/cookies -o /tmp/bind-browser-glob.json -w "%{http_code}" \
-            "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search?record_name=browser*")"
-          if [ "${bind_glob_status}" != "400" ]; then
-            echo "Expected BIND browser wildcard search to return 400; got ${bind_glob_status}"
-            cat /tmp/bind-browser-glob.json
-            exit 1
-          fi
-          python3 -c "import json; b=json.load(open('/tmp/bind-browser-glob.json')); assert 'not supported for BIND' in b['message'], b"
           curl --fail --silent -b /tmp/cookies \
             -H "Origin: http://127.0.0.1:8000" \
             -H "Referer: http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
@@ -698,9 +963,49 @@ jobs:
             -d '{"record_name":"browser","record_type":"A","ttl":300,"values":["192.0.2.77"]}' \
             | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['action']=='created', b"
           wait_for_record_value browser.smoke.test 192.0.2.77
+          echo "[bind] DNS browser blank browse returns zone RRsets (AXFR)"
+          curl --fail --silent -b /tmp/cookies \
+            "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search" \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['match_mode']=='browse'; assert any(r['record_name']=='browser' and r['record_type']=='A' for r in b['records']), b"
+          echo "[bind] DNS browser wildcard search matches browser record"
+          curl --fail --silent -b /tmp/cookies \
+            "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search?record_name=brow?er*&record_type=A" \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['match_mode']=='glob'; assert b['records'][0]['values']==['192.0.2.77'], b"
           curl --fail --silent -b /tmp/cookies \
             "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search?record_name=browser&record_type=A" \
             | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['status']=='success'; assert b['records'][0]['values']==['192.0.2.77'], b"
+          echo "[bind] DNS browser browse truncates at 100 RRsets (streamed AXFR response bound)"
+          python3 - "${BIND_DIR}" <<'PY'
+          from pathlib import Path
+          import sys
+
+          bind_dir = Path(sys.argv[1])
+          lines = ["server 127.0.0.1", "zone smoke.test.", ""]
+          for i in range(1, 121):
+              lines.append(f"update add bulk{i:03d}.smoke.test. 300 A 192.0.2.{(i % 200) + 1}")
+          lines.extend(["send", ""])
+          (bind_dir / "bulk-add.nsupdate").write_text("\n".join(lines) + "\n", newline="\n")
+          PY
+          docker exec bind-test nsupdate -y "hmac-sha256:${TSIG_NAME}:${TSIG_SECRET}" /bind/bulk-add.nsupdate
+          curl --fail --silent -b /tmp/cookies \
+            "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search" \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['match_mode']=='browse', b; assert len(b['records'])==100, len(b['records']); assert b.get('truncated') is True, b"
+          echo "[bind] DNS browser AXFR refused on denied.test (blank browse + glob → 400; exact lookup still works)"
+          for denied_url in \
+            "http://127.0.0.1:8000/zones/${DENIED_ZONE_ID}/records/search" \
+            "http://127.0.0.1:8000/zones/${DENIED_ZONE_ID}/records/search?record_name=ns*&record_type=A"
+          do
+            denied_code="$(curl --silent --show-error -b /tmp/cookies -o /tmp/denied-browse.json -w "%{http_code}" "${denied_url}")"
+            if [ "${denied_code}" != "400" ]; then
+              echo "Expected HTTP 400 for AXFR-refused browser search; got ${denied_code} for ${denied_url}"
+              python3 -c 'from pathlib import Path; print(Path("/tmp/denied-browse.json").read_text(encoding="utf-8", errors="replace")[:800])'
+              exit 1
+            fi
+            python3 -c 'import json; from pathlib import Path; b=json.loads(Path("/tmp/denied-browse.json").read_text(encoding="utf-8")); msg=b.get("message") or (b.get("detail") or {}).get("message",""); assert "allow-transfer" in msg, b'
+          done
+          curl --fail --silent -b /tmp/cookies \
+            "http://127.0.0.1:8000/zones/${DENIED_ZONE_ID}/records/search?record_name=ns&record_type=A" \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['status']=='success'; assert b['records'][0]['record_name']=='ns'; assert b['records'][0]['values']==['127.0.0.1'], b"
           curl --fail --silent -b /tmp/cookies \
             -H "Origin: http://127.0.0.1:8000" \
             -H "Referer: http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
@@ -720,6 +1025,81 @@ jobs:
             | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['action']=='deleted', b"
           wait_for_record_absent browser.smoke.test
 
+          echo "[bind] API-key backup and legacy-mode compatibility"
+          docker exec -i dns-api-test python - <<'PY'
+          from copy import deepcopy
+
+          from sqlmodel import select
+
+          from src.backup_service import (
+              CATEGORY_API_KEYS,
+              BackupError,
+              build_payload,
+              restore_payload,
+              validate_restore_records,
+          )
+          from src.db import SessionLocal
+          from src.models import API_KEY_ACCESS_READ_ONLY, API_KEY_ACCESS_READ_WRITE, ApiKey
+
+          with SessionLocal() as db:
+              payload = build_payload(db, [CATEGORY_API_KEYS])
+              assert any(
+                  item["label"] == "bind-smoke-read-only" and item["access_mode"] == API_KEY_ACCESS_READ_ONLY
+                  for item in payload[CATEGORY_API_KEYS]
+              ), payload[CATEGORY_API_KEYS]
+              restore_payload(db, payload, [CATEGORY_API_KEYS])
+              restored = db.exec(select(ApiKey).where(ApiKey.label == "bind-smoke-read-only")).one()
+              assert restored.access_mode == API_KEY_ACCESS_READ_ONLY, restored.access_mode
+
+              legacy_payload = deepcopy(payload)
+              for item in legacy_payload[CATEGORY_API_KEYS]:
+                  item.pop("access_mode", None)
+              restore_payload(db, legacy_payload, [CATEGORY_API_KEYS])
+              legacy_restored = db.exec(select(ApiKey).where(ApiKey.label == "bind-smoke-read-only")).one()
+              assert legacy_restored.access_mode == API_KEY_ACCESS_READ_WRITE, legacy_restored.access_mode
+
+              invalid_payload = deepcopy(payload)
+              next(item for item in invalid_payload[CATEGORY_API_KEYS] if item["label"] == "bind-smoke-read-only")[
+                  "access_mode"
+              ] = "owner"
+              try:
+                  validate_restore_records([CATEGORY_API_KEYS], invalid_payload)
+              except BackupError:
+                  pass
+              else:
+                  raise AssertionError("Invalid API-key access mode was accepted")
+              untouched = db.exec(select(ApiKey).where(ApiKey.label == "bind-smoke-read-only")).one()
+              assert untouched.access_mode == API_KEY_ACCESS_READ_WRITE, untouched.access_mode
+          print("API-key backup compatibility assertions passed")
+          PY
+          docker exec -i dns-api-test python - <<'PY'
+          from sqlalchemy import create_engine, text
+
+          import src.db as db_module
+          from src.models import API_KEY_ACCESS_READ_WRITE
+
+          legacy_engine = create_engine("sqlite:////tmp/legacy-api-key-mode.db")
+          with legacy_engine.begin() as conn:
+              conn.execute(
+                  text(
+                      "CREATE TABLE apikey (id INTEGER PRIMARY KEY, label VARCHAR NOT NULL, "
+                      "key VARCHAR NOT NULL, active BOOLEAN NOT NULL, created_at DATETIME)"
+                  )
+              )
+              conn.execute(
+                  text("INSERT INTO apikey (id, label, key, active) VALUES (1, 'legacy', 'digest', 1)")
+              )
+          original_engine = db_module.engine
+          try:
+              db_module.engine = legacy_engine
+              db_module._migrate_add_api_key_access_mode_column()
+              mode = legacy_engine.connect().execute(text("SELECT access_mode FROM apikey WHERE id = 1")).scalar_one()
+              assert mode == API_KEY_ACCESS_READ_WRITE, mode
+          finally:
+              db_module.engine = original_engine
+          print("legacy API-key migration assertions passed")
+          PY
+
           echo "[compose] Validate hardened Compose config and startup against the smoke image"
           APP_VERSION="$(tr -d '\r\n' < VERSION)"
           docker tag "${IMAGE_TAG}" "hometinker12/api-to-dns:${APP_VERSION}"
@@ -728,7 +1108,7 @@ jobs:
           import os
           import subprocess
 
-          assert os.environ["APP_VERSION"] == "0.8.0", os.environ["APP_VERSION"]
+          assert os.environ["APP_VERSION"] == "0.8.1", os.environ["APP_VERSION"]
           expected_image = f"hometinker12/api-to-dns:{os.environ['APP_VERSION']}"
           cfg = json.loads(subprocess.check_output(["docker", "compose", "config", "--format", "json"], text=True))
           svc = cfg["services"]["dns-api"]
@@ -1193,9 +1573,32 @@ jobs:
               throw 'Admin header navigation order is not API Keys, Dashboard, Settings, Logout'
             }
             $appVersion = (Get-Content -Raw VERSION).Trim()
-            if ($appVersion -ne '0.8.0') { throw "Expected VERSION 0.8.0; got $appVersion" }
+            if ($appVersion -ne '0.8.1') { throw "Expected VERSION 0.8.1; got $appVersion" }
             if ($admin.Content -notmatch [regex]::Escape("api-to-dns v$appVersion")) {
               throw 'Admin page missing version footer'
+            }
+
+            Write-Host '[microsoft] Static brand assets (favicon + logo mark)'
+            foreach ($asset in @(
+              @{ Name = 'favicon'; Uri = "$base/static/favicon.svg?v=2" },
+              @{ Name = 'logo-mark'; Uri = "$base/static/logo-mark.svg?v=2" }
+            )) {
+              $resp = Invoke-WebRequest -Uri $asset.Uri -WebSession $WebSession -UseBasicParsing
+              if ($resp.StatusCode -ne 200) {
+                throw "Expected 200 for $($asset.Name); got $($resp.StatusCode)"
+              }
+              $ct = [string]$resp.Headers['Content-Type']
+              if ($ct -notmatch 'image/svg\+xml') {
+                throw "Expected image/svg+xml for $($asset.Name); got '$ct'"
+              }
+              if ($resp.Content -notmatch '(?i)<svg') {
+                throw "$($asset.Name) body missing <svg>"
+              }
+              try {
+                [xml]$resp.Content | Out-Null
+              } catch {
+                throw "$($asset.Name) body is not well-formed XML: $_"
+              }
             }
 
             # PowerShell does not treat \ as an escape, so ".\\$user" produced a literal
@@ -1246,10 +1649,17 @@ jobs:
 
             Write-Host '[microsoft-local] POST /api-keys'
             $createKey = Invoke-FormPost -Uri "$base/api-keys" -WebSession $WebSession -MaximumRedirection 10 -Form @{
-              label    = 'ms-local-smoke'
-              zone_ids = "$zoneId"
+              label       = 'ms-local-smoke'
+              access_mode = 'read_write'
+              zone_ids    = "$zoneId"
             }
             $msLocalKey = Get-ApiKeyFromCreateHtml -Html $createKey.Content
+            $createReadOnlyKey = Invoke-FormPost -Uri "$base/api-keys" -WebSession $WebSession -MaximumRedirection 10 -Form @{
+              label       = 'ms-local-read-only'
+              access_mode = 'read_only'
+              zone_ids    = "$zoneId"
+            }
+            $msLocalReadOnlyKey = Get-ApiKeyFromCreateHtml -Html $createReadOnlyKey.Content
 
             Write-Host '[microsoft-local] GET /keycheck'
             $kc = Invoke-RestMethod -Uri "$base/keycheck" -Headers @{ 'X-API-Key' = $msLocalKey }
@@ -1285,6 +1695,12 @@ jobs:
             $jPatch   = @{ zone_name = $la; record_type = 'A'; record_name = 'www'; values = @('192.0.2.30') }
             $qDelete  = @{ zone_name = $la; record_name = 'www'; record_type = 'A' }
             $jDenied  = @{ zone_name = $ld; record_type = 'A'; record_name = 'blocked'; ttl = 300; values = @('192.0.2.55') }
+            $jReadOnly = @{ zone_name = $la; record_type = 'A'; record_name = 'read-only'; ttl = 300; values = @('192.0.2.50') }
+
+            $x = Invoke-DnsRecord -ApiKey $msLocalReadOnlyKey -ExpectedStatus 200 -Method GET -Query @{ zone_name = $la; record_name = 'read-only'; record_type = 'A' }
+            if ($x.status -ne 'not_found') { throw "read-only API key lookup failed: $($x | ConvertTo-Json -Compress)" }
+            $x = Invoke-DnsRecord -ApiKey $msLocalReadOnlyKey -ExpectedStatus 403 -Method POST -JsonBody $jReadOnly
+            Assert-DnsRecordAction -Json $x -ExpectedAction 'access_denied'
 
             $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -Method POST -JsonBody $jCreate
             Assert-DnsRecordAction -Json $x -ExpectedAction 'created'
@@ -1414,7 +1830,7 @@ jobs:
               $keysHtml2 = (Invoke-WebRequest -Uri "$base/api-keys" -WebSession $WebSession -UseBasicParsing).Content
               $rZoneId = Get-ZoneIdFromApiKeysHtml -Html $keysHtml2 -ZoneFqdn $ra
               Write-Host '[microsoft-remote] POST /api-keys'
-              $rk = Invoke-FormPost -Uri "$base/api-keys" -WebSession $WebSession -MaximumRedirection 10 -Form @{ label = 'ms-remote-smoke'; zone_ids = "$rZoneId" }
+              $rk = Invoke-FormPost -Uri "$base/api-keys" -WebSession $WebSession -MaximumRedirection 10 -Form @{ label = 'ms-remote-smoke'; access_mode = 'read_write'; zone_ids = "$rZoneId" }
               $msRemoteKey = Get-ApiKeyFromCreateHtml -Html $rk.Content
 
               $rWww = "www.$ra"

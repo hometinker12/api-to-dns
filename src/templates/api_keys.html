@@ -28,20 +28,21 @@
           <button type="button" id="open-create-key" {% if not all_zones %}disabled{% endif %}>Create API Key</button>
         </div>
       </div>
-      <p class="help">Generate named API keys, scope them to DNS zones, and copy each key when created - it is shown only once.</p>
+      <p class="help">Generate named API keys, scope them to DNS zones, choose read-only or read/write access, and copy each key when created - it is shown only once.</p>
       {% if not all_zones %}
         <p class="help">No zones configured. Add a DNS zone first.</p>
       {% endif %}
       <div class="table-wrap">
         <table>
           <thead>
-            <tr><th>Label</th><th>Key</th><th>Allowed zones</th><th>Status</th><th class="actions-column">Actions</th></tr>
+            <tr><th>Label</th><th>Key</th><th>Access</th><th>Allowed zones</th><th>Status</th><th class="actions-column">Actions</th></tr>
           </thead>
           <tbody>
             {% for key in api_keys %}
               <tr>
                 <td>{{ key.label }}</td>
                 <td>{{ key.key[:12] }}...</td>
+                <td>{{ "read-only" if key.access_mode == "read_only" else "read/write" }}</td>
                 <td>
                   {% if key_zones[key.id] %}
                     {% for zn in key_zones[key.id] %}<code>{{ zn }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
@@ -70,7 +71,7 @@
                 </td>
               </tr>
             {% else %}
-              <tr><td colspan="5">No API keys available</td></tr>
+              <tr><td colspan="6">No API keys available</td></tr>
             {% endfor %}
           </tbody>
         </table>
@@ -91,8 +92,20 @@
             <input type="text" name="label" required placeholder="Example key" value="{{ create_key_label or '' }}" />
           </label>
           <fieldset>
+            <legend>Access mode</legend>
+            <p class="help">Read-only keys may use <code>GET /keycheck</code>, <code>GET /zones</code>, and <code>GET /dns-record</code>. Read/write keys may also create, replace, update, and delete DNS records.</p>
+            <label class="inline-check">
+              <input type="radio" name="access_mode" value="read_only" {% if (create_key_access_mode or "read_only") == "read_only" %}checked{% endif %} />
+              Read-only
+            </label>
+            <label class="inline-check">
+              <input type="radio" name="access_mode" value="read_write" {% if create_key_access_mode == "read_write" %}checked{% endif %} />
+              Read/write
+            </label>
+          </fieldset>
+          <fieldset>
             <legend>Allowed DNS zones</legend>
-            <p class="help">The key may only call <code>/dns-record</code> for zones you select here.</p>
+            <p class="help">The key may only access the selected zones.</p>
             {% for z in all_zones %}
               <label class="inline-check">
                 <input type="checkbox" name="zone_ids" value="{{ z.id }}" />
@@ -126,8 +139,20 @@
                 <input type="text" name="label" required value="{% if edit_key_error_id == key.id %}{{ edit_key_label }}{% else %}{{ key.label }}{% endif %}" />
               </label>
               <fieldset>
+                <legend>Access mode</legend>
+                {% set selected_access_mode = edit_key_access_mode if edit_key_error_id == key.id and edit_key_access_mode is not none else key.access_mode %}
+                <label class="inline-check">
+                  <input type="radio" name="access_mode" value="read_only" {% if selected_access_mode == "read_only" %}checked{% endif %} />
+                  Read-only
+                </label>
+                <label class="inline-check">
+                  <input type="radio" name="access_mode" value="read_write" {% if selected_access_mode == "read_write" %}checked{% endif %} />
+                  Read/write
+                </label>
+              </fieldset>
+              <fieldset>
                 <legend>Allowed DNS zones</legend>
-                <p class="help">The key may only call <code>/dns-record</code> for zones you select here.</p>
+                <p class="help">The key may only access the selected zones.</p>
                 {% for z in all_zones %}
                   <label class="inline-check">
                     <input type="checkbox" name="zone_ids" value="{{ z.id }}" {% if edit_key_error_id == key.id %}{% if z.id in edit_key_selected_zone_ids %}checked{% endif %}{% elif z.zone_name in key_zones[key.id] %}checked{% endif %} />
@@ -164,71 +189,7 @@
       </div>
     </dialog>
 
-    <script>
-      const createDialog = document.getElementById("create-key-dialog");
-      const openCreateKey = document.getElementById("open-create-key");
-      const closeCreateKey = document.getElementById("close-create-key");
-      const cancelCreateKey = document.getElementById("cancel-create-key");
-
-      openCreateKey?.addEventListener("click", () => createDialog?.showModal());
-      closeCreateKey?.addEventListener("click", () => createDialog?.close());
-      cancelCreateKey?.addEventListener("click", () => createDialog?.close());
-      if (createDialog?.dataset.autoOpen === "true") {
-        createDialog?.showModal();
-      }
-
-      document.querySelectorAll("[data-open-edit-key]").forEach((button) => {
-        button.addEventListener("click", () => {
-          const dialog = document.getElementById(`edit-key-dialog-${button.dataset.openEditKey}`);
-          dialog?.showModal();
-        });
-      });
-      document.querySelectorAll("[data-close-edit-key]").forEach((button) => {
-        button.addEventListener("click", () => {
-          const dialog = document.getElementById(`edit-key-dialog-${button.dataset.closeEditKey}`);
-          dialog?.close();
-        });
-      });
-      document.querySelectorAll("dialog[data-auto-open='true']").forEach((dialog) => {
-        if (!dialog.open) {
-          dialog.showModal();
-        }
-      });
-
-      (() => {
-        const revokeDialog = document.getElementById("revoke-api-key-dialog");
-        const revokeForm = document.getElementById("revoke-key-form");
-        const revokeKeyId = document.getElementById("revoke-key-id");
-        const revokeLabelEl = document.getElementById("revoke-key-label");
-        const revokeZonesEl = document.getElementById("revoke-key-zones");
-        const revokeLastUsedEl = document.getElementById("revoke-key-last-used");
-        const revokeClose = document.getElementById("revoke-key-close");
-        const revokeCancel = document.getElementById("revoke-key-cancel");
-
-        const zoneCountLabel = (count) => {
-          const n = Number(count);
-          if (n === 1) return "This key is allowed to use 1 DNS zone.";
-          return `This key is allowed to use ${n} DNS zones.`;
-        };
-
-        document.querySelectorAll("[data-open-revoke-key]").forEach((button) => {
-          button.addEventListener("click", () => {
-            const keyId = button.dataset.keyId || "";
-            const label = button.dataset.keyLabel || "";
-            const zoneCount = button.dataset.zoneCount ?? "0";
-            const lastUsed = button.dataset.lastUsed || "Never used";
-            if (revokeKeyId) revokeKeyId.value = keyId;
-            if (revokeLabelEl) revokeLabelEl.textContent = label;
-            if (revokeZonesEl) revokeZonesEl.textContent = zoneCountLabel(zoneCount);
-            if (revokeLastUsedEl) revokeLastUsedEl.textContent = `Last used: ${lastUsed}`;
-            revokeDialog?.showModal();
-          });
-        });
-
-        revokeClose?.addEventListener("click", () => revokeDialog?.close());
-        revokeCancel?.addEventListener("click", () => revokeDialog?.close());
-      })();
-    </script>
+    <script src="/static/api-keys.js" defer></script>
   </div>
   {% include "_page_footer.html" %}
 </body>

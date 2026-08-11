@@ -22,6 +22,8 @@ from .backup_crypto import (
 )
 from .letsencrypt import ACME_ACCOUNT_KEY_FILENAME
 from .models import (
+    API_KEY_ACCESS_MODES,
+    API_KEY_ACCESS_READ_WRITE,
     ActivityLog,
     AlertRule,
     ApiKey,
@@ -30,7 +32,7 @@ from .models import (
     Setting,
     User,
 )
-from .rbac import ROLE_GLOBAL_ADMIN, effective_roles, parse_roles
+from .rbac import ROLE_GLOBAL_ADMIN, effective_roles, parse_roles, serialize_roles
 from .security import pwd_context
 from .settings_store import delete_setting, get_setting, set_setting
 from .ssl_certs import CERT_FILENAME, KEY_FILENAME, SOURCE_FILENAME, cert_dir
@@ -83,6 +85,16 @@ FERNET_BACKED_CATEGORIES = frozenset(
         CATEGORY_SETTINGS,
         CATEGORY_ZONES,
         CATEGORY_SSL_FILES,
+    }
+)
+ENCRYPTION_REQUIRED_EXPORT_CATEGORIES = frozenset(
+    {
+        CATEGORY_SETTINGS,
+        CATEGORY_USERS,
+        CATEGORY_ZONES,
+        CATEGORY_API_KEYS,
+        CATEGORY_SSL_FILES,
+        CATEGORY_APPLICATION_SECRETS,
     }
 )
 
@@ -263,6 +275,7 @@ def build_payload(db, categories: list[str]) -> dict[str, Any]:
                     "label": key.label,
                     "key": key.key,
                     "key_prefix": key.key_prefix or "",
+                    "access_mode": key.access_mode,
                     "active": bool(key.active),
                     "created_at": _iso(key.created_at),
                     "allowed_zones": allowed,
@@ -346,8 +359,10 @@ def serialize_backup(
     password: str | None,
 ) -> bytes:
     created = (payload.get("manifest") or {}).get("created_at") or utc_now().isoformat()
-    if CATEGORY_APPLICATION_SECRETS in payload and not encrypt:
-        raise BackupError("Application secrets require a password-encrypted backup.")
+    sensitive_categories = sorted(set(payload) & ENCRYPTION_REQUIRED_EXPORT_CATEGORIES)
+    if sensitive_categories and not encrypt:
+        labels = ", ".join(sensitive_categories)
+        raise BackupError(f"Selected backup categories require a password-encrypted backup: {labels}.")
     if encrypt:
         if not password:
             raise BackupError("Password is required when encryption is enabled.")
@@ -517,6 +532,9 @@ def validate_restore_records(categories: list[str], payload: dict[str, Any]) -> 
             if digest in seen_keys:
                 raise BackupError("Duplicate API key digest in backup.")
             seen_keys.add(digest)
+            access_mode = row.get("access_mode", API_KEY_ACCESS_READ_WRITE)
+            if not isinstance(access_mode, str) or access_mode not in API_KEY_ACCESS_MODES:
+                raise BackupError("API key access_mode must be read_only or read_write.")
             allowed = row.get("allowed_zones") or []
             if allowed is not None and not isinstance(allowed, list):
                 raise BackupError("API key allowed_zones must be a list.")
@@ -641,7 +659,7 @@ def restore_payload(
                     User(
                         username=str(item["username"]).strip(),
                         password_hash=item["password_hash"],
-                        roles=item.get("roles") or "",
+                        roles=serialize_roles(parse_roles(item.get("roles") or "")),
                         disabled=bool(item.get("disabled")),
                         session_version=_fresh_session_version(),
                     )
@@ -671,6 +689,7 @@ def restore_payload(
                     label=item.get("label") or "",
                     key=item["key"],
                     key_prefix=item.get("key_prefix") or "",
+                    access_mode=item.get("access_mode", API_KEY_ACCESS_READ_WRITE),
                     active=bool(item.get("active", True)),
                     created_at=_parse_dt(item.get("created_at")) or utc_now(),
                 )

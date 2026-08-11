@@ -397,6 +397,14 @@ h2 {
   margin: 0 0 0 0;
   font-weight: normal;
 }
+.user-status-inline {
+  display: inline;
+  margin-left: 0.4rem;
+}
+.inline-expired-status {
+  display: inline-block;
+  margin-left: 0.5rem;
+}
 #le-zone-field > label {
   margin-bottom: 0.4rem;
 }

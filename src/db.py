@@ -23,12 +23,14 @@ def init_db() -> None:
 
     SQLModel.metadata.create_all(engine)
     _migrate_add_user_roles_column()
+    _migrate_normalize_empty_user_roles()
     _migrate_add_user_disabled_column()
     _migrate_add_user_session_version_column()
     _migrate_activity_log_category_column()
     _migrate_alert_rule_category_column()
     _migrate_activity_log_indexes()
     _migrate_add_api_key_prefix_column()
+    _migrate_add_api_key_access_mode_column()
     _migrate_hash_plaintext_api_keys()
     _migrate_rate_limit_bucket_table()
 
@@ -45,6 +47,32 @@ def _migrate_add_api_key_prefix_column() -> None:
         return
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE apikey ADD COLUMN key_prefix VARCHAR DEFAULT ''"))
+
+
+def _migrate_add_api_key_access_mode_column() -> None:
+    """Add access mode while preserving full access for existing API keys."""
+    from sqlalchemy import inspect, text
+
+    from .models import API_KEY_ACCESS_READ_WRITE
+
+    inspector = inspect(engine)
+    if "apikey" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("apikey")}
+    with engine.begin() as conn:
+        if "access_mode" not in columns:
+            conn.execute(
+                text(
+                    f"ALTER TABLE apikey ADD COLUMN access_mode VARCHAR DEFAULT '{API_KEY_ACCESS_READ_WRITE}' NOT NULL"
+                )
+            )
+        conn.execute(
+            text(
+                "UPDATE apikey "
+                f"SET access_mode = '{API_KEY_ACCESS_READ_WRITE}' "
+                "WHERE access_mode IS NULL OR TRIM(access_mode) = ''"
+            )
+        )
 
 
 def _migrate_hash_plaintext_api_keys() -> None:
@@ -85,6 +113,20 @@ def _migrate_add_user_roles_column() -> None:
         return
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE user ADD COLUMN roles VARCHAR DEFAULT ''"))
+
+
+def _migrate_normalize_empty_user_roles() -> None:
+    """Give legacy users the explicit least-privilege role used by new accounts."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if "user" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("user")}
+    if "roles" not in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE user SET roles = 'dns_zones.read' WHERE roles IS NULL OR TRIM(roles) = ''"))
 
 
 def _migrate_add_user_disabled_column() -> None:

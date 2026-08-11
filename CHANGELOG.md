@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-08-11
+
+### Security
+
+- **CVE-2026-53540**: bump `python-multipart` to 0.0.31 (negative `Content-Length` handling).
+- **Least-privilege roles**: normalize legacy blank user-role records to explicit `dns_zones.read` (startup migration, backup restore, and role-editor display) so a no-op roles save cannot materialize broad legacy permissions.
+- **Encrypted backups**: require password encryption for exports that include settings, users, DNS zones, API keys, SSL files, or application secrets; plaintext alert-rule and activity-log exports remain supported.
+- **OpenAPI + CSP**: gate enabled OpenAPI schema/docs behind an authenticated dashboard session; remove `unsafe-inline` from the application CSP by serving admin scripts/styles from `/static`.
+- **Rate-limit resilience**: retry brief SQLite `locked` / `busy` conditions for rate-limit counters, then preserve the existing fail-closed result.
+- **Secret hygiene**: replace documentation and CI TSIG fixture literals with an explicit placeholder and a per-run generated fixture (narrow `.gitleaks.toml` allowlist).
+
+### Added
+
+- **BIND / TSIG wildcard search**: DNS browser blank browse and `*` / `?` wildcard search via TSIG-signed zone transfer (AXFR). Requires `allow-transfer { key ...; };` on the BIND zone (see `BINDCONFIG.md`); refused transfers return HTTP 400 with that remediation. Exact-name lookup is unchanged.
+- Operator guide [`BINDCONFIG.md`](BINDCONFIG.md): BIND/TSIG prerequisites for dynamic updates and optional AXFR browse (`allow-update` / `allow-transfer`, key setup, dig checks, troubleshooting).
+- Release BIND smoke grants AXFR on `smoke.test` (browse/glob success + truncated browse after 100 RRsets), denies transfer on `denied.test` (browse/glob 400 + exact lookup still works), asserts favicon/logo-mark static SVG delivery on BIND and Microsoft smoke jobs, Playwright UI smoke under hardened CSP, and API key access modes (default read-only mutations → `403 access_denied`, mode edit, backup/legacy restore).
+- API keys now support `read_only` and `read_write` access modes in addition to zone restrictions. New keys default to read-only; existing keys and legacy backups retain read/write access. Read-only keys can validate, list allowed zones, and look up records, but DNS mutations return generic `403 access_denied`.
+
+### Changed
+
+- Application version metadata aligned to **0.8.1** (`VERSION`, OpenAPI, `pyproject.toml`, Docker label, Compose pin).
+- Admin UI favicon (`favicon.svg`) and logo mark (`logo-mark.svg`) redrawn as a higher-resolution 64×64 globe-and-routing SVG (replacing the earlier pulse-line mark) for clearer branding at favicon and header sizes.
+- BIND browse/wildcard AXFR no longer materializes the full zone in memory: transfers stream RRsets, stop once the browse limit (or a 5000-RRset scan cap) is reached, close the TCP transfer early, and allow at most two concurrent AXFRs process-wide.
+
 ## [0.8.0] - 2026-08-07
 
 ### Added

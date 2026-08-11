@@ -18,6 +18,7 @@ from ..models import DnsRecordInfo
 __all__ = [
     "LOOKUP_RECORD_TYPES",
     "dns_relative_name",
+    "format_rdata_value",
     "has_dns_glob",
     "lookup_record_types_to_query",
     "normalize_lookup_record_type",
@@ -108,7 +109,8 @@ def _record_exists_at_name(
     return bool(resp.answer)
 
 
-def _format_rdata_value(record_type: str, rdata) -> str:
+def format_rdata_value(record_type: str, rdata) -> str:
+    """Canonical string form of a dnspython rdata, matching DnsRecordInfo values."""
     rt = record_type.upper()
     if rt == "A":
         return str(rdata.address)
@@ -137,6 +139,9 @@ def _format_rdata_value(record_type: str, rdata) -> str:
     if rt == "SOA":
         return rdata.to_text()
     return rdata.to_text()
+
+
+_format_rdata_value = format_rdata_value
 
 
 def _query_record_details_at_name(

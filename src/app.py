@@ -52,6 +52,8 @@ from .http_utils import (
 )
 from .letsencrypt import LetsEncryptError
 from .models import (
+    API_KEY_ACCESS_MODES,
+    API_KEY_ACCESS_READ_ONLY,
     LOG_CATEGORY_SECURITY,
     LOG_CATEGORY_VALUES,
     LOG_LEVEL_ERROR,
@@ -186,6 +188,13 @@ def _api_keys_html_context(db, *, user: str, message: str | None = None, **extra
         "openapi_enabled": _OPENAPI_ON,
         **extra,
     }
+
+
+def _api_key_access_mode(access_mode: str | None, *, default: str) -> str:
+    selected = default if access_mode is None else access_mode.strip().lower()
+    if selected not in API_KEY_ACCESS_MODES:
+        raise ValueError("Access mode must be read_only or read_write.")
+    return selected
 
 
 AUTH_REDIRECT_DETAILS = {"Authentication required", "Invalid or expired session"}
@@ -355,14 +364,13 @@ _SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "same-origin",
     "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
-    # Compatible with current inline admin scripts/styles; tighten further when assets are externalized.
     "Content-Security-Policy": (
         "default-src 'self'; "
         "base-uri 'self'; "
         "object-src 'none'; "
         "frame-ancestors 'none'; "
-        "script-src 'self' 'unsafe-inline'; "
-        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; "
+        "style-src 'self'; "
         "img-src 'self' data:; "
         "font-src 'self'; "
         "connect-src 'self'"
@@ -372,6 +380,7 @@ _SECURITY_HEADERS = {
 # FastAPI's default Swagger/ReDoc UIs load assets from jsDelivr (and a FastAPI favicon).
 # Keep the strict CSP for the admin app; only relax these paths when OpenAPI is enabled.
 _DOCS_PATHS = frozenset({"/docs", "/redoc", "/docs/oauth2-redirect"})
+_OPENAPI_SCHEMA_PATH = "/openapi.json"
 _DOCS_CSP = (
     "default-src 'self'; "
     "base-uri 'self'; "
@@ -383,6 +392,20 @@ _DOCS_CSP = (
     "font-src 'self' https://cdn.jsdelivr.net data:; "
     "connect-src 'self' https://cdn.jsdelivr.net"
 )
+
+
+@app.middleware("http")
+async def openapi_session_middleware(request: Request, call_next):
+    """Restrict optional API documentation to authenticated dashboard sessions."""
+    path = request.url.path or ""
+    if _OPENAPI_ON and (path == _OPENAPI_SCHEMA_PATH or path in _DOCS_PATHS):
+        try:
+            get_current_user(request)
+        except HTTPException:
+            if path == _OPENAPI_SCHEMA_PATH:
+                return JSONResponse(status_code=401, content={"detail": "Authentication required"})
+            return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -947,6 +970,7 @@ def create_api_key_route(
     label: str = Form(...),
     zone_ids: list[int] = Form(default_factory=list),
     key_id: int | None = Form(None),
+    access_mode: str | None = Form(None),
     user: str = Depends(require_role(ROLE_API_KEYS_UPDATE)),
 ):
     try:
@@ -955,6 +979,23 @@ def create_api_key_route(
                 row = db.get(ApiKey, key_id)
                 if not row:
                     return RedirectResponse(url="/api-keys", status_code=HTTP_303_SEE_OTHER)
+                try:
+                    selected_access_mode = _api_key_access_mode(access_mode, default=row.access_mode)
+                except ValueError as exc:
+                    ctx = _api_keys_html_context(
+                        db,
+                        user=user,
+                        edit_key_error_id=key_id,
+                        edit_key_error=str(exc),
+                        edit_key_label=label,
+                        edit_key_access_mode=access_mode,
+                        edit_key_selected_zone_ids=zone_ids,
+                    )
+                    return templates.TemplateResponse(
+                        request=request,
+                        name="api_keys.html",
+                        context={"request": request, **ctx},
+                    )
                 if not zone_ids:
                     ctx = _api_keys_html_context(
                         db,
@@ -962,6 +1003,7 @@ def create_api_key_route(
                         edit_key_error_id=key_id,
                         edit_key_error="Select at least one DNS zone.",
                         edit_key_label=label,
+                        edit_key_access_mode=access_mode,
                         edit_key_selected_zone_ids=zone_ids,
                     )
                     return templates.TemplateResponse(
@@ -970,6 +1012,7 @@ def create_api_key_route(
                         context={"request": request, **ctx},
                     )
                 row.label = label
+                row.access_mode = selected_access_mode
                 db.add(row)
                 for link in db.exec(select(ApiKeyAllowedZone).where(ApiKeyAllowedZone.api_key_id == key_id)).all():
                     db.delete(link)
@@ -986,9 +1029,30 @@ def create_api_key_route(
                     actor_type="user",
                     actor_label=user,
                     message=f"API key {label!r} updated",
-                    details={"api_key_id": key_id, "api_key_label": label, "allowed_zone_ids": list(zone_ids)},
+                    details={
+                        "api_key_id": key_id,
+                        "api_key_label": label,
+                        "access_mode": row.access_mode,
+                        "allowed_zone_ids": list(zone_ids),
+                    },
                 )
                 ctx = _api_keys_html_context(db, user=user, message="API key updated.")
+            return templates.TemplateResponse(
+                request=request,
+                name="api_keys.html",
+                context={"request": request, **ctx},
+            )
+        try:
+            selected_access_mode = _api_key_access_mode(access_mode, default=API_KEY_ACCESS_READ_ONLY)
+        except ValueError as exc:
+            with SessionLocal() as db:
+                ctx = _api_keys_html_context(
+                    db,
+                    user=user,
+                    create_key_error=str(exc),
+                    create_key_label=label,
+                    create_key_access_mode=access_mode,
+                )
             return templates.TemplateResponse(
                 request=request,
                 name="api_keys.html",
@@ -1001,6 +1065,7 @@ def create_api_key_route(
                     user=user,
                     create_key_error="Select at least one DNS zone for this API key.",
                     create_key_label=label,
+                    create_key_access_mode=access_mode,
                 )
             return templates.TemplateResponse(
                 request=request,
@@ -1009,7 +1074,12 @@ def create_api_key_route(
             )
         new_key = generate_api_key()
         with SessionLocal() as db:
-            api_key = ApiKey(label=label, key=hash_api_key(new_key), key_prefix=api_key_prefix(new_key))
+            api_key = ApiKey(
+                label=label,
+                key=hash_api_key(new_key),
+                key_prefix=api_key_prefix(new_key),
+                access_mode=selected_access_mode,
+            )
             db.add(api_key)
             db.commit()
             db.refresh(api_key)
@@ -1028,6 +1098,7 @@ def create_api_key_route(
                 details={
                     "api_key_id": api_key.id,
                     "api_key_label": api_key.label,
+                    "access_mode": api_key.access_mode,
                     "allowed_zone_ids": list(zone_ids),
                     "key_prefix": api_key.key_prefix,
                 },
@@ -1081,12 +1152,33 @@ def api_key_update(
     key_id: int,
     label: str = Form(...),
     zone_ids: list[int] = Form(default_factory=list),
+    access_mode: str | None = Form(None),
     user: str = Depends(require_role(ROLE_API_KEYS_UPDATE)),
 ):
     with SessionLocal() as db:
         row = db.get(ApiKey, key_id)
         if not row:
             return RedirectResponse(url="/api-keys", status_code=HTTP_303_SEE_OTHER)
+        try:
+            selected_access_mode = _api_key_access_mode(access_mode, default=row.access_mode)
+        except ValueError as exc:
+            all_zones = list_dns_zones(db)
+            allowed_ids = {
+                link.dns_zone_config_id
+                for link in db.exec(select(ApiKeyAllowedZone).where(ApiKeyAllowedZone.api_key_id == key_id)).all()
+            }
+            return templates.TemplateResponse(
+                request=request,
+                name="api_key_edit.html",
+                context={
+                    "request": request,
+                    "user": user,
+                    "api_key_row": api_key_public_dict(row),
+                    "all_zones": [dns_zone_public_dict(z) for z in all_zones],
+                    "allowed_ids": allowed_ids,
+                    "message": str(exc),
+                },
+            )
         if not zone_ids:
             all_zones = list_dns_zones(db)
             allowed_ids = {
@@ -1106,6 +1198,7 @@ def api_key_update(
                 },
             )
         row.label = label
+        row.access_mode = selected_access_mode
         db.add(row)
         for link in db.exec(select(ApiKeyAllowedZone).where(ApiKeyAllowedZone.api_key_id == key_id)).all():
             db.delete(link)
@@ -1122,7 +1215,12 @@ def api_key_update(
             actor_type="user",
             actor_label=user,
             message=f"API key {label!r} updated",
-            details={"api_key_id": key_id, "api_key_label": label, "allowed_zone_ids": list(zone_ids)},
+            details={
+                "api_key_id": key_id,
+                "api_key_label": label,
+                "access_mode": row.access_mode,
+                "allowed_zone_ids": list(zone_ids),
+            },
         )
         all_zones = list_dns_zones(db)
         allowed_ids = {

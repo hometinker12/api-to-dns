@@ -109,6 +109,56 @@ def test_expired_buckets_are_cleaned(enable_rate_limit, monkeypatch: pytest.Monk
     assert remaining == 0
 
 
+def test_rate_limit_retries_transient_sqlite_lock(enable_rate_limit, monkeypatch: pytest.MonkeyPatch) -> None:
+    from sqlalchemy.exc import OperationalError
+
+    import src.rate_limit as rate_limit_module
+
+    original_cleanup = rate_limit_module._maybe_cleanup_expired
+    calls = 0
+    delays: list[float] = []
+
+    def lock_once(db, now: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OperationalError("DELETE", {}, RuntimeError("database is locked"))
+        original_cleanup(db, now)
+
+    monkeypatch.setattr(rate_limit_module, "_maybe_cleanup_expired", lock_once)
+    monkeypatch.setattr(rate_limit_module.time, "sleep", delays.append)
+
+    assert rate_limit_exceeded(_request("/login")) is False
+    assert calls == 2
+    assert delays == [rate_limit_module._RATE_LIMIT_DB_LOCK_BACKOFF_SECONDS]
+
+
+def test_rate_limit_fails_closed_after_transient_lock_retries(
+    enable_rate_limit, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy.exc import OperationalError
+
+    import src.rate_limit as rate_limit_module
+
+    calls = 0
+    delays: list[float] = []
+
+    def always_locked(_db, _now: int) -> None:
+        nonlocal calls
+        calls += 1
+        raise OperationalError("DELETE", {}, RuntimeError("database is busy"))
+
+    monkeypatch.setattr(rate_limit_module, "_maybe_cleanup_expired", always_locked)
+    monkeypatch.setattr(rate_limit_module.time, "sleep", delays.append)
+
+    assert rate_limit_exceeded(_request("/login")) is True
+    assert calls == rate_limit_module._RATE_LIMIT_DB_LOCK_ATTEMPTS
+    assert delays == [
+        rate_limit_module._RATE_LIMIT_DB_LOCK_BACKOFF_SECONDS,
+        rate_limit_module._RATE_LIMIT_DB_LOCK_BACKOFF_SECONDS * 2,
+    ]
+
+
 def test_http_login_returns_429_when_limited(client: TestClient, enable_rate_limit) -> None:
     # Disable CSRF relax? keep default. Hit login until limited.
     for _ in range(3):

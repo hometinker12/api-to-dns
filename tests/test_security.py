@@ -16,7 +16,7 @@ def test_get_app_version_matches_version_file() -> None:
     get_app_version.cache_clear()
     expected = (Path(__file__).resolve().parents[1] / "VERSION").read_text(encoding="utf-8").strip()
     assert get_app_version() == expected
-    assert expected == "0.8.0"
+    assert expected == "0.8.1"
 
 
 def test_fastapi_app_version_matches_version_file() -> None:
@@ -143,6 +143,38 @@ def test_migrate_hashes_plaintext_api_keys() -> None:
         assert is_api_key_hash(row.key)
         assert row.key == hash_api_key("plaintext-legacy-key")
         assert row.key_prefix == "plaintext-le"
+
+
+def test_migrate_api_key_access_mode_preserves_existing_write_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy import create_engine, text
+
+    import src.db as db_module
+    from src.models import API_KEY_ACCESS_READ_WRITE
+
+    legacy_engine = create_engine(f"sqlite:///{tmp_path / 'legacy-api-keys.db'}")
+    with legacy_engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE apikey ("
+                "id INTEGER PRIMARY KEY, "
+                "label VARCHAR NOT NULL, "
+                "key VARCHAR NOT NULL, "
+                "active BOOLEAN NOT NULL, "
+                "created_at DATETIME"
+                ")"
+            )
+        )
+        conn.execute(text("INSERT INTO apikey (id, label, key, active) VALUES (1, 'legacy', 'legacy-key-digest', 1)"))
+
+    monkeypatch.setattr(db_module, "engine", legacy_engine)
+    db_module._migrate_add_api_key_access_mode_column()
+    db_module._migrate_add_api_key_access_mode_column()
+
+    with legacy_engine.connect() as conn:
+        access_mode = conn.execute(text("SELECT access_mode FROM apikey WHERE id = 1")).scalar_one()
+    assert access_mode == API_KEY_ACCESS_READ_WRITE
 
 
 def test_sanitize_client_error_message_redacts_secrets() -> None:
@@ -324,6 +356,7 @@ def test_security_headers_and_hsts(client: TestClient, monkeypatch: pytest.Monke
     assert response.headers.get("referrer-policy") == "same-origin"
     assert "geolocation=()" in (response.headers.get("permissions-policy") or "")
     assert "default-src 'self'" in (response.headers.get("content-security-policy") or "")
+    assert "'unsafe-inline'" not in (response.headers.get("content-security-policy") or "")
     assert response.headers.get("strict-transport-security", "").startswith("max-age=")
 
 
@@ -347,6 +380,26 @@ def test_openapi_disabled_by_default_outside_tests(monkeypatch: pytest.MonkeyPat
     from src import app as app_module
 
     assert app_module._openapi_enabled() is False
+
+
+def test_enabled_openapi_requires_dashboard_session(client: TestClient) -> None:
+    schema = client.get("/openapi.json")
+    assert schema.status_code == 401
+    assert schema.json() == {"detail": "Authentication required"}
+
+    docs = client.get("/docs", follow_redirects=False)
+    assert docs.status_code == 303
+    assert docs.headers["location"] == "/login"
+
+    oauth_redirect = client.get("/docs/oauth2-redirect", follow_redirects=False)
+    assert oauth_redirect.status_code == 303
+    assert oauth_redirect.headers["location"] == "/login"
+
+    client.cookies.set("session", create_session_cookie("admin"))
+    assert client.get("/openapi.json").status_code == 200
+    assert client.get("/docs").status_code == 200
+    assert client.get("/redoc").status_code == 200
+    assert client.get("/docs/oauth2-redirect").status_code == 200
 
 
 def test_api_keys_shows_api_docs_link_when_openapi_enabled(client: TestClient) -> None:
