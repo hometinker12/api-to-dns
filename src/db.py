@@ -29,6 +29,7 @@ def init_db() -> None:
     _migrate_alert_rule_category_column()
     _migrate_activity_log_indexes()
     _migrate_add_api_key_prefix_column()
+    _migrate_add_api_key_access_mode_column()
     _migrate_hash_plaintext_api_keys()
     _migrate_rate_limit_bucket_table()
 
@@ -45,6 +46,32 @@ def _migrate_add_api_key_prefix_column() -> None:
         return
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE apikey ADD COLUMN key_prefix VARCHAR DEFAULT ''"))
+
+
+def _migrate_add_api_key_access_mode_column() -> None:
+    """Add access mode while preserving full access for existing API keys."""
+    from sqlalchemy import inspect, text
+
+    from .models import API_KEY_ACCESS_READ_WRITE
+
+    inspector = inspect(engine)
+    if "apikey" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("apikey")}
+    with engine.begin() as conn:
+        if "access_mode" not in columns:
+            conn.execute(
+                text(
+                    f"ALTER TABLE apikey ADD COLUMN access_mode VARCHAR DEFAULT '{API_KEY_ACCESS_READ_WRITE}' NOT NULL"
+                )
+            )
+        conn.execute(
+            text(
+                "UPDATE apikey "
+                f"SET access_mode = '{API_KEY_ACCESS_READ_WRITE}' "
+                "WHERE access_mode IS NULL OR TRIM(access_mode) = ''"
+            )
+        )
 
 
 def _migrate_hash_plaintext_api_keys() -> None:

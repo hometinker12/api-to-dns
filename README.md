@@ -84,7 +84,7 @@ http://127.0.0.1:8001/login
 > docker run --rm -v api-to-dns_api-to-dns-logs:/vol alpine chown -R 10001:10001 /vol
 > ```
 
-After login, the **Dashboard** shows configured DNS zones. Add one row per zone configuration (each row has a **unique configuration name**, its own provider, a **DNS zone (domain)** for that provider, and credentials). You can add multiple configurations with different names that all target the same DNS domain (for example `example-azure` and `example-cloudflare`, both with domain `example.com`). Use **API Keys** in the top navigation to create or edit a key and select which configurations it may use. Every `/dns-record` request requires a `zone_name` (in the JSON body for `POST`/`PUT`/`PATCH`, in the query string for `GET`/`DELETE`); it must match a configured zone **name** **and** be allowed for that API key, or the API returns **403** with `error: access_denied`. The `zone_name` on API requests is the configuration name, not the provider DNS domain.
+After login, the **Dashboard** shows configured DNS zones. Add one row per zone configuration (each row has a **unique configuration name**, its own provider, a **DNS zone (domain)** for that provider, and credentials). You can add multiple configurations with different names that all target the same DNS domain (for example `example-azure` and `example-cloudflare`, both with domain `example.com`). Use **API Keys** in the top navigation to create or edit a key, select which configurations it may use, and choose its access mode. New keys default to **read-only**; use **read/write** only for clients that need to mutate DNS records. Every `/dns-record` request requires a `zone_name` (in the JSON body for `POST`/`PUT`/`PATCH`, in the query string for `GET`/`DELETE`); it must match a configured zone **name** **and** be allowed for that API key, or the API returns **403** with `error: access_denied`. The `zone_name` on API requests is the configuration name, not the provider DNS domain.
 
 ## Configuration
 
@@ -238,16 +238,25 @@ Authenticate with `**X-API-Key: <key>`** or `**Authorization: Bearer <key>**`.
 
 All examples target `http://localhost:8000/dns-record` with `Content-Type: application/json`.
 
+### API key access modes
+
+Each key combines an access mode with its selected zone configurations:
+
+- **`read_only`** (the default for new keys) can call `GET /keycheck`, JSON `GET /zones`, and `GET /dns-record` for its allowed zones.
+- **`read_write`** can perform those reads and `POST`, `PUT`, `PATCH`, or `DELETE /dns-record` for its allowed zones.
+
+Existing keys are migrated as `read_write` to preserve their current behavior. Backups created before access modes also restore keys as `read_write`. A write request from a read-only key returns the same generic **403** `access_denied` response as other unauthorized zone requests.
+
 `/dns-record` is a single REST resource. Each method has well-defined semantics:
 
 
 | Method   | Scope            | Idempotent | Behavior                                                                                                                                 |
 | -------- | ---------------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET`    | Lookup           | yes        | Return which supported record types exist at a name.                                                                                     |
-| `POST`   | Create           | no         | Create a new record. Returns **409** `record_already_exists` if a record of that type already exists.                                    |
-| `PUT`    | Full replacement | yes        | Replace the record's type/TTL/values. Returns **404** `not_found` if the type does not exist.                                            |
-| `PATCH`  | Partial update   | no         | Update `ttl` and/or `values`; omitted fields are preserved from the live record. Returns **404** `not_found` if the type does not exist. |
-| `DELETE` | Remove           | yes        | Delete the record of the given type. Returns **404** `not_found` if the type does not exist.                                             |
+| `GET`    | Lookup           | yes        | Return which supported record types exist at a name. Available to `read_only` and `read_write` keys.                                     |
+| `POST`   | Create           | no         | Create a new record. Returns **409** `record_already_exists` if a record of that type already exists. Requires `read_write`.             |
+| `PUT`    | Full replacement | yes        | Replace the record's type/TTL/values. Returns **404** `not_found` if the type does not exist. Requires `read_write`.                     |
+| `PATCH`  | Partial update   | no         | Update `ttl` and/or `values`; omitted fields are preserved from the live record. Returns **404** `not_found` if the type does not exist. Requires `read_write`. |
+| `DELETE` | Remove           | yes        | Delete the record of the given type. Returns **404** `not_found` if the type does not exist. Requires `read_write`.                      |
 
 
 `record_type` accepts `**A`**, `**AAAA**`, `**CNAME**`, or `**TXT**`. The legacy `POST` upsert and `record_type: "DELETE"` pseudo-payload have been removed.

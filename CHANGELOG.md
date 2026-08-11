@@ -6,8 +6,8 @@
 
 - BIND / TSIG DNS browser blank browse and `*` / `?` wildcard search via TSIG-signed zone transfer (AXFR). Requires `allow-transfer { key ...; };` on the BIND zone (see `BINDCONFIG.md`); refused transfers return HTTP 400 with that remediation. Exact-name lookup is unchanged. README, `BINDCONFIG.md`, and DNS browser help text updated for the AXFR requirement; unit and app tests cover browse, glob, truncation, and refused-transfer mapping.
 - Operator guide [`BINDCONFIG.md`](BINDCONFIG.md): BIND/TSIG prerequisites for dynamic updates and optional AXFR browse (`allow-update` / `allow-transfer`, key setup, dig checks, troubleshooting).
-- Release BIND smoke grants AXFR on `smoke.test` (browse/glob success + truncated browse after 100 RRsets), denies transfer on `denied.test` (browse/glob 400 + exact lookup still works), and asserts favicon/logo-mark static SVG delivery on BIND and Microsoft smoke jobs.
-- API keys now support `read_only` and `read_write` access modes in addition to zone restrictions. New keys default to read-only; existing keys and legacy backups retain read/write access. Read-only keys can validate, list allowed zones, and look up records, but DNS mutations return `403 read_only_key`.
+- Release BIND smoke grants AXFR on `smoke.test` (browse/glob success + truncated browse after 100 RRsets), denies transfer on `denied.test` (browse/glob 400 + exact lookup still works), asserts favicon/logo-mark static SVG delivery on BIND and Microsoft smoke jobs, and covers API key access modes (default read-only mutations → `403 access_denied`, mode edit, backup/legacy restore).
+- API keys now support `read_only` and `read_write` access modes in addition to zone restrictions. New keys default to read-only; existing keys and legacy backups retain read/write access. Read-only keys can validate, list allowed zones, and look up records, but DNS mutations return generic `403 access_denied`.
 
 ### Changed
 

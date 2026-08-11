@@ -22,6 +22,8 @@ from .backup_crypto import (
 )
 from .letsencrypt import ACME_ACCOUNT_KEY_FILENAME
 from .models import (
+    API_KEY_ACCESS_MODES,
+    API_KEY_ACCESS_READ_WRITE,
     ActivityLog,
     AlertRule,
     ApiKey,
@@ -263,6 +265,7 @@ def build_payload(db, categories: list[str]) -> dict[str, Any]:
                     "label": key.label,
                     "key": key.key,
                     "key_prefix": key.key_prefix or "",
+                    "access_mode": key.access_mode,
                     "active": bool(key.active),
                     "created_at": _iso(key.created_at),
                     "allowed_zones": allowed,
@@ -517,6 +520,9 @@ def validate_restore_records(categories: list[str], payload: dict[str, Any]) -> 
             if digest in seen_keys:
                 raise BackupError("Duplicate API key digest in backup.")
             seen_keys.add(digest)
+            access_mode = row.get("access_mode", API_KEY_ACCESS_READ_WRITE)
+            if not isinstance(access_mode, str) or access_mode not in API_KEY_ACCESS_MODES:
+                raise BackupError("API key access_mode must be read_only or read_write.")
             allowed = row.get("allowed_zones") or []
             if allowed is not None and not isinstance(allowed, list):
                 raise BackupError("API key allowed_zones must be a list.")
@@ -671,6 +677,7 @@ def restore_payload(
                     label=item.get("label") or "",
                     key=item["key"],
                     key_prefix=item.get("key_prefix") or "",
+                    access_mode=item.get("access_mode", API_KEY_ACCESS_READ_WRITE),
                     active=bool(item.get("active", True)),
                     created_at=_parse_dt(item.get("created_at")) or utc_now(),
                 )

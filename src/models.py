@@ -260,11 +260,17 @@ class RateLimitBucket(SQLModel, table=True):
     expires_at: int = SQLField(index=True)
 
 
+API_KEY_ACCESS_READ_ONLY = "read_only"
+API_KEY_ACCESS_READ_WRITE = "read_write"
+API_KEY_ACCESS_MODES = frozenset({API_KEY_ACCESS_READ_ONLY, API_KEY_ACCESS_READ_WRITE})
+
+
 class ApiKey(SQLModel, table=True):
     id: int | None = SQLField(default=None, primary_key=True)
     label: str
     key: str = SQLField(index=True, unique=True)  # SHA-256 hex digest of the raw key
     key_prefix: str | None = SQLField(default="")
+    access_mode: str = SQLField(default=API_KEY_ACCESS_READ_ONLY)
     active: bool = SQLField(default=True)
     created_at: datetime = SQLField(default_factory=utc_now)
 
