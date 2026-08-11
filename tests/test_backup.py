@@ -39,6 +39,7 @@ from src.models import (
 )
 from src.rbac import (
     ROLE_DNS_ZONES_READ,
+    ROLE_GLOBAL_ADMIN,
     ROLE_GLOBAL_READ,
     ROLE_SYSTEM_UPDATE,
     serialize_roles,
@@ -135,8 +136,7 @@ def test_export_encrypted_download(client: TestClient) -> None:
 def test_export_unencrypted_warning_present(client: TestClient) -> None:
     _admin_client(client)
     response = client.get("/settings?area=backup&section=export")
-    assert "unencrypted backup may still include" in response.text
-    assert "Application secrets cannot be exported without encryption" in response.text
+    assert "Only alert rules and audit logs can be exported without password encryption" in response.text
     assert 'id="backup-unencrypted-warning"' in response.text
 
 
@@ -439,6 +439,35 @@ def test_restore_users_assigns_fresh_session_version() -> None:
                 db.commit()
 
 
+def test_restore_normalizes_empty_legacy_user_roles(client: TestClient) -> None:
+    with SessionLocal() as db:
+        admin = db.exec(select(User).where(User.username == "admin")).first()
+        assert admin is not None
+        payload = build_payload(db, [CATEGORY_USERS])
+        payload[CATEGORY_USERS] = [
+            {
+                "username": "admin",
+                "password_hash": admin.password_hash,
+                "roles": serialize_roles([ROLE_GLOBAL_ADMIN]),
+                "disabled": False,
+                "session_version": 0,
+            },
+            {
+                "username": "legacy-zone-reader",
+                "password_hash": admin.password_hash,
+                "roles": "",
+                "disabled": False,
+                "session_version": 0,
+            },
+        ]
+
+        restore_payload(db, payload, [CATEGORY_USERS])
+
+        restored = db.exec(select(User).where(User.username == "legacy-zone-reader")).first()
+        assert restored is not None
+        assert restored.roles == ROLE_DNS_ZONES_READ
+
+
 def test_shell_export_quotes_metacharacters(tmp_path, monkeypatch) -> None:
     import shlex
 
@@ -486,6 +515,35 @@ def test_application_secrets_require_encrypted_archive() -> None:
         payload = build_payload(db, [CATEGORY_APPLICATION_SECRETS])
     with pytest.raises(BackupError, match="password-encrypted"):
         serialize_backup(payload, encrypt=False, password=None)
+
+
+@pytest.mark.parametrize(
+    "category",
+    [CATEGORY_SETTINGS, CATEGORY_USERS, CATEGORY_ZONES, CATEGORY_API_KEYS, CATEGORY_SSL_FILES],
+)
+def test_sensitive_backup_categories_require_encrypted_archive(client: TestClient, category: str) -> None:
+    with SessionLocal() as db:
+        payload = build_payload(db, [category])
+    with pytest.raises(BackupError, match="password-encrypted"):
+        serialize_backup(payload, encrypt=False, password=None)
+
+
+def test_low_risk_backup_categories_allow_unencrypted_archive(client: TestClient) -> None:
+    with SessionLocal() as db:
+        payload = build_payload(db, [CATEGORY_ALERT_RULES, CATEGORY_ACTIVITY_LOGS])
+    raw = serialize_backup(payload, encrypt=False, password=None)
+    envelope = json.loads(raw.decode("utf-8"))
+    assert envelope["encrypted"] is False
+
+
+def test_export_route_rejects_unencrypted_sensitive_category(client: TestClient) -> None:
+    _admin_client(client)
+    response = client.post(
+        "/settings/backup/export",
+        data={"categories": CATEGORY_SSL_FILES},
+    )
+    assert response.status_code == 200
+    assert "password-encrypted backup" in response.text
 
 
 def test_restore_secrets_rejects_unencrypted_envelope() -> None:

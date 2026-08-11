@@ -36,7 +36,6 @@ ALL_ROLES: list[str] = [
     ROLE_PLUGIN_UPDATE,
     ROLE_SYSTEM_UPDATE,
 ]
-LEGACY_DEFAULT_ROLES: set[str] = set(ALL_ROLES) - {ROLE_GLOBAL_ADMIN}
 
 # Roles that account.update may assign without being a global admin.
 ACCOUNT_ADMIN_GRANTABLE_ROLES: set[str] = {
@@ -291,17 +290,14 @@ def require_role(role: str):
 
 
 def user_public_dict(u: User) -> dict[str, Any]:
-    stored_roles = parse_roles(u.roles)
-    display_roles = stored_roles or LEGACY_DEFAULT_ROLES
-    effective_display_roles = effective_roles(display_roles)
+    effective_display_roles = effective_roles(parse_roles(u.roles))
     return {
         "id": u.id,
         "username": u.username,
         "disabled": u.disabled,
         "roles": sorted(effective_display_roles),
-        "stored_roles": sorted(display_roles | MANDATORY_ROLES),
+        "stored_roles": sorted(effective_display_roles),
         "is_global_admin": ROLE_GLOBAL_ADMIN in effective_display_roles,
-        "has_default_roles": not stored_roles,
     }
 
 

@@ -74,38 +74,5 @@
     </div>
   </dialog>
 
-  <script>
-    (() => {
-      const dialog = document.getElementById("delete-zone-dialog");
-      const form = document.getElementById("delete-zone-form");
-      const nameEl = document.getElementById("delete-zone-name");
-      const apiKeysEl = document.getElementById("delete-zone-api-keys");
-      const leWarning = document.getElementById("delete-zone-le-warning");
-      const closeBtn = document.getElementById("delete-zone-close");
-      const cancelBtn = document.getElementById("delete-zone-cancel");
-
-      const apiKeyCountLabel = (count) => {
-        const n = Number(count);
-        if (n === 1) return "1 API key is currently allowed to use this zone.";
-        return `${n} API keys are currently allowed to use this zone.`;
-      };
-
-      document.querySelectorAll("[data-open-delete-zone]").forEach((button) => {
-        button.addEventListener("click", () => {
-          const zoneId = button.dataset.zoneId;
-          const zoneName = button.dataset.zoneName || "";
-          const apiKeyCount = button.dataset.apiKeyCount ?? "0";
-          const leReferenced = button.dataset.leReferenced === "true";
-          if (nameEl) nameEl.textContent = zoneName;
-          if (apiKeysEl) apiKeysEl.textContent = apiKeyCountLabel(apiKeyCount);
-          if (leWarning) leWarning.hidden = !leReferenced;
-          if (form && zoneId) form.action = `/zones/${zoneId}/delete`;
-          dialog?.showModal();
-        });
-      });
-
-      closeBtn?.addEventListener("click", () => dialog?.close());
-      cancelBtn?.addEventListener("click", () => dialog?.close());
-    })();
-  </script>
+  <script src="/static/configured-zones.js" defer></script>
 {% endif %}

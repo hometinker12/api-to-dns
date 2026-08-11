@@ -138,9 +138,9 @@
                     <tr>
                       <td>
                         <code>{{ u.username }}</code>
-                        {% if u.username == user %}<span class="help" style="display:inline; margin-left:0.4rem;">(you)</span>{% endif %}
-                        {% if u.is_global_admin %}<span class="help" style="display:inline; margin-left:0.4rem;">(Global Admin)</span>{% endif %}
-                        {% if u.disabled %}<span class="help" style="display:inline; margin-left:0.4rem;">(Disabled)</span>{% endif %}
+                        {% if u.username == user %}<span class="help user-status-inline">(you)</span>{% endif %}
+                        {% if u.is_global_admin %}<span class="help user-status-inline">(Global Admin)</span>{% endif %}
+                        {% if u.disabled %}<span class="help user-status-inline">(Disabled)</span>{% endif %}
                       </td>
                       <td class="actions-column">
                         <div class="action-cell">
@@ -157,11 +157,11 @@
                               <form action="/settings/users/{{ u.id }}/enable" method="post">
                                 <button type="submit">Enable account</button>
                               </form>
-                              <form action="/settings/users/{{ u.id }}/delete" method="post" onsubmit="return confirm('Delete user {{ u.username }}?');">
+                              <form action="/settings/users/{{ u.id }}/delete" method="post" data-confirm="Delete user {{ u.username }}?">
                                 <button type="submit" class="danger">Delete</button>
                               </form>
                             {% else %}
-                              <form action="/settings/users/{{ u.id }}/disable" method="post" onsubmit="return confirm('Disable user {{ u.username }}?');">
+                              <form action="/settings/users/{{ u.id }}/disable" method="post" data-confirm="Disable user {{ u.username }}?">
                                 <button type="submit" class="danger">Disable account</button>
                               </form>
                             {% endif %}
@@ -260,7 +260,7 @@
                     <form action="/settings/users/{{ u.id }}/roles" method="post">
                       <fieldset>
                         <legend>Roles</legend>
-                        <p class="help">Uncheck every role to leave the user with no permissions. Default admin behavior only applies when no roles have ever been assigned.</p>
+                        <p class="help">Uncheck every optional role to leave the user with DNS zones read access only.</p>
                         {% for role in role_catalog %}
                           {% if not role.grantable and (role.key in u.stored_roles or role.mandatory) %}
                             <input type="hidden" name="roles" value="{{ role.key }}" />
@@ -334,7 +334,7 @@
                         <button type="submit">Enable</button>
                       </form>
                     {% else %}
-                      <form action="/settings/plugins/{{ plugin.key }}/disable" method="post" onsubmit="return confirm('Disable {{ plugin.label }}? It will no longer be available for new DNS zones.');">
+                      <form action="/settings/plugins/{{ plugin.key }}/disable" method="post" data-confirm="Disable {{ plugin.label }}? It will no longer be available for new DNS zones.">
                         <button type="submit" class="danger">Disable</button>
                       </form>
                     {% endif %}
@@ -678,7 +678,7 @@
               <dd>
                 <code>{{ ssl.metadata.not_after_iso }}</code>
                 {% if ssl.metadata.expired %}
-                  <span class="alert error" style="display:inline-block; margin-left:0.5rem;">Expired</span>
+                  <span class="alert error inline-expired-status">Expired</span>
                 {% endif %}
               </dd>
               <dt>SHA-256 fingerprint</dt>
@@ -1074,7 +1074,7 @@
                         <div class="action-cell">
                           {% if can_system_update %}
                             <button type="button" data-open-edit-alert="{{ rule.id }}">Edit</button>
-                            <form action="/settings/alerts/{{ rule.id }}/delete" method="post" onsubmit="return confirm('Delete alert rule {{ rule.name }}?');">
+                            <form action="/settings/alerts/{{ rule.id }}/delete" method="post" data-confirm="Delete alert rule {{ rule.name }}?">
                               <button type="submit" class="danger">Delete</button>
                             </form>
                           {% endif %}
@@ -1262,9 +1262,8 @@
           {% else %}
             <h2>Backup Export</h2>
             <p class="help">
-              Download a configuration archive. At-rest Fernet ciphertext is copied as stored;
-              include Application secrets so a restore can decrypt it. Application secrets require
-              password encryption for the archive.
+              Download a configuration archive. Password encryption is required when exporting
+              settings, users, DNS zones, API keys, SSL files, or Application secrets.
             </p>
             <section class="form-card">
               <form id="backup-export-form" action="/settings/backup/export" method="post">
@@ -1292,8 +1291,7 @@
                   </label>
                 </div>
                 <div class="alert error" id="backup-unencrypted-warning" hidden>
-                  Warning: an unencrypted backup may still include SSL private key material and Fernet
-                  ciphertext. Application secrets cannot be exported without encryption.
+                  Only alert rules and audit logs can be exported without password encryption.
                 </div>
                 <button type="submit">Download backup</button>
               </form>
@@ -1307,567 +1305,7 @@
     </div>
     {% endif %}
 
-    <script>
-      function bindDialog(openSelector, closeSelector, dialog) {
-        document.querySelectorAll(openSelector).forEach((button) => {
-          button.addEventListener("click", () => dialog?.showModal());
-        });
-        document.querySelectorAll(closeSelector).forEach((button) => {
-          button.addEventListener("click", () => dialog?.close());
-        });
-      }
-
-      function enforceRoleDependencies(form) {
-        const roleInputs = Array.from(form.querySelectorAll("input[name='roles']"));
-        const inputByRole = new Map(roleInputs.map((input) => [input.value, input]));
-        const globalAdminInput = inputByRole.get("global.admin");
-
-        function setMandatoryRole(input) {
-          input.checked = true;
-          input.disabled = true;
-          input.closest("label")?.classList.add("role-forced");
-        }
-
-        function setForcedReadRole(input, forced) {
-          if (input.dataset.mandatoryRole === "true" && !forced) {
-            setMandatoryRole(input);
-            return;
-          }
-          input.checked = forced;
-          input.disabled = forced;
-          input.closest("label")?.classList.toggle("role-forced", forced);
-        }
-
-        function setGlobalAdminRoles(forced) {
-          roleInputs.forEach((input) => {
-            if (input === globalAdminInput) {
-              return;
-            }
-            if (forced) {
-              input.checked = true;
-              input.disabled = true;
-              input.closest("label")?.classList.add("role-forced");
-              return;
-            }
-            if (input.dataset.mandatoryRole === "true") {
-              setMandatoryRole(input);
-              return;
-            }
-            input.disabled = false;
-            input.closest("label")?.classList.remove("role-forced");
-          });
-        }
-
-        function syncDependencies(changedInput) {
-          if (globalAdminInput?.checked) {
-            setGlobalAdminRoles(true);
-            return;
-          }
-          setGlobalAdminRoles(false);
-
-          if (changedInput?.dataset.requiresRole) {
-            const requiredInput = inputByRole.get(changedInput.dataset.requiresRole);
-            if (requiredInput) {
-              setForcedReadRole(requiredInput, changedInput.checked);
-            }
-            return;
-          }
-
-          roleInputs.forEach((input) => {
-            if (!input.dataset.requiresRole) {
-              return;
-            }
-            const requiredInput = inputByRole.get(input.dataset.requiresRole);
-            if (requiredInput && input.checked) {
-              setForcedReadRole(requiredInput, true);
-            }
-          });
-        }
-
-        roleInputs.forEach((input) => {
-          input.addEventListener("change", () => syncDependencies(input));
-        });
-        roleInputs.forEach((input) => {
-          if (input.dataset.mandatoryRole === "true") {
-            setMandatoryRole(input);
-          }
-        });
-        form.addEventListener("submit", () => {
-          roleInputs.forEach((input) => {
-            if (input.disabled) {
-              input.disabled = false;
-            }
-          });
-        });
-        syncDependencies();
-      }
-
-      document.querySelectorAll("form").forEach(enforceRoleDependencies);
-
-      const createUserDialog = document.getElementById("create-user-dialog");
-      document.getElementById("open-create-user")?.addEventListener("click", () => createUserDialog?.showModal());
-      document.getElementById("close-create-user")?.addEventListener("click", () => createUserDialog?.close());
-      document.getElementById("cancel-create-user")?.addEventListener("click", () => createUserDialog?.close());
-
-      const changePasswordDialog = document.getElementById("change-password-dialog");
-      document.getElementById("open-change-password")?.addEventListener("click", () => changePasswordDialog?.showModal());
-      document.getElementById("close-change-password")?.addEventListener("click", () => changePasswordDialog?.close());
-      document.getElementById("cancel-change-password")?.addEventListener("click", () => changePasswordDialog?.close());
-
-      document.querySelectorAll("[data-open-edit-roles]").forEach((button) => {
-        button.addEventListener("click", () => {
-          const dialog = document.getElementById(`edit-roles-dialog-${button.dataset.openEditRoles}`);
-          dialog?.showModal();
-        });
-      });
-      document.querySelectorAll("[data-close-edit-roles]").forEach((button) => {
-        button.addEventListener("click", () => {
-          const dialog = document.getElementById(`edit-roles-dialog-${button.dataset.closeEditRoles}`);
-          dialog?.close();
-        });
-      });
-
-      document.querySelectorAll("[data-open-view-roles]").forEach((button) => {
-        button.addEventListener("click", () => {
-          const dialog = document.getElementById(`view-roles-dialog-${button.dataset.openViewRoles}`);
-          dialog?.showModal();
-        });
-      });
-      document.querySelectorAll("[data-close-view-roles]").forEach((button) => {
-        button.addEventListener("click", () => {
-          const dialog = document.getElementById(`view-roles-dialog-${button.dataset.closeViewRoles}`);
-          dialog?.close();
-        });
-      });
-
-      document.querySelectorAll("[data-open-reset-password]").forEach((button) => {
-        button.addEventListener("click", () => {
-          const dialog = document.getElementById(`reset-password-dialog-${button.dataset.openResetPassword}`);
-          dialog?.showModal();
-        });
-      });
-      document.querySelectorAll("[data-close-reset-password]").forEach((button) => {
-        button.addEventListener("click", () => {
-          const dialog = document.getElementById(`reset-password-dialog-${button.dataset.closeResetPassword}`);
-          dialog?.close();
-        });
-      });
-
-      document.querySelectorAll("dialog[data-auto-open='true']").forEach((dialog) => {
-        if (!dialog.open) {
-          dialog.showModal();
-        }
-      });
-
-      const createAlertDialog = document.getElementById("create-alert-dialog");
-      document.getElementById("open-create-alert")?.addEventListener("click", () => createAlertDialog?.showModal());
-      document.getElementById("close-create-alert")?.addEventListener("click", () => createAlertDialog?.close());
-      document.getElementById("cancel-create-alert")?.addEventListener("click", () => createAlertDialog?.close());
-
-      document.querySelectorAll("[data-open-edit-alert]").forEach((button) => {
-        button.addEventListener("click", () => {
-          const dialog = document.getElementById(`edit-alert-dialog-${button.dataset.openEditAlert}`);
-          dialog?.showModal();
-        });
-      });
-      document.querySelectorAll("[data-close-edit-alert]").forEach((button) => {
-        button.addEventListener("click", () => {
-          const dialog = document.getElementById(`edit-alert-dialog-${button.dataset.closeEditAlert}`);
-          dialog?.close();
-        });
-      });
-
-      const sslEnableForm = document.getElementById("ssl-enable-form");
-      sslEnableForm?.addEventListener("submit", (event) => {
-        const confirmed = window.confirm(
-          "SSL changes take effect after you restart the application (container or uvicorn process). Continue?"
-        );
-        if (!confirmed) {
-          event.preventDefault();
-        }
-      });
-
-      const sslRegenerateForm = document.getElementById("ssl-regenerate-form");
-      sslRegenerateForm?.addEventListener("submit", (event) => {
-        const msg = sslRegenerateForm.dataset.confirm;
-        if (msg && !window.confirm(msg)) {
-          event.preventDefault();
-        }
-      });
-
-      const leStartForm = document.getElementById("le-start-form");
-      const leAutoEnrollDialog = document.getElementById("le-auto-enroll-dialog");
-      const leChallengeSelect = leStartForm?.querySelector('[name="challenge_type"]');
-      const leZoneField = document.getElementById("le-zone-field");
-      const leZoneSelect = document.getElementById("le-zone-select");
-      const leRootDnsInput = document.getElementById("le-root-dns-domain");
-
-      function syncLeZoneField() {
-        const isHttp = leChallengeSelect?.value === "http-01";
-        if (leZoneField) {
-          leZoneField.hidden = isHttp;
-        }
-        if (isHttp && leZoneSelect) {
-          leZoneSelect.value = "";
-        }
-      }
-
-      function syncLeRootDnsDomain() {
-        if (!leRootDnsInput) {
-          return;
-        }
-        const challenge = leChallengeSelect?.value;
-        if (challenge === "http-01") {
-          leRootDnsInput.readOnly = false;
-          leRootDnsInput.classList.remove("input-readonly");
-          return;
-        }
-        const zoneId = leZoneSelect?.value?.trim();
-        if (!zoneId) {
-          leRootDnsInput.readOnly = false;
-          leRootDnsInput.classList.remove("input-readonly");
-          return;
-        }
-        const domain = leZoneSelect?.selectedOptions?.[0]?.dataset?.dnsZone?.trim() || "";
-        if (domain) {
-          leRootDnsInput.value = domain;
-          leRootDnsInput.readOnly = true;
-          leRootDnsInput.classList.add("input-readonly");
-        } else {
-          leRootDnsInput.readOnly = false;
-          leRootDnsInput.classList.remove("input-readonly");
-        }
-      }
-
-      function syncLeChallengeUi() {
-        syncLeZoneField();
-        syncLeRootDnsDomain();
-      }
-
-      leChallengeSelect?.addEventListener("change", syncLeChallengeUi);
-      leZoneSelect?.addEventListener("change", syncLeRootDnsDomain);
-      syncLeChallengeUi();
-      const leAutoEnrollProgress = document.getElementById("le-auto-enroll-progress");
-      const leAutoEnrollStatus = document.getElementById("le-auto-enroll-status");
-      const leStartSubmit = leStartForm?.querySelector('button[type="submit"]');
-      let lePollTimer = null;
-
-      function stopLePoll() {
-        if (lePollTimer !== null) {
-          window.clearInterval(lePollTimer);
-          lePollTimer = null;
-        }
-      }
-
-      function resetLeDialog() {
-        if (leAutoEnrollProgress) {
-          leAutoEnrollProgress.value = 0;
-        }
-        if (leAutoEnrollStatus) {
-          leAutoEnrollStatus.textContent = "Auto enrolling with Let's Encrypt. This may take up to 2 minutes.";
-        }
-      }
-
-      async function pollLeProgress() {
-        try {
-          const response = await fetch("/settings/system/ssl-letsencrypt/progress", {
-            credentials: "same-origin",
-            headers: { accept: "application/json" },
-          });
-          if (!response.ok) {
-            return;
-          }
-          const payload = await response.json();
-          if (leAutoEnrollProgress && typeof payload.percent === "number") {
-            leAutoEnrollProgress.value = payload.percent;
-          }
-          if (leAutoEnrollStatus && payload.message) {
-            leAutoEnrollStatus.textContent = payload.message;
-          }
-          if (payload.done) {
-            stopLePoll();
-            if (payload.error) {
-              leAutoEnrollDialog?.close();
-              if (leStartSubmit) {
-                leStartSubmit.disabled = false;
-              }
-              window.alert(payload.error);
-              return;
-            }
-            if (leAutoEnrollProgress) {
-              leAutoEnrollProgress.value = 100;
-            }
-            window.location.reload();
-          }
-        } catch (_err) {
-          stopLePoll();
-          leAutoEnrollDialog?.close();
-          if (leStartSubmit) {
-            leStartSubmit.disabled = false;
-          }
-        }
-      }
-
-      leStartForm?.addEventListener("submit", async (event) => {
-        const challengeType = leChallengeSelect?.value;
-        const zoneId = leStartForm.querySelector('[name="zone_id"]')?.value?.trim();
-        if (challengeType !== "dns-01" || !zoneId) {
-          return;
-        }
-        event.preventDefault();
-        stopLePoll();
-        resetLeDialog();
-        if (leStartSubmit) {
-          leStartSubmit.disabled = true;
-        }
-        leAutoEnrollDialog?.showModal();
-        try {
-          const response = await fetch("/settings/system/ssl-letsencrypt/start-async", {
-            method: "POST",
-            body: new FormData(leStartForm),
-            credentials: "same-origin",
-            headers: { accept: "application/json" },
-          });
-          if (!response.ok) {
-            const detail = await response.json().catch(() => ({}));
-            leAutoEnrollDialog?.close();
-            if (leStartSubmit) {
-              leStartSubmit.disabled = false;
-            }
-            window.alert(detail.detail || "Failed to start Let's Encrypt enrollment.");
-            return;
-          }
-          await pollLeProgress();
-          lePollTimer = window.setInterval(pollLeProgress, 1000);
-        } catch (_err) {
-          leAutoEnrollDialog?.close();
-          if (leStartSubmit) {
-            leStartSubmit.disabled = false;
-          }
-          window.alert("Failed to start Let's Encrypt enrollment.");
-        }
-      });
-      leAutoEnrollDialog?.addEventListener("cancel", (event) => {
-        event.preventDefault();
-      });
-
-      const smtpAnonymous = document.getElementById("smtp-anonymous");
-      const smtpUsername = document.getElementById("smtp-username");
-      const smtpPassword = document.getElementById("smtp-password");
-      function syncSmtpAnonymous() {
-        if (!smtpAnonymous) {
-          return;
-        }
-        const anonymous = smtpAnonymous.checked;
-        if (smtpUsername) {
-          smtpUsername.disabled = anonymous;
-        }
-        if (smtpPassword) {
-          smtpPassword.disabled = anonymous;
-        }
-      }
-      smtpAnonymous?.addEventListener("change", syncSmtpAnonymous);
-      syncSmtpAnonymous();
-
-      const syslogEnabled = document.getElementById("syslog-enabled");
-      const syslogFieldIds = [
-        "syslog-host",
-        "syslog-port",
-        "syslog-protocol",
-        "syslog-allow-insecure",
-        "syslog-facility",
-        "syslog-minimum-level",
-        "syslog-timeout",
-        "syslog-queue-size",
-      ];
-      function syncSyslogEnabled() {
-        if (!syslogEnabled || syslogEnabled.disabled) {
-          return;
-        }
-        const enabled = syslogEnabled.checked;
-        for (const id of syslogFieldIds) {
-          const field = document.getElementById(id);
-          if (field) {
-            field.disabled = !enabled;
-          }
-        }
-      }
-      syslogEnabled?.addEventListener("change", syncSyslogEnabled);
-      syncSyslogEnabled();
-      document.getElementById("remote-syslog-form")?.addEventListener("submit", () => {
-        for (const id of syslogFieldIds) {
-          const field = document.getElementById(id);
-          if (field) {
-            field.disabled = false;
-          }
-        }
-      });
-
-      const backupEncrypt = document.getElementById("backup-encrypt");
-      const backupEncryptFields = document.getElementById("backup-encrypt-fields");
-      const backupUnencryptedWarning = document.getElementById("backup-unencrypted-warning");
-      const backupPassword = document.getElementById("backup-password");
-      const backupPasswordConfirm = document.getElementById("backup-password-confirm");
-      const backupExportForm = document.getElementById("backup-export-form");
-      const backupExportSecrets = document.getElementById("backup-export-secrets");
-      function syncBackupEncryptUi() {
-        const secretsOn = !!backupExportSecrets?.checked;
-        if (secretsOn && backupEncrypt && !backupEncrypt.checked) {
-          backupEncrypt.checked = true;
-        }
-        if (backupEncrypt) {
-          backupEncrypt.disabled = secretsOn;
-        }
-        const on = !backupEncrypt || backupEncrypt.checked;
-        if (backupEncryptFields) {
-          backupEncryptFields.hidden = !on;
-        }
-        if (backupUnencryptedWarning) {
-          backupUnencryptedWarning.hidden = on;
-        }
-        if (backupPassword) {
-          backupPassword.required = on;
-        }
-        if (backupPasswordConfirm) {
-          backupPasswordConfirm.required = on;
-        }
-      }
-      backupEncrypt?.addEventListener("change", syncBackupEncryptUi);
-      backupExportSecrets?.addEventListener("change", syncBackupEncryptUi);
-      syncBackupEncryptUi();
-      backupExportForm?.addEventListener("submit", (event) => {
-        if (backupExportSecrets?.checked && backupEncrypt && !backupEncrypt.checked) {
-          event.preventDefault();
-          window.alert("Application secrets require a password-encrypted backup.");
-          return;
-        }
-        if (backupEncrypt && backupEncrypt.checked) {
-          if ((backupPassword?.value || "") !== (backupPasswordConfirm?.value || "")) {
-            event.preventDefault();
-            window.alert("Backup passwords do not match.");
-          }
-        }
-      });
-
-      const backupImportForm = document.getElementById("backup-import-form");
-      const backupRestoreDialog = document.getElementById("backup-restore-dialog");
-      const backupRestoreProgress = document.getElementById("backup-restore-progress");
-      const backupRestoreStatus = document.getElementById("backup-restore-status");
-      const backupImportSubmit = document.getElementById("backup-import-submit");
-      let backupPollTimer = null;
-      function stopBackupPoll() {
-        if (backupPollTimer !== null) {
-          window.clearInterval(backupPollTimer);
-          backupPollTimer = null;
-        }
-      }
-      function resetBackupDialog() {
-        if (backupRestoreProgress) {
-          backupRestoreProgress.value = 0;
-        }
-        if (backupRestoreStatus) {
-          backupRestoreStatus.textContent = "Restoring configuration…";
-        }
-      }
-      async function pollBackupProgress() {
-        try {
-          const response = await fetch("/settings/backup/import/progress", {
-            credentials: "same-origin",
-            headers: { accept: "application/json" },
-          });
-          if (!response.ok) {
-            if (response.status === 401 || response.status === 403) {
-              stopBackupPoll();
-              window.setTimeout(() => { window.location.href = "/login"; }, 1500);
-            }
-            return;
-          }
-          const payload = await response.json();
-          if (backupRestoreProgress && typeof payload.percent === "number") {
-            backupRestoreProgress.value = payload.percent;
-          }
-          if (backupRestoreStatus && payload.message) {
-            backupRestoreStatus.textContent = payload.message;
-          }
-          if (payload.done) {
-            stopBackupPoll();
-            if (payload.error) {
-              backupRestoreDialog?.close();
-              if (backupImportSubmit) {
-                backupImportSubmit.disabled = false;
-              }
-              window.alert(payload.error);
-              return;
-            }
-            if (backupRestoreProgress) {
-              backupRestoreProgress.value = 100;
-            }
-            if (payload.restarting) {
-              if (backupRestoreStatus) {
-                backupRestoreStatus.textContent = "Restarting application…";
-              }
-              window.setTimeout(() => {
-                window.location.href = "/settings?area=backup&section=import";
-              }, 2500);
-              return;
-            }
-            window.location.href = "/settings?area=backup&section=import";
-          }
-        } catch (_err) {
-          // Process may be restarting after secrets restore.
-          if (backupRestoreStatus) {
-            backupRestoreStatus.textContent = "Waiting for application restart…";
-          }
-          window.setTimeout(() => {
-            window.location.href = "/login";
-          }, 3000);
-        }
-      }
-      backupImportForm?.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        const fernetCats = ["settings", "zones", "ssl_files"];
-        const selected = Array.from(backupImportForm.querySelectorAll('input[name="categories"]:checked')).map((el) => el.value);
-        const needsSecrets = selected.some((c) => fernetCats.includes(c));
-        if (needsSecrets && !selected.includes("application_secrets")) {
-          window.alert("Restoring settings, DNS zones, or SSL files requires Application secrets.");
-          return;
-        }
-        stopBackupPoll();
-        resetBackupDialog();
-        if (backupImportSubmit) {
-          backupImportSubmit.disabled = true;
-        }
-        backupRestoreDialog?.showModal();
-        try {
-          const response = await fetch("/settings/backup/import-async", {
-            method: "POST",
-            body: new FormData(backupImportForm),
-            credentials: "same-origin",
-            headers: { accept: "application/json" },
-          });
-          if (!response.ok) {
-            const detail = await response.json().catch(() => ({}));
-            backupRestoreDialog?.close();
-            if (backupImportSubmit) {
-              backupImportSubmit.disabled = false;
-            }
-            window.alert(detail.detail || "Failed to start restore.");
-            return;
-          }
-          await pollBackupProgress();
-          backupPollTimer = window.setInterval(pollBackupProgress, 1000);
-        } catch (_err) {
-          backupRestoreDialog?.close();
-          if (backupImportSubmit) {
-            backupImportSubmit.disabled = false;
-          }
-          window.alert("Failed to start restore.");
-        }
-      });
-      backupRestoreDialog?.addEventListener("cancel", (event) => {
-        event.preventDefault();
-      });
-    </script>
+    <script src="/static/settings.js" defer></script>
   </div>
   {% include "_page_footer.html" %}
 </body>

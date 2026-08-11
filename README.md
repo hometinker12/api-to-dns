@@ -1,6 +1,6 @@
 # DNS REST Service
 
-[![License: MIT + Commons Clause](https://img.shields.io/badge/License-MIT%20+%20Commons%20Clause-orange)](LICENSE.md) [![Release](https://img.shields.io/badge/release-0.8.0-blue)](VERSION) [![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/) [![Python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/) [![AI Assisted](https://img.shields.io/badge/AI%20Assisted-yes-blue)](https://cursor.com)
+[![License: MIT + Commons Clause](https://img.shields.io/badge/License-MIT%20+%20Commons%20Clause-orange)](LICENSE.md) [![Release](https://img.shields.io/badge/release-0.8.1-blue)](VERSION) [![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/) [![Python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/) [![AI Assisted](https://img.shields.io/badge/AI%20Assisted-yes-blue)](https://cursor.com)
 
 
 A Dockerized FastAPI service to manage DNS records through a protected admin web UI and secure API key authentication.
@@ -76,7 +76,7 @@ http://127.0.0.1:8001/login
 
 > SSL is **off by default**; the container listens on plain HTTP on port `8000` (mapped to host `127.0.0.1:8001`). See **Optional: HTTPS with self-signed or uploaded certificates** below for the enable workflow.
 >
-> The image runs as non-root uid/gid **10001**. Compose pins `hometinker12/api-to-dns:0.8.0`, enables `read_only`, drops capabilities, and binds published ports to localhost. If you upgrade from a root-owned named volume, fix ownership once (do not start the app as root):
+> The image runs as non-root uid/gid **10001**. Compose pins `hometinker12/api-to-dns:0.8.1`, enables `read_only`, drops capabilities, and binds published ports to localhost. If you upgrade from a root-owned named volume, fix ownership once (do not start the app as root):
 >
 > ```bash
 > docker run --rm -v api-to-dns_api-to-dns-data:/vol alpine chown -R 10001:10001 /vol
@@ -105,9 +105,11 @@ Create a `.env` file using `.env.example` and configure the following values:
 | `SSL_ENABLED`    | Optional override of the DB `ssl_enabled` toggle (`0`/`1`); used by tests and local dev           |
 | `SESSION_COOKIE_SECURE` | Optional force Secure cookies (`1`/`0`); when unset, follows HTTPS / trusted proxy / in-app SSL |
 | `TRUST_PROXY_HEADERS` | When `1`, honor `X-Forwarded-Proto=https` for Secure cookies (only behind a trusted proxy) |
-| `OPENAPI_ENABLED` | When `1`, expose `/openapi.json`, `/docs`, and `/redoc` (default off) |
+| `OPENAPI_ENABLED` | When `1`, enable `/openapi.json`, `/docs`, and `/redoc` for authenticated dashboard sessions (default off) |
 | `DEBUG_ERRORS` | When `1`, include exception tracebacks in HTML error pages (dev only) |
 | `CORS_ORIGINS` | Comma-separated browser origins; empty disables cross-origin browser access |
+
+Rate-limit counters use SQLite and retry brief transient `locked` / `busy` errors before failing closed. Persistent database failures therefore protect abuse boundaries at the cost of temporarily rejecting protected requests until the database recovers.
 
 
 ### Generating the ENCRYPTION_KEY
@@ -151,7 +153,7 @@ The web interface allows you to:
 - Open the **DNS browser** from a zone name on the Dashboard. Zone name links appear only for accounts with `dns_zones.update`. Leave the relative-name search blank to browse, enter an exact name such as `@` or `www`, or use case-insensitive `*` and `?` glob patterns. Searches return at most 100 RRsets and indicate when results are capped. BIND / TSIG browse and wildcard search use a TSIG-signed zone transfer (AXFR) and require `allow-transfer { key ...; };` on the BIND zone (see [`BINDCONFIG.md`](BINDCONFIG.md)); without that grant, blank/`*`/`?` search returns a clear configuration error while exact-name lookup still works. The type filter supports All records, A, AAAA, CNAME, TXT, MX, NS, SRV, CAA, PTR, and SOA. Browse, search, and mutations all require `dns_zones.update` (mandatory `dns_zones.read` alone is not enough, because lookups return live provider data). Edits replace the whole RRset for that name and type. SOA is view-only; apex NS (including the zone FQDN) cannot be modified. PTR mutations are limited to reverse zones (`in-addr.arpa` / `ip6.arpa`). A and AAAA form values are validated as IPv4/IPv6 addresses before save and on the server. For Cloudflare zones with **Proxied (orange cloud)** enabled in the zone configuration, eligible A/AAAA/CNAME writes remain zone-controlled. Canonical value formats: MX `priority exchange`, SRV `priority weight port target`, CAA `flags tag value`. Credentials stay server-side (session auth, not API keys). Browser routes share the `RATE_LIMIT_DNS_BROWSER` bucket (default `60:60`).
 - Create and revoke **API keys**, and **edit** keys to change their label or **allowed zones**
 - Review and search activity logs under **Settings → Log Viewing / Searching**
-- Export and restore configuration under **Settings → Backup** (global admin only): password-encrypted archives include settings, users, DNS zones, API key hashes, alert rules, SSL files, and `SECRET_KEY` / `ENCRYPTION_KEY` (application secrets require encryption). Audit logs are optional. Restore is destructive for selected categories and shows an inline progress dialog; restoring application secrets writes durable secrets and restarts the app.
+- Export and restore configuration under **Settings → Backup** (global admin only): password encryption is required for settings, users, DNS zones, API key hashes, SSL files, and application secrets. Alert rules and audit logs may be exported without a password. Restore remains backward-compatible with legacy plaintext archives, is destructive for selected categories, and shows an inline progress dialog; restoring application secrets writes durable secrets and restarts the app.
 - Configure logging level, retention, SMTP delivery, operational log rotation, and remote syslog under **Settings → System Settings**
 - Create email alert rules under **Settings → Email Alerting**
 

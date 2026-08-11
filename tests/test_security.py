@@ -16,7 +16,7 @@ def test_get_app_version_matches_version_file() -> None:
     get_app_version.cache_clear()
     expected = (Path(__file__).resolve().parents[1] / "VERSION").read_text(encoding="utf-8").strip()
     assert get_app_version() == expected
-    assert expected == "0.8.0"
+    assert expected == "0.8.1"
 
 
 def test_fastapi_app_version_matches_version_file() -> None:
@@ -356,6 +356,7 @@ def test_security_headers_and_hsts(client: TestClient, monkeypatch: pytest.Monke
     assert response.headers.get("referrer-policy") == "same-origin"
     assert "geolocation=()" in (response.headers.get("permissions-policy") or "")
     assert "default-src 'self'" in (response.headers.get("content-security-policy") or "")
+    assert "'unsafe-inline'" not in (response.headers.get("content-security-policy") or "")
     assert response.headers.get("strict-transport-security", "").startswith("max-age=")
 
 
@@ -379,6 +380,26 @@ def test_openapi_disabled_by_default_outside_tests(monkeypatch: pytest.MonkeyPat
     from src import app as app_module
 
     assert app_module._openapi_enabled() is False
+
+
+def test_enabled_openapi_requires_dashboard_session(client: TestClient) -> None:
+    schema = client.get("/openapi.json")
+    assert schema.status_code == 401
+    assert schema.json() == {"detail": "Authentication required"}
+
+    docs = client.get("/docs", follow_redirects=False)
+    assert docs.status_code == 303
+    assert docs.headers["location"] == "/login"
+
+    oauth_redirect = client.get("/docs/oauth2-redirect", follow_redirects=False)
+    assert oauth_redirect.status_code == 303
+    assert oauth_redirect.headers["location"] == "/login"
+
+    client.cookies.set("session", create_session_cookie("admin"))
+    assert client.get("/openapi.json").status_code == 200
+    assert client.get("/docs").status_code == 200
+    assert client.get("/redoc").status_code == 200
+    assert client.get("/docs/oauth2-redirect").status_code == 200
 
 
 def test_api_keys_shows_api_docs_link_when_openapi_enabled(client: TestClient) -> None:

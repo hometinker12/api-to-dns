@@ -105,72 +105,7 @@
       </div>
     </form>
 
-    <script>
-      const providerSelect = document.getElementById("dns-provider-type");
-      const providerPanels = Array.from(document.querySelectorAll("[data-provider-panel]"));
-      const zoneForm = document.getElementById("zone-form");
-      const zoneTestBtn = document.getElementById("zone-test-btn");
-      const zoneTestResult = document.getElementById("zone-test-result");
-
-      function syncProviderPanels() {
-        const selectedProvider = providerSelect.value;
-        providerPanels.forEach((panel) => {
-          const isActive = panel.dataset.providerPanel === selectedProvider;
-          panel.hidden = !isActive;
-          panel.querySelectorAll("input, select, textarea").forEach((field) => {
-            field.disabled = !isActive;
-          });
-        });
-      }
-
-      function showZoneTestResult(kind, message) {
-        if (!zoneTestResult) return;
-        zoneTestResult.hidden = false;
-        zoneTestResult.className = "alert";
-        if (kind === "success") {
-          zoneTestResult.classList.add("success");
-        } else if (kind === "error") {
-          zoneTestResult.classList.add("error");
-        }
-        zoneTestResult.textContent = message;
-      }
-
-      zoneTestBtn?.addEventListener("click", async () => {
-        if (!zoneForm) return;
-        const originalLabel = zoneTestBtn.textContent;
-        zoneTestBtn.disabled = true;
-        zoneTestBtn.textContent = "Testing Authentication…";
-        if (zoneTestResult) {
-          zoneTestResult.hidden = true;
-        }
-
-        try {
-          const formData = new FormData(zoneForm);
-          const response = await fetch("/zones/test", {
-            method: "POST",
-            headers: { Accept: "application/json" },
-            body: formData,
-            credentials: "same-origin",
-          });
-          const payload = await response.json();
-          if (payload.status === "success") {
-            showZoneTestResult("success", "Authentication test successful. Found matching records.");
-          } else if (payload.status === "not_found") {
-            showZoneTestResult("success", payload.message || "Authentication test successful. No matching records found.");
-          } else {
-            showZoneTestResult("error", payload.message || "DNS test failed.");
-          }
-        } catch (error) {
-          showZoneTestResult("error", "DNS test failed.");
-        } finally {
-          zoneTestBtn.disabled = false;
-          zoneTestBtn.textContent = originalLabel;
-        }
-      });
-
-      providerSelect?.addEventListener("change", syncProviderPanels);
-      syncProviderPanels();
-    </script>
+    <script src="/static/zone-form.js" defer></script>
   </div>
   {% include "_page_footer.html" %}
 </body>

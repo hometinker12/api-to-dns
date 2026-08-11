@@ -69,4 +69,5 @@ When validating fixes locally:
 
 - Use disposable credentials and non-production DNS zones
 - Never commit `.env`, certificates, provider secrets, or real API keys
+- Treat backup archives containing settings, users, zones, API keys, SSL files, or application secrets as sensitive; the application requires password encryption for those exports.
 - Prefer mocked provider tests under `tests/` over live mutation of production DNS
