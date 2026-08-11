@@ -271,7 +271,14 @@ def dns_zone_summary_dict(z: DnsZoneConfig) -> dict[str, Any]:
 def api_key_public_dict(k: ApiKey) -> dict[str, Any]:
     # Never expose the stored hash; UI shows the non-secret prefix only.
     display = (k.key_prefix or "").strip() or "********"
-    return {"id": k.id, "label": k.label, "key": display, "key_prefix": display, "active": k.active}
+    return {
+        "id": k.id,
+        "label": k.label,
+        "key": display,
+        "key_prefix": display,
+        "access_mode": k.access_mode,
+        "active": k.active,
+    }
 
 
 def api_key_admin_dict(db, k: ApiKey) -> dict[str, Any]:

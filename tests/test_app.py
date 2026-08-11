@@ -41,6 +41,7 @@ from src.auth import SESSION_IDLE_TIMEOUT_SECONDS, create_session_cookie
 from src.db import SessionLocal, init_db
 from src.dns_client import create_dns_client, discover_plugins, dns_provider_display_name
 from src.models import (
+    API_KEY_ACCESS_READ_ONLY,
     LOG_CATEGORY_SECURITY,
     LOG_LEVEL_ERROR,
     LOG_LEVEL_INFORMATIONAL,
@@ -230,10 +231,7 @@ def test_api_keys_page_has_revoke_confirmation_dialog(client: TestClient) -> Non
     assert response.status_code == 200
     assert 'id="revoke-api-key-dialog"' in response.text
     assert "data-open-revoke-key" in response.text
-    assert (
-        "Generate named API keys, scope them to DNS zones, and copy each key when created - it is shown only once."
-        in response.text
-    )
+    assert "Generate named API keys, scope them to DNS zones, choose read-only or read/write access" in response.text
 
 
 def test_builtin_dns_plugins_are_discovered() -> None:
@@ -385,6 +383,126 @@ def test_zones_json_request_returns_zone_ids(client: TestClient) -> None:
         assert api_key_last_used_at(db, int(key.id)) is not None
 
 
+def test_read_only_api_key_allows_read_endpoints(
+    client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.models import DnsRecordInfo
+
+    with SessionLocal() as db:
+        key = db.exec(select(ApiKey).where(ApiKey.key == hash_api_key(api_key_value))).first()
+        assert key is not None
+        key.access_mode = API_KEY_ACCESS_READ_ONLY
+        db.add(key)
+        db.commit()
+
+    monkeypatch.setattr(
+        "src.app.test_zone_record_lookup",
+        lambda _settings, **kwargs: [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])],
+    )
+    headers = {"X-API-Key": api_key_value}
+
+    assert client.get("/keycheck", headers=headers).json() == {"status": "success"}
+    zones_response = client.get("/zones", headers={**headers, "Accept": "application/json"})
+    assert zones_response.status_code == 200
+    assert {zone["zone_name"] for zone in zones_response.json()} == {"example.com"}
+
+    records_response = client.get(
+        "/dns-record",
+        headers=headers,
+        params={"zone_name": "example.com", "record_name": "www", "record_type": "A"},
+    )
+    assert records_response.status_code == 200
+    assert records_response.json()["records"][0]["values"] == ["192.0.2.1"]
+
+
+@pytest.mark.parametrize(
+    ("method", "request_kwargs"),
+    [
+        (
+            "post",
+            {
+                "json": {
+                    "zone_name": "example.com",
+                    "record_type": "A",
+                    "record_name": "read-only",
+                    "ttl": 300,
+                    "values": ["192.0.2.1"],
+                }
+            },
+        ),
+        (
+            "put",
+            {
+                "json": {
+                    "zone_name": "example.com",
+                    "record_type": "A",
+                    "record_name": "read-only",
+                    "ttl": 300,
+                    "values": ["192.0.2.1"],
+                }
+            },
+        ),
+        (
+            "patch",
+            {
+                "json": {
+                    "zone_name": "example.com",
+                    "record_type": "A",
+                    "record_name": "read-only",
+                    "values": ["192.0.2.1"],
+                }
+            },
+        ),
+        (
+            "delete",
+            {
+                "params": {
+                    "zone_name": "example.com",
+                    "record_name": "read-only",
+                    "record_type": "A",
+                }
+            },
+        ),
+    ],
+)
+def test_read_only_api_key_cannot_mutate_dns_records(
+    client: TestClient,
+    api_key_value: str,
+    method: str,
+    request_kwargs: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with SessionLocal() as db:
+        key = db.exec(select(ApiKey).where(ApiKey.key == hash_api_key(api_key_value))).first()
+        assert key is not None
+        key_id = int(key.id)
+        key.access_mode = API_KEY_ACCESS_READ_ONLY
+        db.add(key)
+        db.commit()
+
+    client_factory = MagicMock()
+    monkeypatch.setattr("src.app.get_dns_client_from_settings", client_factory)
+    response = getattr(client, method)("/dns-record", headers={"X-API-Key": api_key_value}, **request_kwargs)
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == {
+        "error": "access_denied",
+        "message": "You do not have access or an invalid key was provided.",
+    }
+    client_factory.assert_not_called()
+    with SessionLocal() as db:
+        event = db.exec(
+            select(ActivityLog)
+            .where(ActivityLog.event_type == "dns.access_denied")
+            .where(ActivityLog.actor_id == str(key_id))
+            .order_by(ActivityLog.timestamp.desc())  # type: ignore[arg-type]
+        ).first()
+        assert event is not None
+        assert event.record_name == "read-only"
+        assert event.details_json is not None
+        assert '"access_mode": "read_only"' in event.details_json
+
+
 def test_zones_json_request_without_api_key_returns_access_denied(client: TestClient) -> None:
     response = client.get("/zones", headers={"Content-Type": "application/json"})
     assert response.status_code == 403
@@ -495,6 +613,64 @@ def test_create_api_key_without_zone_keeps_error_in_popup(client: TestClient) ->
     assert '<div class="alert error">Select at least one DNS zone for this API key.</div>' in response.text
     assert 'value="missing-zone"' in response.text
     assert "createDialog?.showModal();" in response.text
+
+
+def test_create_api_key_defaults_to_read_only_and_renders_access_mode(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+
+    response = client.post("/api-keys", data={"label": "read-only-default", "zone_ids": str(zone.id)})
+
+    assert response.status_code == 200
+    assert "read-only-default" in response.text
+    assert "<th>Access</th>" in response.text
+    assert "Read-only" in response.text
+    with SessionLocal() as db:
+        key = db.exec(select(ApiKey).where(ApiKey.label == "read-only-default")).first()
+        assert key is not None
+        assert key.access_mode == API_KEY_ACCESS_READ_ONLY
+
+
+def test_api_key_access_mode_update_and_validation(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        api_key = db.exec(select(ApiKey).where(ApiKey.label == "pytest")).first()
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert api_key is not None
+        assert zone is not None
+
+    response = client.post(
+        "/api-keys",
+        data={
+            "key_id": str(api_key.id),
+            "label": "read-only-updated",
+            "access_mode": API_KEY_ACCESS_READ_ONLY,
+            "zone_ids": str(zone.id),
+        },
+    )
+    assert response.status_code == 200
+    with SessionLocal() as db:
+        updated = db.get(ApiKey, api_key.id)
+        assert updated is not None
+        assert updated.access_mode == API_KEY_ACCESS_READ_ONLY
+
+    response = client.post(
+        "/api-keys",
+        data={
+            "key_id": str(api_key.id),
+            "label": "invalid-access",
+            "access_mode": "owner",
+            "zone_ids": str(zone.id),
+        },
+    )
+    assert response.status_code == 200
+    assert "Access mode must be read_only or read_write." in response.text
+    with SessionLocal() as db:
+        unchanged = db.get(ApiKey, api_key.id)
+        assert unchanged is not None
+        assert unchanged.access_mode == API_KEY_ACCESS_READ_ONLY
 
 
 def test_edit_api_key_posts_to_api_keys_page(client: TestClient) -> None:
@@ -3448,7 +3624,7 @@ def test_dns_browser_browse_and_glob_search(
     assert glob.json()["records"][0]["record_name"] == "api-v2"
 
 
-def test_dns_browser_browse_reports_bind_enumeration_limitation(
+def test_dns_browser_browse_reports_bind_transfer_refused(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3460,13 +3636,14 @@ def test_dns_browser_browse_reports_bind_enumeration_limitation(
 
     fake = MagicMock()
     fake.list_records.side_effect = ValueError(
-        "Browse and wildcard search are not supported for BIND / TSIG. Enter an exact record name instead."
+        "Zone transfer (AXFR) was refused (REFUSED). Browse and wildcard search require "
+        'allow-transfer { key "api-to-dns"; }; on the BIND zone — see BINDCONFIG.md.'
     )
     monkeypatch.setattr("src.dns_browser_service.create_dns_client_from_settings", lambda *_a, **_k: fake)
 
     response = client.get(f"/zones/{zone_id}/records/search")
     assert response.status_code == 400
-    assert "not supported for BIND" in response.json()["message"]
+    assert "allow-transfer" in response.json()["message"]
 
 
 def test_dns_browser_requires_dns_zones_update(
@@ -3657,6 +3834,9 @@ def test_activity_events_written_for_api_key_creation_and_revocation(client: Tes
         assert create_event is not None
         assert create_event.actor_label == "admin"
         assert "audit-key" in (create_event.message or "")
+        assert created.access_mode == API_KEY_ACCESS_READ_ONLY
+        assert create_event.details_json is not None
+        assert '"access_mode": "read_only"' in create_event.details_json
         # Raw key must not be persisted.
         assert created.key != attr.group(1)
 

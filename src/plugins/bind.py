@@ -1,4 +1,6 @@
 import base64
+import threading
+from collections.abc import Iterator
 
 import dns.name
 import dns.query
@@ -6,11 +8,28 @@ import dns.rcode
 import dns.rdatatype
 import dns.tsig
 import dns.update
+import dns.xfr
 
 from ..dns_record_types import MUTABLE_RECORD_TYPES, normalize_record_values
-from ..models import DnsRecordRequest
+from ..models import DnsRecordInfo, DnsRecordListResult, DnsRecordRequest
 from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
-from .utils import dns_relative_name, query_dns_records_at_name, record_existed_before_update, tcp_endpoint_host
+from .utils import (
+    LOOKUP_RECORD_TYPES,
+    dns_relative_name,
+    format_rdata_value,
+    normalize_lookup_record_type,
+    query_dns_records_at_name,
+    record_existed_before_update,
+    record_name_matches,
+    tcp_endpoint_host,
+)
+
+# Bound AXFR memory/CPU: stop after this many answer RRsets from the wire, even if
+# fewer than ``limit`` matched the browse/glob filter.
+_AXFR_MAX_RRSETS_SCANNED = 5_000
+# Cap concurrent BIND transfers process-wide so browse storms cannot open unbounded TCP AXFRs.
+_AXFR_MAX_CONCURRENT = 2
+_AXFR_SLOTS = threading.BoundedSemaphore(_AXFR_MAX_CONCURRENT)
 
 
 class BindTsigDnsClient:
@@ -102,10 +121,99 @@ class BindTsigDnsClient:
         limit: int = 100,
         dns_server: str | None = None,
         dns_zone: str | None = None,
-    ):
-        raise ValueError(
-            "Browse and wildcard search are not supported for BIND / TSIG. Enter an exact record name instead."
-        )
+    ) -> DnsRecordListResult:
+        if not dns_server:
+            raise ValueError("DNS server host is required for BIND (set Target DNS Server in settings).")
+        zone_name = (dns_zone or "").strip().rstrip(".")
+        if not zone_name:
+            raise ValueError("DNS zone (domain) is required in the zone configuration.")
+
+        wanted_type = normalize_lookup_record_type(record_type)
+        records: list[DnsRecordInfo] = []
+        truncated = False
+        scanned = 0
+
+        for relative, rdataset in self._iter_axfr_rrsets(dns_server, zone_name):
+            scanned += 1
+            if scanned > _AXFR_MAX_RRSETS_SCANNED:
+                truncated = True
+                break
+            if not record_name_matches(name_pattern, relative):
+                continue
+            rt = dns.rdatatype.to_text(rdataset.rdtype)
+            if rt not in LOOKUP_RECORD_TYPES:
+                continue  # skip RRSIG/NSEC/TSIG and other non-browsable types
+            if wanted_type and rt != wanted_type:
+                continue
+            if len(records) >= limit:
+                truncated = True
+                break
+            records.append(
+                DnsRecordInfo(
+                    record_name=relative,
+                    record_type=rt,
+                    ttl=int(rdataset.ttl),
+                    values=[format_rdata_value(rt, rdata) for rdata in rdataset],
+                )
+            )
+        return DnsRecordListResult(records=records, truncated=truncated)
+
+    def _iter_axfr_rrsets(self, dns_server: str, zone_name: str) -> Iterator[tuple[str, object]]:
+        """Yield ``(relative_name, rrset)`` from a TSIG-signed AXFR without materializing the zone.
+
+        Acquires a process-wide slot, streams messages, and closes the transfer early when the
+        caller stops iterating (browse/glob limit or scan cap).
+        """
+        if not _AXFR_SLOTS.acquire(blocking=False):
+            raise RuntimeError("Too many concurrent BIND zone transfers in progress; retry browse/search shortly.")
+        xfr = None
+        seen_soa = False
+        try:
+            try:
+                xfr = dns.query.xfr(
+                    tcp_endpoint_host(dns_server),
+                    zone_name,
+                    keyring=self._keyring,
+                    keyname=self._keyname,
+                    relativize=True,
+                    timeout=30,
+                    lifetime=60,
+                )
+            except dns.xfr.TransferError as e:
+                raise self._map_transfer_error(e) from e
+
+            try:
+                for msg in xfr:
+                    for rrset in msg.answer:
+                        if rrset.rdtype == dns.rdatatype.SOA:
+                            if seen_soa:
+                                continue  # trailing AXFR SOA
+                            seen_soa = True
+                        relative = rrset.name.to_text()
+                        if relative in (".", ""):
+                            relative = "@"
+                        yield relative, rrset
+            except dns.xfr.TransferError as e:
+                raise self._map_transfer_error(e) from e
+        finally:
+            close = getattr(xfr, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            _AXFR_SLOTS.release()
+
+    def _map_transfer_error(self, e: dns.xfr.TransferError) -> Exception:
+        rcode_text = dns.rcode.to_text(e.rcode)
+        if e.rcode in (dns.rcode.REFUSED, dns.rcode.NOTAUTH):
+            key_label = self._keyname.to_text().rstrip(".")
+            return ValueError(
+                f"Zone transfer (AXFR) was refused ({rcode_text}). Browse and wildcard search "
+                f'require allow-transfer {{ key "{key_label}"; }}; '
+                "on the BIND zone — see BINDCONFIG.md. Exact record names still work."
+            )
+        return RuntimeError(f"Zone transfer (AXFR) failed: {rcode_text}")
 
 
 def create_client(settings: dict[str, str | None]) -> BindTsigDnsClient:

@@ -28,6 +28,8 @@ from src.backup_service import (
 )
 from src.db import SessionLocal
 from src.models import (
+    API_KEY_ACCESS_READ_ONLY,
+    API_KEY_ACCESS_READ_WRITE,
     LOG_LEVEL_INFORMATIONAL,
     ActivityLog,
     AlertRule,
@@ -353,7 +355,13 @@ def test_ssl_files_round_trip(client: TestClient) -> None:
 def test_api_key_hash_survives_restore(client: TestClient, api_key_value: str) -> None:
     digest = hash_api_key(api_key_value)
     with SessionLocal() as db:
+        key = db.exec(select(ApiKey).where(ApiKey.key == digest)).first()
+        assert key is not None
+        key.access_mode = API_KEY_ACCESS_READ_ONLY
+        db.add(key)
+        db.commit()
         payload = build_payload(db, [CATEGORY_API_KEYS, CATEGORY_ZONES, CATEGORY_APPLICATION_SECRETS])
+        assert payload[CATEGORY_API_KEYS][0]["access_mode"] == API_KEY_ACCESS_READ_ONLY
         raw = serialize_backup(payload, encrypt=True, password="password1")
         for row in list(db.exec(select(ApiKey)).all()):
             db.delete(row)
@@ -366,8 +374,29 @@ def test_api_key_hash_survives_restore(client: TestClient, api_key_value: str) -
         )
         key = db.exec(select(ApiKey).where(ApiKey.key == digest)).first()
         assert key is not None
+        assert key.access_mode == API_KEY_ACCESS_READ_ONLY
         zones = list(db.exec(select(DnsZoneConfig)).all())
         assert zones
+
+
+def test_legacy_api_key_backup_defaults_to_read_write(client: TestClient, api_key_value: str) -> None:
+    digest = hash_api_key(api_key_value)
+    with SessionLocal() as db:
+        payload = build_payload(db, [CATEGORY_API_KEYS])
+        for item in payload[CATEGORY_API_KEYS]:
+            item.pop("access_mode", None)
+        for row in list(db.exec(select(ApiKey)).all()):
+            db.delete(row)
+        db.commit()
+
+        restore_payload(
+            db,
+            payload,
+            [CATEGORY_API_KEYS],
+        )
+        key = db.exec(select(ApiKey).where(ApiKey.key == digest)).first()
+        assert key is not None
+        assert key.access_mode == API_KEY_ACCESS_READ_WRITE
 
 
 def test_restore_rejects_malformed_users_before_wipe() -> None:

@@ -231,7 +231,8 @@ def get_dns_record(
     description=(
         "Create a new DNS record of the given type. "
         "Pre-checks the zone with ``get_record`` and returns **409** "
-        "``record_already_exists`` if a record of that type is already present at the name."
+        "``record_already_exists`` if a record of that type is already present at the name. "
+        "Requires a ``read_write`` API key with access to the zone."
     ),
     responses={
         HTTP_409_CONFLICT: {
@@ -266,7 +267,7 @@ def create_dns_record(
     description=(
         "Replace the record's type, TTL, and values. "
         "Pre-checks with ``get_record`` and returns **404** ``not_found`` if no record "
-        "of the given type exists at the name."
+        "of the given type exists at the name. Requires a ``read_write`` API key with access to the zone."
     ),
     responses={
         HTTP_404_NOT_FOUND: {
@@ -301,7 +302,7 @@ def replace_dns_record(
     description=(
         "Update ``ttl`` and/or ``values`` on an existing record. Omitted fields are preserved "
         "from the live record (via ``get_record``). Returns **404** ``not_found`` if no record "
-        "of the given type exists at the name."
+        "of the given type exists at the name. Requires a ``read_write`` API key with access to the zone."
     ),
     responses={
         HTTP_404_NOT_FOUND: {
@@ -339,7 +340,7 @@ def patch_dns_record(
         "Delete the record of the given type at the given name. "
         "Identity is taken from query parameters (same as ``GET /dns-record``). "
         "Pre-checks with ``get_record`` and returns **404** ``not_found`` if no record "
-        "of the given type exists at the name."
+        "of the given type exists at the name. Requires a ``read_write`` API key with access to the zone."
     ),
     responses={
         HTTP_404_NOT_FOUND: {

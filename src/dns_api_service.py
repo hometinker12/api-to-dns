@@ -12,6 +12,7 @@ from .db import SessionLocal
 from .dns_mutation import apply_rrset_mutation, record_exists_at_type
 from .http_utils import api_key_fingerprint, http_exception_from_dns_error, sanitize_client_error_message
 from .models import (
+    API_KEY_ACCESS_READ_WRITE,
     LOG_LEVEL_ERROR,
     LOG_LEVEL_INFORMATIONAL,
     LOG_LEVEL_WARNING,
@@ -40,7 +41,7 @@ ACCESS_DENIED_DETAIL: dict[str, str] = {
 _MUTATION_RESPONSES: dict[int, dict[str, Any]] = {
     400: {"description": "Invalid request, record type, or configuration."},
     401: {"description": "API key is missing or invalid."},
-    403: {"description": "API key is not allowed to use this zone, or the zone is not configured."},
+    403: {"description": "API key is read-only, is not allowed to use this zone, or the zone is not configured."},
     502: {"description": "DNS provider reported a failure (e.g. WinRM or dynamic update)."},
     503: {"description": "A required component is not installed or misconfigured."},
 }
@@ -180,6 +181,35 @@ def _resolve_dns_api_zone(
     return key, zone_row, settings, actor_id, actor_label, provider
 
 
+def _require_dns_api_key_write_access(
+    db,
+    *,
+    key: ApiKey,
+    actor_id: str | None,
+    actor_label: str,
+    zone_name: str,
+    record_name: str,
+    endpoint: str,
+) -> None:
+    """Reject DNS mutations unless the resolved API key explicitly allows writes."""
+    if key.access_mode == API_KEY_ACCESS_READ_WRITE:
+        return
+    emit_activity_event(
+        db,
+        event_type="dns.access_denied",
+        level=LOG_LEVEL_WARNING,
+        status="error",
+        actor_type="api_key",
+        actor_id=actor_id,
+        actor_label=actor_label,
+        zone_name=zone_name,
+        record_name=record_name,
+        message=f"Read-only API key {actor_label!r} denied on {endpoint}",
+        details={"access_mode": key.access_mode, "required_access_mode": API_KEY_ACCESS_READ_WRITE},
+    )
+    raise HTTPException(status_code=403, detail=ACCESS_DENIED_DETAIL)
+
+
 def _record_exists_at_type(
     client,
     *,
@@ -224,10 +254,19 @@ def _apply_dns_mutation(
     rt_upper = (record_type or "").strip().upper()
 
     with SessionLocal() as db:
-        _key, zone_row, settings, actor_id, actor_label, provider = _resolve_dns_api_zone(
+        key, zone_row, settings, actor_id, actor_label, provider = _resolve_dns_api_zone(
             db,
             api_key=api_key,
             zone_name=zone_name or "",
+            record_name=record_name,
+            endpoint=endpoint,
+        )
+        _require_dns_api_key_write_access(
+            db,
+            key=key,
+            actor_id=actor_id,
+            actor_label=actor_label,
+            zone_name=zone_row.zone_name,
             record_name=record_name,
             endpoint=endpoint,
         )

@@ -25,6 +25,18 @@
         <input type="text" name="label" required value="{{ api_key_row.label }}" />
       </label>
       <fieldset>
+        <legend>Access mode</legend>
+        <p class="help">Read-only keys can list zones and look up DNS records. Read/write keys can also create, replace, update, and delete records.</p>
+        <label class="inline-check">
+          <input type="radio" name="access_mode" value="read_only" {% if api_key_row.access_mode == "read_only" %}checked{% endif %} />
+          Read-only
+        </label>
+        <label class="inline-check">
+          <input type="radio" name="access_mode" value="read_write" {% if api_key_row.access_mode == "read_write" %}checked{% endif %} />
+          Read/write
+        </label>
+      </fieldset>
+      <fieldset>
         <legend>Allowed DNS zones</legend>
         {% if all_zones %}
           {% for z in all_zones %}

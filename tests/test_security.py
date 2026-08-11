@@ -145,6 +145,38 @@ def test_migrate_hashes_plaintext_api_keys() -> None:
         assert row.key_prefix == "plaintext-le"
 
 
+def test_migrate_api_key_access_mode_preserves_existing_write_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy import create_engine, text
+
+    import src.db as db_module
+    from src.models import API_KEY_ACCESS_READ_WRITE
+
+    legacy_engine = create_engine(f"sqlite:///{tmp_path / 'legacy-api-keys.db'}")
+    with legacy_engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TABLE apikey ("
+                "id INTEGER PRIMARY KEY, "
+                "label VARCHAR NOT NULL, "
+                "key VARCHAR NOT NULL, "
+                "active BOOLEAN NOT NULL, "
+                "created_at DATETIME"
+                ")"
+            )
+        )
+        conn.execute(text("INSERT INTO apikey (id, label, key, active) VALUES (1, 'legacy', 'legacy-key-digest', 1)"))
+
+    monkeypatch.setattr(db_module, "engine", legacy_engine)
+    db_module._migrate_add_api_key_access_mode_column()
+    db_module._migrate_add_api_key_access_mode_column()
+
+    with legacy_engine.connect() as conn:
+        access_mode = conn.execute(text("SELECT access_mode FROM apikey WHERE id = 1")).scalar_one()
+    assert access_mode == API_KEY_ACCESS_READ_WRITE
+
+
 def test_sanitize_client_error_message_redacts_secrets() -> None:
     from src.http_utils import sanitize_client_error_message
 
