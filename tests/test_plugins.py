@@ -15,6 +15,7 @@ import httpx
 import pytest
 
 from src.models import DnsRecordInfo, DnsRecordRequest
+from src.plugins import bind as bind_mod
 from src.plugins.azure import AzureDnsClient
 from src.plugins.bind import BindTsigDnsClient
 from src.plugins.cloudflare import CloudflareDnsClient
@@ -328,10 +329,17 @@ def _fake_bind_zone() -> dns.zone.Zone:
     )
 
 
+def _fake_axfr_rrsets():
+    zone = _fake_bind_zone()
+    for name in sorted(zone.nodes, key=lambda n: n.to_text()):
+        for rdataset in zone.nodes[name].rdatasets:
+            yield name.to_text(), rdataset
+
+
 @patch.object(BindTsigDnsClient, "__init__", lambda self, *args, **kwargs: None)
 def test_bind_list_records_blank_browse_returns_all_rrsets() -> None:
     client = BindTsigDnsClient.__new__(BindTsigDnsClient)
-    with patch.object(client, "_transfer_zone", return_value=_fake_bind_zone()):
+    with patch.object(client, "_iter_axfr_rrsets", return_value=_fake_axfr_rrsets()):
         result = client.list_records(dns_server="127.0.0.1", dns_zone="example.com")
     names = {(r.record_name, r.record_type) for r in result.records}
     assert ("www", "A") in names
@@ -342,7 +350,7 @@ def test_bind_list_records_blank_browse_returns_all_rrsets() -> None:
 @patch.object(BindTsigDnsClient, "__init__", lambda self, *args, **kwargs: None)
 def test_bind_list_records_glob_and_type_filter() -> None:
     client = BindTsigDnsClient.__new__(BindTsigDnsClient)
-    with patch.object(client, "_transfer_zone", return_value=_fake_bind_zone()):
+    with patch.object(client, "_iter_axfr_rrsets", return_value=_fake_axfr_rrsets()):
         result = client.list_records(
             name_pattern="API-*",
             record_type="A",
@@ -355,7 +363,7 @@ def test_bind_list_records_glob_and_type_filter() -> None:
 @patch.object(BindTsigDnsClient, "__init__", lambda self, *args, **kwargs: None)
 def test_bind_list_records_caps_at_limit_and_flags_truncated() -> None:
     client = BindTsigDnsClient.__new__(BindTsigDnsClient)
-    with patch.object(client, "_transfer_zone", return_value=_fake_bind_zone()):
+    with patch.object(client, "_iter_axfr_rrsets", return_value=_fake_axfr_rrsets()):
         result = client.list_records(limit=2, dns_server="127.0.0.1", dns_zone="example.com")
     assert len(result.records) == 2
     assert result.truncated is True
@@ -371,6 +379,42 @@ def test_bind_list_records_refused_axfr_maps_to_value_error() -> None:
         pytest.raises(ValueError, match="allow-transfer"),
     ):
         client.list_records(dns_server="127.0.0.1", dns_zone="example.com")
+
+
+@patch.object(BindTsigDnsClient, "__init__", lambda self, *args, **kwargs: None)
+def test_bind_list_records_stops_iterating_after_limit() -> None:
+    """Browse must close the AXFR stream after ``limit`` matches (no full-zone materialize)."""
+    client = BindTsigDnsClient.__new__(BindTsigDnsClient)
+    yielded = {"n": 0}
+
+    def limited_stream(*_a, **_k):
+        for relative, rdataset in _fake_axfr_rrsets():
+            yielded["n"] += 1
+            yield relative, rdataset
+            if yielded["n"] > 10:
+                raise AssertionError("AXFR iterator continued after browse should have stopped")
+
+    with patch.object(client, "_iter_axfr_rrsets", side_effect=limited_stream):
+        result = client.list_records(limit=2, dns_server="127.0.0.1", dns_zone="example.com")
+    assert len(result.records) == 2
+    assert result.truncated is True
+    # 2 kept + 1 extra scanned to learn truncation, then generator closed.
+    assert yielded["n"] == 3
+
+
+@patch.object(BindTsigDnsClient, "__init__", lambda self, *args, **kwargs: None)
+def test_bind_list_records_concurrent_axfr_slot_busy() -> None:
+    client = BindTsigDnsClient.__new__(BindTsigDnsClient)
+    client._keyring = {}
+    client._keyname = dns.name.from_text("api-to-dns.")
+    assert bind_mod._AXFR_SLOTS.acquire(blocking=False)
+    assert bind_mod._AXFR_SLOTS.acquire(blocking=False)
+    try:
+        with pytest.raises(RuntimeError, match="concurrent BIND zone transfers"):
+            client.list_records(dns_server="127.0.0.1", dns_zone="example.com")
+    finally:
+        bind_mod._AXFR_SLOTS.release()
+        bind_mod._AXFR_SLOTS.release()
 
 
 class _CloudflareFake:

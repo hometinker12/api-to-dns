@@ -11,6 +11,7 @@
 ### Changed
 
 - Admin UI favicon (`favicon.svg`) and logo mark (`logo-mark.svg`) redrawn as a higher-resolution 64×64 globe-and-routing SVG (replacing the earlier pulse-line mark) for clearer branding at favicon and header sizes.
+- BIND browse/wildcard AXFR no longer materializes the full zone in memory: transfers stream RRsets, stop once the browse limit (or a 5000-RRset scan cap) is reached, close the TCP transfer early, and allow at most two concurrent AXFRs process-wide.
 
 ## [0.8.0] - 2026-08-07
 
