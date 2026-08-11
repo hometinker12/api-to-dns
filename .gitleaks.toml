@@ -1,0 +1,10 @@
+title = "api-to-dns secret-scanning allowlist"
+
+[allowlist]
+  description = "Explicit documentation placeholder, not a credential"
+  paths = [
+    '''BINDCONFIG\.md''',
+  ]
+  regexes = [
+    '''<BASE64_TSIG_SECRET_FROM_tsig-keygen>''',
+  ]

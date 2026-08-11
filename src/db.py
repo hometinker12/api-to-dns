@@ -23,6 +23,7 @@ def init_db() -> None:
 
     SQLModel.metadata.create_all(engine)
     _migrate_add_user_roles_column()
+    _migrate_normalize_empty_user_roles()
     _migrate_add_user_disabled_column()
     _migrate_add_user_session_version_column()
     _migrate_activity_log_category_column()
@@ -112,6 +113,20 @@ def _migrate_add_user_roles_column() -> None:
         return
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE user ADD COLUMN roles VARCHAR DEFAULT ''"))
+
+
+def _migrate_normalize_empty_user_roles() -> None:
+    """Give legacy users the explicit least-privilege role used by new accounts."""
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if "user" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("user")}
+    if "roles" not in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE user SET roles = 'dns_zones.read' WHERE roles IS NULL OR TRIM(roles) = ''"))
 
 
 def _migrate_add_user_disabled_column() -> None:

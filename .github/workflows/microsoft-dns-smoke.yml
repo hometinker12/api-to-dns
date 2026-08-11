@@ -152,7 +152,7 @@ jobs:
           NETWORK_NAME="dns-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           BIND_DIR="${RUNNER_TEMP}/bind-smoke"
           TSIG_NAME="api-to-dns."
-          TSIG_SECRET="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+          TSIG_SECRET="$(python3 -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
           : "${SYSLOG_OUTPUT:?SYSLOG_OUTPUT must be set by the rsyslog prerequisite step}"
           : "${RSYSLOG_SHELL_PID:?RSYSLOG_SHELL_PID must be set by the rsyslog prerequisite step}"
 
@@ -308,6 +308,7 @@ jobs:
             --tmpfs /app/logs:size=16M,uid=10001,gid=10001,mode=1755 \
             --env-file .env \
             -e RATE_LIMIT_LOGIN=3:8 \
+            -e OPENAPI_ENABLED=1 \
             -p 127.0.0.1:8000:8000 \
             "$IMAGE_TAG"
 
@@ -329,11 +330,16 @@ jobs:
             sleep 2
           done
 
-          echo "[bind] Security defaults: OpenAPI/docs off, headers, CSRF, logout method"
-          for path in /openapi.json /docs /redoc; do
+          echo "[bind] Security defaults: authenticated OpenAPI/docs, headers, CSRF, logout method"
+          schema_code="$(curl --silent --show-error -o /dev/null -w "%{http_code}" "http://127.0.0.1:8000/openapi.json")"
+          if [ "${schema_code}" != "401" ]; then
+            echo "Expected /openapi.json to return 401 without a session; got ${schema_code}"
+            exit 1
+          fi
+          for path in /docs /redoc /docs/oauth2-redirect; do
             code="$(curl --silent --show-error -o /dev/null -w "%{http_code}" "http://127.0.0.1:8000${path}")"
-            if [ "${code}" != "404" ]; then
-              echo "Expected ${path} to return 404 when OPENAPI_ENABLED is unset; got ${code}"
+            if [ "${code}" != "303" ]; then
+              echo "Expected ${path} to redirect to login without a session; got ${code}"
               exit 1
             fi
           done
@@ -345,9 +351,12 @@ jobs:
               "x-content-type-options: nosniff",
               "x-frame-options: deny",
               "referrer-policy: same-origin",
-              "content-security-policy:",
+              "content-security-policy: default-src 'self';",
+              "script-src 'self';",
+              "style-src 'self';",
           ):
               assert name in headers, f"missing security header: {name}\n{headers}"
+          assert "unsafe-inline" not in headers, headers
           PY
           logout_get_code="$(curl --silent --show-error -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/logout)"
           if [ "${logout_get_code}" != "405" ]; then
@@ -399,6 +408,30 @@ jobs:
           assert cookie_lines, headers
           assert all("secure" not in line.lower() for line in cookie_lines), cookie_lines
           PY
+          curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/openapi.json -o /tmp/openapi.json
+          docs_code="$(curl --silent --show-error -o /dev/null -w "%{http_code}" -b /tmp/cookies http://127.0.0.1:8000/docs)"
+          if [ "${docs_code}" != "200" ]; then
+            echo "Expected authenticated /docs to return 200; got ${docs_code}"
+            exit 1
+          fi
+          oauth_code="$(curl --silent --show-error -o /dev/null -w "%{http_code}" -b /tmp/cookies http://127.0.0.1:8000/docs/oauth2-redirect)"
+          if [ "${oauth_code}" != "200" ]; then
+            echo "Expected authenticated /docs/oauth2-redirect to return 200; got ${oauth_code}"
+            exit 1
+          fi
+          echo "[bind] BINDCONFIG.md uses placeholder TSIG secret only"
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          text = Path("BINDCONFIG.md").read_text(encoding="utf-8")
+          secrets = re.findall(r'secret\s+"([^"]+)"', text)
+          assert secrets, "expected at least one secret example in BINDCONFIG.md"
+          assert all(value == "<BASE64_TSIG_SECRET_FROM_tsig-keygen>" for value in secrets), secrets
+          allowlist = Path(".gitleaks.toml").read_text(encoding="utf-8")
+          assert "<BASE64_TSIG_SECRET_FROM_tsig-keygen>" in allowlist
+          print("BINDCONFIG placeholder + gitleaks allowlist assertions passed")
+          PY
           echo "[bind] Verify admin page, shared nav, and version metadata"
           curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/admin -o /tmp/admin.html
           python3 - <<'PY'
@@ -410,12 +443,12 @@ jobs:
           nav = html.split('<nav class="nav-links">', 1)[1].split("</nav>", 1)[0]
           assert nav.index('href="/api-keys"') < nav.index('href="/admin"') < nav.index('href="/settings"') < nav.index('action="/logout"'), nav
           version = Path("VERSION").read_text(encoding="utf-8").strip()
-          assert version == "0.8.0", version
+          assert version == "0.8.1", version
           assert f"api-to-dns v{version}" in html, html[-400:]
-          assert 'version = "0.8.0"' in Path("pyproject.toml").read_text(encoding="utf-8")
-          assert "ARG VERSION=0.8.0" in Path("Dockerfile").read_text(encoding="utf-8")
-          assert "hometinker12/api-to-dns:0.8.0" in Path("docker-compose.yml").read_text(encoding="utf-8")
-          print("admin nav + 0.8.0 metadata assertions passed")
+          assert 'version = "0.8.1"' in Path("pyproject.toml").read_text(encoding="utf-8")
+          assert "ARG VERSION=0.8.1" in Path("Dockerfile").read_text(encoding="utf-8")
+          assert "hometinker12/api-to-dns:0.8.1" in Path("docker-compose.yml").read_text(encoding="utf-8")
+          print("admin nav + 0.8.1 metadata assertions passed")
           PY
 
           echo "[bind] Static brand assets (favicon + logo mark)"
@@ -438,6 +471,16 @@ jobs:
               ET.fromstring(body)
           print("static brand asset assertions passed")
           PY
+          echo "[bind] Static JavaScript assets for CSP-hardened admin pages"
+          for asset in theme page-header configured-zones api-keys zone-form settings dns-browser; do
+            curl --fail --silent -D "/tmp/${asset}.headers" -o "/dev/null" \
+              "http://127.0.0.1:8000/static/${asset}.js"
+            if ! grep -qi '^content-type:.*javascript' "/tmp/${asset}.headers"; then
+              echo "Expected JavaScript content type for ${asset}.js"
+              cat "/tmp/${asset}.headers"
+              exit 1
+            fi
+          done
 
           echo "[bind] POST logout clears session"
           curl --fail --silent -b /tmp/cookies -c /tmp/cookies -X POST http://127.0.0.1:8000/logout \
@@ -548,6 +591,77 @@ jobs:
           DENIED_ZONE_ID="$(python3 -c 'import re; html=open("/tmp/api-keys.html", encoding="utf-8").read(); match=re.search(r"name=\"zone_ids\" value=\"(\d+)\"\s*/>\s*<code>denied\.test</code>", html, re.DOTALL); assert match, "Could not find denied.test zone ID"; print(match.group(1))')"
           : "${SMOKE_ZONE_ID:?Could not extract smoke.test zone ID}"
           : "${DENIED_ZONE_ID:?Could not extract denied.test zone ID}"
+          echo "[bind] Browser smoke for CSP-hardened admin assets"
+          npm install --no-save playwright
+          npx playwright install --with-deps chromium
+          node - "${SMOKE_ZONE_ID}" <<'NODE'
+          const { chromium } = require("playwright");
+
+          (async () => {
+            const zoneId = process.argv[2];
+            const baseUrl = "http://127.0.0.1:8000";
+            const browser = await chromium.launch({ headless: true });
+            const page = await browser.newPage();
+            const errors = [];
+            page.on("pageerror", (error) => errors.push(`page error: ${error.message}`));
+            page.on("console", (message) => {
+              if (message.type() === "error") errors.push(`console error: ${message.text()}`);
+            });
+            try {
+            await page.goto(`${baseUrl}/login`);
+            await page.locator('input[name="username"]').fill("admin");
+            await page.locator('input[name="password"]').fill("your-admin-password");
+            await Promise.all([
+              page.waitForURL("**/admin"),
+              page.locator('button[type="submit"]').click(),
+            ]);
+
+            await page.goto(`${baseUrl}/api-keys`);
+            await page.locator("#open-create-key").click();
+            if (!(await page.locator("#create-key-dialog").evaluate((dialog) => dialog.open))) {
+              throw new Error("API key create dialog did not open");
+            }
+
+            await page.goto(`${baseUrl}/settings?area=backup&section=export`);
+            if (!(await page.locator("#backup-encrypt").isDisabled())) {
+              throw new Error("Sensitive backup categories did not force encryption");
+            }
+
+            await page.goto(`${baseUrl}/settings?area=plugins`);
+            const disablePlugin = page.locator('form[data-confirm][action*="/settings/plugins/"][action$="/disable"] button[type="submit"]').first();
+            if (!(await disablePlugin.count())) {
+              throw new Error("Expected a plugin disable form with data-confirm");
+            }
+            page.once("dialog", async (dialog) => {
+              if (!dialog.message().includes("Disable")) {
+                throw new Error(`Unexpected confirm dialog: ${dialog.message()}`);
+              }
+              await dialog.dismiss();
+            });
+            await disablePlugin.click();
+            if ((await page.locator('form[data-confirm][action*="/settings/plugins/"][action$="/disable"]').count()) < 1) {
+              throw new Error("Plugin disable submitted despite dismissed confirm dialog");
+            }
+
+            await page.goto(`${baseUrl}/zones/new`);
+            await page.locator("#dns-provider-type").selectOption("bind");
+            if (!(await page.locator('[data-provider-panel="bind"]').isVisible())) {
+              throw new Error("Zone provider panel did not synchronize");
+            }
+
+            await page.goto(`${baseUrl}/zones/${zoneId}/records`);
+            await page.locator("#record-name").fill("@");
+            await page.locator("#dns-browser-search button[type=submit]").click();
+            await page.locator("#dns-browser-results").waitFor({ state: "visible" });
+            } finally {
+              await browser.close();
+            }
+            if (errors.length) throw new Error(errors.join("\n"));
+          })().catch((error) => {
+            console.error(error);
+            process.exit(1);
+          });
+          NODE
           python3 - <<'PY'
           import re
           from pathlib import Path
@@ -994,7 +1108,7 @@ jobs:
           import os
           import subprocess
 
-          assert os.environ["APP_VERSION"] == "0.8.0", os.environ["APP_VERSION"]
+          assert os.environ["APP_VERSION"] == "0.8.1", os.environ["APP_VERSION"]
           expected_image = f"hometinker12/api-to-dns:{os.environ['APP_VERSION']}"
           cfg = json.loads(subprocess.check_output(["docker", "compose", "config", "--format", "json"], text=True))
           svc = cfg["services"]["dns-api"]
@@ -1459,7 +1573,7 @@ jobs:
               throw 'Admin header navigation order is not API Keys, Dashboard, Settings, Logout'
             }
             $appVersion = (Get-Content -Raw VERSION).Trim()
-            if ($appVersion -ne '0.8.0') { throw "Expected VERSION 0.8.0; got $appVersion" }
+            if ($appVersion -ne '0.8.1') { throw "Expected VERSION 0.8.1; got $appVersion" }
             if ($admin.Content -notmatch [regex]::Escape("api-to-dns v$appVersion")) {
               throw 'Admin page missing version footer'
             }

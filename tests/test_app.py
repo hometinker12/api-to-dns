@@ -62,6 +62,13 @@ from src.time_utils import utc_now
 from src.zone_service import decode_zone_config, provider_dns_zone
 
 
+def _openapi_schema(client: TestClient) -> dict:
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/openapi.json")
+    assert response.status_code == 200
+    return response.json()
+
+
 def test_root_redirects_to_login_without_session(client: TestClient) -> None:
     response = client.get("/", follow_redirects=False)
     assert response.status_code == 303
@@ -513,7 +520,7 @@ def test_zones_json_request_without_api_key_returns_access_denied(client: TestCl
 
 
 def test_zones_json_schema_is_documented(client: TestClient) -> None:
-    schema = client.get("/openapi.json").json()
+    schema = _openapi_schema(client)
     zones_response = schema["paths"]["/zones"]["get"]["responses"]["200"]
     assert zones_response["content"]["application/json"]["schema"]["items"]["$ref"].endswith("/DnsZoneSummary")
     assert "DnsZoneSummary" in schema["components"]["schemas"]
@@ -612,7 +619,8 @@ def test_create_api_key_without_zone_keeps_error_in_popup(client: TestClient) ->
     assert 'data-auto-open="true"' in response.text
     assert '<div class="alert error">Select at least one DNS zone for this API key.</div>' in response.text
     assert 'value="missing-zone"' in response.text
-    assert "createDialog?.showModal();" in response.text
+    assert 'src="/static/api-keys.js"' in response.text
+    assert "createDialog.showModal()" in client.get("/static/api-keys.js").text
 
 
 def test_create_api_key_defaults_to_read_only_and_renders_access_mode(client: TestClient) -> None:
@@ -708,14 +716,14 @@ def test_edit_api_key_without_zone_keeps_error_in_popup(client: TestClient) -> N
 
 
 def test_api_key_management_routes_are_not_in_openapi(client: TestClient) -> None:
-    schema = client.get("/openapi.json").json()
+    schema = _openapi_schema(client)
     assert "/api-keys" not in schema["paths"]
     assert "/api-keys/revoke" not in schema["paths"]
     assert not any(path.startswith("/api-keys/") for path in schema["paths"])
 
 
 def test_session_backed_pages_are_not_in_openapi(client: TestClient) -> None:
-    schema = client.get("/openapi.json").json()
+    schema = _openapi_schema(client)
     hidden_paths = {
         "/",
         "/login",
@@ -753,7 +761,7 @@ def test_session_backed_pages_are_not_in_openapi(client: TestClient) -> None:
 
 
 def test_keycheck_unauthorized_response_is_documented(client: TestClient) -> None:
-    schema = client.get("/openapi.json").json()
+    schema = _openapi_schema(client)
     response = schema["paths"]["/keycheck"]["get"]["responses"]["401"]
     assert response["description"] == "Unauthorized"
     content = response["content"]["application/json"]
@@ -762,7 +770,7 @@ def test_keycheck_unauthorized_response_is_documented(client: TestClient) -> Non
 
 
 def test_keycheck_success_response_is_documented(client: TestClient) -> None:
-    schema = client.get("/openapi.json").json()
+    schema = _openapi_schema(client)
     response = schema["paths"]["/keycheck"]["get"]["responses"]["200"]
     assert response["description"] == "API key is valid"
     content = response["content"]["application/json"]
@@ -771,7 +779,7 @@ def test_keycheck_success_response_is_documented(client: TestClient) -> None:
 
 
 def test_dns_record_get_schema_is_documented(client: TestClient) -> None:
-    schema = client.get("/openapi.json").json()
+    schema = _openapi_schema(client)
     get_op = schema["paths"]["/dns-record"]["get"]
     param_names = {param["name"] for param in get_op["parameters"]}
     assert {"zone_name", "record_name", "record_type", "X-API-Key", "Authorization"} <= param_names
@@ -1309,7 +1317,7 @@ def test_dns_record_provider_runtime_error_returns_502(
 
 
 def test_dns_record_schema_excludes_azure_zone_settings(client: TestClient) -> None:
-    schema = client.get("/openapi.json").json()
+    schema = _openapi_schema(client)
     components = schema["components"]["schemas"]
     for model_name in ("DnsRecordCreateRequest", "DnsRecordReplaceRequest", "DnsRecordPatchRequest"):
         assert model_name in components
@@ -1320,7 +1328,7 @@ def test_dns_record_schema_excludes_azure_zone_settings(client: TestClient) -> N
 
 
 def test_dns_record_openapi_documents_all_methods(client: TestClient) -> None:
-    schema = client.get("/openapi.json").json()
+    schema = _openapi_schema(client)
     path = schema["paths"]["/dns-record"]
     assert set(path) == {"get", "post", "put", "patch", "delete"}
     assert "409" in path["post"]["responses"]
@@ -1533,8 +1541,16 @@ def test_settings_renders_for_authenticated_session(client: TestClient) -> None:
     assert 'class="settings-menu"' in response.text
     assert 'data-requires-role="api_keys.read"' in response.text
     assert 'data-requires-role="dns_zones.read"' in response.text
-    assert "setForcedReadRole(requiredInput, changedInput.checked)" in response.text
-    assert 'classList.toggle("role-forced", forced)' in response.text
+    assert 'src="/static/settings.js"' in response.text
+    assert "onsubmit=" not in response.text
+    settings_js = client.get("/static/settings.js")
+    assert "setForcedReadRole(required, changedInput.checked)" in settings_js.text
+    assert 'classList.toggle("role-forced", forced)' in settings_js.text
+    assert "form[data-confirm]" in settings_js.text
+    plugins = client.get("/settings?area=plugins")
+    assert plugins.status_code == 200
+    assert "onsubmit=" not in plugins.text
+    assert 'data-confirm="Disable' in plugins.text
     assert "Authentication" in response.text
     assert "Plugin Management" in response.text
     assert "System Settings" in response.text
@@ -1544,7 +1560,7 @@ def test_settings_renders_for_authenticated_session(client: TestClient) -> None:
 
 
 def test_settings_route_hidden_from_openapi(client: TestClient) -> None:
-    schema = client.get("/openapi.json").json()
+    schema = _openapi_schema(client)
     assert "/settings" not in schema["paths"]
     assert not any(path.startswith("/settings") for path in schema["paths"])
 
@@ -1671,6 +1687,61 @@ def test_settings_create_user_always_persists_dns_zones_read(client: TestClient)
         assert (created.roles or "") == ROLE_DNS_ZONES_READ
 
 
+def test_init_db_normalizes_empty_legacy_roles_to_dns_zones_read(client: TestClient) -> None:
+    with SessionLocal() as db:
+        _delete_users(db)
+        legacy = User(username="legacy-user", password_hash=hash_password("x"), roles="")
+        db.add(legacy)
+        db.commit()
+
+    init_db()
+
+    with SessionLocal() as db:
+        legacy = db.exec(select(User).where(User.username == "legacy-user")).first()
+        assert legacy is not None
+        assert legacy.roles == ROLE_DNS_ZONES_READ
+        assert get_user_roles(db, "legacy-user") == {ROLE_DNS_ZONES_READ}
+        assert not user_has_role(db, "legacy-user", ROLE_SYSTEM_UPDATE)
+
+
+def test_role_editor_does_not_include_sensitive_hidden_roles_for_zone_reader(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("account-admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "account-admin", "x", [ROLE_ACCOUNT_UPDATE])
+        target = _create_user(db, "zone-reader", "x", [ROLE_DNS_ZONES_READ])
+        target_id = target.id
+
+    response = client.get("/settings")
+    assert response.status_code == 200
+    dialog = response.text.split(f'<dialog id="edit-roles-dialog-{target_id}">', 1)[1].split("</dialog>", 1)[0]
+    assert 'name="roles" value="account.update"' not in dialog
+    assert 'name="roles" value="api_keys.update"' not in dialog
+    assert 'name="roles" value="plugin.update"' not in dialog
+    assert 'name="roles" value="system.update"' not in dialog
+
+
+def test_role_save_keeps_explicit_least_privilege_roles(client: TestClient) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        _delete_users(db)
+        _create_user(db, "admin", "x", ALL_ROLES)
+        target = _create_user(db, "zone-reader", "x", [ROLE_DNS_ZONES_READ])
+        target_id = target.id
+
+    response = client.post(
+        f"/settings/users/{target_id}/roles",
+        data={"roles": [ROLE_DNS_ZONES_READ]},
+    )
+    assert response.status_code == 200
+
+    with SessionLocal() as db:
+        target = db.get(User, target_id)
+        assert target is not None
+        assert target.roles == ROLE_DNS_ZONES_READ
+        assert get_user_roles(db, target.username) == {ROLE_DNS_ZONES_READ}
+
+
 def test_current_user_row_shows_read_only_roles_view(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
     with SessionLocal() as db:
@@ -1790,8 +1861,11 @@ def test_global_admin_edit_dialog_checks_all_roles_and_js_locks_them(client: Tes
     assert "checked" in global_admin_input
     assert "disabled" not in global_admin_input
     assert "checked" in account_update_input
-    assert "setGlobalAdminRoles(true)" in response.text
-    assert "input.disabled = true;" in response.text
+    assert 'src="/static/settings.js"' in response.text
+    settings_js = client.get("/static/settings.js")
+    assert settings_js.status_code == 200
+    assert "setGlobalAdminRoles" in settings_js.text
+    assert "input.disabled = true" in settings_js.text
 
 
 def test_global_admin_selection_persists_all_roles(client: TestClient) -> None:
@@ -3496,8 +3570,10 @@ def test_dns_browser_page_blank_until_search(client: TestClient) -> None:
     assert "azure_client_secret" not in response.text
     assert "<h1>DNS Browser</h1>" in response.text
     assert 'class="page-subtitle"' in response.text
-    assert "IP Address" in response.text
-    assert "Adding new record..." in response.text
+    assert 'src="/static/dns-browser.js"' in response.text
+    dns_browser_js = client.get("/static/dns-browser.js").text
+    assert "IP Address" in dns_browser_js
+    assert "Adding new record..." in dns_browser_js
 
 
 def test_dns_browser_page_shows_cloudflare_zone_proxy_indicator(client: TestClient) -> None:
@@ -3522,7 +3598,8 @@ def test_dns_browser_page_shows_cloudflare_zone_proxy_indicator(client: TestClie
     response = client.get(f"/zones/{zone_id}/records")
     assert response.status_code == 200
     assert "<code>Cloudflare DNS (REST API)</code>" in response.text
-    assert "const cloudflareProxyEnabled = true;" in response.text
+    assert 'data-cloudflare-proxy-enabled="true"' in response.text
+    assert "cloudflareProxyEnabled" in client.get("/static/dns-browser.js").text
     assert 'id="cloudflare-proxy-indicator"' in response.text
 
 

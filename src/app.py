@@ -364,14 +364,13 @@ _SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "same-origin",
     "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
-    # Compatible with current inline admin scripts/styles; tighten further when assets are externalized.
     "Content-Security-Policy": (
         "default-src 'self'; "
         "base-uri 'self'; "
         "object-src 'none'; "
         "frame-ancestors 'none'; "
-        "script-src 'self' 'unsafe-inline'; "
-        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; "
+        "style-src 'self'; "
         "img-src 'self' data:; "
         "font-src 'self'; "
         "connect-src 'self'"
@@ -381,6 +380,7 @@ _SECURITY_HEADERS = {
 # FastAPI's default Swagger/ReDoc UIs load assets from jsDelivr (and a FastAPI favicon).
 # Keep the strict CSP for the admin app; only relax these paths when OpenAPI is enabled.
 _DOCS_PATHS = frozenset({"/docs", "/redoc", "/docs/oauth2-redirect"})
+_OPENAPI_SCHEMA_PATH = "/openapi.json"
 _DOCS_CSP = (
     "default-src 'self'; "
     "base-uri 'self'; "
@@ -392,6 +392,20 @@ _DOCS_CSP = (
     "font-src 'self' https://cdn.jsdelivr.net data:; "
     "connect-src 'self' https://cdn.jsdelivr.net"
 )
+
+
+@app.middleware("http")
+async def openapi_session_middleware(request: Request, call_next):
+    """Restrict optional API documentation to authenticated dashboard sessions."""
+    path = request.url.path or ""
+    if _OPENAPI_ON and (path == _OPENAPI_SCHEMA_PATH or path in _DOCS_PATHS):
+        try:
+            get_current_user(request)
+        except HTTPException:
+            if path == _OPENAPI_SCHEMA_PATH:
+                return JSONResponse(status_code=401, content={"detail": "Authentication required"})
+            return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
+    return await call_next(request)
 
 
 @app.middleware("http")

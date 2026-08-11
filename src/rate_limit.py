@@ -17,6 +17,8 @@ from .db import SessionLocal
 from .http_utils import api_key_from_headers, wants_json_response
 
 LOGGER = logging.getLogger("api-to-dns")
+_RATE_LIMIT_DB_LOCK_ATTEMPTS = 3
+_RATE_LIMIT_DB_LOCK_BACKOFF_SECONDS = 0.01
 
 # path prefix -> (max_requests, window_seconds)
 _DEFAULT_LIMITS = {
@@ -106,6 +108,11 @@ def _maybe_cleanup_expired(db, now: int) -> None:
     db.execute(text("DELETE FROM rate_limit_bucket WHERE expires_at < :now"), {"now": now})
 
 
+def _is_transient_sqlite_lock(error: OperationalError) -> bool:
+    message = str(error).lower()
+    return "database is locked" in message or "database is busy" in message
+
+
 def rate_limit_exceeded(request: Request) -> bool:
     if os.getenv("API_TO_DNS_DISABLE_RATE_LIMIT", "").strip().lower() in {"1", "true", "yes"}:
         return False
@@ -120,51 +127,56 @@ def rate_limit_exceeded(request: Request) -> bool:
     window_start = now - (now % window)
     expires_at = window_start + window
 
-    try:
-        with SessionLocal() as db:
-            _maybe_cleanup_expired(db, now)
-            # Atomic upsert/increment shared across workers.
-            db.execute(
-                text(
-                    """
-                    INSERT INTO rate_limit_bucket (route_prefix, identity_hash, window_start, count, expires_at)
-                    VALUES (:route_prefix, :identity_hash, :window_start, 1, :expires_at)
-                    ON CONFLICT(route_prefix, identity_hash, window_start)
-                    DO UPDATE SET count = count + 1
-                    """
-                ),
-                {
-                    "route_prefix": route_prefix,
-                    "identity_hash": identity,
-                    "window_start": window_start,
-                    "expires_at": expires_at,
-                },
-            )
-            row = db.execute(
-                text(
-                    """
-                    SELECT count FROM rate_limit_bucket
-                    WHERE route_prefix = :route_prefix
-                      AND identity_hash = :identity_hash
-                      AND window_start = :window_start
-                    """
-                ),
-                {
-                    "route_prefix": route_prefix,
-                    "identity_hash": identity,
-                    "window_start": window_start,
-                },
-            ).first()
-            db.commit()
-            count = int(row[0]) if row else 1
-            return count > max_requests
-    except OperationalError as exc:
-        # Fail closed on transient lock contention without taking the app down.
-        LOGGER.warning("rate limit check failed closed due to database error: %s", exc)
-        return True
-    except Exception:
-        LOGGER.exception("rate limit check failed closed due to unexpected error")
-        return True
+    for attempt in range(_RATE_LIMIT_DB_LOCK_ATTEMPTS):
+        try:
+            with SessionLocal() as db:
+                _maybe_cleanup_expired(db, now)
+                # Atomic upsert/increment shared across workers.
+                db.execute(
+                    text(
+                        """
+                        INSERT INTO rate_limit_bucket (route_prefix, identity_hash, window_start, count, expires_at)
+                        VALUES (:route_prefix, :identity_hash, :window_start, 1, :expires_at)
+                        ON CONFLICT(route_prefix, identity_hash, window_start)
+                        DO UPDATE SET count = count + 1
+                        """
+                    ),
+                    {
+                        "route_prefix": route_prefix,
+                        "identity_hash": identity,
+                        "window_start": window_start,
+                        "expires_at": expires_at,
+                    },
+                )
+                row = db.execute(
+                    text(
+                        """
+                        SELECT count FROM rate_limit_bucket
+                        WHERE route_prefix = :route_prefix
+                          AND identity_hash = :identity_hash
+                          AND window_start = :window_start
+                        """
+                    ),
+                    {
+                        "route_prefix": route_prefix,
+                        "identity_hash": identity,
+                        "window_start": window_start,
+                    },
+                ).first()
+                db.commit()
+                count = int(row[0]) if row else 1
+                return count > max_requests
+        except OperationalError as exc:
+            if _is_transient_sqlite_lock(exc) and attempt + 1 < _RATE_LIMIT_DB_LOCK_ATTEMPTS:
+                time.sleep(_RATE_LIMIT_DB_LOCK_BACKOFF_SECONDS * (attempt + 1))
+                continue
+            LOGGER.warning("rate limit check failed closed due to database error: %s", exc)
+            return True
+        except Exception:
+            LOGGER.exception("rate limit check failed closed due to unexpected error")
+            return True
+
+    return True
 
 
 def rate_limit_rejection_response(request: Request):

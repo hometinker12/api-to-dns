@@ -189,71 +189,7 @@
       </div>
     </dialog>
 
-    <script>
-      const createDialog = document.getElementById("create-key-dialog");
-      const openCreateKey = document.getElementById("open-create-key");
-      const closeCreateKey = document.getElementById("close-create-key");
-      const cancelCreateKey = document.getElementById("cancel-create-key");
-
-      openCreateKey?.addEventListener("click", () => createDialog?.showModal());
-      closeCreateKey?.addEventListener("click", () => createDialog?.close());
-      cancelCreateKey?.addEventListener("click", () => createDialog?.close());
-      if (createDialog?.dataset.autoOpen === "true") {
-        createDialog?.showModal();
-      }
-
-      document.querySelectorAll("[data-open-edit-key]").forEach((button) => {
-        button.addEventListener("click", () => {
-          const dialog = document.getElementById(`edit-key-dialog-${button.dataset.openEditKey}`);
-          dialog?.showModal();
-        });
-      });
-      document.querySelectorAll("[data-close-edit-key]").forEach((button) => {
-        button.addEventListener("click", () => {
-          const dialog = document.getElementById(`edit-key-dialog-${button.dataset.closeEditKey}`);
-          dialog?.close();
-        });
-      });
-      document.querySelectorAll("dialog[data-auto-open='true']").forEach((dialog) => {
-        if (!dialog.open) {
-          dialog.showModal();
-        }
-      });
-
-      (() => {
-        const revokeDialog = document.getElementById("revoke-api-key-dialog");
-        const revokeForm = document.getElementById("revoke-key-form");
-        const revokeKeyId = document.getElementById("revoke-key-id");
-        const revokeLabelEl = document.getElementById("revoke-key-label");
-        const revokeZonesEl = document.getElementById("revoke-key-zones");
-        const revokeLastUsedEl = document.getElementById("revoke-key-last-used");
-        const revokeClose = document.getElementById("revoke-key-close");
-        const revokeCancel = document.getElementById("revoke-key-cancel");
-
-        const zoneCountLabel = (count) => {
-          const n = Number(count);
-          if (n === 1) return "This key is allowed to use 1 DNS zone.";
-          return `This key is allowed to use ${n} DNS zones.`;
-        };
-
-        document.querySelectorAll("[data-open-revoke-key]").forEach((button) => {
-          button.addEventListener("click", () => {
-            const keyId = button.dataset.keyId || "";
-            const label = button.dataset.keyLabel || "";
-            const zoneCount = button.dataset.zoneCount ?? "0";
-            const lastUsed = button.dataset.lastUsed || "Never used";
-            if (revokeKeyId) revokeKeyId.value = keyId;
-            if (revokeLabelEl) revokeLabelEl.textContent = label;
-            if (revokeZonesEl) revokeZonesEl.textContent = zoneCountLabel(zoneCount);
-            if (revokeLastUsedEl) revokeLastUsedEl.textContent = `Last used: ${lastUsed}`;
-            revokeDialog?.showModal();
-          });
-        });
-
-        revokeClose?.addEventListener("click", () => revokeDialog?.close());
-        revokeCancel?.addEventListener("click", () => revokeDialog?.close());
-      })();
-    </script>
+    <script src="/static/api-keys.js" defer></script>
   </div>
   {% include "_page_footer.html" %}
 </body>

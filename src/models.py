@@ -241,7 +241,7 @@ class User(SQLModel, table=True):
     id: int | None = SQLField(default=None, primary_key=True)
     username: str = SQLField(index=True, unique=True)
     password_hash: str
-    roles: str | None = SQLField(default="")
+    roles: str = SQLField(default="dns_zones.read")
     disabled: bool = SQLField(default=False)
     session_version: int = SQLField(default=0)
 

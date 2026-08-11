@@ -21,7 +21,7 @@ This produces a file like:
 ```text
 key "api-to-dns" {
     algorithm hmac-sha256;
-    secret "8Lt0S0XkK1DcPZFCkOOJHGBRUlXjr9uYFyLbUcJ3Vqg=";
+    secret "<BASE64_TSIG_SECRET_FROM_tsig-keygen>";
 };
 ```
 
@@ -114,7 +114,7 @@ dig +tcp @192.0.2.10 www.example.com A
 **Dynamic update** (creates and removes a test record):
 
 ```bash
-nsupdate -y "hmac-sha256:api-to-dns:8Lt0S0XkK1DcPZFCkOOJHGBRUlXjr9uYFyLbUcJ3Vqg=" <<'EOF'
+nsupdate -y "hmac-sha256:api-to-dns:<BASE64_TSIG_SECRET_FROM_tsig-keygen>" <<'EOF'
 server 192.0.2.10
 zone example.com
 update add _apitodns-test.example.com 60 TXT "connectivity check"
@@ -128,7 +128,7 @@ EOF
 
 ```bash
 dig +tcp @192.0.2.10 example.com AXFR \
-    -y "hmac-sha256:api-to-dns:8Lt0S0XkK1DcPZFCkOOJHGBRUlXjr9uYFyLbUcJ3Vqg="
+    -y "hmac-sha256:api-to-dns:<BASE64_TSIG_SECRET_FROM_tsig-keygen>"
 ```
 
 A successful AXFR prints every record in the zone. A `Transfer failed.` / `REFUSED` response means the zone is missing the `allow-transfer { key "api-to-dns"; };` grant.
