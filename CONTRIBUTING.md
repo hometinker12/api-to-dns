@@ -60,6 +60,8 @@ Maintainers promote tested changes from `develop` to `release` after CI and secu
 
 Avoid adding more routes directly to `src/app.py` when they can be placed in a focused module under `src/routes/`.
 
+When mocking DNS clients in tests, patch `src.zone_service.create_dns_client_from_settings`, not `src.app`.
+
 ## Coding standards
 
 Python code is checked with Ruff:

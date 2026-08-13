@@ -218,6 +218,33 @@ def test_disabled_plugin_blocks_dns_client_creation(client: TestClient) -> None:
             set_disabled_dns_plugins(db, set())
 
 
+def test_disabled_plugin_returns_503_on_dns_record(client: TestClient, api_key_value: str) -> None:
+    from src.db import SessionLocal
+    from src.zone_service import decode_zone_config, list_dns_zones, set_disabled_dns_plugins
+
+    with SessionLocal() as db:
+        zone = next(z for z in list_dns_zones(db) if z.zone_name == "example.com")
+        cfg = decode_zone_config(zone)
+        set_disabled_dns_plugins(db, {cfg["dns_provider_type"]})
+    try:
+        response = client.post(
+            "/dns-record",
+            headers={"X-API-Key": api_key_value},
+            json={
+                "zone_name": "example.com",
+                "record_type": "A",
+                "record_name": "www",
+                "ttl": 300,
+                "values": ["192.0.2.1"],
+            },
+        )
+        assert response.status_code == 503
+        assert response.json()["detail"]["error"] == "provider_disabled"
+    finally:
+        with SessionLocal() as db:
+            set_disabled_dns_plugins(db, set())
+
+
 def test_csrf_rejects_cross_origin_post(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("src.csrf.relax_csrf_for_tests", lambda: False)
     client.cookies.set("session", create_session_cookie("admin"))
