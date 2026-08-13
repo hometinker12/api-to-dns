@@ -223,7 +223,8 @@ def test_disabled_plugin_returns_503_on_dns_record(client: TestClient, api_key_v
     from src.zone_service import decode_zone_config, list_dns_zones, set_disabled_dns_plugins
 
     with SessionLocal() as db:
-        cfg = decode_zone_config(list_dns_zones(db)[0])
+        zone = next(z for z in list_dns_zones(db) if z.zone_name == "example.com")
+        cfg = decode_zone_config(zone)
         set_disabled_dns_plugins(db, {cfg["dns_provider_type"]})
     try:
         response = client.post(
