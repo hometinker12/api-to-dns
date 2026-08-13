@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from sqlmodel import select
 from starlette.status import HTTP_404_NOT_FOUND, HTTP_409_CONFLICT
 
+from . import zone_service
 from .activity_logging import emit_activity_event
 from .db import SessionLocal
 from .dns_mutation import apply_rrset_mutation, record_exists_at_type
@@ -45,13 +46,6 @@ _MUTATION_RESPONSES: dict[int, dict[str, Any]] = {
     502: {"description": "DNS provider reported a failure (e.g. WinRM or dynamic update)."},
     503: {"description": "A required component is not installed or misconfigured."},
 }
-
-
-def _get_dns_client_from_settings(settings: dict[str, Any]):
-    """Resolve DNS client factory via ``app`` so tests can monkeypatch ``src.app.get_dns_client_from_settings``."""
-    from . import app as app_module
-
-    return app_module.get_dns_client_from_settings(settings)
 
 
 def _resolve_dns_api_zone(
@@ -277,7 +271,7 @@ def _apply_dns_mutation(
                     f"{dns_provider_display_name(provider)} is disabled. "
                     "Enable it in Settings before using it for DNS operations."
                 )
-            client = _get_dns_client_from_settings(settings)
+            client = zone_service.create_dns_client_from_settings(settings, db=db)
             provider_domain = provider_dns_zone(settings)
 
             if mode == "patch":

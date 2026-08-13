@@ -36,9 +36,10 @@ import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from sqlmodel import select  # noqa: E402
 
-from src.app import ALL_ROLES, _serialize_roles, app  # noqa: E402
+from src.app import app  # noqa: E402
 from src.db import SessionLocal, init_db  # noqa: E402
 from src.models import API_KEY_ACCESS_READ_WRITE, ApiKey, ApiKeyAllowedZone, DnsZoneConfig, User  # noqa: E402
+from src.rbac import ALL_ROLES, serialize_roles  # noqa: E402
 from src.security import hash_password  # noqa: E402
 from src.zone_service import encode_zone_config_dict, normalize_zone_name, set_disabled_dns_plugins  # noqa: E402
 
@@ -108,7 +109,7 @@ def client(api_key_value: str) -> TestClient:
         _seed_example_zone_and_permission(db, api_key_value)
         admin = db.exec(select(User).where(User.username == "admin")).first()
         if admin is None:
-            db.add(User(username="admin", password_hash=hash_password("x"), roles=_serialize_roles(ALL_ROLES)))
+            db.add(User(username="admin", password_hash=hash_password("x"), roles=serialize_roles(ALL_ROLES)))
             db.commit()
         else:
             # Backup secrets-only restore bumps session_version; reset so tests that
