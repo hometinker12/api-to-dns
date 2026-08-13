@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Admin HTTP handlers moved from `src/app.py` into `src/routes/` (zones, API keys, settings, SSL/Let’s Encrypt, backup, alerts, restart). `src/app.py` remains the composition root (lifespan, middleware, router registration). Public URLs, RBAC, and templates are unchanged. DNS client tests patch `src.zone_service.create_dns_client_from_settings`.
+
 ## [0.8.1] - 2026-08-11
 
 ### Security
