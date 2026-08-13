@@ -93,8 +93,7 @@ def test_api_key_fingerprint_only_defined_in_http_utils() -> None:
     import src.http_utils as http_utils
 
     assert callable(http_utils.api_key_fingerprint)
-    # Local duplicate at bottom of app.py was removed; attribute should be the import.
-    assert app_module.api_key_fingerprint is http_utils.api_key_fingerprint
+    assert not hasattr(app_module, "api_key_fingerprint")
 
 
 def test_hash_api_key_is_sha256_hex() -> None:
@@ -415,9 +414,9 @@ def test_api_keys_hides_api_docs_link_when_openapi_disabled(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import src.app as app_module
+    import src.routes.api_keys as api_keys_module
 
-    monkeypatch.setattr(app_module, "_OPENAPI_ON", False)
+    monkeypatch.setattr(api_keys_module, "_OPENAPI_ON", False)
     client.cookies.set("session", create_session_cookie("admin"))
     response = client.get("/api-keys")
     assert response.status_code == 200

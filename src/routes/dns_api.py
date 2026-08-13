@@ -2,6 +2,7 @@ from fastapi import APIRouter, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 from starlette.status import HTTP_404_NOT_FOUND, HTTP_409_CONFLICT
 
+from .. import zone_service
 from ..activity_logging import emit_activity_event
 from ..db import SessionLocal
 from ..dns_api_service import (
@@ -27,13 +28,6 @@ from ..models import (
 from ..plugins.utils import normalize_lookup_record_type
 from ..web import record_activity
 from ..zone_service import get_api_key, provider_dns_zone
-
-
-def _test_zone_record_lookup(*args, **kwargs):
-    from .. import app as app_module
-
-    return app_module.test_zone_record_lookup(*args, **kwargs)
-
 
 router = APIRouter(tags=["dns"])
 
@@ -141,7 +135,7 @@ def get_dns_record(
 
         try:
             lookup_type = normalize_lookup_record_type(record_type)
-            records = _test_zone_record_lookup(
+            records = zone_service.test_zone_record_lookup(
                 settings,
                 record_name=record_name,
                 record_type=lookup_type,

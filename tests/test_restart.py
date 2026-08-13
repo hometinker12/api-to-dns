@@ -188,7 +188,7 @@ def test_scheduled_restart_due_once_per_day(client: TestClient) -> None:
 
 
 def test_restart_route_clears_flag_without_sigterm(client: TestClient, monkeypatch) -> None:
-    monkeypatch.setattr(app_module, "perform_application_restart", lambda *, scheduled=False: None)
+    monkeypatch.setattr("src.routes.restart.perform_application_restart", lambda *, scheduled=False: None)
     client.cookies.set("session", create_session_cookie("admin"))
     with SessionLocal() as db:
         mark_restart_required(db, reason="test")

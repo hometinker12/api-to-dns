@@ -1,4 +1,5 @@
 .env
+.plans/
 data/
 data/ssl/
 # Cursor IDE — track project agents, rules, and skills; ignore local/ephemeral files

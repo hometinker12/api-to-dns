@@ -1,4 +1,4 @@
-import src.app as app_module
+import src.routes.settings_ssl as ssl_routes
 from src import letsencrypt
 from src.auth import create_session_cookie
 from src.db import SessionLocal, init_db
@@ -92,7 +92,7 @@ def test_start_enrollment_reports_progress_via_callback(monkeypatch) -> None:
 
 
 def test_start_async_returns_202(client, monkeypatch) -> None:
-    monkeypatch.setattr(app_module, "_le_enrollment_in_progress", False)
+    monkeypatch.setattr(ssl_routes, "_le_enrollment_in_progress", False)
 
     def fake_sync(kwargs, *, user: str) -> None:
         with SessionLocal() as db:
@@ -105,7 +105,7 @@ def test_start_async_returns_202(client, monkeypatch) -> None:
                 result_status="issued",
             )
 
-    monkeypatch.setattr(app_module, "_run_le_auto_enrollment_sync", fake_sync)
+    monkeypatch.setattr(ssl_routes, "_run_le_auto_enrollment_sync", fake_sync)
     client.cookies.set("session", create_session_cookie("admin"))
     response = client.post(
         "/settings/system/ssl-letsencrypt/start-async",
@@ -123,7 +123,7 @@ def test_start_async_returns_202(client, monkeypatch) -> None:
 
 
 def test_start_async_rejects_concurrent_run(client, monkeypatch) -> None:
-    monkeypatch.setattr(app_module, "_le_enrollment_in_progress", True)
+    monkeypatch.setattr(ssl_routes, "_le_enrollment_in_progress", True)
     client.cookies.set("session", create_session_cookie("admin"))
     response = client.post(
         "/settings/system/ssl-letsencrypt/start-async",

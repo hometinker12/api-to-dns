@@ -207,7 +207,7 @@ def test_round_trip_restore_replaces_categories(client: TestClient) -> None:
         db.commit()
 
         restored = load_backup_bytes(raw, "password1")
-        with patch("src.app.perform_application_restart") as restart_mock:
+        with patch("src.restart.perform_application_restart") as restart_mock:
             # Direct restore (unit path); secrets would restart via route.
             result = restore_payload(
                 db,
@@ -232,8 +232,8 @@ def test_round_trip_restore_replaces_categories(client: TestClient) -> None:
 
 
 def test_import_async_progress_and_restart(client: TestClient) -> None:
-    from src.app import _run_backup_import_sync
     from src.backup_service import set_import_in_progress
+    from src.routes.settings_backup import _run_backup_import_sync
 
     _admin_client(client)
     with SessionLocal() as db:
@@ -245,8 +245,8 @@ def test_import_async_progress_and_restart(client: TestClient) -> None:
 
     set_import_in_progress(False)
     try:
-        with patch("src.app.perform_application_restart") as restart_mock:
-            with patch("src.app.asyncio.create_task") as create_task:
+        with patch("src.routes.settings_backup.perform_application_restart") as restart_mock:
+            with patch("src.routes.settings_backup.asyncio.create_task") as create_task:
 
                 def _discard(coro):
                     coro.close()
