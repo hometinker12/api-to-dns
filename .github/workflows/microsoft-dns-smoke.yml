@@ -616,6 +616,47 @@ jobs:
               page.locator('button[type="submit"]').click(),
             ]);
 
+            const assertNamedDialog = async (name, dialogPrefix) => {
+              const button = page.locator(`[data-open-${name}]`).first();
+              if (!(await button.count())) {
+                throw new Error(`Expected [data-open-${name}]`);
+              }
+              const id = await button.getAttribute(`data-open-${name}`);
+              await button.click();
+              const dialog = page.locator(`#${dialogPrefix}-${id}`);
+              if (!(await dialog.evaluate((el) => el.open))) {
+                throw new Error(`${dialogPrefix} did not open`);
+              }
+              await page.locator(`[data-close-${name}="${id}"]`).first().click();
+              if (await dialog.evaluate((el) => el.open)) {
+                throw new Error(`${dialogPrefix} did not close`);
+              }
+            };
+
+            await page.goto(`${baseUrl}/settings?area=authentication`);
+            await assertNamedDialog("view-roles", "view-roles-dialog");
+            await page.locator("#open-create-user").click();
+            if (!(await page.locator("#create-user-dialog").evaluate((dialog) => dialog.open))) {
+              throw new Error("Create user dialog did not open");
+            }
+            await page.locator('#create-user-dialog input[name="username"]').fill("smoke-dialog-user");
+            await page.locator('#create-user-dialog input[name="password"]').fill("SmokePass1!");
+            await page.locator('#create-user-dialog button[type="submit"]').click();
+            await page.locator("[data-open-edit-roles]").first().waitFor({ state: "visible" });
+            await assertNamedDialog("edit-roles", "edit-roles-dialog");
+            await assertNamedDialog("reset-password", "reset-password-dialog");
+
+            await page.goto(`${baseUrl}/settings?area=email_alerting`);
+            await page.locator("#open-create-alert").click();
+            if (!(await page.locator("#create-alert-dialog").evaluate((dialog) => dialog.open))) {
+              throw new Error("Create alert dialog did not open");
+            }
+            await page.locator('#create-alert-dialog input[name="name"]').fill("smoke-edit-alert");
+            await page.locator('#create-alert-dialog input[name="email_recipients"]').fill("smoke@example.com");
+            await page.locator('#create-alert-dialog button[type="submit"]').click();
+            await page.locator("[data-open-edit-alert]").first().waitFor({ state: "visible" });
+            await assertNamedDialog("edit-alert", "edit-alert-dialog");
+
             await page.goto(`${baseUrl}/api-keys`);
             await page.locator("#open-create-key").click();
             if (!(await page.locator("#create-key-dialog").evaluate((dialog) => dialog.open))) {
