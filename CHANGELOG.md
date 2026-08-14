@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Settings → Authentication **View roles**, **Edit roles**, and **Reset password** dialogs open again. After admin scripts moved to `/static/settings.js`, open/close used a `dataset` key that did not match `data-open-edit-roles` (and the same pattern for view-roles and reset-password), so `showModal()` targeted a missing element.
+
 ### Changed
 
 - Admin HTTP handlers moved from `src/app.py` into `src/routes/` (zones, API keys, settings, SSL/Let’s Encrypt, backup, alerts, restart). `src/app.py` remains the composition root (lifespan, middleware, router registration). Public URLs, RBAC, and templates are unchanged. DNS client tests patch `src.zone_service.create_dns_client_from_settings`.

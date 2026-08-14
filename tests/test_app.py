@@ -1547,6 +1547,8 @@ def test_settings_renders_for_authenticated_session(client: TestClient) -> None:
     assert "setForcedReadRole(required, changedInput.checked)" in settings_js.text
     assert 'classList.toggle("role-forced", forced)' in settings_js.text
     assert "form[data-confirm]" in settings_js.text
+    assert "getAttribute(`data-open-${name}`)" in settings_js.text
+    assert "getAttribute(`data-close-${name}`)" in settings_js.text
     plugins = client.get("/settings?area=plugins")
     assert plugins.status_code == 200
     assert "onsubmit=" not in plugins.text
