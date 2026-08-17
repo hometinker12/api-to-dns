@@ -26,7 +26,7 @@ from ..rbac import (
     require_role,
 )
 from ..settings_context import render_settings
-from ..settings_store import set_setting
+from ..settings_store import set_typed_setting_by_key
 
 router = APIRouter(tags=["settings"], include_in_schema=False)
 
@@ -292,9 +292,9 @@ def settings_update_log_rotation(
             section=redirect_section,
         )
     with SessionLocal() as db:
-        set_setting(db, activity_logging.SETTING_LOG_FILE, log_file or "")
-        set_setting(db, activity_logging.SETTING_LOG_MAX_BYTES, str(max(1024, int(max_bytes))))
-        set_setting(db, activity_logging.SETTING_LOG_BACKUP_COUNT, str(max(0, int(backup_count))))
+        set_typed_setting_by_key(db, activity_logging.SETTING_LOG_FILE, log_file or "")
+        set_typed_setting_by_key(db, activity_logging.SETTING_LOG_MAX_BYTES, max(1024, int(max_bytes)))
+        set_typed_setting_by_key(db, activity_logging.SETTING_LOG_BACKUP_COUNT, max(0, int(backup_count)))
         configure_operational_logging(
             level=get_log_level(db),
             log_file=log_file or None,

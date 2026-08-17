@@ -16,6 +16,7 @@
 - Default Compose published ports bind to localhost (`127.0.0.1:8001` and `127.0.0.1:8443`) so the HTTP admin UI is not exposed on every host interface. README documents an explicit `0.0.0.0` override for reverse-proxy hosts. README TOC now links to shipped Remote Syslog (0.8.0) instead of Planned Infrastructure Settings. SQLite is documented as the supported database engine.
 - Azure DNS mutations now use the same mutable-type allowlist and relative-name helper as BIND, Microsoft, and Cloudflare. Apex FQDNs such as `example.com` in zone `example.com` write the `@` record set; unknown and SOA types are rejected on create/update/delete.
 - Public `/dns-record` mutations and the admin DNS browser share one validation/PATCH-merge core (`src.dns_mutation`). OpenAPI `DnsRecordInfo.record_type` now lists lookup types returned by GET. Public create/replace/patch/delete remain limited to A/AAAA/CNAME/TXT.
+- Persistent encrypted settings use a typed registry (`src.settings_registry`) with bool/int/JSON accessors. Unknown restored keys still read; unregistered writes log at DEBUG. Startup logs unknown `Setting` row names without deleting them.
 
 ## [0.8.1] - 2026-08-11
 

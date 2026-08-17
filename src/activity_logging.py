@@ -47,7 +47,7 @@ from .models import (
     ActivityLog,
     AlertRule,
 )
-from .settings_store import get_setting, set_setting
+from .settings_store import get_typed_setting_by_key, set_typed_setting_by_key
 from .time_utils import utc_now
 
 LOGGER = logging.getLogger("api_to_dns")
@@ -123,8 +123,30 @@ _REDACTED = "***redacted***"
 _retention_state: dict[str, datetime] = {}
 
 
+def _typed_bool(db, key: str) -> bool:
+    try:
+        return bool(get_typed_setting_by_key(db, key))
+    except ValueError:
+        return False
+
+
+def _typed_int(db, key: str, fallback: int) -> int:
+    try:
+        return int(get_typed_setting_by_key(db, key))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _typed_str(db, key: str) -> str:
+    try:
+        value = get_typed_setting_by_key(db, key)
+    except ValueError:
+        return ""
+    return "" if value is None else str(value)
+
+
 def get_log_level(db) -> str:
-    raw = (get_setting(db, SETTING_LOG_LEVEL) or "").strip().upper()
+    raw = _typed_str(db, SETTING_LOG_LEVEL).strip().upper()
     if raw not in LOG_LEVEL_VALUES:
         return DEFAULT_LOG_LEVEL
     return raw
@@ -134,24 +156,21 @@ def set_log_level(db, value: str) -> str:
     cleaned = (value or "").strip().upper()
     if cleaned not in LOG_LEVEL_VALUES:
         raise ValueError(f"Unsupported log level: {value!r}")
-    set_setting(db, SETTING_LOG_LEVEL, cleaned)
+    set_typed_setting_by_key(db, SETTING_LOG_LEVEL, cleaned)
     return cleaned
 
 
 def get_retention_days(db) -> int:
-    raw = get_setting(db, SETTING_RETENTION_DAYS)
-    if raw is None:
-        return DEFAULT_RETENTION_DAYS
     try:
-        value = int(raw)
-    except ValueError:
+        value = int(get_typed_setting_by_key(db, SETTING_RETENTION_DAYS))
+    except (TypeError, ValueError):
         return DEFAULT_RETENTION_DAYS
     return max(1, value)
 
 
 def set_retention_days(db, value: int) -> int:
     days = max(1, int(value))
-    set_setting(db, SETTING_RETENTION_DAYS, str(days))
+    set_typed_setting_by_key(db, SETTING_RETENTION_DAYS, days)
     return days
 
 
@@ -288,7 +307,7 @@ def default_app_dns_name() -> str:
 
 
 def get_app_dns_name(db) -> str:
-    stored = (get_setting(db, SETTING_APP_DNS_NAME) or "").strip()
+    stored = _typed_str(db, SETTING_APP_DNS_NAME).strip()
     if stored:
         return stored
     return default_app_dns_name()
@@ -298,7 +317,7 @@ def set_app_dns_name(db, name: str) -> str:
     from .hostnames import validate_dns_hostname
 
     cleaned = validate_dns_hostname(name)
-    set_setting(db, SETTING_APP_DNS_NAME, cleaned)
+    set_typed_setting_by_key(db, SETTING_APP_DNS_NAME, cleaned)
     return cleaned
 
 
@@ -475,7 +494,7 @@ def run_retention_cleanup(db, *, force: bool = False) -> int:
         last_local = _retention_state.get("last")
         if last_local is not None and (utc_now() - last_local) < timedelta(hours=24):
             return 0
-        stored = get_setting(db, SETTING_LAST_RETENTION)
+        stored = _typed_str(db, SETTING_LAST_RETENTION)
         if stored:
             try:
                 last_db = datetime.fromisoformat(stored)
@@ -495,7 +514,7 @@ def run_retention_cleanup(db, *, force: bool = False) -> int:
     if removed:
         db.commit()
     now = utc_now()
-    set_setting(db, SETTING_LAST_RETENTION, now.isoformat())
+    set_typed_setting_by_key(db, SETTING_LAST_RETENTION, now.isoformat())
     _retention_state["last"] = now
     return removed
 
@@ -509,10 +528,6 @@ def _parse_csv(value: str | None) -> list[str]:
     if not value:
         return []
     return [part.strip() for part in value.split(",") if part.strip()]
-
-
-def _smtp_truthy(value: str | None) -> bool:
-    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def validate_smtp_transport_security(
@@ -540,30 +555,25 @@ def validate_smtp_transport_security(
 
 
 def get_smtp_config(db) -> dict[str, Any]:
-    servers = _parse_csv(get_setting(db, SETTING_SMTP_SERVERS))
-    try:
-        port = int(get_setting(db, SETTING_SMTP_PORT) or DEFAULT_SMTP_PORT)
-    except ValueError:
-        port = DEFAULT_SMTP_PORT
-    anonymous = _smtp_truthy(get_setting(db, SETTING_SMTP_ANONYMOUS))
-    security = (get_setting(db, SETTING_SMTP_SECURITY) or DEFAULT_SMTP_SECURITY).strip().lower()
+    servers = _parse_csv(_typed_str(db, SETTING_SMTP_SERVERS))
+    port = _typed_int(db, SETTING_SMTP_PORT, DEFAULT_SMTP_PORT)
+    anonymous = _typed_bool(db, SETTING_SMTP_ANONYMOUS)
+    security = _typed_str(db, SETTING_SMTP_SECURITY).strip().lower() or DEFAULT_SMTP_SECURITY
     if security not in {"none", "starttls", "ssl"}:
         security = DEFAULT_SMTP_SECURITY
-    try:
-        timeout = int(get_setting(db, SETTING_SMTP_TIMEOUT) or DEFAULT_SMTP_TIMEOUT)
-    except ValueError:
-        timeout = DEFAULT_SMTP_TIMEOUT
+    timeout = _typed_int(db, SETTING_SMTP_TIMEOUT, DEFAULT_SMTP_TIMEOUT)
+    password = _typed_str(db, SETTING_SMTP_PASSWORD)
     return {
         "servers": servers,
         "port": port,
         "anonymous": anonymous,
-        "username": get_setting(db, SETTING_SMTP_USERNAME) or "",
-        "password": get_setting(db, SETTING_SMTP_PASSWORD) or "",
-        "from_address": get_setting(db, SETTING_SMTP_FROM) or "",
+        "username": _typed_str(db, SETTING_SMTP_USERNAME),
+        "password": password,
+        "from_address": _typed_str(db, SETTING_SMTP_FROM),
         "security": security,
         "timeout": timeout,
-        "allow_insecure_auth": _smtp_truthy(get_setting(db, SETTING_SMTP_ALLOW_INSECURE_AUTH)),
-        "password_set": bool(get_setting(db, SETTING_SMTP_PASSWORD)),
+        "allow_insecure_auth": _typed_bool(db, SETTING_SMTP_ALLOW_INSECURE_AUTH),
+        "password_set": bool(password),
     }
 
 
@@ -581,30 +591,24 @@ def get_remote_syslog_config(db) -> dict[str, Any]:
         validate_syslog_config,
     )
 
-    enabled = _smtp_truthy(get_setting(db, SETTING_SYSLOG_ENABLED))
-    host = get_setting(db, SETTING_SYSLOG_HOST) or ""
-    try:
-        port = int(get_setting(db, SETTING_SYSLOG_PORT) or DEFAULT_TLS_PORT)
-    except ValueError:
-        port = DEFAULT_TLS_PORT
-    protocol = (get_setting(db, SETTING_SYSLOG_PROTOCOL) or DEFAULT_PROTOCOL).strip().lower()
+    enabled = _typed_bool(db, SETTING_SYSLOG_ENABLED)
+    host = _typed_str(db, SETTING_SYSLOG_HOST)
+    port = _typed_int(db, SETTING_SYSLOG_PORT, DEFAULT_TLS_PORT)
+    protocol = _typed_str(db, SETTING_SYSLOG_PROTOCOL).strip().lower() or DEFAULT_PROTOCOL
     if protocol not in SYSLOG_PROTOCOLS:
         protocol = DEFAULT_PROTOCOL
-    facility = (get_setting(db, SETTING_SYSLOG_FACILITY) or DEFAULT_FACILITY).strip().lower()
+    facility = _typed_str(db, SETTING_SYSLOG_FACILITY).strip().lower() or DEFAULT_FACILITY
     if facility not in SYSLOG_FACILITY:
         facility = DEFAULT_FACILITY
-    minimum_level = (get_setting(db, SETTING_SYSLOG_MINIMUM_LEVEL) or DEFAULT_MINIMUM_LEVEL).strip().upper()
+    minimum_level = _typed_str(db, SETTING_SYSLOG_MINIMUM_LEVEL).strip().upper() or DEFAULT_MINIMUM_LEVEL
     if minimum_level not in LOG_LEVEL_VALUES:
         minimum_level = DEFAULT_MINIMUM_LEVEL
     try:
-        timeout = float(get_setting(db, SETTING_SYSLOG_TIMEOUT) or DEFAULT_TIMEOUT)
+        timeout = float(_typed_str(db, SETTING_SYSLOG_TIMEOUT) or DEFAULT_TIMEOUT)
     except ValueError:
         timeout = DEFAULT_TIMEOUT
-    try:
-        queue_size = int(get_setting(db, SETTING_SYSLOG_QUEUE_SIZE) or DEFAULT_QUEUE_SIZE)
-    except ValueError:
-        queue_size = DEFAULT_QUEUE_SIZE
-    allow_insecure_plaintext = _smtp_truthy(get_setting(db, SETTING_SYSLOG_ALLOW_INSECURE))
+    queue_size = _typed_int(db, SETTING_SYSLOG_QUEUE_SIZE, DEFAULT_QUEUE_SIZE)
+    allow_insecure_plaintext = _typed_bool(db, SETTING_SYSLOG_ALLOW_INSECURE)
 
     # Return a dict even when disabled/incomplete so the UI can render defaults.
     try:
@@ -679,19 +683,15 @@ def set_remote_syslog_config(
         allow_insecure_plaintext=allow_insecure_plaintext,
         hostname=get_app_dns_name(db),
     )
-    set_setting(db, SETTING_SYSLOG_ENABLED, "true" if validated.enabled else "false")
-    set_setting(db, SETTING_SYSLOG_HOST, validated.host)
-    set_setting(db, SETTING_SYSLOG_PORT, str(validated.port))
-    set_setting(db, SETTING_SYSLOG_PROTOCOL, validated.protocol)
-    set_setting(db, SETTING_SYSLOG_FACILITY, validated.facility)
-    set_setting(db, SETTING_SYSLOG_MINIMUM_LEVEL, validated.minimum_level)
-    set_setting(db, SETTING_SYSLOG_TIMEOUT, str(validated.timeout))
-    set_setting(db, SETTING_SYSLOG_QUEUE_SIZE, str(validated.queue_size))
-    set_setting(
-        db,
-        SETTING_SYSLOG_ALLOW_INSECURE,
-        "true" if validated.allow_insecure_plaintext else "false",
-    )
+    set_typed_setting_by_key(db, SETTING_SYSLOG_ENABLED, validated.enabled)
+    set_typed_setting_by_key(db, SETTING_SYSLOG_HOST, validated.host)
+    set_typed_setting_by_key(db, SETTING_SYSLOG_PORT, validated.port)
+    set_typed_setting_by_key(db, SETTING_SYSLOG_PROTOCOL, validated.protocol)
+    set_typed_setting_by_key(db, SETTING_SYSLOG_FACILITY, validated.facility)
+    set_typed_setting_by_key(db, SETTING_SYSLOG_MINIMUM_LEVEL, validated.minimum_level)
+    set_typed_setting_by_key(db, SETTING_SYSLOG_TIMEOUT, str(validated.timeout))
+    set_typed_setting_by_key(db, SETTING_SYSLOG_QUEUE_SIZE, validated.queue_size)
+    set_typed_setting_by_key(db, SETTING_SYSLOG_ALLOW_INSECURE, validated.allow_insecure_plaintext)
     return get_remote_syslog_config(db)
 
 
@@ -732,7 +732,7 @@ def set_smtp_config(
     cleaned_security = (security or DEFAULT_SMTP_SECURITY).strip().lower()
     if cleaned_security not in {"none", "starttls", "ssl"}:
         cleaned_security = DEFAULT_SMTP_SECURITY
-    existing_password = get_setting(db, SETTING_SMTP_PASSWORD) or ""
+    existing_password = _typed_str(db, SETTING_SMTP_PASSWORD)
     effective_password = password if (password or not preserve_password_if_blank) else existing_password
     guard = validate_smtp_transport_security(
         anonymous=anonymous,
@@ -744,16 +744,16 @@ def set_smtp_config(
     if guard:
         raise ValueError(guard)
 
-    set_setting(db, SETTING_SMTP_SERVERS, servers or "")
-    set_setting(db, SETTING_SMTP_PORT, str(int(port)))
-    set_setting(db, SETTING_SMTP_ANONYMOUS, "true" if anonymous else "false")
-    set_setting(db, SETTING_SMTP_USERNAME, username or "")
+    set_typed_setting_by_key(db, SETTING_SMTP_SERVERS, servers or "")
+    set_typed_setting_by_key(db, SETTING_SMTP_PORT, int(port))
+    set_typed_setting_by_key(db, SETTING_SMTP_ANONYMOUS, anonymous)
+    set_typed_setting_by_key(db, SETTING_SMTP_USERNAME, username or "")
     if password or not preserve_password_if_blank:
-        set_setting(db, SETTING_SMTP_PASSWORD, password or "")
-    set_setting(db, SETTING_SMTP_FROM, from_address or "")
-    set_setting(db, SETTING_SMTP_SECURITY, cleaned_security)
-    set_setting(db, SETTING_SMTP_TIMEOUT, str(int(timeout)))
-    set_setting(db, SETTING_SMTP_ALLOW_INSECURE_AUTH, "true" if allow_insecure_auth else "false")
+        set_typed_setting_by_key(db, SETTING_SMTP_PASSWORD, password or "")
+    set_typed_setting_by_key(db, SETTING_SMTP_FROM, from_address or "")
+    set_typed_setting_by_key(db, SETTING_SMTP_SECURITY, cleaned_security)
+    set_typed_setting_by_key(db, SETTING_SMTP_TIMEOUT, int(timeout))
+    set_typed_setting_by_key(db, SETTING_SMTP_ALLOW_INSECURE_AUTH, allow_insecure_auth)
 
 
 def _build_smtp_client(server: str, port: int, security: str, timeout: int) -> smtplib.SMTP:

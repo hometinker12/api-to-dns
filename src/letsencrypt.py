@@ -7,7 +7,6 @@ configured zone plugins as the public DNS API.
 
 from __future__ import annotations
 
-import json
 import os
 import time
 from collections.abc import Callable
@@ -22,7 +21,7 @@ from cryptography.x509.oid import NameOID
 from .activity_logging import emit_activity_event, get_app_dns_name
 from .models import LOG_LEVEL_INFORMATIONAL, DnsRecordRequest, DnsZoneConfig
 from .security import decrypt_value, encrypt_value
-from .settings_store import delete_setting, get_setting, set_setting
+from .settings_store import delete_setting, get_typed_setting_by_key, set_typed_setting_by_key
 from .ssl_certs import SOURCE_LETSENCRYPT, _read_source, cert_dir, cert_metadata, install_letsencrypt_cert
 from .zone_service import (
     create_dns_client_from_settings,
@@ -96,18 +95,15 @@ def _emit_le_dns_audit(
 
 
 def _read_json_setting(db, name: str) -> dict[str, Any] | None:
-    raw = get_setting(db, name)
-    if not raw:
-        return None
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
+        parsed = get_typed_setting_by_key(db, name)
+    except (KeyError, ValueError):
         return None
     return parsed if isinstance(parsed, dict) else None
 
 
 def _write_json_setting(db, name: str, value: dict[str, Any]) -> None:
-    set_setting(db, name, json.dumps(value, sort_keys=True))
+    set_typed_setting_by_key(db, name, value)
 
 
 def get_config(db) -> dict[str, Any] | None:
