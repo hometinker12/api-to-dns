@@ -1,4 +1,5 @@
 import os
+from collections.abc import Iterator
 
 from sqlalchemy.orm import sessionmaker
 from sqlmodel import Session, SQLModel, create_engine
@@ -16,6 +17,12 @@ engine = create_engine(
     connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite:///") else {},
 )
 SessionLocal = sessionmaker(class_=Session, autoflush=False, bind=engine)
+
+
+def get_db() -> Iterator[Session]:
+    """Request-scoped session for FastAPI handlers and auth dependencies."""
+    with SessionLocal() as db:
+        yield db
 
 
 def init_db() -> None:
