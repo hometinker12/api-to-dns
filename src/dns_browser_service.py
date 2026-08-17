@@ -24,11 +24,9 @@ from .log_constants import (
     LOG_LEVEL_INFORMATIONAL,
     LOG_LEVEL_WARNING,
 )
-from .models import (
-    DnsRecordInfo,
-    DnsZoneConfig,
-)
+from .models import DnsZoneConfig
 from .plugins.utils import has_dns_glob
+from .schemas.dns import DnsRecordInfo
 from .zone_service import (
     create_dns_client_from_settings,
     decode_zone_config,

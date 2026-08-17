@@ -13,7 +13,7 @@ from ..dns_record_types import (
     normalize_lookup_record_type,
     normalize_record_value,
 )
-from ..models import DnsRecordInfo
+from ..schemas.dns import DnsRecordInfo
 
 __all__ = [
     "LOOKUP_RECORD_TYPES",

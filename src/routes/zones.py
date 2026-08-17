@@ -29,7 +29,6 @@ from ..log_constants import (
 from ..models import (
     ApiKeyAllowedZone,
     DnsZoneConfig,
-    DnsZoneSummary,
 )
 from ..plugins.utils import normalize_lookup_record_type
 from ..rbac import (
@@ -38,6 +37,7 @@ from ..rbac import (
     require_role,
     user_has_role,
 )
+from ..schemas.dns import DnsZoneSummary
 from ..web import (
     record_activity,
     render_error_response,

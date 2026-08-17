@@ -20,7 +20,8 @@ from cryptography.x509.oid import NameOID
 
 from .activity_logging import emit_activity_event
 from .log_constants import LOG_LEVEL_INFORMATIONAL
-from .models import DnsRecordRequest, DnsZoneConfig
+from .models import DnsZoneConfig
+from .schemas.dns import DnsRecordRequest
 from .security import decrypt_value, encrypt_value
 from .settings_store import begin_immediate, delete_setting, get_typed_setting_by_key, set_typed_setting_by_key
 from .ssl_certs import SOURCE_LETSENCRYPT, _read_source, cert_dir, cert_metadata, install_letsencrypt_cert

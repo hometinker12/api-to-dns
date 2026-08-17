@@ -14,7 +14,6 @@ import dns.zone
 import httpx
 import pytest
 
-from src.models import DnsRecordInfo, DnsRecordRequest
 from src.plugins import bind as bind_mod
 from src.plugins.azure import AzureDnsClient
 from src.plugins.bind import BindTsigDnsClient
@@ -27,6 +26,7 @@ from src.plugins.utils import (
     query_dns_records_at_name,
     record_name_matches,
 )
+from src.schemas.dns import DnsRecordInfo, DnsRecordRequest
 
 
 def test_normalize_lookup_record_type_accepts_supported_types() -> None:

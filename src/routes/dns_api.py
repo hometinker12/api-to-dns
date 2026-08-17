@@ -21,14 +21,14 @@ from ..log_constants import (
     LOG_LEVEL_INFORMATIONAL,
     LOG_LEVEL_WARNING,
 )
-from ..models import (
+from ..plugins.utils import normalize_lookup_record_type
+from ..schemas.dns import (
     DnsRecordCreateRequest,
     DnsRecordGetResponse,
     DnsRecordPatchRequest,
     DnsRecordReplaceRequest,
     DnsRecordResponse,
 )
-from ..plugins.utils import normalize_lookup_record_type
 from ..web import record_activity
 from ..zone_service import get_api_key, provider_dns_zone
 
