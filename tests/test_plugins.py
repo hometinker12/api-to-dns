@@ -9,6 +9,7 @@ import dns.rdata
 import dns.rdataclass
 import dns.rdataset
 import dns.rrset
+import dns.tsig
 import dns.xfr
 import dns.zone
 import httpx
@@ -439,6 +440,48 @@ def test_bind_list_records_refused_axfr_maps_to_value_error() -> None:
     with (
         patch("src.plugins.bind.dns.query.xfr", side_effect=dns.xfr.TransferError(dns.rcode.REFUSED)),
         pytest.raises(ValueError, match="allow-transfer"),
+    ):
+        client.list_records(dns_server="127.0.0.1", dns_zone="example.com")
+
+
+def test_bind_list_records_badkey_maps_to_value_error() -> None:
+    client = BindTsigDnsClient("dev-api-to-dns", "dGVzdA==", "hmac-sha256")
+
+    def _badkey(*_a, **_k):
+        raise dns.tsig.PeerBadKey()
+        yield  # pragma: no cover — generator so dns.query.xfr is iterated
+
+    with (
+        patch("src.plugins.bind.dns.query.xfr", side_effect=_badkey),
+        pytest.raises(ValueError, match="BADKEY"),
+    ):
+        client.list_records(dns_server="127.0.0.1", dns_zone="example.com")
+
+
+def test_bind_list_records_badsig_maps_to_value_error() -> None:
+    client = BindTsigDnsClient("dev-api-to-dns", "dGVzdA==", "hmac-sha256")
+
+    def _badsig(*_a, **_k):
+        raise dns.tsig.PeerBadSignature()
+        yield  # pragma: no cover
+
+    with (
+        patch("src.plugins.bind.dns.query.xfr", side_effect=_badsig),
+        pytest.raises(ValueError, match="BADSIG"),
+    ):
+        client.list_records(dns_server="127.0.0.1", dns_zone="example.com")
+
+
+def test_bind_list_records_badtime_maps_to_value_error() -> None:
+    client = BindTsigDnsClient("dev-api-to-dns", "dGVzdA==", "hmac-sha256")
+
+    def _badtime(*_a, **_k):
+        raise dns.tsig.PeerBadTime()
+        yield  # pragma: no cover
+
+    with (
+        patch("src.plugins.bind.dns.query.xfr", side_effect=_badtime),
+        pytest.raises(ValueError, match="BADTIME"),
     ):
         client.list_records(dns_server="127.0.0.1", dns_zone="example.com")
 

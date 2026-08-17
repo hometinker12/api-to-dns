@@ -476,12 +476,12 @@ jobs:
           nav = html.split('<nav class="nav-links">', 1)[1].split("</nav>", 1)[0]
           assert nav.index('href="/api-keys"') < nav.index('href="/admin"') < nav.index('href="/settings"') < nav.index('action="/logout"'), nav
           version = Path("VERSION").read_text(encoding="utf-8").strip()
-          assert version == "0.8.5", version
+          assert version == "0.8.6", version
           assert f"api-to-dns v{version}" in html, html[-400:]
-          assert 'version = "0.8.5"' in Path("pyproject.toml").read_text(encoding="utf-8")
-          assert "ARG VERSION=0.8.5" in Path("Dockerfile").read_text(encoding="utf-8")
-          assert "hometinker12/api-to-dns:0.8.5" in Path("docker-compose.yml").read_text(encoding="utf-8")
-          print("admin nav + 0.8.5 metadata assertions passed")
+          assert 'version = "0.8.6"' in Path("pyproject.toml").read_text(encoding="utf-8")
+          assert "ARG VERSION=0.8.6" in Path("Dockerfile").read_text(encoding="utf-8")
+          assert "hometinker12/api-to-dns:0.8.6" in Path("docker-compose.yml").read_text(encoding="utf-8")
+          print("admin nav + 0.8.6 metadata assertions passed")
           PY
 
           echo "[bind] Static brand assets (favicon + logo mark)"
@@ -624,6 +624,30 @@ jobs:
           DENIED_ZONE_ID="$(python3 -c 'import re; html=open("/tmp/api-keys.html", encoding="utf-8").read(); match=re.search(r"name=\"zone_ids\" value=\"(\d+)\"\s*/>\s*<code>denied\.test</code>", html, re.DOTALL); assert match, "Could not find denied.test zone ID"; print(match.group(1))')"
           : "${SMOKE_ZONE_ID:?Could not extract smoke.test zone ID}"
           : "${DENIED_ZONE_ID:?Could not extract denied.test zone ID}"
+
+          echo "[bind] Configure zone with unknown TSIG key (BADKEY browse)"
+          badkey_body="/tmp/zone-create-badkey-mismatch.html"
+          badkey_status="$(curl --silent --show-error -b /tmp/cookies -X POST http://127.0.0.1:8000/zones \
+            -w "%{http_code}" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/admin" \
+            --data-urlencode "zone_name=badkey-mismatch" \
+            --data-urlencode "dns_zone=smoke.test" \
+            --data-urlencode "dns_provider_type=bind" \
+            --data-urlencode "dns_server=bind-test" \
+            --data-urlencode "dns_username=wrong-tsig-key" \
+            --data-urlencode "dns_password=dGVzdA==" \
+            --data-urlencode "dns_tsig_algorithm=hmac-sha256" \
+            -o "${badkey_body}")"
+          if [ "${badkey_status}" != "200" ] || ! grep -Eq "Zone ('badkey-mismatch'|&#39;badkey-mismatch&#39;) added" "${badkey_body}"; then
+            echo "[bind] Zone create assertion failed for badkey-mismatch; response excerpt:"
+            python3 -c 'from pathlib import Path; print(Path("/tmp/zone-create-badkey-mismatch.html").read_text(encoding="utf-8", errors="replace")[:1200])'
+            exit 1
+          fi
+          curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/api-keys -o /tmp/api-keys.html
+          BADKEY_ZONE_ID="$(python3 -c 'import re; html=open("/tmp/api-keys.html", encoding="utf-8").read(); match=re.search(r"name=\"zone_ids\" value=\"(\d+)\"\s*/>\s*<code>badkey-mismatch</code>", html, re.DOTALL); assert match, "Could not find badkey-mismatch zone ID"; print(match.group(1))')"
+          : "${BADKEY_ZONE_ID:?Could not extract badkey-mismatch zone ID}"
           echo "[bind] Browser smoke for CSP-hardened admin assets"
           npm install --no-save playwright
           npx playwright install --with-deps chromium
@@ -1110,6 +1134,22 @@ jobs:
           curl --fail --silent -b /tmp/cookies \
             "http://127.0.0.1:8000/zones/${DENIED_ZONE_ID}/records/search?record_name=ns&record_type=A" \
             | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['status']=='success'; assert b['records'][0]['record_name']=='ns'; assert b['records'][0]['values']==['127.0.0.1'], b"
+          echo "[bind] DNS browser AXFR BADKEY on unknown TSIG key (blank browse + glob → 400; exact lookup still works)"
+          for badkey_url in \
+            "http://127.0.0.1:8000/zones/${BADKEY_ZONE_ID}/records/search" \
+            "http://127.0.0.1:8000/zones/${BADKEY_ZONE_ID}/records/search?record_name=ns*&record_type=A"
+          do
+            badkey_code="$(curl --silent --show-error -b /tmp/cookies -o /tmp/badkey-browse.json -w "%{http_code}" "${badkey_url}")"
+            if [ "${badkey_code}" != "400" ]; then
+              echo "Expected HTTP 400 for AXFR BADKEY browser search; got ${badkey_code} for ${badkey_url}"
+              python3 -c 'from pathlib import Path; print(Path("/tmp/badkey-browse.json").read_text(encoding="utf-8", errors="replace")[:800])'
+              exit 1
+            fi
+            python3 -c 'import json; from pathlib import Path; b=json.loads(Path("/tmp/badkey-browse.json").read_text(encoding="utf-8")); msg=b.get("message") or (b.get("detail") or {}).get("message",""); assert "BADKEY" in msg, b'
+          done
+          curl --fail --silent -b /tmp/cookies \
+            "http://127.0.0.1:8000/zones/${BADKEY_ZONE_ID}/records/search?record_name=ns&record_type=A" \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['status']=='success'; assert b['records'][0]['record_name']=='ns'; assert b['records'][0]['values']==['127.0.0.1'], b"
           curl --fail --silent -b /tmp/cookies \
             -H "Origin: http://127.0.0.1:8000" \
             -H "Referer: http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
@@ -1212,7 +1252,7 @@ jobs:
           import os
           import subprocess
 
-          assert os.environ["APP_VERSION"] == "0.8.5", os.environ["APP_VERSION"]
+          assert os.environ["APP_VERSION"] == "0.8.6", os.environ["APP_VERSION"]
           expected_image = f"hometinker12/api-to-dns:{os.environ['APP_VERSION']}"
           cfg = json.loads(subprocess.check_output(["docker", "compose", "config", "--format", "json"], text=True))
           svc = cfg["services"]["dns-api"]
@@ -1689,7 +1729,7 @@ jobs:
               throw 'Admin header navigation order is not API Keys, Dashboard, Settings, Logout'
             }
             $appVersion = (Get-Content -Raw VERSION).Trim()
-            if ($appVersion -ne '0.8.5') { throw "Expected VERSION 0.8.5; got $appVersion" }
+            if ($appVersion -ne '0.8.6') { throw "Expected VERSION 0.8.6; got $appVersion" }
             if ($admin.Content -notmatch [regex]::Escape("api-to-dns v$appVersion")) {
               throw 'Admin page missing version footer'
             }

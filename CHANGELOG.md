@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-08-17
+
+### Fixed
+
+- BIND / TSIG browse and wildcard search now return HTTP 400 with a clear `BADKEY` / `BADSIG` / `BADTIME` message when BIND rejects the AXFR TSIG, instead of a generic HTTP 500. Exact-name lookup is unchanged.
+
+### Changed
+
+- Application version metadata aligned to **0.8.6** (`VERSION`, OpenAPI, `pyproject.toml`, Docker label, Compose pin).
+- Release BIND smoke covers unknown TSIG key browse/glob `400` (`BADKEY`) while exact-name lookup still works.
+
 ## [0.8.5] - 2026-08-17
 
 ### Security
