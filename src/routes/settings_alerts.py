@@ -1,10 +1,11 @@
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse
+from sqlmodel import Session
 
 from ..activity_logging import (
     emit_activity_event,
 )
-from ..db import SessionLocal
+from ..db import get_db
 from ..models import (
     LOG_CATEGORY_VALUES,
     LOG_LEVEL_INFORMATIONAL,
@@ -34,54 +35,69 @@ def settings_alerts_create(
     email_body_template: str = Form(""),
     cooldown_minutes: int = Form(0),
     enabled: str | None = Form("on"),
+    db: Session = Depends(get_db),
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
     cleaned_level = (minimum_level or LOG_LEVEL_WARNING).strip().upper()
     if cleaned_level not in LOG_LEVEL_VALUES:
         return render_settings(
-            request, user, "email_alerting", message=f"Unsupported level: {minimum_level}", message_kind="error"
+            request,
+            user,
+            "email_alerting",
+            db=db,
+            message=f"Unsupported level: {minimum_level}",
+            message_kind="error",
         )
     cleaned_category = (category or "").strip().lower()
     if cleaned_category and cleaned_category not in LOG_CATEGORY_VALUES:
         return render_settings(
-            request, user, "email_alerting", message=f"Unsupported category: {category}", message_kind="error"
+            request,
+            user,
+            "email_alerting",
+            db=db,
+            message=f"Unsupported category: {category}",
+            message_kind="error",
         )
     if not email_recipients.strip():
         return render_settings(
-            request, user, "email_alerting", message="At least one email recipient is required.", message_kind="error"
+            request,
+            user,
+            "email_alerting",
+            db=db,
+            message="At least one email recipient is required.",
+            message_kind="error",
         )
-    with SessionLocal() as db:
-        rule = AlertRule(
-            enabled=bool(enabled),
-            name=name.strip(),
-            event_type=event_type.strip() or None,
-            category=cleaned_category or None,
-            minimum_level=cleaned_level,
-            message_contains=message_contains.strip() or None,
-            email_recipients=email_recipients.strip(),
-            email_subject_template=email_subject_template,
-            email_body_template=email_body_template,
-            cooldown_minutes=max(0, int(cooldown_minutes)),
-        )
-        db.add(rule)
-        db.commit()
-        db.refresh(rule)
-        emit_activity_event(
-            db,
-            event_type="alert_rule.created",
-            level=LOG_LEVEL_INFORMATIONAL,
-            status="success",
-            actor_type="user",
-            actor_label=user,
-            message=f"Alert rule {name!r} created",
-            details={
-                "rule_id": rule.id,
-                "rule_name": rule.name,
-                "category": cleaned_category,
-                "minimum_level": cleaned_level,
-            },
-        )
-    return render_settings(request, user, "email_alerting", message=f"Alert rule {name!r} created.")
+    rule = AlertRule(
+        enabled=bool(enabled),
+        name=name.strip(),
+        event_type=event_type.strip() or None,
+        category=cleaned_category or None,
+        minimum_level=cleaned_level,
+        message_contains=message_contains.strip() or None,
+        email_recipients=email_recipients.strip(),
+        email_subject_template=email_subject_template,
+        email_body_template=email_body_template,
+        cooldown_minutes=max(0, int(cooldown_minutes)),
+    )
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    emit_activity_event(
+        db,
+        event_type="alert_rule.created",
+        level=LOG_LEVEL_INFORMATIONAL,
+        status="success",
+        actor_type="user",
+        actor_label=user,
+        message=f"Alert rule {name!r} created",
+        details={
+            "rule_id": rule.id,
+            "rule_name": rule.name,
+            "category": cleaned_category,
+            "minimum_level": cleaned_level,
+        },
+    )
+    return render_settings(request, user, "email_alerting", db=db, message=f"Alert rule {name!r} created.")
 
 
 @router.post("/settings/alerts/{rule_id}", response_class=HTMLResponse, include_in_schema=False)
@@ -98,77 +114,87 @@ def settings_alerts_update(
     email_body_template: str = Form(""),
     cooldown_minutes: int = Form(0),
     enabled: str | None = Form(None),
+    db: Session = Depends(get_db),
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
     cleaned_level = (minimum_level or LOG_LEVEL_WARNING).strip().upper()
     if cleaned_level not in LOG_LEVEL_VALUES:
         return render_settings(
-            request, user, "email_alerting", message=f"Unsupported level: {minimum_level}", message_kind="error"
+            request,
+            user,
+            "email_alerting",
+            db=db,
+            message=f"Unsupported level: {minimum_level}",
+            message_kind="error",
         )
     cleaned_category = (category or "").strip().lower()
     if cleaned_category and cleaned_category not in LOG_CATEGORY_VALUES:
         return render_settings(
-            request, user, "email_alerting", message=f"Unsupported category: {category}", message_kind="error"
+            request,
+            user,
+            "email_alerting",
+            db=db,
+            message=f"Unsupported category: {category}",
+            message_kind="error",
         )
-    with SessionLocal() as db:
-        rule = db.get(AlertRule, rule_id)
-        if rule is None:
-            return render_settings(
-                request, user, "email_alerting", message="Alert rule not found.", message_kind="error"
-            )
-        rule.enabled = enabled is not None
-        rule.name = name.strip()
-        rule.event_type = event_type.strip() or None
-        rule.category = cleaned_category or None
-        rule.minimum_level = cleaned_level
-        rule.message_contains = message_contains.strip() or None
-        rule.email_recipients = email_recipients.strip()
-        rule.email_subject_template = email_subject_template
-        rule.email_body_template = email_body_template
-        rule.cooldown_minutes = max(0, int(cooldown_minutes))
-        db.add(rule)
-        db.commit()
-        emit_activity_event(
-            db,
-            event_type="alert_rule.updated",
-            level=LOG_LEVEL_INFORMATIONAL,
-            status="success",
-            actor_type="user",
-            actor_label=user,
-            message=f"Alert rule {name!r} updated",
-            details={
-                "rule_id": rule_id,
-                "rule_name": rule.name,
-                "category": cleaned_category,
-                "minimum_level": cleaned_level,
-            },
+    rule = db.get(AlertRule, rule_id)
+    if rule is None:
+        return render_settings(
+            request, user, "email_alerting", db=db, message="Alert rule not found.", message_kind="error"
         )
-    return render_settings(request, user, "email_alerting", message=f"Alert rule {name!r} updated.")
+    rule.enabled = enabled is not None
+    rule.name = name.strip()
+    rule.event_type = event_type.strip() or None
+    rule.category = cleaned_category or None
+    rule.minimum_level = cleaned_level
+    rule.message_contains = message_contains.strip() or None
+    rule.email_recipients = email_recipients.strip()
+    rule.email_subject_template = email_subject_template
+    rule.email_body_template = email_body_template
+    rule.cooldown_minutes = max(0, int(cooldown_minutes))
+    db.add(rule)
+    db.commit()
+    emit_activity_event(
+        db,
+        event_type="alert_rule.updated",
+        level=LOG_LEVEL_INFORMATIONAL,
+        status="success",
+        actor_type="user",
+        actor_label=user,
+        message=f"Alert rule {name!r} updated",
+        details={
+            "rule_id": rule_id,
+            "rule_name": rule.name,
+            "category": cleaned_category,
+            "minimum_level": cleaned_level,
+        },
+    )
+    return render_settings(request, user, "email_alerting", db=db, message=f"Alert rule {name!r} updated.")
 
 
 @router.post("/settings/alerts/{rule_id}/delete", response_class=HTMLResponse, include_in_schema=False)
 def settings_alerts_delete(
     request: Request,
     rule_id: int,
+    db: Session = Depends(get_db),
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
-    with SessionLocal() as db:
-        rule = db.get(AlertRule, rule_id)
-        if rule is None:
-            return render_settings(
-                request, user, "email_alerting", message="Alert rule not found.", message_kind="error"
-            )
-        rule_name = rule.name
-        db.delete(rule)
-        db.commit()
-        emit_activity_event(
-            db,
-            event_type="alert_rule.deleted",
-            level=LOG_LEVEL_WARNING,
-            status="success",
-            actor_type="user",
-            actor_label=user,
-            message=f"Alert rule {rule_name!r} deleted",
-            details={"rule_id": rule_id, "rule_name": rule_name},
+    rule = db.get(AlertRule, rule_id)
+    if rule is None:
+        return render_settings(
+            request, user, "email_alerting", db=db, message="Alert rule not found.", message_kind="error"
         )
-    return render_settings(request, user, "email_alerting", message=f"Alert rule {rule_name!r} deleted.")
+    rule_name = rule.name
+    db.delete(rule)
+    db.commit()
+    emit_activity_event(
+        db,
+        event_type="alert_rule.deleted",
+        level=LOG_LEVEL_WARNING,
+        status="success",
+        actor_type="user",
+        actor_label=user,
+        message=f"Alert rule {rule_name!r} deleted",
+        details={"rule_id": rule_id, "rule_name": rule_name},
+    )
+    return render_settings(request, user, "email_alerting", db=db, message=f"Alert rule {rule_name!r} deleted.")

@@ -2,6 +2,7 @@ import asyncio
 
 from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
+from sqlmodel import Session
 from starlette.status import HTTP_202_ACCEPTED, HTTP_409_CONFLICT
 
 from .. import backup_service
@@ -10,7 +11,7 @@ from ..activity_logging import (
     emit_activity_event,
 )
 from ..backup_service import BackupError
-from ..db import SessionLocal
+from ..db import SessionLocal, get_db
 from ..event_types import (
     EVENT_SYSTEM_BACKUP_EXPORTED,
     EVENT_SYSTEM_BACKUP_IMPORT_FAILED,
@@ -47,6 +48,7 @@ def settings_backup_export(
     encrypt: str | None = Form(None),
     password: str = Form(""),
     password_confirm: str = Form(""),
+    db: Session = Depends(get_db),
     user: str = Depends(require_role(ROLE_GLOBAL_ADMIN)),
 ):
     selected = _backup_categories_from_form(categories)
@@ -55,6 +57,7 @@ def settings_backup_export(
             request,
             user,
             "backup",
+            db=db,
             section="export",
             message="Select at least one category to export.",
             message_kind="error",
@@ -66,39 +69,40 @@ def settings_backup_export(
                 request,
                 user,
                 "backup",
+                db=db,
                 section="export",
                 message="Backup passwords do not match.",
                 message_kind="error",
             )
     try:
-        with SessionLocal() as db:
-            payload = backup_service.build_payload(db, selected)
-            raw = backup_service.serialize_backup(payload, encrypt=do_encrypt, password=password or None)
-            emit_activity_event(
-                db,
-                event_type=EVENT_SYSTEM_BACKUP_EXPORTED,
-                level=LOG_LEVEL_WARNING,
-                category=LOG_CATEGORY_SECURITY,
-                status="success",
-                actor_type="user",
-                actor_id=user,
-                actor_label=user,
-                message="Configuration backup exported",
-                details={
-                    "categories": selected,
-                    "encrypted": do_encrypt,
-                    "bytes": len(raw),
-                },
-                request_method=request.method,
-                request_path=str(request.url.path),
-                request_ip=client_ip(request),
-            )
-            db.commit()
+        payload = backup_service.build_payload(db, selected)
+        raw = backup_service.serialize_backup(payload, encrypt=do_encrypt, password=password or None)
+        emit_activity_event(
+            db,
+            event_type=EVENT_SYSTEM_BACKUP_EXPORTED,
+            level=LOG_LEVEL_WARNING,
+            category=LOG_CATEGORY_SECURITY,
+            status="success",
+            actor_type="user",
+            actor_id=user,
+            actor_label=user,
+            message="Configuration backup exported",
+            details={
+                "categories": selected,
+                "encrypted": do_encrypt,
+                "bytes": len(raw),
+            },
+            request_method=request.method,
+            request_path=str(request.url.path),
+            request_ip=client_ip(request),
+        )
+        db.commit()
     except BackupError as exc:
         return render_settings(
             request,
             user,
             "backup",
+            db=db,
             section="export",
             message=str(exc),
             message_kind="error",
@@ -112,9 +116,11 @@ def settings_backup_export(
 
 
 @router.get("/settings/backup/import/progress", include_in_schema=False)
-def settings_backup_import_progress(user: str = Depends(require_role(ROLE_GLOBAL_ADMIN))):
-    with SessionLocal() as db:
-        return JSONResponse(backup_service.get_restore_progress(db))
+def settings_backup_import_progress(
+    db: Session = Depends(get_db),
+    user: str = Depends(require_role(ROLE_GLOBAL_ADMIN)),
+):
+    return JSONResponse(backup_service.get_restore_progress(db))
 
 
 def _run_backup_import_sync(
@@ -214,6 +220,7 @@ async def settings_backup_import_async(
     categories: list[str] = Form(default_factory=list),
     password: str = Form(""),
     confirm_replace: str | None = Form(None),
+    db: Session = Depends(get_db),
     user: str = Depends(require_role(ROLE_GLOBAL_ADMIN)),
 ):
     if (confirm_replace or "").strip() not in {"1", "true", "on", "yes"}:
@@ -242,8 +249,7 @@ async def settings_backup_import_async(
     except BackupError as exc:
         return JSONResponse({"detail": str(exc)}, status_code=400)
 
-    with SessionLocal() as db:
-        if not backup_service.try_begin_restore(db):
-            return JSONResponse({"detail": "A restore is already in progress."}, status_code=HTTP_409_CONFLICT)
+    if not backup_service.try_begin_restore(db):
+        return JSONResponse({"detail": "A restore is already in progress."}, status_code=HTTP_409_CONFLICT)
     asyncio.create_task(_run_backup_import(raw=raw, password=password, categories=selected, user=user))
     return JSONResponse({"status": "started"}, status_code=HTTP_202_ACCEPTED)
