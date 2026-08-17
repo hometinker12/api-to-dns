@@ -21,10 +21,12 @@ from ..http_utils import (
     http_exception_from_dns_error,
     wants_json_response,
 )
-from ..models import (
+from ..log_constants import (
     LOG_LEVEL_ERROR,
     LOG_LEVEL_INFORMATIONAL,
     LOG_LEVEL_WARNING,
+)
+from ..models import (
     ApiKeyAllowedZone,
     DnsZoneConfig,
     DnsZoneSummary,

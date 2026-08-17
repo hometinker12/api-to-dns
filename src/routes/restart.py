@@ -10,7 +10,7 @@ from ..db import get_db
 from ..http_utils import (
     wants_json_response,
 )
-from ..models import (
+from ..log_constants import (
     LOG_LEVEL_WARNING,
 )
 from ..rbac import (

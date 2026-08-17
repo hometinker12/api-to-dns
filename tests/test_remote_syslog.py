@@ -10,7 +10,8 @@ from datetime import UTC, datetime
 import pytest
 from fastapi.testclient import TestClient
 
-from src.models import LOG_LEVEL_ERROR, LOG_LEVEL_INFORMATIONAL, LOG_LEVEL_WARNING, ActivityLog
+from src.log_constants import LOG_LEVEL_ERROR, LOG_LEVEL_INFORMATIONAL, LOG_LEVEL_WARNING
+from src.models import ActivityLog
 from src.remote_syslog import (
     APP_NAME,
     ActivityLogSnapshot,

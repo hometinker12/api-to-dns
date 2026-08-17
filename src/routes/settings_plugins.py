@@ -6,7 +6,7 @@ from ..activity_logging import (
     emit_activity_event,
 )
 from ..db import get_db
-from ..models import (
+from ..log_constants import (
     LOG_LEVEL_INFORMATIONAL,
 )
 from ..rbac import (

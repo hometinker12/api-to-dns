@@ -10,11 +10,13 @@ from ..activity_logging import (
     emit_activity_event,
 )
 from ..db import get_db
+from ..log_constants import (
+    LOG_LEVEL_INFORMATIONAL,
+    LOG_LEVEL_WARNING,
+)
 from ..models import (
     API_KEY_ACCESS_MODES,
     API_KEY_ACCESS_READ_ONLY,
-    LOG_LEVEL_INFORMATIONAL,
-    LOG_LEVEL_WARNING,
     ApiKey,
     ApiKeyAllowedZone,
     DnsZoneConfig,

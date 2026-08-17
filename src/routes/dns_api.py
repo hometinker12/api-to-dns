@@ -16,10 +16,12 @@ from ..http_utils import (
     http_exception_from_dns_error,
     sanitize_client_error_message,
 )
-from ..models import (
+from ..log_constants import (
     LOG_LEVEL_ERROR,
     LOG_LEVEL_INFORMATIONAL,
     LOG_LEVEL_WARNING,
+)
+from ..models import (
     DnsRecordCreateRequest,
     DnsRecordGetResponse,
     DnsRecordPatchRequest,

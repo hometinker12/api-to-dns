@@ -18,7 +18,8 @@ from .activity_logging import (
 )
 from .db import SessionLocal
 from .letsencrypt import config_view as letsencrypt_config_view
-from .models import LOG_CATEGORY_VALUES, LOG_LEVEL_VALUES, AlertRule, User
+from .log_constants import LOG_CATEGORY_VALUES, LOG_LEVEL_VALUES
+from .models import AlertRule, User
 from .rbac import (
     BACKUP_SECTIONS,
     ROLE_ACCOUNT_RESET_PASSWORD,

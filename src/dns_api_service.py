@@ -17,11 +17,13 @@ from .dns_mutation import (
     record_exists_at_type,
 )
 from .http_utils import api_key_fingerprint, http_exception_from_dns_error, sanitize_client_error_message
-from .models import (
-    API_KEY_ACCESS_READ_WRITE,
+from .log_constants import (
     LOG_LEVEL_ERROR,
     LOG_LEVEL_INFORMATIONAL,
     LOG_LEVEL_WARNING,
+)
+from .models import (
+    API_KEY_ACCESS_READ_WRITE,
     ApiKey,
     ApiKeyAllowedZone,
     DnsRecordResponse,

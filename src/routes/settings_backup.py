@@ -17,7 +17,7 @@ from ..event_types import (
     EVENT_SYSTEM_BACKUP_IMPORT_FAILED,
     EVENT_SYSTEM_BACKUP_IMPORTED,
 )
-from ..models import (
+from ..log_constants import (
     LOG_CATEGORY_SECURITY,
     LOG_LEVEL_ERROR,
     LOG_LEVEL_WARNING,

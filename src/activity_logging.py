@@ -33,7 +33,7 @@ from typing import Any
 
 from sqlmodel import select
 
-from .models import (
+from .log_constants import (
     LOG_CATEGORY_ALERT,
     LOG_CATEGORY_SECURITY,
     LOG_CATEGORY_VALUES,
@@ -44,6 +44,8 @@ from .models import (
     LOG_LEVEL_VERBOSE,
     LOG_LEVEL_WARNING,
     SECURITY_EVENT_PREFIXES,
+)
+from .models import (
     ActivityLog,
     AlertRule,
 )

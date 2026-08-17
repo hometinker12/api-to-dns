@@ -13,7 +13,7 @@ from ..activity_logging import (
 )
 from ..db import SessionLocal, get_db
 from ..letsencrypt import LetsEncryptError
-from ..models import (
+from ..log_constants import (
     LOG_CATEGORY_SECURITY,
     LOG_LEVEL_WARNING,
 )
