@@ -758,6 +758,16 @@ jobs:
           assert "data-open-delete-zone" in html
           print("dashboard configured-zones controls assertions passed")
           PY
+          echo "[bind] Zone edit form uses the request-scoped session"
+          curl --fail --silent -b /tmp/cookies "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/edit" -o /tmp/zone-edit.html
+          python3 - <<'PY'
+          from pathlib import Path
+
+          html = Path("/tmp/zone-edit.html").read_text(encoding="utf-8", errors="replace")
+          assert "smoke.test" in html, html[:800]
+          assert 'name="dns_provider_type"' in html, html[:800]
+          print("zone edit form assertions passed")
+          PY
           zones_redirect="$(curl --silent --show-error -D /tmp/zones-redirect-headers -o /dev/null -w "%{http_code}" -b /tmp/cookies http://127.0.0.1:8000/zones)"
           if [ "${zones_redirect}" != "303" ]; then
             echo "Expected /zones to redirect to /admin; got ${zones_redirect}"
