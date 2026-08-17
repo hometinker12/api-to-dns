@@ -409,6 +409,16 @@ jobs:
           assert all("secure" not in line.lower() for line in cookie_lines), cookie_lines
           PY
           curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/openapi.json -o /tmp/openapi.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          schema = json.loads(Path("/tmp/openapi.json").read_text(encoding="utf-8"))
+          desc = schema["components"]["schemas"]["DnsRecordInfo"]["properties"]["record_type"]["description"]
+          for token in ("MX", "NS", "SRV", "CAA", "PTR", "SOA"):
+              assert token in desc, (token, desc)
+          print("DnsRecordInfo lookup-type description assertion passed")
+          PY
           docs_code="$(curl --silent --show-error -o /dev/null -w "%{http_code}" -b /tmp/cookies http://127.0.0.1:8000/docs)"
           if [ "${docs_code}" != "200" ]; then
             echo "Expected authenticated /docs to return 200; got ${docs_code}"
@@ -910,6 +920,7 @@ jobs:
             "${DNS_RECORD_URL}?zone_name=smoke.test&record_name=read-only&record_type=A" \
             | python3 -c "import json,sys; assert json.load(sys.stdin)['status'] == 'not_found'"
           call_read_only_dns_api POST "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"read-only","ttl":300,"values":["192.0.2.50"]}'
+          call_read_only_dns_api POST "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"read-only","ttl":300,"values":["not-an-ip"]}'
           call_read_only_dns_api PUT "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"read-only","ttl":300,"values":["192.0.2.50"]}'
           call_read_only_dns_api PATCH "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"read-only","values":["192.0.2.50"]}'
           call_read_only_dns_api DELETE "${DNS_RECORD_URL}?zone_name=smoke.test&record_name=read-only&record_type=A" ''
@@ -1013,6 +1024,16 @@ jobs:
             -d '{"record_name":"browser","record_type":"A","ttl":300,"values":["192.0.2.77"]}' \
             | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['action']=='created', b"
           wait_for_record_value browser.smoke.test 192.0.2.77
+          echo "[bind] DNS browser shared mutation guards reject apex NS"
+          curl --silent --show-error -b /tmp/cookies \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -o /tmp/apex-ns.json -w "%{http_code}" \
+            -X POST "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
+            -d '{"record_name":"@","record_type":"NS","ttl":300,"values":["ns.smoke.test"]}' \
+            | python3 -c "import json,sys; from pathlib import Path; code=sys.stdin.read().strip(); b=json.loads(Path('/tmp/apex-ns.json').read_text(encoding='utf-8')); assert code=='400', (code,b); msg=(b.get('detail') or {}).get('message') or ''; assert 'Apex NS' in msg, b"
           echo "[bind] DNS browser blank browse returns zone RRsets (AXFR)"
           curl --fail --silent -b /tmp/cookies \
             "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search" \

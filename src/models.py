@@ -177,7 +177,10 @@ class DnsRecordPatchRequest(BaseModel):
 
 class DnsRecordInfo(BaseModel):
     record_name: str = Field(..., description="Record name relative to the zone, e.g. www or @")
-    record_type: str = Field(..., description="DNS record type: A, AAAA, CNAME, or TXT")
+    record_type: str = Field(
+        ...,
+        description="DNS record type returned by lookup: A, AAAA, CNAME, TXT, MX, NS, SRV, CAA, PTR, or SOA.",
+    )
     ttl: int | None = Field(None, description="Time to live in seconds when the record exists.")
     values: list[str] | None = Field(
         None,

@@ -901,6 +901,21 @@ def test_dns_record_requires_api_key(client: TestClient) -> None:
     assert response.status_code == 401
 
 
+def test_dns_record_post_rejects_mx(client: TestClient, api_key_value: str) -> None:
+    response = client.post(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "MX",
+            "record_name": "www",
+            "ttl": 300,
+            "values": ["10 mail.example.com"],
+        },
+    )
+    assert response.status_code == 422
+
+
 def test_dns_record_with_mock_client(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = MagicMock()
     fake.get_record.return_value = []
