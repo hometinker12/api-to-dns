@@ -3,11 +3,12 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlmodel import select
 from starlette.status import HTTP_303_SEE_OTHER
 
-from ..activity_logging import LOGGER, emit_activity_event
+from ..activity_logging import emit_activity_event
 from ..auth import create_session_cookie, session_cookie_secure, session_cookie_settings
 from ..db import SessionLocal
 from ..log_constants import LOG_LEVEL_INFORMATIONAL, LOG_LEVEL_WARNING
 from ..models import User
+from ..operational_logging import LOGGER
 from ..security import DUMMY_PASSWORD_HASH, verify_password
 from ..web import client_ip, record_activity, render_error_response, templates
 

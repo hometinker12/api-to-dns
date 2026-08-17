@@ -7,7 +7,6 @@ from starlette.status import HTTP_202_ACCEPTED, HTTP_409_CONFLICT
 
 from .. import backup_service
 from ..activity_logging import (
-    LOGGER,
     emit_activity_event,
 )
 from ..backup_service import BackupError
@@ -22,6 +21,7 @@ from ..log_constants import (
     LOG_LEVEL_ERROR,
     LOG_LEVEL_WARNING,
 )
+from ..operational_logging import LOGGER
 from ..rbac import (
     ROLE_GLOBAL_ADMIN,
     require_role,

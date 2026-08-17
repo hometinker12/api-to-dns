@@ -14,9 +14,6 @@ from starlette.status import HTTP_303_SEE_OTHER
 
 from . import letsencrypt, ssl_certs
 from .activity_logging import (
-    LOGGER,
-    apply_remote_syslog_config,
-    configure_operational_logging,
     emit_activity_event,
     get_log_level,
     run_retention_cleanup,
@@ -31,6 +28,7 @@ from .csrf import csrf_origin_allowed, csrf_rejection_response
 from .db import SessionLocal, init_db
 from .log_constants import LOG_LEVEL_VERBOSE
 from .models import User
+from .operational_logging import LOGGER, configure_operational_logging
 from .paths import STATIC_DIR
 from .rate_limit import rate_limit_exceeded, rate_limit_rejection_response
 from .rbac import (
@@ -39,6 +37,7 @@ from .rbac import (
     ROLE_GLOBAL_ADMIN,
     serialize_roles,
 )
+from .remote_syslog import apply_remote_syslog_config
 from .restart import (
     apply_le_renewal_restart_policy,
     clear_le_renewal_pending_restart,
