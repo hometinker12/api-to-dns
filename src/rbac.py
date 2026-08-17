@@ -1,10 +1,9 @@
 from typing import Any
 
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Request
 from sqlmodel import select
 
-from .auth import get_current_user
-from .db import SessionLocal
+from .auth import get_current_user_db
 from .models import User
 
 ROLE_GLOBAL_ADMIN = "global.admin"
@@ -197,13 +196,16 @@ def get_user_roles(db, username: str) -> set[str]:
     return effective_roles(parse_roles(user_row.roles))
 
 
-def user_has_role(db, username: str, role: str) -> bool:
-    roles = get_user_roles(db, username)
+def roles_satisfy(roles: set[str], role: str) -> bool:
     return (
         ROLE_GLOBAL_ADMIN in roles
         or role in roles
         or (ROLE_GLOBAL_READ in roles and role in {ROLE_API_KEYS_READ, ROLE_DNS_ZONES_READ})
     )
+
+
+def user_has_role(db, username: str, role: str) -> bool:
+    return roles_satisfy(get_user_roles(db, username), role)
 
 
 def user_has_any_role(db, username: str, roles) -> bool:
@@ -280,10 +282,12 @@ def role_catalog_for_actor(db, actor: str) -> list[dict[str, Any]]:
 
 
 def require_role(role: str):
-    def _dependency(username: str = Depends(get_current_user)) -> str:
-        with SessionLocal() as db:
-            if not user_has_role(db, username, role):
-                raise HTTPException(status_code=403, detail=ROLE_FORBIDDEN_DETAIL)
+    def _dependency(request: Request, username: str = Depends(get_current_user_db)) -> str:
+        cached = getattr(request.state, "user_roles", None)
+        if cached is None:
+            raise HTTPException(status_code=401, detail="Invalid or expired session")
+        if not roles_satisfy(set(cached), role):
+            raise HTTPException(status_code=403, detail=ROLE_FORBIDDEN_DETAIL)
         return username
 
     return _dependency
