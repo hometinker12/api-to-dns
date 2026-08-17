@@ -22,6 +22,7 @@
 - Activity log levels, categories, and security event prefixes live in `src/log_constants.py`. `src/models.py` re-exports them for compatibility.
 - Operational Python logging and system identity helpers live in `src/operational_logging.py` and `src/system_identity.py`. SMTP alerting lives in `src/alerting.py`; remote syslog get/set/apply lives in `src/remote_syslog.py`. Callers import from those owner modules; `src/activity_logging.py` still re-exports the names for compatibility.
 - Public DNS request/response models live in `src/schemas/dns.py`. Callers import them from that module; SQLModel tables stay in `src/models.py`.
+- Startup warns when `DATABASE_URL` is not SQLite. `API_TO_DNS_ALLOW_NON_SQLITE=1` only silences that warning; it is not a support claim. Schema migrations stay hand-rolled and SQLite-only (no Alembic).
 
 ## [0.8.1] - 2026-08-11
 
