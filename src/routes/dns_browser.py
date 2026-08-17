@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from sqlmodel import Session
 
-from ..db import SessionLocal
+from ..db import get_db
 from ..dns_browser_service import (
     AdminRecordDelete,
     AdminRecordMutation,
@@ -20,11 +21,11 @@ router = APIRouter(tags=["dns-browser"])
 def dns_browser_page(
     request: Request,
     zone_id: int,
+    db: Session = Depends(get_db),
     user: str = Depends(require_role(ROLE_DNS_ZONES_UPDATE)),
 ):
     # Live DNS browse/search returns provider record data; require update role (not mandatory read).
-    with SessionLocal() as db:
-        ctx = browser_page_context(db, zone_id, user=user, can_update=True)
+    ctx = browser_page_context(db, zone_id, user=user, can_update=True)
     return templates.TemplateResponse(
         request=request,
         name="dns_browser.html",
@@ -35,12 +36,14 @@ def dns_browser_page(
 @router.get("/zones/{zone_id}/records/search", include_in_schema=False)
 def search_records(
     zone_id: int,
+    db: Session = Depends(get_db),
     record_name: str | None = Query(None),
     record_type: str | None = Query(None),
     user: str = Depends(require_role(ROLE_DNS_ZONES_UPDATE)),
 ):
     try:
         return lookup_admin_records(
+            db,
             zone_id,
             record_name=record_name,
             record_type=record_type,
@@ -64,9 +67,11 @@ def search_records(
 def create_record(
     zone_id: int,
     payload: AdminRecordMutation,
+    db: Session = Depends(get_db),
     user: str = Depends(require_role(ROLE_DNS_ZONES_UPDATE)),
 ):
     return mutate_admin_record(
+        db,
         zone_id,
         mode="create",
         record_name=payload.record_name,
@@ -81,9 +86,11 @@ def create_record(
 def replace_record(
     zone_id: int,
     payload: AdminRecordMutation,
+    db: Session = Depends(get_db),
     user: str = Depends(require_role(ROLE_DNS_ZONES_UPDATE)),
 ):
     return mutate_admin_record(
+        db,
         zone_id,
         mode="replace",
         record_name=payload.record_name,
@@ -98,9 +105,11 @@ def replace_record(
 def delete_record(
     zone_id: int,
     payload: AdminRecordDelete,
+    db: Session = Depends(get_db),
     user: str = Depends(require_role(ROLE_DNS_ZONES_UPDATE)),
 ):
     return mutate_admin_record(
+        db,
         zone_id,
         mode="delete",
         record_name=payload.record_name,

@@ -9,7 +9,6 @@ from starlette.status import HTTP_404_NOT_FOUND, HTTP_409_CONFLICT
 
 from . import zone_service
 from .activity_logging import emit_activity_event
-from .db import SessionLocal
 from .dns_mutation import (
     PatchMergeError,
     apply_patch_mutation,
@@ -226,6 +225,7 @@ def _record_exists_at_type(
 
 
 def _apply_dns_mutation(
+    db,
     *,
     api_key: str | None,
     zone_name: str | None,
@@ -252,114 +252,60 @@ def _apply_dns_mutation(
 
     rt_upper = (record_type or "").strip().upper()
 
-    with SessionLocal() as db:
-        key, zone_row, settings, actor_id, actor_label, provider = _resolve_dns_api_zone(
-            db,
-            api_key=api_key,
-            zone_name=zone_name or "",
-            record_name=record_name,
-            endpoint=endpoint,
-        )
-        _require_dns_api_key_write_access(
-            db,
-            key=key,
-            actor_id=actor_id,
-            actor_label=actor_label,
-            zone_name=zone_row.zone_name,
-            record_name=record_name,
-            endpoint=endpoint,
-        )
+    key, zone_row, settings, actor_id, actor_label, provider = _resolve_dns_api_zone(
+        db,
+        api_key=api_key,
+        zone_name=zone_name or "",
+        record_name=record_name,
+        endpoint=endpoint,
+    )
+    _require_dns_api_key_write_access(
+        db,
+        key=key,
+        actor_id=actor_id,
+        actor_label=actor_label,
+        zone_name=zone_row.zone_name,
+        record_name=record_name,
+        endpoint=endpoint,
+    )
 
-        try:
-            if provider in get_disabled_dns_plugins(db):
-                raise DnsProviderDisabledError(
-                    f"{dns_provider_display_name(provider)} is disabled. "
-                    "Enable it in Settings before using it for DNS operations."
-                )
-            client = zone_service.create_dns_client_from_settings(settings, db=db)
-            provider_domain = provider_dns_zone(settings)
-            prepared = prepare_mutation(
-                record_name=record_name,
-                record_type=rt_upper,
-                ttl=ttl if mode != "patch" else patch_ttl,
-                values=list(values) if mode not in ("delete", "patch") else list(patch_values or []),
-                dns_zone=provider_domain,
-                require_values=mode not in ("delete", "patch") or (mode == "patch" and patch_values is not None),
-                require_ttl=mode == "replace",
+    try:
+        if provider in get_disabled_dns_plugins(db):
+            raise DnsProviderDisabledError(
+                f"{dns_provider_display_name(provider)} is disabled. "
+                "Enable it in Settings before using it for DNS operations."
             )
+        client = zone_service.create_dns_client_from_settings(settings, db=db)
+        provider_domain = provider_dns_zone(settings)
+        prepared = prepare_mutation(
+            record_name=record_name,
+            record_type=rt_upper,
+            ttl=ttl if mode != "patch" else patch_ttl,
+            values=list(values) if mode not in ("delete", "patch") else list(patch_values or []),
+            dns_zone=provider_domain,
+            require_values=mode not in ("delete", "patch") or (mode == "patch" and patch_values is not None),
+            require_ttl=mode == "replace",
+        )
 
-            if mode == "patch":
-                try:
-                    outcome = apply_patch_mutation(
-                        client,
-                        settings=settings,
-                        zone_name=zone_row.zone_name,
-                        record_name=prepared.record_name,
-                        record_type=prepared.record_type,
-                        patch_ttl=prepared.ttl if patch_ttl is not None else None,
-                        patch_values=prepared.values if patch_values is not None else None,
-                    )
-                except PatchMergeError as exc:
-                    raise HTTPException(
-                        status_code=502,
-                        detail={
-                            "error": "dns_provider_failed",
-                            "message": str(exc),
-                        },
-                    ) from exc
-                body = DnsRecordResponse(
-                    status=outcome.status,
-                    action=outcome.action,
+        if mode == "patch":
+            try:
+                outcome = apply_patch_mutation(
+                    client,
+                    settings=settings,
                     zone_name=zone_row.zone_name,
-                    dns_zone=outcome.dns_zone,
-                    record_name=outcome.record_name,
-                    record_type=outcome.record_type,
-                    values=outcome.values,
+                    record_name=prepared.record_name,
+                    record_type=prepared.record_type,
+                    patch_ttl=prepared.ttl if patch_ttl is not None else None,
+                    patch_values=prepared.values if patch_values is not None else None,
                 )
-                if outcome.http_status == HTTP_404_NOT_FOUND:
-                    emit_activity_event(
-                        db,
-                        event_type="dns.record_not_found",
-                        level=LOG_LEVEL_WARNING,
-                        status="error",
-                        actor_type="api_key",
-                        actor_id=actor_id,
-                        actor_label=actor_label,
-                        zone_name=zone_row.zone_name,
-                        record_name=record_name,
-                        message=f"DNS record {record_name}.{provider_domain} {prepared.record_type} not found",
-                        details={"record_type": prepared.record_type, "provider": provider},
-                    )
-                    return JSONResponse(status_code=HTTP_404_NOT_FOUND, content=body.model_dump())
-                emit_activity_event(
-                    db,
-                    event_type="dns.record_updated",
-                    level=LOG_LEVEL_INFORMATIONAL,
-                    status="success",
-                    actor_type="api_key",
-                    actor_id=actor_id,
-                    actor_label=actor_label,
-                    zone_name=zone_row.zone_name,
-                    record_name=record_name,
-                    message=f"DNS record {record_name}.{provider_domain} updated",
-                    details={
-                        "record_type": prepared.record_type,
-                        "values_count": len(outcome.values),
-                        "provider": provider,
+            except PatchMergeError as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "error": "dns_provider_failed",
+                        "message": str(exc),
                     },
-                )
-                return body
-
-            outcome = apply_rrset_mutation(
-                client,
-                settings=settings,
-                zone_name=zone_row.zone_name,
-                record_name=prepared.record_name,
-                record_type=prepared.record_type,
-                ttl=prepared.ttl,
-                values=list(prepared.values),
-                mode=mode,  # type: ignore[arg-type]
-            )
+                ) from exc
             body = DnsRecordResponse(
                 status=outcome.status,
                 action=outcome.action,
@@ -369,21 +315,6 @@ def _apply_dns_mutation(
                 record_type=outcome.record_type,
                 values=outcome.values,
             )
-            if outcome.http_status == HTTP_409_CONFLICT:
-                emit_activity_event(
-                    db,
-                    event_type="dns.record_already_exists",
-                    level=LOG_LEVEL_WARNING,
-                    status="error",
-                    actor_type="api_key",
-                    actor_id=actor_id,
-                    actor_label=actor_label,
-                    zone_name=zone_row.zone_name,
-                    record_name=record_name,
-                    message=f"DNS record {record_name}.{provider_domain} {rt_upper} already exists",
-                    details={"record_type": rt_upper, "provider": provider},
-                )
-                return JSONResponse(status_code=HTTP_409_CONFLICT, content=body.model_dump())
             if outcome.http_status == HTTP_404_NOT_FOUND:
                 emit_activity_event(
                     db,
@@ -395,14 +326,13 @@ def _apply_dns_mutation(
                     actor_label=actor_label,
                     zone_name=zone_row.zone_name,
                     record_name=record_name,
-                    message=f"DNS record {record_name}.{provider_domain} {rt_upper} not found",
-                    details={"record_type": rt_upper, "provider": provider},
+                    message=f"DNS record {record_name}.{provider_domain} {prepared.record_type} not found",
+                    details={"record_type": prepared.record_type, "provider": provider},
                 )
                 return JSONResponse(status_code=HTTP_404_NOT_FOUND, content=body.model_dump())
-
             emit_activity_event(
                 db,
-                event_type=f"dns.record_{outcome.action}",
+                event_type="dns.record_updated",
                 level=LOG_LEVEL_INFORMATIONAL,
                 status="success",
                 actor_type="api_key",
@@ -410,34 +340,103 @@ def _apply_dns_mutation(
                 actor_label=actor_label,
                 zone_name=zone_row.zone_name,
                 record_name=record_name,
-                message=f"DNS record {record_name}.{provider_domain} {outcome.action}",
+                message=f"DNS record {record_name}.{provider_domain} updated",
                 details={
-                    "record_type": rt_upper,
-                    "values_count": len(values),
+                    "record_type": prepared.record_type,
+                    "values_count": len(outcome.values),
                     "provider": provider,
                 },
             )
             return body
-        except HTTPException:
-            raise
-        except Exception as exc:
-            mapped = http_exception_from_dns_error(exc)
-            sanitized_error = sanitize_client_error_message(exc, fallback="DNS provider error")
+
+        outcome = apply_rrset_mutation(
+            client,
+            settings=settings,
+            zone_name=zone_row.zone_name,
+            record_name=prepared.record_name,
+            record_type=prepared.record_type,
+            ttl=prepared.ttl,
+            values=list(prepared.values),
+            mode=mode,  # type: ignore[arg-type]
+        )
+        body = DnsRecordResponse(
+            status=outcome.status,
+            action=outcome.action,
+            zone_name=zone_row.zone_name,
+            dns_zone=outcome.dns_zone,
+            record_name=outcome.record_name,
+            record_type=outcome.record_type,
+            values=outcome.values,
+        )
+        if outcome.http_status == HTTP_409_CONFLICT:
             emit_activity_event(
                 db,
-                event_type="dns.provider_failed",
-                level=LOG_LEVEL_ERROR,
+                event_type="dns.record_already_exists",
+                level=LOG_LEVEL_WARNING,
                 status="error",
                 actor_type="api_key",
                 actor_id=actor_id,
                 actor_label=actor_label,
                 zone_name=zone_row.zone_name,
                 record_name=record_name,
-                message=sanitized_error,
-                details={
-                    "provider": provider,
-                    "record_type": rt_upper,
-                    "exception_type": type(exc).__name__,
-                },
+                message=f"DNS record {record_name}.{provider_domain} {rt_upper} already exists",
+                details={"record_type": rt_upper, "provider": provider},
             )
-            raise mapped from exc
+            return JSONResponse(status_code=HTTP_409_CONFLICT, content=body.model_dump())
+        if outcome.http_status == HTTP_404_NOT_FOUND:
+            emit_activity_event(
+                db,
+                event_type="dns.record_not_found",
+                level=LOG_LEVEL_WARNING,
+                status="error",
+                actor_type="api_key",
+                actor_id=actor_id,
+                actor_label=actor_label,
+                zone_name=zone_row.zone_name,
+                record_name=record_name,
+                message=f"DNS record {record_name}.{provider_domain} {rt_upper} not found",
+                details={"record_type": rt_upper, "provider": provider},
+            )
+            return JSONResponse(status_code=HTTP_404_NOT_FOUND, content=body.model_dump())
+
+        emit_activity_event(
+            db,
+            event_type=f"dns.record_{outcome.action}",
+            level=LOG_LEVEL_INFORMATIONAL,
+            status="success",
+            actor_type="api_key",
+            actor_id=actor_id,
+            actor_label=actor_label,
+            zone_name=zone_row.zone_name,
+            record_name=record_name,
+            message=f"DNS record {record_name}.{provider_domain} {outcome.action}",
+            details={
+                "record_type": rt_upper,
+                "values_count": len(values),
+                "provider": provider,
+            },
+        )
+        return body
+    except HTTPException:
+        raise
+    except Exception as exc:
+        mapped = http_exception_from_dns_error(exc)
+        sanitized_error = sanitize_client_error_message(exc, fallback="DNS provider error")
+        emit_activity_event(
+            db,
+            event_type="dns.provider_failed",
+            level=LOG_LEVEL_ERROR,
+            status="error",
+            actor_type="api_key",
+            actor_id=actor_id,
+            actor_label=actor_label,
+            zone_name=zone_row.zone_name,
+            record_name=record_name,
+            message=sanitized_error,
+            details={
+                "provider": provider,
+                "record_type": rt_upper,
+                "exception_type": type(exc).__name__,
+            },
+        )
+        raise mapped from exc
