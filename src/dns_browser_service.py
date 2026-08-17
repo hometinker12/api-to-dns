@@ -11,9 +11,8 @@ from pydantic import BaseModel, Field, model_validator
 
 from .activity_logging import emit_activity_event
 from .db import SessionLocal
-from .dns_mutation import apply_rrset_mutation
+from .dns_mutation import apply_rrset_mutation, prepare_mutation
 from .dns_record_types import (
-    guard_mutation_allowed,
     normalize_lookup_record_type,
     normalize_mutable_record_type,
     normalize_record_values,
@@ -232,20 +231,23 @@ def mutate_admin_record(
         provider = (settings.get("dns_provider_type") or "azure").strip().lower()
         dns_zone = provider_dns_zone(settings)
         try:
-            rt = normalize_mutable_record_type(record_type)
-            name = record_name.strip()
-            guard_mutation_allowed(record_name=name, record_type=rt, dns_zone=dns_zone)
-            final_ttl = validate_ttl(ttl) if mode != "delete" else (ttl or 300)
-            final_values = normalize_record_values(rt, list(values or [])) if mode != "delete" else []
+            prepared = prepare_mutation(
+                record_name=record_name,
+                record_type=record_type,
+                ttl=ttl,
+                values=list(values or []),
+                dns_zone=dns_zone,
+                require_values=mode != "delete",
+            )
             client = create_dns_client_from_settings(settings, db=db)
             outcome = apply_rrset_mutation(
                 client,
                 settings=settings,
                 zone_name=row.zone_name,
-                record_name=name,
-                record_type=rt,
-                ttl=final_ttl,
-                values=final_values,
+                record_name=prepared.record_name,
+                record_type=prepared.record_type,
+                ttl=prepared.ttl,
+                values=list(prepared.values),
                 mode=mode,
             )
         except HTTPException:

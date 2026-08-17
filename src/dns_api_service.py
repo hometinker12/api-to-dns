@@ -10,7 +10,13 @@ from starlette.status import HTTP_404_NOT_FOUND, HTTP_409_CONFLICT
 from . import zone_service
 from .activity_logging import emit_activity_event
 from .db import SessionLocal
-from .dns_mutation import apply_rrset_mutation, record_exists_at_type
+from .dns_mutation import (
+    PatchMergeError,
+    apply_patch_mutation,
+    apply_rrset_mutation,
+    prepare_mutation,
+    record_exists_at_type,
+)
 from .http_utils import api_key_fingerprint, http_exception_from_dns_error, sanitize_client_error_message
 from .models import (
     API_KEY_ACCESS_READ_WRITE,
@@ -19,7 +25,6 @@ from .models import (
     LOG_LEVEL_WARNING,
     ApiKey,
     ApiKeyAllowedZone,
-    DnsRecordRequest,
     DnsRecordResponse,
     DnsZoneConfig,
 )
@@ -273,24 +278,45 @@ def _apply_dns_mutation(
                 )
             client = zone_service.create_dns_client_from_settings(settings, db=db)
             provider_domain = provider_dns_zone(settings)
+            prepared = prepare_mutation(
+                record_name=record_name,
+                record_type=rt_upper,
+                ttl=ttl if mode != "patch" else patch_ttl,
+                values=list(values) if mode not in ("delete", "patch") else list(patch_values or []),
+                dns_zone=provider_domain,
+                require_values=mode not in ("delete", "patch") or (mode == "patch" and patch_values is not None),
+                require_ttl=mode == "replace",
+            )
 
             if mode == "patch":
-                records = client.get_record(
-                    record_name=record_name,
-                    record_type=rt_upper,
-                    dns_server=settings.get("dns_server"),
-                    dns_zone=provider_domain,
-                )
-                if not records:
-                    body = DnsRecordResponse(
-                        status="error",
-                        action="not_found",
+                try:
+                    outcome = apply_patch_mutation(
+                        client,
+                        settings=settings,
                         zone_name=zone_row.zone_name,
-                        dns_zone=provider_domain,
-                        record_name=record_name,
-                        record_type=rt_upper,
-                        values=list(patch_values or []),
+                        record_name=prepared.record_name,
+                        record_type=prepared.record_type,
+                        patch_ttl=prepared.ttl if patch_ttl is not None else None,
+                        patch_values=prepared.values if patch_values is not None else None,
                     )
+                except PatchMergeError as exc:
+                    raise HTTPException(
+                        status_code=502,
+                        detail={
+                            "error": "dns_provider_failed",
+                            "message": str(exc),
+                        },
+                    ) from exc
+                body = DnsRecordResponse(
+                    status=outcome.status,
+                    action=outcome.action,
+                    zone_name=zone_row.zone_name,
+                    dns_zone=outcome.dns_zone,
+                    record_name=outcome.record_name,
+                    record_type=outcome.record_type,
+                    values=outcome.values,
+                )
+                if outcome.http_status == HTTP_404_NOT_FOUND:
                     emit_activity_event(
                         db,
                         event_type="dns.record_not_found",
@@ -301,43 +327,10 @@ def _apply_dns_mutation(
                         actor_label=actor_label,
                         zone_name=zone_row.zone_name,
                         record_name=record_name,
-                        message=f"DNS record {record_name}.{provider_domain} {rt_upper} not found",
-                        details={"record_type": rt_upper, "provider": provider},
+                        message=f"DNS record {record_name}.{provider_domain} {prepared.record_type} not found",
+                        details={"record_type": prepared.record_type, "provider": provider},
                     )
                     return JSONResponse(status_code=HTTP_404_NOT_FOUND, content=body.model_dump())
-
-                existing = records[0]
-                if existing.ttl is None or not existing.values:
-                    raise HTTPException(
-                        status_code=502,
-                        detail={
-                            "error": "dns_provider_failed",
-                            "message": "Could not read existing TTL and values for PATCH merge.",
-                        },
-                    )
-                final_ttl = patch_ttl if patch_ttl is not None else existing.ttl
-                final_values = list(patch_values) if patch_values is not None else list(existing.values)
-                internal = DnsRecordRequest(
-                    zone_name=zone_row.zone_name,
-                    record_type=rt_upper,
-                    record_name=record_name,
-                    ttl=final_ttl,
-                    values=final_values,
-                )
-                client.create_or_update_record(
-                    internal,
-                    dns_server=settings.get("dns_server"),
-                    dns_zone=provider_domain,
-                )
-                body = DnsRecordResponse(
-                    status="success",
-                    action="updated",
-                    zone_name=zone_row.zone_name,
-                    dns_zone=provider_domain,
-                    record_name=record_name,
-                    record_type=rt_upper,
-                    values=final_values,
-                )
                 emit_activity_event(
                     db,
                     event_type="dns.record_updated",
@@ -350,8 +343,8 @@ def _apply_dns_mutation(
                     record_name=record_name,
                     message=f"DNS record {record_name}.{provider_domain} updated",
                     details={
-                        "record_type": rt_upper,
-                        "values_count": len(final_values),
+                        "record_type": prepared.record_type,
+                        "values_count": len(outcome.values),
                         "provider": provider,
                     },
                 )
@@ -361,10 +354,10 @@ def _apply_dns_mutation(
                 client,
                 settings=settings,
                 zone_name=zone_row.zone_name,
-                record_name=record_name,
-                record_type=rt_upper,
-                ttl=ttl,
-                values=list(values),
+                record_name=prepared.record_name,
+                record_type=prepared.record_type,
+                ttl=prepared.ttl,
+                values=list(prepared.values),
                 mode=mode,  # type: ignore[arg-type]
             )
             body = DnsRecordResponse(
