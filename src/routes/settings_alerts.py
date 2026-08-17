@@ -6,11 +6,13 @@ from ..activity_logging import (
     emit_activity_event,
 )
 from ..db import get_db
-from ..models import (
+from ..log_constants import (
     LOG_CATEGORY_VALUES,
     LOG_LEVEL_INFORMATIONAL,
     LOG_LEVEL_VALUES,
     LOG_LEVEL_WARNING,
+)
+from ..models import (
     AlertRule,
 )
 from ..rbac import (

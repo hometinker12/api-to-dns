@@ -22,13 +22,15 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
-from .models import (
+from .log_constants import (
     LOG_LEVEL_ERROR,
     LOG_LEVEL_INFORMATIONAL,
     LOG_LEVEL_ORDER,
     LOG_LEVEL_VALUES,
     LOG_LEVEL_VERBOSE,
     LOG_LEVEL_WARNING,
+)
+from .models import (
     ActivityLog,
 )
 

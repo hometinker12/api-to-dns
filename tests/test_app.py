@@ -22,13 +22,15 @@ from src.app import app
 from src.auth import SESSION_IDLE_TIMEOUT_SECONDS, create_session_cookie
 from src.db import SessionLocal, init_db
 from src.dns_client import create_dns_client, discover_plugins, dns_provider_display_name
-from src.models import (
-    API_KEY_ACCESS_READ_ONLY,
+from src.log_constants import (
     LOG_CATEGORY_SECURITY,
     LOG_LEVEL_ERROR,
     LOG_LEVEL_INFORMATIONAL,
     LOG_LEVEL_VERBOSE,
     LOG_LEVEL_WARNING,
+)
+from src.models import (
+    API_KEY_ACCESS_READ_ONLY,
     ActivityLog,
     AlertRule,
     ApiKey,

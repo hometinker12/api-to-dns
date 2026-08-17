@@ -13,9 +13,11 @@ from ..auth import (
     session_cookie_settings,
 )
 from ..db import get_db
-from ..models import (
+from ..log_constants import (
     LOG_LEVEL_INFORMATIONAL,
     LOG_LEVEL_WARNING,
+)
+from ..models import (
     User,
 )
 from ..rbac import (

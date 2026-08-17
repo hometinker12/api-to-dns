@@ -19,6 +19,7 @@
 - Persistent encrypted settings use a typed registry (`src.settings_registry`) with bool/int/JSON accessors. Unknown restored keys still read; unregistered writes log at DEBUG. Startup logs unknown `Setting` row names without deleting them.
 - Let's Encrypt renewal runs in a worker thread with its own DB session so ACME/DNS work cannot stall the asyncio loop. Enrollment and backup restore concurrency gates are stored in the encrypted settings table. Run a single uvicorn worker (entrypoint and `serve` pass `--workers 1`); shutdown signaling, the remote syslog queue, and BIND AXFR slots remain process-local. Startup drops an unreadable restore-progress row so an application-secrets restore cannot brick the next boot.
 - Authenticated requests load the user once via a request-scoped DB session (`Depends(get_db)`). `require_role` uses roles cached on `request.state` instead of opening a second session. Middleware, rate limits, and background workers keep their own sessions. `/ready`, `/system/restart`, zone/API-key admin pages, the public DNS API, the DNS browser, settings users/plugins/system, SSL/Let’s Encrypt, backup, and alert pages use the request session. Enrollment and restore progress workers still open their own sessions.
+- Activity log levels, categories, and security event prefixes live in `src/log_constants.py`. `src/models.py` re-exports them for compatibility.
 
 ## [0.8.1] - 2026-08-11
 

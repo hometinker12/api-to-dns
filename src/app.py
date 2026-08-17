@@ -29,7 +29,8 @@ from .auth import (
 )
 from .csrf import csrf_origin_allowed, csrf_rejection_response
 from .db import SessionLocal, init_db
-from .models import LOG_LEVEL_VERBOSE, User
+from .log_constants import LOG_LEVEL_VERBOSE
+from .models import User
 from .paths import STATIC_DIR
 from .rate_limit import rate_limit_exceeded, rate_limit_rejection_response
 from .rbac import (

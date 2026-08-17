@@ -19,7 +19,7 @@ from ..db import get_db
 from ..event_types import (
     EVENT_SYSTEM_SYSLOG_UPDATED,
 )
-from ..models import (
+from ..log_constants import (
     LOG_LEVEL_INFORMATIONAL,
 )
 from ..rbac import (

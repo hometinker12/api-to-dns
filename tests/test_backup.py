@@ -27,10 +27,10 @@ from src.backup_service import (
     serialize_backup,
 )
 from src.db import SessionLocal
+from src.log_constants import LOG_LEVEL_INFORMATIONAL
 from src.models import (
     API_KEY_ACCESS_READ_ONLY,
     API_KEY_ACCESS_READ_WRITE,
-    LOG_LEVEL_INFORMATIONAL,
     ActivityLog,
     AlertRule,
     ApiKey,
