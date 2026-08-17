@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Security
+
+- **CVE-2026-53615**: upgrade Debian `util-linux` / `libblkid` packages in the container image to `2.41.5-0+deb13u1` (integer overflow in DOS extended partition parsing).
+
 ### Fixed
 
 - Settings → Authentication **View roles**, **Edit roles**, and **Reset password** dialogs open again. After admin scripts moved to `/static/settings.js`, open/close used a `dataset` key that did not match `data-open-edit-roles` (and the same pattern for view-roles and reset-password), so `showModal()` targeted a missing element.
