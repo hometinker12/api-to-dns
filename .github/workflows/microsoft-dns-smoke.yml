@@ -317,15 +317,6 @@ jobs:
             echo "API container process is running as root"
             exit 1
           fi
-          API_CMDLINE="$(docker exec dns-api-test tr '\0' ' ' < /proc/1/cmdline)"
-          echo "dns-api-test cmdline: ${API_CMDLINE}"
-          case " ${API_CMDLINE} " in
-            *" --workers 1 "*|*" --workers=1 "*) ;;
-            *)
-              echo "Expected uvicorn --workers 1; got: ${API_CMDLINE}"
-              exit 1
-              ;;
-          esac
 
           for i in $(seq 1 60); do
             # Probe /health (not /login) so readiness checks do not consume RATE_LIMIT_LOGIN.
@@ -338,6 +329,17 @@ jobs:
             fi
             sleep 2
           done
+
+          # Read /proc/1/cmdline inside the container (host-side < redirects to the runner).
+          API_CMDLINE="$(docker exec dns-api-test sh -c 'tr "\0" " " < /proc/1/cmdline')"
+          echo "dns-api-test cmdline: ${API_CMDLINE}"
+          case " ${API_CMDLINE} " in
+            *" --workers 1 "*|*" --workers=1 "*) ;;
+            *)
+              echo "Expected uvicorn --workers 1; got: ${API_CMDLINE}"
+              exit 1
+              ;;
+          esac
 
           echo "[bind] Security defaults: authenticated OpenAPI/docs, headers, CSRF, logout method"
           schema_code="$(curl --silent --show-error -o /dev/null -w "%{http_code}" "http://127.0.0.1:8000/openapi.json")"
@@ -1236,7 +1238,7 @@ jobs:
             docker compose down -v --remove-orphans || true
             exit 1
           fi
-          COMPOSE_CMDLINE="$(docker compose exec -T dns-api tr '\0' ' ' < /proc/1/cmdline | tr -d '\r')"
+          COMPOSE_CMDLINE="$(docker compose exec -T dns-api sh -c 'tr "\0" " " < /proc/1/cmdline' | tr -d '\r')"
           echo "compose dns-api cmdline: ${COMPOSE_CMDLINE}"
           case " ${COMPOSE_CMDLINE} " in
             *" --workers 1 "*|*" --workers=1 "*) ;;
