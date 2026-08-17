@@ -27,10 +27,10 @@ from src.backup_service import (
     serialize_backup,
 )
 from src.db import SessionLocal
+from src.log_constants import LOG_LEVEL_INFORMATIONAL
 from src.models import (
     API_KEY_ACCESS_READ_ONLY,
     API_KEY_ACCESS_READ_WRITE,
-    LOG_LEVEL_INFORMATIONAL,
     ActivityLog,
     AlertRule,
     ApiKey,
@@ -207,7 +207,7 @@ def test_round_trip_restore_replaces_categories(client: TestClient) -> None:
         db.commit()
 
         restored = load_backup_bytes(raw, "password1")
-        with patch("src.app.perform_application_restart") as restart_mock:
+        with patch("src.restart.perform_application_restart") as restart_mock:
             # Direct restore (unit path); secrets would restart via route.
             result = restore_payload(
                 db,
@@ -232,8 +232,8 @@ def test_round_trip_restore_replaces_categories(client: TestClient) -> None:
 
 
 def test_import_async_progress_and_restart(client: TestClient) -> None:
-    from src.app import _run_backup_import_sync
     from src.backup_service import set_import_in_progress
+    from src.routes.settings_backup import _run_backup_import_sync
 
     _admin_client(client)
     with SessionLocal() as db:
@@ -245,8 +245,8 @@ def test_import_async_progress_and_restart(client: TestClient) -> None:
 
     set_import_in_progress(False)
     try:
-        with patch("src.app.perform_application_restart") as restart_mock:
-            with patch("src.app.asyncio.create_task") as create_task:
+        with patch("src.routes.settings_backup.perform_application_restart") as restart_mock:
+            with patch("src.routes.settings_backup.asyncio.create_task") as create_task:
 
                 def _discard(coro):
                     coro.close()
@@ -283,6 +283,71 @@ def test_import_async_progress_and_restart(client: TestClient) -> None:
             assert get_setting(db, "app_dns_name") == "async.example.com"
     finally:
         set_import_in_progress(False)
+
+
+def test_import_async_rejects_concurrent(client: TestClient) -> None:
+    from src.backup_service import try_begin_restore
+
+    _admin_client(client)
+    with SessionLocal() as db:
+        payload = build_payload(db, [CATEGORY_SETTINGS, CATEGORY_APPLICATION_SECRETS])
+        raw = serialize_backup(payload, encrypt=True, password="password1")
+        assert try_begin_restore(db) is True
+    response = client.post(
+        "/settings/backup/import-async",
+        data={
+            "categories": [CATEGORY_SETTINGS, CATEGORY_APPLICATION_SECRETS],
+            "password": "password1",
+            "confirm_replace": "1",
+        },
+        files={"backup_file": ("test.atdb", raw, "application/octet-stream")},
+    )
+    assert response.status_code == 409
+    with SessionLocal() as db:
+        from src.backup_service import clear_restore_progress
+
+        clear_restore_progress(db)
+
+
+def test_try_begin_restore_is_exclusive(client: TestClient) -> None:
+    from src.backup_service import clear_restore_progress, try_begin_restore, write_restore_progress
+
+    with SessionLocal() as db:
+        clear_restore_progress(db)
+        assert try_begin_restore(db) is True
+        assert try_begin_restore(db) is False
+        write_restore_progress(
+            db,
+            phase="complete",
+            percent=100,
+            message="Restore complete.",
+            done=True,
+            result_status="success",
+        )
+        assert try_begin_restore(db) is True
+        clear_restore_progress(db)
+
+
+def test_clear_stale_restore_progress_drops_undecryptable_row(client: TestClient) -> None:
+    from cryptography.fernet import Fernet
+    from sqlmodel import select
+
+    from src.backup_service import SETTING_BACKUP_PROGRESS, clear_stale_restore_progress, get_restore_progress
+    from src.models import Setting
+
+    foreign = Fernet(Fernet.generate_key()).encrypt(b'{"phase":"complete","done":true}').decode()
+    with SessionLocal() as db:
+        row = db.exec(select(Setting).where(Setting.name == SETTING_BACKUP_PROGRESS)).first()
+        if row:
+            row.value = foreign
+            db.add(row)
+        else:
+            db.add(Setting(name=SETTING_BACKUP_PROGRESS, value=foreign))
+        db.commit()
+        clear_stale_restore_progress(db)
+        leftover = db.exec(select(Setting).where(Setting.name == SETTING_BACKUP_PROGRESS)).first()
+        assert leftover is None
+        assert get_restore_progress(db)["phase"] == "idle"
 
 
 def test_import_requires_confirm(client: TestClient) -> None:

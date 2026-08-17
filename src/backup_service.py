@@ -11,6 +11,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
+from cryptography.fernet import InvalidToken
 from sqlmodel import select
 
 from . import env_bootstrap
@@ -33,8 +34,8 @@ from .models import (
     User,
 )
 from .rbac import ROLE_GLOBAL_ADMIN, effective_roles, parse_roles, serialize_roles
-from .security import pwd_context
-from .settings_store import delete_setting, get_setting, set_setting
+from .security import decrypt_value, pwd_context
+from .settings_store import begin_immediate, delete_setting, get_typed_setting_by_key, set_typed_setting_by_key
 from .ssl_certs import CERT_FILENAME, KEY_FILENAME, SOURCE_FILENAME, cert_dir
 from .time_utils import utc_now
 from .version import get_app_version
@@ -116,20 +117,9 @@ SSL_FILE_NAMES = (KEY_FILENAME, CERT_FILENAME, SOURCE_FILENAME, ACME_ACCOUNT_KEY
 
 ProgressCallback = Callable[[str, int, str], None]
 
-_IMPORT_IN_PROGRESS = False
-
 
 class BackupError(RuntimeError):
     """Raised when backup export or import cannot proceed."""
-
-
-def import_in_progress() -> bool:
-    return _IMPORT_IN_PROGRESS
-
-
-def set_import_in_progress(value: bool) -> None:
-    global _IMPORT_IN_PROGRESS
-    _IMPORT_IN_PROGRESS = bool(value)
 
 
 def write_restore_progress(
@@ -152,25 +142,16 @@ def write_restore_progress(
         "result_status": result_status,
         "restarting": bool(restarting),
     }
-    set_setting(db, SETTING_BACKUP_PROGRESS, json.dumps(payload))
+    set_typed_setting_by_key(db, SETTING_BACKUP_PROGRESS, payload)
     db.commit()
 
 
 def get_restore_progress(db) -> dict[str, Any]:
-    raw = get_setting(db, SETTING_BACKUP_PROGRESS)
-    if not raw:
-        return {
-            "phase": "idle",
-            "percent": 0,
-            "message": "Idle",
-            "done": False,
-            "error": None,
-            "result_status": None,
-            "restarting": False,
-        }
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
+        data = get_typed_setting_by_key(db, SETTING_BACKUP_PROGRESS)
+    except (ValueError, InvalidToken):
+        data = {}
+    if not isinstance(data, dict):
         data = {}
     return {
         "phase": data.get("phase") or "idle",
@@ -181,6 +162,73 @@ def get_restore_progress(db) -> dict[str, Any]:
         "result_status": data.get("result_status"),
         "restarting": bool(data.get("restarting")),
     }
+
+
+def _restore_is_running(progress: dict[str, Any]) -> bool:
+    if bool(progress.get("done")):
+        return False
+    phase = str(progress.get("phase") or "idle").strip().lower()
+    return phase not in {"", "idle"}
+
+
+def is_restore_in_progress(db) -> bool:
+    return _restore_is_running(get_restore_progress(db))
+
+
+def try_begin_restore(db, *, message: str = "Starting restore…") -> bool:
+    """Atomically mark restore as starting. Returns False if already running."""
+    begin_immediate(db)
+    if is_restore_in_progress(db):
+        db.rollback()
+        return False
+    write_restore_progress(db, phase="starting", percent=0, message=message)
+    return True
+
+
+def mark_restore_worker_finished(db) -> None:
+    if is_restore_in_progress(db):
+        write_restore_progress(
+            db,
+            phase="error",
+            percent=100,
+            message="Restore worker ended unexpectedly.",
+            done=True,
+            error="Restore worker ended unexpectedly.",
+            result_status="error",
+        )
+
+
+def clear_stale_restore_progress(db) -> None:
+    """Drop in-progress or unreadable restore rows (e.g. after ENCRYPTION_KEY restore)."""
+    row = db.exec(select(Setting).where(Setting.name == SETTING_BACKUP_PROGRESS)).first()
+    if row is None:
+        return
+    try:
+        decrypt_value(row.value)
+    except Exception:
+        LOGGER.warning("Restore progress could not be decrypted after startup; dropping the row")
+        delete_setting(db, SETTING_BACKUP_PROGRESS)
+        return
+    if is_restore_in_progress(db):
+        clear_restore_progress(db)
+
+
+def import_in_progress() -> bool:
+    from .db import SessionLocal
+
+    with SessionLocal() as db:
+        return is_restore_in_progress(db)
+
+
+def set_import_in_progress(value: bool) -> None:
+    """Compatibility helper: map the old process flag onto DB-backed restore progress."""
+    from .db import SessionLocal
+
+    with SessionLocal() as db:
+        if value:
+            write_restore_progress(db, phase="starting", percent=0, message="Starting restore…")
+        elif is_restore_in_progress(db):
+            clear_restore_progress(db)
 
 
 def clear_restore_progress(db) -> None:

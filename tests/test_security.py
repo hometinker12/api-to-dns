@@ -16,7 +16,7 @@ def test_get_app_version_matches_version_file() -> None:
     get_app_version.cache_clear()
     expected = (Path(__file__).resolve().parents[1] / "VERSION").read_text(encoding="utf-8").strip()
     assert get_app_version() == expected
-    assert expected == "0.8.1"
+    assert expected == "0.8.5"
 
 
 def test_fastapi_app_version_matches_version_file() -> None:
@@ -93,8 +93,7 @@ def test_api_key_fingerprint_only_defined_in_http_utils() -> None:
     import src.http_utils as http_utils
 
     assert callable(http_utils.api_key_fingerprint)
-    # Local duplicate at bottom of app.py was removed; attribute should be the import.
-    assert app_module.api_key_fingerprint is http_utils.api_key_fingerprint
+    assert not hasattr(app_module, "api_key_fingerprint")
 
 
 def test_hash_api_key_is_sha256_hex() -> None:
@@ -216,6 +215,33 @@ def test_disabled_plugin_blocks_dns_client_creation(client: TestClient) -> None:
             with pytest.raises(DnsProviderDisabledError):
                 create_dns_client_from_settings(cfg, db=db)
         finally:
+            set_disabled_dns_plugins(db, set())
+
+
+def test_disabled_plugin_returns_503_on_dns_record(client: TestClient, api_key_value: str) -> None:
+    from src.db import SessionLocal
+    from src.zone_service import decode_zone_config, list_dns_zones, set_disabled_dns_plugins
+
+    with SessionLocal() as db:
+        zone = next(z for z in list_dns_zones(db) if z.zone_name == "example.com")
+        cfg = decode_zone_config(zone)
+        set_disabled_dns_plugins(db, {cfg["dns_provider_type"]})
+    try:
+        response = client.post(
+            "/dns-record",
+            headers={"X-API-Key": api_key_value},
+            json={
+                "zone_name": "example.com",
+                "record_type": "A",
+                "record_name": "www",
+                "ttl": 300,
+                "values": ["192.0.2.1"],
+            },
+        )
+        assert response.status_code == 503
+        assert response.json()["detail"]["error"] == "provider_disabled"
+    finally:
+        with SessionLocal() as db:
             set_disabled_dns_plugins(db, set())
 
 
@@ -396,7 +422,12 @@ def test_enabled_openapi_requires_dashboard_session(client: TestClient) -> None:
     assert oauth_redirect.headers["location"] == "/login"
 
     client.cookies.set("session", create_session_cookie("admin"))
-    assert client.get("/openapi.json").status_code == 200
+    from src.version import get_app_version
+
+    get_app_version.cache_clear()
+    schema = client.get("/openapi.json")
+    assert schema.status_code == 200
+    assert schema.json()["info"]["version"] == get_app_version()
     assert client.get("/docs").status_code == 200
     assert client.get("/redoc").status_code == 200
     assert client.get("/docs/oauth2-redirect").status_code == 200
@@ -415,9 +446,9 @@ def test_api_keys_hides_api_docs_link_when_openapi_disabled(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import src.app as app_module
+    import src.routes.api_keys as api_keys_module
 
-    monkeypatch.setattr(app_module, "_OPENAPI_ON", False)
+    monkeypatch.setattr(api_keys_module, "_OPENAPI_ON", False)
     client.cookies.set("session", create_session_cookie("admin"))
     response = client.get("/api-keys")
     assert response.status_code == 200

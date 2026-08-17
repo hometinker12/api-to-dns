@@ -55,7 +55,7 @@ body:
     attributes:
       label: Version
       description: Value from the VERSION file, image tag, or commit SHA.
-      placeholder: "0.8.1 or abc1234"
+      placeholder: "0.8.5 or abc1234"
     validations:
       required: true
   - type: dropdown

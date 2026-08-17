@@ -43,12 +43,16 @@ CERT_DIR="$SSL_DIR"
 GRACEFUL_SHUTDOWN="${UVICORN_GRACEFUL_SHUTDOWN_SECONDS:-10}"
 EXTRA="${UVICORN_EXTRA_ARGS:-}"
 
+# Single uvicorn worker is required (LE/backup progress, syslog queue, AXFR slots).
+# Do not add --workers via UVICORN_EXTRA_ARGS; this entrypoint forces one worker.
 if [ "$MODE" = "https" ]; then
   exec uvicorn src.app:app --host 0.0.0.0 --port "$TLS_PORT" \
     --timeout-graceful-shutdown "$GRACEFUL_SHUTDOWN" $EXTRA \
     --ssl-keyfile "$CERT_DIR/server.key" \
-    --ssl-certfile "$CERT_DIR/server.crt"
+    --ssl-certfile "$CERT_DIR/server.crt" \
+    --workers 1
 else
   exec uvicorn src.app:app --host 0.0.0.0 --port "$HTTP_PORT" \
-    --timeout-graceful-shutdown "$GRACEFUL_SHUTDOWN" $EXTRA
+    --timeout-graceful-shutdown "$GRACEFUL_SHUTDOWN" $EXTRA \
+    --workers 1
 fi

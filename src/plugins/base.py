@@ -1,6 +1,8 @@
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
+
+from ..schemas.dns import DnsRecordInfo, DnsRecordListResult, DnsRecordRequest
 
 
 @dataclass(frozen=True)
@@ -23,11 +25,44 @@ DNS_ZONE_DOMAIN_FIELD = PluginField(
 )
 
 
+class DnsProviderClient(Protocol):
+    """Structural contract for clients returned by ``DnsProviderPlugin.create_client``.
+
+    Implementations are duck-typed; they do not need to inherit this Protocol.
+    """
+
+    def get_record(
+        self,
+        *,
+        record_name: str,
+        record_type: str | None = None,
+        dns_server: str | None = None,
+        dns_zone: str | None = None,
+    ) -> list[DnsRecordInfo]: ...
+
+    def list_records(
+        self,
+        *,
+        name_pattern: str | None = None,
+        record_type: str | None = None,
+        limit: int = 100,
+        dns_server: str | None = None,
+        dns_zone: str | None = None,
+    ) -> DnsRecordListResult: ...
+
+    def create_or_update_record(
+        self,
+        payload: DnsRecordRequest,
+        dns_server: str | None = None,
+        dns_zone: str | None = None,
+    ) -> bool: ...
+
+
 @dataclass(frozen=True)
 class DnsProviderPlugin:
     """Provider registration entry.
 
-    Clients created by ``create_client`` must implement:
+    Clients created by ``create_client`` must satisfy :class:`DnsProviderClient`:
 
     - ``get_record(record_name=..., record_type=None, dns_server=None, dns_zone=None)``
       returning ``list[DnsRecordInfo]`` using canonical value formats from
@@ -47,7 +82,7 @@ class DnsProviderPlugin:
     heading: str
     help_text: str
     fields: list[PluginField]
-    create_client: Callable[[dict[str, str | None]], Any]
+    create_client: Callable[[dict[str, str | None]], DnsProviderClient]
 
 
 def plugin_to_template_dict(plugin: DnsProviderPlugin) -> dict[str, Any]:

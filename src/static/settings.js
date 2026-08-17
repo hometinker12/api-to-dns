@@ -80,17 +80,14 @@ bindDialog("#open-change-password", "#close-change-password, #cancel-change-pass
   ["reset-password", "reset-password-dialog"],
   ["edit-alert", "edit-alert-dialog"],
 ].forEach(([name, dialogPrefix]) => {
-  const suffix = name.replace(/-([a-z])/g, (_, character) => character.toUpperCase());
-  const openKey = `open${suffix}`;
-  const closeKey = `close${suffix}`;
   document.querySelectorAll(`[data-open-${name}]`).forEach((button) => {
     button.addEventListener("click", () => {
-      document.getElementById(`${dialogPrefix}-${button.dataset[openKey]}`)?.showModal();
+      document.getElementById(`${dialogPrefix}-${button.getAttribute(`data-open-${name}`)}`)?.showModal();
     });
   });
   document.querySelectorAll(`[data-close-${name}]`).forEach((button) => {
     button.addEventListener("click", () => {
-      document.getElementById(`${dialogPrefix}-${button.dataset[closeKey]}`)?.close();
+      document.getElementById(`${dialogPrefix}-${button.getAttribute(`data-close-${name}`)}`)?.close();
     });
   });
 });

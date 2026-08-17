@@ -27,10 +27,10 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, rsa
 from cryptography.x509.oid import NameOID
 
-from .activity_logging import get_app_dns_name
 from .db import SessionLocal, init_db
 from .hostnames import validate_dns_hostname
-from .settings_store import get_setting, set_setting
+from .settings_store import get_typed_setting_by_key, set_typed_setting_by_key
+from .system_identity import get_app_dns_name
 
 LOGGER = logging.getLogger("api_to_dns")
 
@@ -130,13 +130,14 @@ def _coerce_truthy(raw: str | None) -> bool | None:
 
 
 def is_ssl_enabled(db) -> bool:
-    stored = get_setting(db, SETTING_SSL_ENABLED)
-    coerced = _coerce_truthy(stored)
-    return bool(coerced) if coerced is not None else False
+    try:
+        return bool(get_typed_setting_by_key(db, SETTING_SSL_ENABLED))
+    except ValueError:
+        return False
 
 
 def set_ssl_enabled(db, enabled: bool) -> bool:
-    set_setting(db, SETTING_SSL_ENABLED, "true" if enabled else "false")
+    set_typed_setting_by_key(db, SETTING_SSL_ENABLED, bool(enabled))
     return bool(enabled)
 
 
@@ -532,8 +533,10 @@ def _uvicorn_command(mode: str) -> list:
             str(key_path),
             "--ssl-certfile",
             str(cert_path),
+            "--workers",
+            "1",
         ]
-    return base + ["--port", str(http_port()), *extra]
+    return base + ["--port", str(http_port()), *extra, "--workers", "1"]
 
 
 def serve() -> int:

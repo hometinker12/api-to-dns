@@ -7,7 +7,6 @@ configured zone plugins as the public DNS API.
 
 from __future__ import annotations
 
-import json
 import os
 import time
 from collections.abc import Callable
@@ -19,11 +18,14 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-from .activity_logging import emit_activity_event, get_app_dns_name
-from .models import LOG_LEVEL_INFORMATIONAL, DnsRecordRequest, DnsZoneConfig
+from .activity_logging import emit_activity_event
+from .log_constants import LOG_LEVEL_INFORMATIONAL
+from .models import DnsZoneConfig
+from .schemas.dns import DnsRecordRequest
 from .security import decrypt_value, encrypt_value
-from .settings_store import delete_setting, get_setting, set_setting
+from .settings_store import begin_immediate, delete_setting, get_typed_setting_by_key, set_typed_setting_by_key
 from .ssl_certs import SOURCE_LETSENCRYPT, _read_source, cert_dir, cert_metadata, install_letsencrypt_cert
+from .system_identity import get_app_dns_name
 from .zone_service import (
     create_dns_client_from_settings,
     decode_zone_config,
@@ -96,18 +98,15 @@ def _emit_le_dns_audit(
 
 
 def _read_json_setting(db, name: str) -> dict[str, Any] | None:
-    raw = get_setting(db, name)
-    if not raw:
-        return None
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
+        parsed = get_typed_setting_by_key(db, name)
+    except (KeyError, ValueError):
         return None
     return parsed if isinstance(parsed, dict) else None
 
 
 def _write_json_setting(db, name: str, value: dict[str, Any]) -> None:
-    set_setting(db, name, json.dumps(value, sort_keys=True))
+    set_typed_setting_by_key(db, name, value)
 
 
 def get_config(db) -> dict[str, Any] | None:
@@ -169,6 +168,52 @@ def get_enrollment_progress(db) -> dict[str, Any]:
 
 def clear_enrollment_progress(db) -> None:
     delete_setting(db, SETTING_ENROLLMENT_PROGRESS)
+
+
+def _enrollment_is_running(progress: dict[str, Any]) -> bool:
+    if bool(progress.get("done")):
+        return False
+    phase = str(progress.get("phase") or "idle").strip().lower()
+    return phase not in {"", "idle"}
+
+
+def is_enrollment_in_progress(db) -> bool:
+    return _enrollment_is_running(get_enrollment_progress(db))
+
+
+def try_begin_enrollment(db, *, message: str = "Starting enrollment...") -> bool:
+    """Atomically mark enrollment as starting. Returns False if already running."""
+    begin_immediate(db)
+    if is_enrollment_in_progress(db):
+        db.rollback()
+        return False
+    write_enrollment_progress(db, phase="starting", percent=0, message=message)
+    return True
+
+
+def mark_enrollment_worker_finished(db) -> None:
+    """If a worker exits without writing a terminal status, fail the gate closed."""
+    if is_enrollment_in_progress(db):
+        write_enrollment_progress(
+            db,
+            phase="error",
+            percent=0,
+            message="Enrollment worker ended unexpectedly.",
+            done=True,
+            error="Enrollment worker ended unexpectedly.",
+        )
+
+
+def maybe_renew_certificate_standalone() -> dict[str, Any] | None:
+    """Renew using a thread-owned session; never pass a loop-owned session here."""
+    from .db import SessionLocal
+    from .restart import apply_le_renewal_restart_policy
+
+    with SessionLocal() as db:
+        result = maybe_renew_certificate(db)
+        if result:
+            apply_le_renewal_restart_policy(db, result.get("config") or {})
+        return result
 
 
 def _noop_progress(_phase: str, _percent: int, _message: str) -> None:

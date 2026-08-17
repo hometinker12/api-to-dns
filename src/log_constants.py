@@ -1,0 +1,60 @@
+"""Shared activity-log levels, categories, and security event prefixes.
+
+ORM models, audit logging, and remote syslog import these constants so they
+do not depend on each other merely for string values.
+"""
+
+LOG_LEVEL_VERBOSE = "VERBOSE"
+LOG_LEVEL_INFORMATIONAL = "INFORMATIONAL"
+LOG_LEVEL_WARNING = "WARNING"
+LOG_LEVEL_ERROR = "ERROR"
+LOG_LEVEL_VALUES = (LOG_LEVEL_VERBOSE, LOG_LEVEL_INFORMATIONAL, LOG_LEVEL_WARNING, LOG_LEVEL_ERROR)
+LOG_LEVEL_ORDER = {LOG_LEVEL_VERBOSE: 0, LOG_LEVEL_INFORMATIONAL: 10, LOG_LEVEL_WARNING: 20, LOG_LEVEL_ERROR: 30}
+
+LOG_CATEGORY_SECURITY = "security"
+LOG_CATEGORY_HTTP = "http"
+LOG_CATEGORY_DNS = "dns"
+LOG_CATEGORY_PLUGIN = "plugin"
+LOG_CATEGORY_DNS_ZONE = "dns_zone"
+LOG_CATEGORY_ALERT = "alert"
+LOG_CATEGORY_ALERT_RULE = "alert_rule"
+LOG_CATEGORY_SYSTEM = "system"
+LOG_CATEGORY_USER = "user"
+LOG_CATEGORY_VALUES = (
+    LOG_CATEGORY_SECURITY,
+    LOG_CATEGORY_HTTP,
+    LOG_CATEGORY_DNS,
+    LOG_CATEGORY_PLUGIN,
+    LOG_CATEGORY_DNS_ZONE,
+    LOG_CATEGORY_ALERT,
+    LOG_CATEGORY_ALERT_RULE,
+    LOG_CATEGORY_SYSTEM,
+    LOG_CATEGORY_USER,
+)
+
+# Event types with these prefixes always use the security category (see infer_event_category).
+SECURITY_EVENT_PREFIXES = (
+    "auth.",
+    "api_key.",
+    "user.",
+)
+
+__all__ = [
+    "LOG_CATEGORY_ALERT",
+    "LOG_CATEGORY_ALERT_RULE",
+    "LOG_CATEGORY_DNS",
+    "LOG_CATEGORY_DNS_ZONE",
+    "LOG_CATEGORY_HTTP",
+    "LOG_CATEGORY_PLUGIN",
+    "LOG_CATEGORY_SECURITY",
+    "LOG_CATEGORY_SYSTEM",
+    "LOG_CATEGORY_USER",
+    "LOG_CATEGORY_VALUES",
+    "LOG_LEVEL_ERROR",
+    "LOG_LEVEL_INFORMATIONAL",
+    "LOG_LEVEL_ORDER",
+    "LOG_LEVEL_VALUES",
+    "LOG_LEVEL_VERBOSE",
+    "LOG_LEVEL_WARNING",
+    "SECURITY_EVENT_PREFIXES",
+]

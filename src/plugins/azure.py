@@ -1,5 +1,6 @@
 from ..dns_record_types import (
     LOOKUP_RECORD_TYPES,
+    MUTABLE_RECORD_TYPES,
     format_caa,
     format_mx,
     format_srv,
@@ -9,7 +10,7 @@ from ..dns_record_types import (
     parse_mx,
     parse_srv,
 )
-from ..models import DnsRecordInfo, DnsRecordListResult, DnsRecordRequest
+from ..schemas.dns import DnsRecordInfo, DnsRecordListResult, DnsRecordRequest
 from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
 from .utils import dns_relative_name, lookup_record_types_to_query, record_name_matches
 
@@ -57,13 +58,13 @@ class AzureDnsClient:
             raise ValueError("DNS zone (domain) is required in the zone configuration.")
 
         client = self.DnsManagementClient(self.credential, self.subscription_id)
-        record_set_name = payload.record_name.strip(".") or "@"
+        record_set_name = dns_relative_name(dns_zone, payload.record_name)
         record_type = payload.record_type.upper()
 
         if record_type == "DELETE":
             inner = payload.values[0].strip().upper()
-            if inner == "SOA":
-                raise ValueError("SOA records are view-only and cannot be deleted.")
+            if inner not in MUTABLE_RECORD_TYPES:
+                raise ValueError(f"Unsupported record type for Azure DNS: {inner}")
             existing = self._get_existing_record_set(
                 client,
                 self.resource_group,
@@ -84,8 +85,8 @@ class AzureDnsClient:
                 return False
             return True
 
-        if record_type == "SOA":
-            raise ValueError("SOA records are view-only and cannot be created or updated.")
+        if record_type not in MUTABLE_RECORD_TYPES:
+            raise ValueError(f"Unsupported record type for Azure DNS: {record_type}")
 
         existing = self._get_existing_record_set(
             client,
@@ -120,7 +121,7 @@ class AzureDnsClient:
         if not dns_zone:
             raise ValueError("DNS zone (domain) is required in the zone configuration.")
 
-        record_set_name = record_name.strip(".") or "@"
+        record_set_name = dns_relative_name(dns_zone, record_name)
         display_name = record_set_name
         client = self.DnsManagementClient(self.credential, self.subscription_id)
         types_to_query = lookup_record_types_to_query(record_type)

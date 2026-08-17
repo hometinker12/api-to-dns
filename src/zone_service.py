@@ -38,9 +38,10 @@ __all__ = [
     "test_zone_record_lookup",
     "zones_using_dns_provider",
 ]
-from .models import ActivityLog, ApiKey, ApiKeyAllowedZone, DnsRecordInfo, DnsZoneConfig
+from .models import ActivityLog, ApiKey, ApiKeyAllowedZone, DnsZoneConfig
+from .schemas.dns import DnsRecordInfo
 from .security import decrypt_value, encrypt_value
-from .settings_store import delete_setting, get_setting, set_setting
+from .settings_store import delete_setting, get_setting, get_typed_setting_by_key, set_typed_setting_by_key
 
 DISABLED_DNS_PLUGINS_SETTING = "disabled_dns_plugins"
 
@@ -95,12 +96,9 @@ def create_dns_client_from_settings(settings: dict, db=None):
 
 
 def get_disabled_dns_plugins(db) -> set[str]:
-    raw = get_setting(db, DISABLED_DNS_PLUGINS_SETTING)
-    if not raw:
-        return set()
     try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
+        parsed = get_typed_setting_by_key(db, DISABLED_DNS_PLUGINS_SETTING)
+    except ValueError:
         return set()
     if not isinstance(parsed, list):
         return set()
@@ -112,7 +110,7 @@ def set_disabled_dns_plugins(db, plugin_keys) -> None:
     known_keys = get_known_dns_provider_keys()
     cleaned = sorted({str(key).strip().lower() for key in plugin_keys if str(key).strip().lower() in known_keys})
     if cleaned:
-        set_setting(db, DISABLED_DNS_PLUGINS_SETTING, json.dumps(cleaned))
+        set_typed_setting_by_key(db, DISABLED_DNS_PLUGINS_SETTING, cleaned)
     else:
         delete_setting(db, DISABLED_DNS_PLUGINS_SETTING)
 

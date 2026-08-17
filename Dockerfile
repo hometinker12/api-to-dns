@@ -23,7 +23,7 @@
 
 FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
 
-ARG VERSION=0.8.1
+ARG VERSION=0.8.5
 
 LABEL org.opencontainers.image.title="api-to-dns" \
       org.opencontainers.image.description="DNS REST API and admin UI (Azure, Cloudflare, Microsoft DNS, BIND/TSIG)" \
@@ -40,8 +40,18 @@ ENV PYTHONUNBUFFERED=1 \
     TLS_PORT=8443
 
 # openssl is used by the self-signed cert generator in src/ssl_certs.py.
+# Upgrade util-linux/libblkid for CVE-2026-53615 (Debian trixie 2.41.5-0+deb13u1).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends openssl \
+        bsdutils \
+        libblkid1 \
+        liblastlog2-2 \
+        libmount1 \
+        libsmartcols1 \
+        libuuid1 \
+        login \
+        mount \
+        util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 app \
     && useradd --uid 10001 --gid 10001 --home-dir /app --shell /usr/sbin/nologin app

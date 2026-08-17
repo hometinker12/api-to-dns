@@ -1,8 +1,9 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
+from sqlmodel import Session
 
-from ..db import SessionLocal
+from ..db import get_db
 
 router = APIRouter(tags=["health"])
 
@@ -13,10 +14,9 @@ def health() -> dict:
 
 
 @router.get("/ready", include_in_schema=False)
-def ready():
+def ready(db: Session = Depends(get_db)):
     try:
-        with SessionLocal() as db:
-            db.exec(text("SELECT 1"))
+        db.exec(text("SELECT 1"))
     except Exception:
         return JSONResponse(status_code=503, content={"status": "not_ready"})
     return {"status": "ready"}

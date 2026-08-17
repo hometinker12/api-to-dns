@@ -11,7 +11,7 @@ import dns.update
 import dns.xfr
 
 from ..dns_record_types import MUTABLE_RECORD_TYPES, normalize_record_values
-from ..models import DnsRecordInfo, DnsRecordListResult, DnsRecordRequest
+from ..schemas.dns import DnsRecordInfo, DnsRecordListResult, DnsRecordRequest
 from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
 from .utils import (
     LOOKUP_RECORD_TYPES,
@@ -28,6 +28,7 @@ from .utils import (
 # fewer than ``limit`` matched the browse/glob filter.
 _AXFR_MAX_RRSETS_SCANNED = 5_000
 # Cap concurrent BIND transfers process-wide so browse storms cannot open unbounded TCP AXFRs.
+# Process-local semaphore; multi-worker uvicorn is unsupported.
 _AXFR_MAX_CONCURRENT = 2
 _AXFR_SLOTS = threading.BoundedSemaphore(_AXFR_MAX_CONCURRENT)
 

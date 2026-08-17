@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime
 
 from fastapi.testclient import TestClient
@@ -5,7 +6,12 @@ from fastapi.testclient import TestClient
 import src.app as app_module
 import src.letsencrypt as letsencrypt_module
 import src.ssl_certs as ssl_certs_module
-from src.app import _apply_le_renewal_restart_policy, _maybe_scheduled_le_restart, startup_event
+from src.app import (
+    _apply_le_renewal_restart_policy,
+    _maybe_scheduled_le_restart,
+    _run_letsencrypt_renewal_once,
+    startup_event,
+)
 from src.auth import create_session_cookie
 from src.db import SessionLocal
 from src.restart import (
@@ -188,7 +194,7 @@ def test_scheduled_restart_due_once_per_day(client: TestClient) -> None:
 
 
 def test_restart_route_clears_flag_without_sigterm(client: TestClient, monkeypatch) -> None:
-    monkeypatch.setattr(app_module, "perform_application_restart", lambda *, scheduled=False: None)
+    monkeypatch.setattr("src.routes.restart.perform_application_restart", lambda *, scheduled=False: None)
     client.cookies.set("session", create_session_cookie("admin"))
     with SessionLocal() as db:
         mark_restart_required(db, reason="test")
@@ -197,3 +203,33 @@ def test_restart_route_clears_flag_without_sigterm(client: TestClient, monkeypat
     assert response.json()["status"] == "restarting"
     with SessionLocal() as db:
         assert is_restart_required(db) is False
+
+
+def test_renewal_once_dispatches_via_to_thread(client: TestClient, monkeypatch) -> None:
+    recorded: list[object] = []
+
+    async def fake_to_thread(func, /, *args, **kwargs):
+        recorded.append(func)
+        return None
+
+    monkeypatch.setattr(app_module.asyncio, "to_thread", fake_to_thread)
+    asyncio.run(_run_letsencrypt_renewal_once())
+    assert recorded == [letsencrypt_module.maybe_renew_certificate_standalone]
+
+
+def test_maybe_renew_certificate_standalone_applies_restart(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(
+        letsencrypt_module,
+        "maybe_renew_certificate",
+        lambda _db: {"status": "renewed", "config": {"scheduled_restart_enabled": False}},
+    )
+    with SessionLocal() as db:
+        clear_restart_required(db)
+        clear_le_renewal_pending_restart(db)
+    result = letsencrypt_module.maybe_renew_certificate_standalone()
+    assert result is not None
+    assert result["status"] == "renewed"
+    with SessionLocal() as db:
+        assert is_restart_required(db) is True
+        assert is_le_renewal_pending_restart(db) is False
+        clear_restart_required(db)

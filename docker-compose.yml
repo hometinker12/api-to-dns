@@ -1,6 +1,6 @@
 services:
   dns-api:
-    image: hometinker12/api-to-dns:0.8.1
+    image: hometinker12/api-to-dns:0.8.5
     build: .
     user: "10001:10001"
     read_only: true
@@ -10,9 +10,12 @@ services:
       - no-new-privileges:true
     tmpfs:
       - /tmp:size=64M,mode=1777
+    # Bind to loopback so the unauthenticated-by-default HTTP admin UI is not
+    # published on every host interface. Override to 0.0.0.0 only when a
+    # reverse proxy on another host must reach this container (see README).
     ports:
-      - "8001:8000"
-      - "8443:8443"
+      - "127.0.0.1:8001:8000"
+      - "127.0.0.1:8443:8443"
     # Secrets and optional knobs come from .env (copy from .env.example).
     # Do not duplicate live values here — Compose environment: below only
     # overrides paths/ports that must differ inside the container.
@@ -52,6 +55,7 @@ services:
       - api-to-dns-ssl:/app/data/ssl
       - api-to-dns-logs:/app/logs
     restart: unless-stopped
+    # Single uvicorn worker is required; the image entrypoint passes --workers 1.
     healthcheck:
       test: ["CMD", "python", "-m", "src.ssl_certs", "healthcheck"]
       interval: 30s

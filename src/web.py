@@ -1,4 +1,3 @@
-import html
 import traceback
 from typing import Any
 
@@ -6,8 +5,9 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
-from .activity_logging import LOGGER, emit_activity_event
+from .activity_logging import emit_activity_event
 from .db import SessionLocal
+from .operational_logging import LOGGER
 from .paths import TEMPLATES_DIR
 from .rbac import (
     ROLE_API_KEYS_READ,
@@ -37,31 +37,38 @@ def record_activity(**kwargs: Any) -> None:
         LOGGER.exception("emit_activity_event failed for event %s", kwargs.get("event_type"))
 
 
+def render_error_page(
+    *,
+    status_code: int,
+    title: str,
+    heading: str,
+    message: str,
+    back_href: str = "/admin",
+    back_label: str = "Back to dashboard",
+    debug_traceback: str | None = None,
+) -> HTMLResponse:
+    """Render a branded HTML error using the shared admin template and assets."""
+    content = templates.get_template("error.html").render(
+        {
+            "title": title,
+            "heading": heading,
+            "message": message,
+            "back_href": back_href,
+            "back_label": back_label,
+            "debug_traceback": debug_traceback,
+        }
+    )
+    return HTMLResponse(content=content, status_code=status_code)
+
+
 def render_access_denied_response() -> HTMLResponse:
-    return HTMLResponse(
-        content=(
-            "<!DOCTYPE html><html><head><title>Access denied</title>"
-            "<script>(function(){var k='api-to-dns-theme';var s=localStorage.getItem(k);"
-            "var t=(s==='light'||s==='dark')?s:(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');"
-            "document.documentElement.setAttribute('data-theme',t);})();</script>"
-            '<link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=2" />'
-            '<link rel="stylesheet" href="/static/style.css" /></head>'
-            '<body><div class="page">'
-            '<a class="app-brand" href="/admin" aria-label="api-to-dns dashboard">'
-            '<img class="app-brand-mark" src="/static/logo-mark.svg?v=2" alt="" />'
-            '<span class="app-brand-name">api-to-dns</span></a>'
-            "<h1>Access denied</h1>"
-            f'<div class="alert error">{html.escape(ROLE_FORBIDDEN_DETAIL)}</div>'
-            '<p><a class="button" href="/admin">Back to dashboard</a></p>'
-            "</div>"
-            '<footer class="app-version-footer">'
-            '<a href="https://github.com/hometinker12/api-to-dns" target="_blank" '
-            'rel="noopener noreferrer" title="api-to-dns on GitHub">'
-            f"<code>api-to-dns v{html.escape(get_app_version())}</code></a>"
-            "</footer>"
-            "</body></html>"
-        ),
+    return render_error_page(
         status_code=403,
+        title="Access denied",
+        heading="Access denied",
+        message=ROLE_FORBIDDEN_DETAIL,
+        back_href="/admin",
+        back_label="Back to dashboard",
     )
 
 
@@ -94,8 +101,16 @@ def render_error_response(request: Request, error: Exception, status_code: int =
     from .security import debug_errors_enabled
 
     if debug_errors_enabled():
-        detail = f"<p>{html.escape(str(error))}</p><pre>{html.escape(traceback_text)}</pre>"
-    else:
-        detail = "<p>An unexpected error occurred. Details are available in the server logs.</p>"
-    content = f"<html><body><h1>Application error</h1>{detail}</body></html>"
-    return HTMLResponse(content=content, status_code=status_code)
+        return render_error_page(
+            status_code=status_code,
+            title="Application error",
+            heading="Application error",
+            message=str(error),
+            debug_traceback=traceback_text,
+        )
+    return render_error_page(
+        status_code=status_code,
+        title="Application error",
+        heading="Application error",
+        message="An unexpected error occurred. Details are available in the server logs.",
+    )

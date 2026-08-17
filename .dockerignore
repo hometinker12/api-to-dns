@@ -11,3 +11,4 @@ data/
 tests/
 debug-*.log
 *.db
+.plans/

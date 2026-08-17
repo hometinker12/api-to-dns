@@ -13,7 +13,7 @@ from ..dns_record_types import (
     normalize_lookup_record_type,
     normalize_record_value,
 )
-from ..models import DnsRecordInfo
+from ..schemas.dns import DnsRecordInfo
 
 __all__ = [
     "LOOKUP_RECORD_TYPES",
@@ -52,7 +52,7 @@ def winrm_record_type_to_api(ps_type: str) -> str:
 def dns_relative_name(zone_name: str, record_name: str) -> str:
     z = zone_name.strip().rstrip(".")
     r = record_name.strip().rstrip(".")
-    if not r or r == "@":
+    if not r or r == "@" or r.lower() == z.lower():
         return "@"
     suffix = "." + z
     if r.lower().endswith(suffix.lower()):

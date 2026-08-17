@@ -76,6 +76,13 @@ jobs:
           IMAGE_TAG="api-to-dns-bind-smoke:$(date +%s)"
           docker build . --file Dockerfile --tag "$IMAGE_TAG"
           echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+          EXPECTED_VERSION="$(tr -d '\r\n' < VERSION)"
+          OCI_VERSION="$(docker image inspect "$IMAGE_TAG" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')"
+          if [ "$OCI_VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "Expected org.opencontainers.image.version=${EXPECTED_VERSION}; got ${OCI_VERSION}"
+            exit 1
+          fi
+          echo "OCI version label ${OCI_VERSION} matches VERSION"
 
       - name: Scan smoke image with Trivy
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -330,6 +337,20 @@ jobs:
             sleep 2
           done
 
+          curl --fail --silent http://127.0.0.1:8000/ready \
+            | python3 -c "import json,sys; assert json.load(sys.stdin)=={'status':'ready'}"
+
+          # Read /proc/1/cmdline inside the container (host-side < redirects to the runner).
+          API_CMDLINE="$(docker exec dns-api-test sh -c 'tr "\0" " " < /proc/1/cmdline')"
+          echo "dns-api-test cmdline: ${API_CMDLINE}"
+          case " ${API_CMDLINE} " in
+            *" --workers 1 "*|*" --workers=1 "*) ;;
+            *)
+              echo "Expected uvicorn --workers 1; got: ${API_CMDLINE}"
+              exit 1
+              ;;
+          esac
+
           echo "[bind] Security defaults: authenticated OpenAPI/docs, headers, CSRF, logout method"
           schema_code="$(curl --silent --show-error -o /dev/null -w "%{http_code}" "http://127.0.0.1:8000/openapi.json")"
           if [ "${schema_code}" != "401" ]; then
@@ -409,6 +430,18 @@ jobs:
           assert all("secure" not in line.lower() for line in cookie_lines), cookie_lines
           PY
           curl --fail --silent -b /tmp/cookies http://127.0.0.1:8000/openapi.json -o /tmp/openapi.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          schema = json.loads(Path("/tmp/openapi.json").read_text(encoding="utf-8"))
+          version = Path("VERSION").read_text(encoding="utf-8").strip()
+          assert schema["info"]["version"] == version, schema.get("info")
+          desc = schema["components"]["schemas"]["DnsRecordInfo"]["properties"]["record_type"]["description"]
+          for token in ("MX", "NS", "SRV", "CAA", "PTR", "SOA"):
+              assert token in desc, (token, desc)
+          print("OpenAPI version + DnsRecordInfo lookup-type description assertions passed")
+          PY
           docs_code="$(curl --silent --show-error -o /dev/null -w "%{http_code}" -b /tmp/cookies http://127.0.0.1:8000/docs)"
           if [ "${docs_code}" != "200" ]; then
             echo "Expected authenticated /docs to return 200; got ${docs_code}"
@@ -443,12 +476,12 @@ jobs:
           nav = html.split('<nav class="nav-links">', 1)[1].split("</nav>", 1)[0]
           assert nav.index('href="/api-keys"') < nav.index('href="/admin"') < nav.index('href="/settings"') < nav.index('action="/logout"'), nav
           version = Path("VERSION").read_text(encoding="utf-8").strip()
-          assert version == "0.8.1", version
+          assert version == "0.8.5", version
           assert f"api-to-dns v{version}" in html, html[-400:]
-          assert 'version = "0.8.1"' in Path("pyproject.toml").read_text(encoding="utf-8")
-          assert "ARG VERSION=0.8.1" in Path("Dockerfile").read_text(encoding="utf-8")
-          assert "hometinker12/api-to-dns:0.8.1" in Path("docker-compose.yml").read_text(encoding="utf-8")
-          print("admin nav + 0.8.1 metadata assertions passed")
+          assert 'version = "0.8.5"' in Path("pyproject.toml").read_text(encoding="utf-8")
+          assert "ARG VERSION=0.8.5" in Path("Dockerfile").read_text(encoding="utf-8")
+          assert "hometinker12/api-to-dns:0.8.5" in Path("docker-compose.yml").read_text(encoding="utf-8")
+          print("admin nav + 0.8.5 metadata assertions passed")
           PY
 
           echo "[bind] Static brand assets (favicon + logo mark)"
@@ -616,6 +649,47 @@ jobs:
               page.locator('button[type="submit"]').click(),
             ]);
 
+            const assertNamedDialog = async (name, dialogPrefix) => {
+              const button = page.locator(`[data-open-${name}]`).first();
+              if (!(await button.count())) {
+                throw new Error(`Expected [data-open-${name}]`);
+              }
+              const id = await button.getAttribute(`data-open-${name}`);
+              await button.click();
+              const dialog = page.locator(`#${dialogPrefix}-${id}`);
+              if (!(await dialog.evaluate((el) => el.open))) {
+                throw new Error(`${dialogPrefix} did not open`);
+              }
+              await page.locator(`[data-close-${name}="${id}"]`).first().click();
+              if (await dialog.evaluate((el) => el.open)) {
+                throw new Error(`${dialogPrefix} did not close`);
+              }
+            };
+
+            await page.goto(`${baseUrl}/settings?area=authentication`);
+            await assertNamedDialog("view-roles", "view-roles-dialog");
+            await page.locator("#open-create-user").click();
+            if (!(await page.locator("#create-user-dialog").evaluate((dialog) => dialog.open))) {
+              throw new Error("Create user dialog did not open");
+            }
+            await page.locator('#create-user-dialog input[name="username"]').fill("smoke-dialog-user");
+            await page.locator('#create-user-dialog input[name="password"]').fill("SmokePass1!");
+            await page.locator('#create-user-dialog button[type="submit"]').click();
+            await page.locator("[data-open-edit-roles]").first().waitFor({ state: "visible" });
+            await assertNamedDialog("edit-roles", "edit-roles-dialog");
+            await assertNamedDialog("reset-password", "reset-password-dialog");
+
+            await page.goto(`${baseUrl}/settings?area=email_alerting`);
+            await page.locator("#open-create-alert").click();
+            if (!(await page.locator("#create-alert-dialog").evaluate((dialog) => dialog.open))) {
+              throw new Error("Create alert dialog did not open");
+            }
+            await page.locator('#create-alert-dialog input[name="name"]').fill("smoke-edit-alert");
+            await page.locator('#create-alert-dialog input[name="email_recipients"]').fill("smoke@example.com");
+            await page.locator('#create-alert-dialog button[type="submit"]').click();
+            await page.locator("[data-open-edit-alert]").first().waitFor({ state: "visible" });
+            await assertNamedDialog("edit-alert", "edit-alert-dialog");
+
             await page.goto(`${baseUrl}/api-keys`);
             await page.locator("#open-create-key").click();
             if (!(await page.locator("#create-key-dialog").evaluate((dialog) => dialog.open))) {
@@ -692,6 +766,16 @@ jobs:
           assert f'href="/zones/{zone_id}/edit"' in html
           assert "data-open-delete-zone" in html
           print("dashboard configured-zones controls assertions passed")
+          PY
+          echo "[bind] Zone edit form uses the request-scoped session"
+          curl --fail --silent -b /tmp/cookies "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/edit" -o /tmp/zone-edit.html
+          python3 - <<'PY'
+          from pathlib import Path
+
+          html = Path("/tmp/zone-edit.html").read_text(encoding="utf-8", errors="replace")
+          assert "smoke.test" in html, html[:800]
+          assert 'name="dns_provider_type"' in html, html[:800]
+          print("zone edit form assertions passed")
           PY
           zones_redirect="$(curl --silent --show-error -D /tmp/zones-redirect-headers -o /dev/null -w "%{http_code}" -b /tmp/cookies http://127.0.0.1:8000/zones)"
           if [ "${zones_redirect}" != "303" ]; then
@@ -869,6 +953,7 @@ jobs:
             "${DNS_RECORD_URL}?zone_name=smoke.test&record_name=read-only&record_type=A" \
             | python3 -c "import json,sys; assert json.load(sys.stdin)['status'] == 'not_found'"
           call_read_only_dns_api POST "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"read-only","ttl":300,"values":["192.0.2.50"]}'
+          call_read_only_dns_api POST "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"read-only","ttl":300,"values":["not-an-ip"]}'
           call_read_only_dns_api PUT "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"read-only","ttl":300,"values":["192.0.2.50"]}'
           call_read_only_dns_api PATCH "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"read-only","values":["192.0.2.50"]}'
           call_read_only_dns_api DELETE "${DNS_RECORD_URL}?zone_name=smoke.test&record_name=read-only&record_type=A" ''
@@ -951,6 +1036,15 @@ jobs:
           call_dns_api PUT 404 not_found "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.40"]}'
           call_dns_api POST 403 access_denied "${DNS_RECORD_URL}" '{"zone_name":"denied.test","record_type":"A","record_name":"blocked","ttl":300,"values":["192.0.2.55"]}'
 
+          echo "[bind] Apex FQDN record_name maps to the zone apex A"
+          call_dns_api POST 200 created "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"smoke.test","ttl":300,"values":["192.0.2.80"]}'
+          wait_for_record_value smoke.test 192.0.2.80
+          curl --fail --silent -H "X-API-Key: ${API_KEY}" \
+            "${DNS_RECORD_URL}?zone_name=smoke.test&record_name=smoke.test&record_type=A" \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['status']=='success'; assert b['records'][0]['record_name'] in ('@','smoke.test'); assert b['records'][0]['values']==['192.0.2.80'], b"
+          call_dns_api DELETE 200 deleted "${DNS_RECORD_URL}?zone_name=smoke.test&record_name=smoke.test&record_type=A" ''
+          wait_for_record_absent smoke.test
+
           echo "[bind] Admin DNS browser session CRUD for temporary A record"
           browser_page="$(curl --fail --silent -b /tmp/cookies "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records")"
           echo "${browser_page}" | python3 -c "import sys; html=sys.stdin.read(); assert 'dns-browser-search' in html; assert 'dns-browser-results' in html and 'hidden' in html"
@@ -963,6 +1057,16 @@ jobs:
             -d '{"record_name":"browser","record_type":"A","ttl":300,"values":["192.0.2.77"]}' \
             | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['action']=='created', b"
           wait_for_record_value browser.smoke.test 192.0.2.77
+          echo "[bind] DNS browser shared mutation guards reject apex NS"
+          curl --silent --show-error -b /tmp/cookies \
+            -H "Origin: http://127.0.0.1:8000" \
+            -H "Referer: http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -o /tmp/apex-ns.json -w "%{http_code}" \
+            -X POST "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records" \
+            -d '{"record_name":"@","record_type":"NS","ttl":300,"values":["ns.smoke.test"]}' \
+            | python3 -c "import json,sys; from pathlib import Path; code=sys.stdin.read().strip(); b=json.loads(Path('/tmp/apex-ns.json').read_text(encoding='utf-8')); assert code=='400', (code,b); msg=(b.get('detail') or {}).get('message') or ''; assert 'Apex NS' in msg, b"
           echo "[bind] DNS browser blank browse returns zone RRsets (AXFR)"
           curl --fail --silent -b /tmp/cookies \
             "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records/search" \
@@ -1108,7 +1212,7 @@ jobs:
           import os
           import subprocess
 
-          assert os.environ["APP_VERSION"] == "0.8.1", os.environ["APP_VERSION"]
+          assert os.environ["APP_VERSION"] == "0.8.5", os.environ["APP_VERSION"]
           expected_image = f"hometinker12/api-to-dns:{os.environ['APP_VERSION']}"
           cfg = json.loads(subprocess.check_output(["docker", "compose", "config", "--format", "json"], text=True))
           svc = cfg["services"]["dns-api"]
@@ -1126,8 +1230,7 @@ jobs:
                   isinstance(port, dict)
                   and str(port.get("published")) == published
                   and int(port.get("target") or 0) == target
-                  # host_ip may be omitted (all interfaces) or set to 127.0.0.1
-                  and str(port.get("host_ip") or "") in {"", "0.0.0.0", "127.0.0.1"}
+                  and str(port.get("host_ip") or "") == "127.0.0.1"
                   for port in ports
               )
 
@@ -1150,6 +1253,8 @@ jobs:
             sleep 2
           done
           curl --fail --silent http://127.0.0.1:8001/health >/dev/null
+          curl --fail --silent http://127.0.0.1:8001/ready \
+            | python3 -c "import json,sys; assert json.load(sys.stdin)=={'status':'ready'}"
           COMPOSE_UID="$(docker compose exec -T dns-api id -u | tr -d '\r')"
           if [ "${COMPOSE_UID}" = "0" ]; then
             echo "Compose service process is running as root"
@@ -1157,6 +1262,17 @@ jobs:
             docker compose down -v --remove-orphans || true
             exit 1
           fi
+          COMPOSE_CMDLINE="$(docker compose exec -T dns-api sh -c 'tr "\0" " " < /proc/1/cmdline' | tr -d '\r')"
+          echo "compose dns-api cmdline: ${COMPOSE_CMDLINE}"
+          case " ${COMPOSE_CMDLINE} " in
+            *" --workers 1 "*|*" --workers=1 "*) ;;
+            *)
+              echo "Expected compose uvicorn --workers 1; got: ${COMPOSE_CMDLINE}"
+              docker compose logs dns-api || true
+              docker compose down -v --remove-orphans || true
+              exit 1
+              ;;
+          esac
           curl --fail --silent -c /tmp/compose-cookies -X POST http://127.0.0.1:8001/login \
             -H "Content-Type: application/x-www-form-urlencoded" \
             -H "Origin: http://127.0.0.1:8001" \
@@ -1573,7 +1689,7 @@ jobs:
               throw 'Admin header navigation order is not API Keys, Dashboard, Settings, Logout'
             }
             $appVersion = (Get-Content -Raw VERSION).Trim()
-            if ($appVersion -ne '0.8.1') { throw "Expected VERSION 0.8.1; got $appVersion" }
+            if ($appVersion -ne '0.8.5') { throw "Expected VERSION 0.8.5; got $appVersion" }
             if ($admin.Content -notmatch [regex]::Escape("api-to-dns v$appVersion")) {
               throw 'Admin page missing version footer'
             }
@@ -1730,6 +1846,17 @@ jobs:
 
             $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 404 -Method PUT -JsonBody $jReplace
             Assert-DnsRecordAction -Json $x -ExpectedAction 'not_found'
+
+            Write-Host '[microsoft-local] Apex FQDN record_name maps to the zone apex A'
+            $jApex = @{ zone_name = $la; record_type = 'A'; record_name = $la; ttl = 300; values = @('192.0.2.80') }
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -Method POST -JsonBody $jApex
+            Assert-DnsRecordAction -Json $x -ExpectedAction 'created'
+            Wait-LocalA -Fqdn $la -ExpectedIp '192.0.2.80'
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -Method GET -Query @{ zone_name = $la; record_name = $la; record_type = 'A' }
+            if ($x.status -ne 'success') { throw "apex FQDN lookup failed: $($x | ConvertTo-Json -Compress)" }
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -Method DELETE -Query @{ zone_name = $la; record_name = $la; record_type = 'A' }
+            Assert-DnsRecordAction -Json $x -ExpectedAction 'deleted'
+            Wait-LocalAbsent -Fqdn $la
 
             $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 403 -Method POST -JsonBody $jDenied
             Assert-DnsRecordAction -Json $x -ExpectedAction 'access_denied'

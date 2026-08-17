@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-08-17
+
+### Security
+
+- **CVE-2026-53615**: upgrade Debian `util-linux` / `libblkid` packages in the container image to `2.41.5-0+deb13u1` (integer overflow in DOS extended partition parsing).
+
+### Fixed
+
+- Settings → Authentication **View roles**, **Edit roles**, and **Reset password** dialogs open again. After admin scripts moved to `/static/settings.js`, open/close used a `dataset` key that did not match `data-open-edit-roles` (and the same pattern for view-roles and reset-password), so `showModal()` targeted a missing element.
+
+### Changed
+
+- Application version metadata aligned to **0.8.5** (`VERSION`, OpenAPI, `pyproject.toml`, Docker label, Compose pin).
+- Admin HTTP handlers moved from `src/app.py` into `src/routes/` (zones, API keys, settings, SSL/Let’s Encrypt, backup, alerts, restart). `src/app.py` remains the composition root (lifespan, middleware, router registration). Public URLs, RBAC, and templates are unchanged. DNS client tests patch `src.zone_service.create_dns_client_from_settings`.
+- Default Compose published ports bind to localhost (`127.0.0.1:8001` and `127.0.0.1:8443`) so the HTTP admin UI is not exposed on every host interface. README documents an explicit `0.0.0.0` override for reverse-proxy hosts. README TOC now links to shipped Remote Syslog (0.8.0) instead of Planned Infrastructure Settings. SQLite is documented as the supported database engine.
+- Azure DNS mutations now use the same mutable-type allowlist and relative-name helper as BIND, Microsoft, and Cloudflare. Apex FQDNs such as `example.com` in zone `example.com` write the `@` record set; unknown and SOA types are rejected on create/update/delete.
+- Public `/dns-record` mutations and the admin DNS browser share one validation/PATCH-merge core (`src.dns_mutation`). OpenAPI `DnsRecordInfo.record_type` now lists lookup types returned by GET. Public create/replace/patch/delete remain limited to A/AAAA/CNAME/TXT.
+- Persistent encrypted settings use a typed registry (`src.settings_registry`) with bool/int/JSON accessors. Unknown restored keys still read; unregistered writes log at DEBUG. Startup logs unknown `Setting` row names without deleting them.
+- Let's Encrypt renewal runs in a worker thread with its own DB session so ACME/DNS work cannot stall the asyncio loop. Enrollment and backup restore concurrency gates are stored in the encrypted settings table. Run a single uvicorn worker (entrypoint and `serve` pass `--workers 1`); shutdown signaling, the remote syslog queue, and BIND AXFR slots remain process-local. Startup drops an unreadable restore-progress row so an application-secrets restore cannot brick the next boot.
+- Authenticated requests load the user once via a request-scoped DB session (`Depends(get_db)`). `require_role` uses roles cached on `request.state` instead of opening a second session. Middleware, rate limits, and background workers keep their own sessions. `/ready`, `/system/restart`, zone/API-key admin pages, the public DNS API, the DNS browser, settings users/plugins/system, SSL/Let’s Encrypt, backup, and alert pages use the request session. Enrollment and restore progress workers still open their own sessions.
+- Activity log levels, categories, and security event prefixes live in `src/log_constants.py`. `src/models.py` re-exports them for compatibility.
+- Operational Python logging and system identity helpers live in `src/operational_logging.py` and `src/system_identity.py`. SMTP alerting lives in `src/alerting.py`; remote syslog get/set/apply lives in `src/remote_syslog.py`. Callers import from those owner modules; `src/activity_logging.py` still re-exports the names for compatibility.
+- Public DNS request/response models live in `src/schemas/dns.py`. Callers import them from that module; SQLModel tables stay in `src/models.py`.
+- Startup warns when `DATABASE_URL` is not SQLite. `API_TO_DNS_ALLOW_NON_SQLITE=1` only silences that warning; it is not a support claim. Schema migrations stay hand-rolled and SQLite-only (no Alembic).
+- Admin HTML errors (access denied, CSRF failure, and unexpected 500s) share `templates/error.html` with the same theme, favicon, brand mark, and version footer as other pages. JSON CSRF and API error envelopes are unchanged.
+
 ## [0.8.1] - 2026-08-11
 
 ### Security

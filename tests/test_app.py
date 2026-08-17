@@ -12,13 +12,33 @@ from src.activity_logging import (
     emit_activity_event,
     infer_event_category,
     query_activity_logs,
-    render_alert_template,
     run_retention_cleanup,
     set_log_level,
     set_retention_days,
-    set_smtp_config,
 )
-from src.app import (
+from src.alerting import render_alert_template, set_smtp_config
+from src.app import app
+from src.auth import SESSION_IDLE_TIMEOUT_SECONDS, create_session_cookie
+from src.db import SessionLocal, init_db
+from src.dns_client import create_dns_client, discover_plugins, dns_provider_display_name
+from src.log_constants import (
+    LOG_CATEGORY_SECURITY,
+    LOG_LEVEL_ERROR,
+    LOG_LEVEL_INFORMATIONAL,
+    LOG_LEVEL_VERBOSE,
+    LOG_LEVEL_WARNING,
+)
+from src.models import (
+    API_KEY_ACCESS_READ_ONLY,
+    ActivityLog,
+    AlertRule,
+    ApiKey,
+    ApiKeyAllowedZone,
+    DnsZoneConfig,
+    User,
+)
+from src.plugins.bind import BindTsigDnsClient
+from src.rbac import (
     ALL_ROLES,
     ROLE_ACCOUNT_RESET_PASSWORD,
     ROLE_ACCOUNT_UPDATE,
@@ -30,36 +50,16 @@ from src.app import (
     ROLE_GLOBAL_READ,
     ROLE_PLUGIN_UPDATE,
     ROLE_SYSTEM_UPDATE,
-    _serialize_roles,
-    app,
-    encode_zone_config_dict,
     get_user_roles,
-    normalize_zone_name,
     user_has_role,
 )
-from src.auth import SESSION_IDLE_TIMEOUT_SECONDS, create_session_cookie
-from src.db import SessionLocal, init_db
-from src.dns_client import create_dns_client, discover_plugins, dns_provider_display_name
-from src.models import (
-    API_KEY_ACCESS_READ_ONLY,
-    LOG_CATEGORY_SECURITY,
-    LOG_LEVEL_ERROR,
-    LOG_LEVEL_INFORMATIONAL,
-    LOG_LEVEL_VERBOSE,
-    LOG_LEVEL_WARNING,
-    ActivityLog,
-    AlertRule,
-    ApiKey,
-    ApiKeyAllowedZone,
-    DnsRecordInfo,
-    DnsRecordListResult,
-    DnsZoneConfig,
-    User,
+from src.rbac import (
+    serialize_roles as _serialize_roles,
 )
-from src.plugins.bind import BindTsigDnsClient
+from src.schemas.dns import DnsRecordInfo, DnsRecordListResult
 from src.security import hash_api_key, hash_password
 from src.time_utils import utc_now
-from src.zone_service import decode_zone_config, provider_dns_zone
+from src.zone_service import decode_zone_config, encode_zone_config_dict, normalize_zone_name, provider_dns_zone
 
 
 def _openapi_schema(client: TestClient) -> dict:
@@ -299,10 +299,10 @@ def test_zone_test_requires_auth(client: TestClient) -> None:
 
 def test_zone_test_success(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     monkeypatch.setattr(
-        "src.app.test_zone_record_lookup",
+        "src.zone_service.test_zone_record_lookup",
         lambda _cfg, **kwargs: [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])],
     )
     response = client.post(
@@ -329,7 +329,7 @@ def test_zone_test_success(client: TestClient, monkeypatch: pytest.MonkeyPatch) 
 
 def test_zone_test_not_found(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
-    monkeypatch.setattr("src.app.test_zone_record_lookup", lambda _cfg, **kwargs: [])
+    monkeypatch.setattr("src.zone_service.test_zone_record_lookup", lambda _cfg, **kwargs: [])
     response = client.post(
         "/zones/test",
         data={
@@ -393,7 +393,7 @@ def test_zones_json_request_returns_zone_ids(client: TestClient) -> None:
 def test_read_only_api_key_allows_read_endpoints(
     client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     with SessionLocal() as db:
         key = db.exec(select(ApiKey).where(ApiKey.key == hash_api_key(api_key_value))).first()
@@ -403,7 +403,7 @@ def test_read_only_api_key_allows_read_endpoints(
         db.commit()
 
     monkeypatch.setattr(
-        "src.app.test_zone_record_lookup",
+        "src.zone_service.test_zone_record_lookup",
         lambda _settings, **kwargs: [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])],
     )
     headers = {"X-API-Key": api_key_value}
@@ -488,7 +488,7 @@ def test_read_only_api_key_cannot_mutate_dns_records(
         db.commit()
 
     client_factory = MagicMock()
-    monkeypatch.setattr("src.app.get_dns_client_from_settings", client_factory)
+    monkeypatch.setattr("src.zone_service.create_dns_client_from_settings", client_factory)
     response = getattr(client, method)("/dns-record", headers={"X-API-Key": api_key_value}, **request_kwargs)
 
     assert response.status_code == 403
@@ -806,10 +806,10 @@ def test_dns_record_get_requires_api_key(client: TestClient) -> None:
 def test_dns_record_get_with_mock_client(
     client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     monkeypatch.setattr(
-        "src.app.test_zone_record_lookup",
+        "src.zone_service.test_zone_record_lookup",
         lambda _settings, **kwargs: [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])],
     )
     response = client.get(
@@ -833,10 +833,10 @@ def test_dns_record_get_with_mock_client(
 def test_dns_record_get_untyped_multi_type(
     client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     monkeypatch.setattr(
-        "src.app.test_zone_record_lookup",
+        "src.zone_service.test_zone_record_lookup",
         lambda _settings, **kwargs: [
             DnsRecordInfo(record_name="@", record_type="A", ttl=500, values=["10.0.0.1"]),
             DnsRecordInfo(record_name="@", record_type="CNAME", ttl=1000, values=["target.example.com"]),
@@ -857,7 +857,7 @@ def test_dns_record_get_untyped_multi_type(
 
 
 def test_dns_record_get_not_found(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("src.app.test_zone_record_lookup", lambda _settings, **kwargs: [])
+    monkeypatch.setattr("src.zone_service.test_zone_record_lookup", lambda _settings, **kwargs: [])
     response = client.get(
         "/dns-record",
         headers={"X-API-Key": api_key_value},
@@ -901,11 +901,26 @@ def test_dns_record_requires_api_key(client: TestClient) -> None:
     assert response.status_code == 401
 
 
+def test_dns_record_post_rejects_mx(client: TestClient, api_key_value: str) -> None:
+    response = client.post(
+        "/dns-record",
+        headers={"X-API-Key": api_key_value},
+        json={
+            "zone_name": "example.com",
+            "record_type": "MX",
+            "record_name": "www",
+            "ttl": 300,
+            "values": ["10 mail.example.com"],
+        },
+    )
+    assert response.status_code == 422
+
+
 def test_dns_record_with_mock_client(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
     fake = MagicMock()
     fake.get_record.return_value = []
     fake.create_or_update_record.return_value = False
-    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+    monkeypatch.setattr("src.zone_service.create_dns_client_from_settings", lambda _settings, db=None: fake)
 
     response = client.post(
         "/dns-record",
@@ -975,7 +990,7 @@ def test_dns_record_audit_message_uses_provider_dns_zone(
     fake = MagicMock()
     fake.get_record.return_value = []
     fake.create_or_update_record.return_value = True
-    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+    monkeypatch.setattr("src.zone_service.create_dns_client_from_settings", lambda _settings, db=None: fake)
 
     response = client.post(
         "/dns-record",
@@ -1006,11 +1021,11 @@ def test_dns_record_audit_message_uses_provider_dns_zone(
 def test_dns_record_post_conflict_returns_409(
     client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     fake = MagicMock()
     fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A")]
-    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+    monkeypatch.setattr("src.zone_service.create_dns_client_from_settings", lambda _settings, db=None: fake)
 
     response = client.post(
         "/dns-record",
@@ -1039,12 +1054,12 @@ def test_dns_record_post_conflict_returns_409(
 def test_dns_record_put_replaces_existing_record(
     client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     fake = MagicMock()
     fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A")]
     fake.create_or_update_record.return_value = True
-    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+    monkeypatch.setattr("src.zone_service.create_dns_client_from_settings", lambda _settings, db=None: fake)
 
     response = client.put(
         "/dns-record",
@@ -1070,7 +1085,7 @@ def test_dns_record_put_missing_returns_404(
 ) -> None:
     fake = MagicMock()
     fake.get_record.return_value = []
-    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+    monkeypatch.setattr("src.zone_service.create_dns_client_from_settings", lambda _settings, db=None: fake)
 
     response = client.put(
         "/dns-record",
@@ -1107,12 +1122,12 @@ def test_dns_record_put_requires_ttl(client: TestClient, api_key_value: str) -> 
 def test_dns_record_patch_updates_values(
     client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     fake = MagicMock()
     fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])]
     fake.create_or_update_record.return_value = True
-    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+    monkeypatch.setattr("src.zone_service.create_dns_client_from_settings", lambda _settings, db=None: fake)
 
     response = client.patch(
         "/dns-record",
@@ -1136,12 +1151,12 @@ def test_dns_record_patch_updates_values(
 
 
 def test_dns_record_patch_ttl_only(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     fake = MagicMock()
     fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])]
     fake.create_or_update_record.return_value = True
-    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+    monkeypatch.setattr("src.zone_service.create_dns_client_from_settings", lambda _settings, db=None: fake)
 
     response = client.patch(
         "/dns-record",
@@ -1160,12 +1175,12 @@ def test_dns_record_patch_ttl_only(client: TestClient, api_key_value: str, monke
 
 
 def test_dns_record_patch_both_fields(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     fake = MagicMock()
     fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])]
     fake.create_or_update_record.return_value = True
-    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+    monkeypatch.setattr("src.zone_service.create_dns_client_from_settings", lambda _settings, db=None: fake)
 
     response = client.patch(
         "/dns-record",
@@ -1216,7 +1231,7 @@ def test_dns_record_patch_missing_returns_404(
 ) -> None:
     fake = MagicMock()
     fake.get_record.return_value = []
-    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+    monkeypatch.setattr("src.zone_service.create_dns_client_from_settings", lambda _settings, db=None: fake)
 
     response = client.patch(
         "/dns-record",
@@ -1238,12 +1253,12 @@ def test_dns_record_patch_missing_returns_404(
 def test_dns_record_delete_with_mock_client(
     client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     fake = MagicMock()
     fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A")]
     fake.create_or_update_record.return_value = True
-    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+    monkeypatch.setattr("src.zone_service.create_dns_client_from_settings", lambda _settings, db=None: fake)
 
     response = client.delete(
         "/dns-record",
@@ -1267,7 +1282,7 @@ def test_dns_record_delete_not_found_returns_404(
 ) -> None:
     fake = MagicMock()
     fake.get_record.return_value = []
-    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+    monkeypatch.setattr("src.zone_service.create_dns_client_from_settings", lambda _settings, db=None: fake)
 
     response = client.delete(
         "/dns-record",
@@ -1297,7 +1312,7 @@ def test_dns_record_provider_runtime_error_returns_502(
     fake = MagicMock()
     fake.get_record.return_value = []
     fake.create_or_update_record.side_effect = RuntimeError("WinRM/PowerShell failed (1): example")
-    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+    monkeypatch.setattr("src.zone_service.create_dns_client_from_settings", lambda _settings, db=None: fake)
 
     response = client.post(
         "/dns-record",
@@ -1547,6 +1562,8 @@ def test_settings_renders_for_authenticated_session(client: TestClient) -> None:
     assert "setForcedReadRole(required, changedInput.checked)" in settings_js.text
     assert 'classList.toggle("role-forced", forced)' in settings_js.text
     assert "form[data-confirm]" in settings_js.text
+    assert "getAttribute(`data-open-${name}`)" in settings_js.text
+    assert "getAttribute(`data-close-${name}`)" in settings_js.text
     plugins = client.get("/settings?area=plugins")
     assert plugins.status_code == 200
     assert "onsubmit=" not in plugins.text
@@ -2810,20 +2827,24 @@ def test_settings_app_dns_name_post_persists(client: TestClient) -> None:
     assert response.status_code == 200
     assert "App DNS name saved as my-dns.example" in response.text
     with SessionLocal() as db:
-        from src.activity_logging import get_app_dns_name
+        from src.system_identity import get_app_dns_name
 
         assert get_app_dns_name(db) == "my-dns.example"
 
 
 def test_default_app_dns_name_uses_docker_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(activity_logging, "is_running_in_docker", lambda: True)
-    assert activity_logging.default_app_dns_name() == "apitodns.local"
+    from src import system_identity
+
+    monkeypatch.setattr(system_identity, "is_running_in_docker", lambda: True)
+    assert system_identity.default_app_dns_name() == "apitodns.local"
 
 
 def test_default_app_dns_name_uses_hostname_off_docker(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(activity_logging, "is_running_in_docker", lambda: False)
-    monkeypatch.setattr(activity_logging, "_host_system_dns_name", lambda: "host.example")
-    assert activity_logging.default_app_dns_name() == "host.example"
+    from src import system_identity
+
+    monkeypatch.setattr(system_identity, "is_running_in_docker", lambda: False)
+    monkeypatch.setattr(system_identity, "_host_system_dns_name", lambda: "host.example")
+    assert system_identity.default_app_dns_name() == "host.example"
 
 
 def test_settings_operational_log_rotation_docker_shows_message_only(
@@ -3325,8 +3346,8 @@ def test_settings_remote_syslog_post_persists_and_emits_audit(client: TestClient
         assert "checked" in response.text.split('name="syslog_enabled"')[1].split(">")[0]
 
         with SessionLocal() as db:
-            from src.activity_logging import get_remote_syslog_config
             from src.models import ActivityLog
+            from src.remote_syslog import get_remote_syslog_config
 
             config = get_remote_syslog_config(db)
             assert config["enabled"] is True
@@ -3368,8 +3389,7 @@ def test_settings_remote_syslog_rejects_plaintext_without_opt_in(client: TestCli
 
 
 def test_settings_remote_syslog_requires_system_update(client: TestClient) -> None:
-    from src.activity_logging import get_remote_syslog_config, set_remote_syslog_config
-    from src.remote_syslog import REMOTE_SYSLOG, SyslogConfig
+    from src.remote_syslog import REMOTE_SYSLOG, SyslogConfig, get_remote_syslog_config, set_remote_syslog_config
 
     with SessionLocal() as db:
         _delete_users(db)
@@ -3467,7 +3487,7 @@ def test_settings_remote_syslog_can_be_disabled(client: TestClient) -> None:
         assert response.status_code == 200
         assert "Remote syslog settings saved." in response.text
         with SessionLocal() as db:
-            from src.activity_logging import get_remote_syslog_config
+            from src.remote_syslog import get_remote_syslog_config
 
             config = get_remote_syslog_config(db)
             assert config["enabled"] is False
@@ -3860,7 +3880,7 @@ def test_api_key_post_to_dns_record_unaffected_by_session_roles(
     fake = MagicMock()
     fake.get_record.return_value = []
     fake.create_or_update_record.return_value = False
-    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+    monkeypatch.setattr("src.zone_service.create_dns_client_from_settings", lambda _settings, db=None: fake)
 
     response = client.post(
         "/dns-record",
@@ -3936,7 +3956,7 @@ def test_dns_provider_failure_writes_error_activity_log(
     fake = MagicMock()
     fake.get_record.return_value = []
     fake.create_or_update_record.side_effect = RuntimeError("WinRM failed with password=supersecret")
-    monkeypatch.setattr("src.app.get_dns_client_from_settings", lambda _settings: fake)
+    monkeypatch.setattr("src.zone_service.create_dns_client_from_settings", lambda _settings, db=None: fake)
 
     response = client.post(
         "/dns-record",
@@ -4095,9 +4115,11 @@ def test_alert_rules_trigger_render_templates_and_respect_cooldown(
         sent_messages.append({"recipients": recipients, "subject": subject, "body": body})
         return True, []
 
-    monkeypatch.setattr(activity_logging, "send_alert_email", fake_send_alert_email)
+    from src import alerting
+
+    monkeypatch.setattr(alerting, "send_alert_email", fake_send_alert_email)
     monkeypatch.setattr(
-        activity_logging,
+        alerting,
         "system_identity",
         lambda db: {"system_dns_name": "dns-host.example", "system_ip_address": "192.0.2.44"},
     )
@@ -4169,7 +4191,9 @@ def test_smtp_alert_delivery_tries_csv_servers_in_order(client: TestClient, monk
             raise OSError("connection refused")
         return FakeSmtp()
 
-    monkeypatch.setattr(activity_logging, "_build_smtp_client", fake_build_smtp_client)
+    from src import alerting
+
+    monkeypatch.setattr(alerting, "_build_smtp_client", fake_build_smtp_client)
     with SessionLocal() as db:
         _delete_activity_logs(db)
         set_smtp_config(

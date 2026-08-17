@@ -6,7 +6,7 @@ import os
 from urllib.parse import urlparse
 
 from fastapi import Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import JSONResponse
 
 from .http_utils import api_key_from_headers, wants_json_response
 
@@ -75,21 +75,13 @@ def csrf_rejection_response(request: Request):
     message = "CSRF validation failed"
     if wants_json_response(request):
         return JSONResponse(status_code=403, content={"detail": {"error": "csrf_failed", "message": message}})
-    return HTMLResponse(
-        content=(
-            "<!DOCTYPE html><html><head><title>CSRF failed</title>"
-            "<script>(function(){var k='api-to-dns-theme';var s=localStorage.getItem(k);"
-            "var t=(s==='light'||s==='dark')?s:(window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');"
-            "document.documentElement.setAttribute('data-theme',t);})();</script>"
-            '<link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=2" />'
-            '<link rel="stylesheet" href="/static/style.css" /></head>'
-            '<body><div class="page">'
-            '<a class="app-brand" href="/admin" aria-label="api-to-dns dashboard">'
-            '<img class="app-brand-mark" src="/static/logo-mark.svg?v=2" alt="" />'
-            '<span class="app-brand-name">api-to-dns</span></a>'
-            f"<h1>Request blocked</h1>"
-            f'<div class="alert error">{message}</div>'
-            '<p><a class="button" href="/admin">Back</a></p></div></body></html>'
-        ),
+    from .web import render_error_page
+
+    return render_error_page(
         status_code=403,
+        title="CSRF failed",
+        heading="Request blocked",
+        message=message,
+        back_href="/admin",
+        back_label="Back",
     )

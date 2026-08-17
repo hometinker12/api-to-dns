@@ -1,9 +1,10 @@
 import os
 
-from fastapi import HTTPException, Request
+from fastapi import Depends, HTTPException, Request
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-from sqlmodel import select
+from sqlmodel import Session, select
 
+from .db import get_db
 from .security import allow_insecure_defaults
 
 _INSECURE_SECRET_DEFAULTS = frozenset(
@@ -123,7 +124,8 @@ def bump_session_version(db, user) -> int:
     return int(user.session_version or 0)
 
 
-def get_current_user(request: Request) -> str:
+def load_current_user(request: Request, db: Session) -> str:
+    """Validate the session cookie against ``db`` and cache identity/roles on the request."""
     session_token = request.cookies.get("session")
     if not session_token:
         raise HTTPException(status_code=401, detail="Authentication required")
@@ -131,16 +133,29 @@ def get_current_user(request: Request) -> str:
         username, cookie_version = verify_session_cookie(session_token)
     except (BadSignature, SignatureExpired):
         raise HTTPException(status_code=401, detail="Invalid or expired session")
-    from .db import SessionLocal
     from .models import User
+    from .rbac import effective_roles, parse_roles
 
-    with SessionLocal() as db:
-        user = db.exec(select(User).where(User.username == username)).first()
-        if user is None or user.disabled:
-            raise HTTPException(status_code=401, detail="Invalid or expired session")
-        db_version = int(getattr(user, "session_version", 0) or 0)
-        if cookie_version != db_version:
-            raise HTTPException(status_code=401, detail="Invalid or expired session")
+    user = db.exec(select(User).where(User.username == username)).first()
+    if user is None or user.disabled:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    db_version = int(getattr(user, "session_version", 0) or 0)
+    if cookie_version != db_version:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
     request.state.session_user = username
     request.state.session_version = cookie_version
+    request.state.user_roles = frozenset(effective_roles(parse_roles(user.roles)))
     return username
+
+
+def get_current_user(request: Request) -> str:
+    """Authenticate a browser session. Safe to call from middleware (no FastAPI DI)."""
+    from .db import SessionLocal
+
+    with SessionLocal() as db:
+        return load_current_user(request, db)
+
+
+def get_current_user_db(request: Request, db: Session = Depends(get_db)) -> str:
+    """Authenticate using the request-scoped ``get_db`` session."""
+    return load_current_user(request, db)

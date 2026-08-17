@@ -22,15 +22,19 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
-from .models import (
+from .log_constants import (
     LOG_LEVEL_ERROR,
     LOG_LEVEL_INFORMATIONAL,
     LOG_LEVEL_ORDER,
     LOG_LEVEL_VALUES,
     LOG_LEVEL_VERBOSE,
     LOG_LEVEL_WARNING,
+)
+from .models import (
     ActivityLog,
 )
+from .settings_store import get_typed_setting_by_key, set_typed_setting_by_key
+from .system_identity import get_app_dns_name
 
 LOGGER = logging.getLogger("api_to_dns")
 
@@ -42,6 +46,16 @@ DEFAULT_FACILITY = "local0"
 DEFAULT_MINIMUM_LEVEL = LOG_LEVEL_INFORMATIONAL
 DEFAULT_TIMEOUT = 5.0
 DEFAULT_QUEUE_SIZE = 1000
+
+SETTING_SYSLOG_ENABLED = "remote_syslog_enabled"
+SETTING_SYSLOG_HOST = "remote_syslog_host"
+SETTING_SYSLOG_PORT = "remote_syslog_port"
+SETTING_SYSLOG_PROTOCOL = "remote_syslog_protocol"
+SETTING_SYSLOG_FACILITY = "remote_syslog_facility"
+SETTING_SYSLOG_MINIMUM_LEVEL = "remote_syslog_minimum_level"
+SETTING_SYSLOG_TIMEOUT = "remote_syslog_timeout"
+SETTING_SYSLOG_QUEUE_SIZE = "remote_syslog_queue_size"
+SETTING_SYSLOG_ALLOW_INSECURE = "remote_syslog_allow_insecure_plaintext"
 MAX_TIMEOUT_SECONDS = 30.0
 MAX_QUEUE_SIZE = 5000
 DEFAULT_DRAIN_TIMEOUT = 2.0
@@ -312,7 +326,7 @@ def validate_syslog_config(
 
 
 class RemoteSyslogForwarder:
-    """Singleton-style worker that drains a bounded queue to a remote syslog server."""
+    """In-process syslog queue and worker thread. Not shared across uvicorn workers."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -534,6 +548,150 @@ class RemoteSyslogForwarder:
 
 REMOTE_SYSLOG = RemoteSyslogForwarder()
 
+
+def _typed_bool(db, key: str) -> bool:
+    try:
+        return bool(get_typed_setting_by_key(db, key))
+    except ValueError:
+        return False
+
+
+def _typed_int(db, key: str, fallback: int) -> int:
+    try:
+        return int(get_typed_setting_by_key(db, key))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _typed_str(db, key: str) -> str:
+    try:
+        value = get_typed_setting_by_key(db, key)
+    except ValueError:
+        return ""
+    return "" if value is None else str(value)
+
+
+def get_remote_syslog_config(db) -> dict[str, Any]:
+    """Return sanitized remote syslog settings for UI and worker configuration."""
+    enabled = _typed_bool(db, SETTING_SYSLOG_ENABLED)
+    host = _typed_str(db, SETTING_SYSLOG_HOST)
+    port = _typed_int(db, SETTING_SYSLOG_PORT, DEFAULT_TLS_PORT)
+    protocol = _typed_str(db, SETTING_SYSLOG_PROTOCOL).strip().lower() or DEFAULT_PROTOCOL
+    if protocol not in SYSLOG_PROTOCOLS:
+        protocol = DEFAULT_PROTOCOL
+    facility = _typed_str(db, SETTING_SYSLOG_FACILITY).strip().lower() or DEFAULT_FACILITY
+    if facility not in SYSLOG_FACILITY:
+        facility = DEFAULT_FACILITY
+    minimum_level = _typed_str(db, SETTING_SYSLOG_MINIMUM_LEVEL).strip().upper() or DEFAULT_MINIMUM_LEVEL
+    if minimum_level not in LOG_LEVEL_VALUES:
+        minimum_level = DEFAULT_MINIMUM_LEVEL
+    try:
+        timeout = float(_typed_str(db, SETTING_SYSLOG_TIMEOUT) or DEFAULT_TIMEOUT)
+    except ValueError:
+        timeout = DEFAULT_TIMEOUT
+    queue_size = _typed_int(db, SETTING_SYSLOG_QUEUE_SIZE, DEFAULT_QUEUE_SIZE)
+    allow_insecure_plaintext = _typed_bool(db, SETTING_SYSLOG_ALLOW_INSECURE)
+
+    try:
+        validated = validate_syslog_config(
+            enabled=enabled,
+            host=host,
+            port=port,
+            protocol=protocol,
+            facility=facility,
+            minimum_level=minimum_level,
+            timeout=timeout,
+            queue_size=queue_size,
+            allow_insecure_plaintext=allow_insecure_plaintext,
+            hostname=get_app_dns_name(db),
+        )
+        return {
+            "enabled": validated.enabled,
+            "host": validated.host,
+            "port": validated.port,
+            "protocol": validated.protocol,
+            "facility": validated.facility,
+            "minimum_level": validated.minimum_level,
+            "timeout": validated.timeout,
+            "queue_size": validated.queue_size,
+            "allow_insecure_plaintext": validated.allow_insecure_plaintext,
+            "hostname": validated.hostname,
+            "facilities": list(SYSLOG_FACILITY.keys()),
+            "protocols": list(SYSLOG_PROTOCOLS),
+        }
+    except ValueError:
+        return {
+            "enabled": False,
+            "host": host,
+            "port": port,
+            "protocol": protocol,
+            "facility": facility,
+            "minimum_level": minimum_level,
+            "timeout": timeout,
+            "queue_size": queue_size,
+            "allow_insecure_plaintext": allow_insecure_plaintext,
+            "hostname": get_app_dns_name(db),
+            "facilities": list(SYSLOG_FACILITY.keys()),
+            "protocols": list(SYSLOG_PROTOCOLS),
+        }
+
+
+def set_remote_syslog_config(
+    db,
+    *,
+    enabled: bool,
+    host: str,
+    port: int,
+    protocol: str,
+    facility: str,
+    minimum_level: str,
+    timeout: float,
+    queue_size: int,
+    allow_insecure_plaintext: bool = False,
+) -> dict[str, Any]:
+    """Validate and persist remote syslog settings; return the sanitized config dict."""
+    validated = validate_syslog_config(
+        enabled=enabled,
+        host=host,
+        port=port,
+        protocol=protocol,
+        facility=facility,
+        minimum_level=minimum_level,
+        timeout=timeout,
+        queue_size=queue_size,
+        allow_insecure_plaintext=allow_insecure_plaintext,
+        hostname=get_app_dns_name(db),
+    )
+    set_typed_setting_by_key(db, SETTING_SYSLOG_ENABLED, validated.enabled)
+    set_typed_setting_by_key(db, SETTING_SYSLOG_HOST, validated.host)
+    set_typed_setting_by_key(db, SETTING_SYSLOG_PORT, validated.port)
+    set_typed_setting_by_key(db, SETTING_SYSLOG_PROTOCOL, validated.protocol)
+    set_typed_setting_by_key(db, SETTING_SYSLOG_FACILITY, validated.facility)
+    set_typed_setting_by_key(db, SETTING_SYSLOG_MINIMUM_LEVEL, validated.minimum_level)
+    set_typed_setting_by_key(db, SETTING_SYSLOG_TIMEOUT, str(validated.timeout))
+    set_typed_setting_by_key(db, SETTING_SYSLOG_QUEUE_SIZE, validated.queue_size)
+    set_typed_setting_by_key(db, SETTING_SYSLOG_ALLOW_INSECURE, validated.allow_insecure_plaintext)
+    return get_remote_syslog_config(db)
+
+
+def apply_remote_syslog_config(db) -> None:
+    """Load persisted settings and apply them to the process-wide forwarder."""
+    raw = get_remote_syslog_config(db)
+    config = validate_syslog_config(
+        enabled=bool(raw.get("enabled")),
+        host=str(raw.get("host") or ""),
+        port=int(raw.get("port") or DEFAULT_TLS_PORT),
+        protocol=str(raw.get("protocol") or DEFAULT_PROTOCOL),
+        facility=str(raw.get("facility") or "local0"),
+        minimum_level=str(raw.get("minimum_level") or LOG_LEVEL_INFORMATIONAL),
+        timeout=float(raw.get("timeout") or 5.0),
+        queue_size=int(raw.get("queue_size") or 1000),
+        allow_insecure_plaintext=bool(raw.get("allow_insecure_plaintext")),
+        hostname=str(raw.get("hostname") or get_app_dns_name(db)),
+    )
+    REMOTE_SYSLOG.configure(config)
+
+
 __all__ = [
     "APP_NAME",
     "ActivityLogSnapshot",
@@ -549,14 +707,26 @@ __all__ = [
     "PLAINTEXT_PROTOCOLS",
     "REMOTE_SYSLOG",
     "RemoteSyslogForwarder",
+    "SETTING_SYSLOG_ALLOW_INSECURE",
+    "SETTING_SYSLOG_ENABLED",
+    "SETTING_SYSLOG_FACILITY",
+    "SETTING_SYSLOG_HOST",
+    "SETTING_SYSLOG_MINIMUM_LEVEL",
+    "SETTING_SYSLOG_PORT",
+    "SETTING_SYSLOG_PROTOCOL",
+    "SETTING_SYSLOG_QUEUE_SIZE",
+    "SETTING_SYSLOG_TIMEOUT",
     "SYSLOG_FACILITY",
     "SYSLOG_PROTOCOLS",
     "SYSLOG_SEVERITY",
     "SyslogConfig",
+    "apply_remote_syslog_config",
     "encode_rfc5424",
     "frame_tcp",
+    "get_remote_syslog_config",
     "meets_minimum_level",
     "sanitize_hostname",
     "sanitize_msg_id",
+    "set_remote_syslog_config",
     "validate_syslog_config",
 ]

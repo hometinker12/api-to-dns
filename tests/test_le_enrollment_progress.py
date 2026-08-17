@@ -1,4 +1,4 @@
-import src.app as app_module
+import src.routes.settings_ssl as ssl_routes
 from src import letsencrypt
 from src.auth import create_session_cookie
 from src.db import SessionLocal, init_db
@@ -92,8 +92,6 @@ def test_start_enrollment_reports_progress_via_callback(monkeypatch) -> None:
 
 
 def test_start_async_returns_202(client, monkeypatch) -> None:
-    monkeypatch.setattr(app_module, "_le_enrollment_in_progress", False)
-
     def fake_sync(kwargs, *, user: str) -> None:
         with SessionLocal() as db:
             letsencrypt.write_enrollment_progress(
@@ -105,7 +103,9 @@ def test_start_async_returns_202(client, monkeypatch) -> None:
                 result_status="issued",
             )
 
-    monkeypatch.setattr(app_module, "_run_le_auto_enrollment_sync", fake_sync)
+    monkeypatch.setattr(ssl_routes, "_run_le_auto_enrollment_sync", fake_sync)
+    with SessionLocal() as db:
+        letsencrypt.clear_enrollment_progress(db)
     client.cookies.set("session", create_session_cookie("admin"))
     response = client.post(
         "/settings/system/ssl-letsencrypt/start-async",
@@ -122,8 +122,14 @@ def test_start_async_returns_202(client, monkeypatch) -> None:
     assert response.json()["status"] == "started"
 
 
-def test_start_async_rejects_concurrent_run(client, monkeypatch) -> None:
-    monkeypatch.setattr(app_module, "_le_enrollment_in_progress", True)
+def test_start_async_rejects_concurrent_run(client) -> None:
+    with SessionLocal() as db:
+        letsencrypt.write_enrollment_progress(
+            db,
+            phase="verify_dns",
+            percent=40,
+            message="Waiting for DNS",
+        )
     client.cookies.set("session", create_session_cookie("admin"))
     response = client.post(
         "/settings/system/ssl-letsencrypt/start-async",
@@ -136,3 +142,23 @@ def test_start_async_rejects_concurrent_run(client, monkeypatch) -> None:
         },
     )
     assert response.status_code == 409
+    with SessionLocal() as db:
+        letsencrypt.clear_enrollment_progress(db)
+
+
+def test_try_begin_enrollment_is_exclusive() -> None:
+    _ensure_db()
+    with SessionLocal() as db:
+        letsencrypt.clear_enrollment_progress(db)
+        assert letsencrypt.try_begin_enrollment(db) is True
+        assert letsencrypt.try_begin_enrollment(db) is False
+        letsencrypt.write_enrollment_progress(
+            db,
+            phase="complete",
+            percent=100,
+            message="Done",
+            done=True,
+            result_status="issued",
+        )
+        assert letsencrypt.try_begin_enrollment(db) is True
+        letsencrypt.clear_enrollment_progress(db)

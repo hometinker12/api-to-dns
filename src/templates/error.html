@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>{{ title }} - api-to-dns</title>
+  {% include "_theme_init.html" %}
+  {% include "_brand_head.html" %}
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="page">
+    {% include "_app_brand.html" %}
+    <h1>{{ heading }}</h1>
+    <div class="alert error">{{ message }}</div>
+    {% if debug_traceback %}
+      <pre>{{ debug_traceback }}</pre>
+    {% endif %}
+    <p><a class="button" href="{{ back_href }}">{{ back_label }}</a></p>
+  </div>
+  {% include "_page_footer.html" %}
+</body>
+</html>
