@@ -97,6 +97,8 @@ http://127.0.0.1:8001/login
 
 After login, the **Dashboard** shows configured DNS zones. Add one row per zone configuration (each row has a **unique configuration name**, its own provider, a **DNS zone (domain)** for that provider, and credentials). You can add multiple configurations with different names that all target the same DNS domain (for example `example-azure` and `example-cloudflare`, both with domain `example.com`). Use **API Keys** in the top navigation to create or edit a key, select which configurations it may use, and choose its access mode. New keys default to **read-only**; use **read/write** only for clients that need to mutate DNS records. Every `/dns-record` request requires a `zone_name` (in the JSON body for `POST`/`PUT`/`PATCH`, in the query string for `GET`/`DELETE`); it must match a configured zone **name** **and** be allowed for that API key, or the API returns **403** with `error: access_denied`. The `zone_name` on API requests is the configuration name, not the provider DNS domain.
 
+Run **one** uvicorn worker. The container entrypoint and `python -m src.ssl_certs serve` pass `--workers 1`. Multiple workers are unsupported: Let's Encrypt enrollment and backup restore use SQLite-backed gates, but shutdown signaling, the remote syslog queue, and BIND AXFR slots stay process-local. Do not add `--workers` via `UVICORN_EXTRA_ARGS`.
+
 ## Configuration
 
 Create a `.env` file using `.env.example` and configure the following values:
@@ -119,6 +121,7 @@ Create a `.env` file using `.env.example` and configure the following values:
 | `OPENAPI_ENABLED` | When `1`, enable `/openapi.json`, `/docs`, and `/redoc` for authenticated dashboard sessions (default off) |
 | `DEBUG_ERRORS` | When `1`, include exception tracebacks in HTML error pages (dev only) |
 | `CORS_ORIGINS` | Comma-separated browser origins; empty disables cross-origin browser access |
+| `UVICORN_EXTRA_ARGS` | Optional extra uvicorn flags. Do not pass `--workers`; the process is single-worker only |
 
 Rate-limit counters use SQLite and retry brief transient `locked` / `busy` errors before failing closed. Persistent database failures therefore protect abuse boundaries at the cost of temporarily rejecting protected requests until the database recovers.
 

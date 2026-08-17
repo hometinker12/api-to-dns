@@ -317,6 +317,15 @@ jobs:
             echo "API container process is running as root"
             exit 1
           fi
+          API_CMDLINE="$(docker exec dns-api-test tr '\0' ' ' < /proc/1/cmdline)"
+          echo "dns-api-test cmdline: ${API_CMDLINE}"
+          case " ${API_CMDLINE} " in
+            *" --workers 1 "*|*" --workers=1 "*) ;;
+            *)
+              echo "Expected uvicorn --workers 1; got: ${API_CMDLINE}"
+              exit 1
+              ;;
+          esac
 
           for i in $(seq 1 60); do
             # Probe /health (not /login) so readiness checks do not consume RATE_LIMIT_LOGIN.
@@ -1227,6 +1236,17 @@ jobs:
             docker compose down -v --remove-orphans || true
             exit 1
           fi
+          COMPOSE_CMDLINE="$(docker compose exec -T dns-api tr '\0' ' ' < /proc/1/cmdline | tr -d '\r')"
+          echo "compose dns-api cmdline: ${COMPOSE_CMDLINE}"
+          case " ${COMPOSE_CMDLINE} " in
+            *" --workers 1 "*|*" --workers=1 "*) ;;
+            *)
+              echo "Expected compose uvicorn --workers 1; got: ${COMPOSE_CMDLINE}"
+              docker compose logs dns-api || true
+              docker compose down -v --remove-orphans || true
+              exit 1
+              ;;
+          esac
           curl --fail --silent -c /tmp/compose-cookies -X POST http://127.0.0.1:8001/login \
             -H "Content-Type: application/x-www-form-urlencoded" \
             -H "Origin: http://127.0.0.1:8001" \

@@ -298,6 +298,16 @@ def test_cli_bootstrap_prints_mode(ssl_workspace: Path, capsys: pytest.CaptureFi
     assert captured.out.strip() == "http"
 
 
+def test_uvicorn_command_forces_single_worker(ssl_workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("UVICORN_EXTRA_ARGS", "--proxy-headers")
+    http_cmd = ssl_certs._uvicorn_command("http")
+    assert http_cmd[-2:] == ["--workers", "1"]
+    assert "--proxy-headers" in http_cmd
+    https_cmd = ssl_certs._uvicorn_command("https")
+    assert https_cmd[-2:] == ["--workers", "1"]
+    assert "--ssl-keyfile" in https_cmd
+
+
 def test_cli_unknown_command_returns_error(capsys: pytest.CaptureFixture[str]) -> None:
     rc = ssl_certs._cli(["nope"])  # type: ignore[attr-defined]
     assert rc == 2
