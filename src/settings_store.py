@@ -1,6 +1,7 @@
 import json
 import logging
 
+from sqlalchemy import text
 from sqlmodel import select
 
 from .models import Setting
@@ -117,3 +118,12 @@ def log_unknown_settings(db) -> list[str]:
     if names:
         LOGGER.warning("Unregistered Setting rows present: %s", ", ".join(names))
     return names
+
+
+def begin_immediate(db) -> None:
+    """Take a SQLite write lock so a check-then-write gate cannot interleave."""
+    bind = db.get_bind()
+    if bind.dialect.name != "sqlite":
+        return
+    db.commit()
+    db.execute(text("BEGIN IMMEDIATE"))

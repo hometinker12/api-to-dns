@@ -55,6 +55,7 @@ services:
       - api-to-dns-ssl:/app/data/ssl
       - api-to-dns-logs:/app/logs
     restart: unless-stopped
+    # Single uvicorn worker is required; the image entrypoint passes --workers 1.
     healthcheck:
       test: ["CMD", "python", "-m", "src.ssl_certs", "healthcheck"]
       interval: 30s

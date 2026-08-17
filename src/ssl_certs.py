@@ -533,8 +533,10 @@ def _uvicorn_command(mode: str) -> list:
             str(key_path),
             "--ssl-certfile",
             str(cert_path),
+            "--workers",
+            "1",
         ]
-    return base + ["--port", str(http_port()), *extra]
+    return base + ["--port", str(http_port()), *extra, "--workers", "1"]
 
 
 def serve() -> int:

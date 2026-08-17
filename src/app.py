@@ -39,11 +39,10 @@ from .rbac import (
     serialize_roles,
 )
 from .restart import (
+    apply_le_renewal_restart_policy,
     clear_le_renewal_pending_restart,
     clear_restart_required,
     is_le_renewal_pending_restart,
-    mark_le_renewal_pending_restart,
-    mark_restart_required,
     perform_application_restart,
     scheduled_restart_due,
 )
@@ -62,6 +61,7 @@ WEB_AUTH_PATH_PREFIXES = (
 )
 _REQUEST_LOG_IGNORE_PREFIXES = ("/static",)
 
+# Process-local shutdown latch. Not shared across uvicorn workers — run a single worker.
 _shutting_down = False
 
 
@@ -88,6 +88,9 @@ def _startup_init() -> None:
         clear_restart_required(db)
         clear_le_renewal_pending_restart(db)
         letsencrypt.clear_enrollment_progress(db)
+        from . import backup_service
+
+        backup_service.clear_stale_restore_progress(db)
         try:
             run_retention_cleanup(db, force=True)
         except Exception:
@@ -134,14 +137,15 @@ async def lifespan(app: FastAPI):
         signal.signal(signal.SIGINT, previous_sigint)
 
 
+async def _run_letsencrypt_renewal_once() -> None:
+    await asyncio.to_thread(letsencrypt.maybe_renew_certificate_standalone)
+
+
 async def _letsencrypt_renewal_loop() -> None:
     while True:
         await asyncio.sleep(12 * 60 * 60)
         try:
-            with SessionLocal() as db:
-                result = letsencrypt.maybe_renew_certificate(db)
-                if result:
-                    _apply_le_renewal_restart_policy(db, result.get("config") or {})
+            await _run_letsencrypt_renewal_once()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -149,10 +153,7 @@ async def _letsencrypt_renewal_loop() -> None:
 
 
 def _apply_le_renewal_restart_policy(db, config: dict[str, Any]) -> None:
-    if config.get("scheduled_restart_enabled") and config.get("scheduled_restart_time"):
-        mark_le_renewal_pending_restart(db)
-    else:
-        mark_restart_required(db, reason="Let's Encrypt certificate renewed.")
+    apply_le_renewal_restart_policy(db, config)
 
 
 def _maybe_scheduled_le_restart(db, *, now: datetime | None = None) -> bool:

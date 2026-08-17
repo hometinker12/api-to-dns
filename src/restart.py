@@ -11,6 +11,7 @@ import asyncio
 import os
 import signal
 from datetime import datetime
+from typing import Any
 
 from .settings_store import delete_setting, get_typed_setting_by_key, set_typed_setting_by_key
 from .ssl_certs import access_url
@@ -57,6 +58,13 @@ def clear_le_renewal_pending_restart(db) -> None:
 
 def is_le_renewal_pending_restart(db) -> bool:
     return _typed_bool(db, SETTING_LE_RENEWAL_PENDING_RESTART)
+
+
+def apply_le_renewal_restart_policy(db, config: dict[str, Any]) -> None:
+    if config.get("scheduled_restart_enabled") and config.get("scheduled_restart_time"):
+        mark_le_renewal_pending_restart(db)
+    else:
+        mark_restart_required(db, reason="Let's Encrypt certificate renewed.")
 
 
 def preview_restart_urls(db) -> dict[str, str]:

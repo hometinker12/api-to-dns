@@ -312,7 +312,7 @@ def validate_syslog_config(
 
 
 class RemoteSyslogForwarder:
-    """Singleton-style worker that drains a bounded queue to a remote syslog server."""
+    """In-process syslog queue and worker thread. Not shared across uvicorn workers."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()

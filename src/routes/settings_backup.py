@@ -191,8 +191,6 @@ def _run_backup_import_sync(
                 error=str(exc)[:500],
                 result_status="error",
             )
-    finally:
-        backup_service.set_import_in_progress(False)
 
 
 async def _run_backup_import(*, raw: bytes, password: str, categories: list[str], user: str) -> None:
@@ -205,7 +203,8 @@ async def _run_backup_import(*, raw: bytes, password: str, categories: list[str]
             user=user,
         )
     finally:
-        backup_service.set_import_in_progress(False)
+        with SessionLocal() as db:
+            backup_service.mark_restore_worker_finished(db)
 
 
 @router.post("/settings/backup/import-async", include_in_schema=False)
@@ -217,8 +216,6 @@ async def settings_backup_import_async(
     confirm_replace: str | None = Form(None),
     user: str = Depends(require_role(ROLE_GLOBAL_ADMIN)),
 ):
-    if backup_service.import_in_progress():
-        return JSONResponse({"detail": "A restore is already in progress."}, status_code=HTTP_409_CONFLICT)
     if (confirm_replace or "").strip() not in {"1", "true", "on", "yes"}:
         return JSONResponse(
             {"detail": "Confirm destructive replace before restoring."},
@@ -246,13 +243,7 @@ async def settings_backup_import_async(
         return JSONResponse({"detail": str(exc)}, status_code=400)
 
     with SessionLocal() as db:
-        backup_service.clear_restore_progress(db)
-        backup_service.write_restore_progress(
-            db,
-            phase="starting",
-            percent=0,
-            message="Starting restore…",
-        )
-    backup_service.set_import_in_progress(True)
+        if not backup_service.try_begin_restore(db):
+            return JSONResponse({"detail": "A restore is already in progress."}, status_code=HTTP_409_CONFLICT)
     asyncio.create_task(_run_backup_import(raw=raw, password=password, categories=selected, user=user))
     return JSONResponse({"status": "started"}, status_code=HTTP_202_ACCEPTED)

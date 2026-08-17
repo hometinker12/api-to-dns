@@ -285,6 +285,49 @@ def test_import_async_progress_and_restart(client: TestClient) -> None:
         set_import_in_progress(False)
 
 
+def test_import_async_rejects_concurrent(client: TestClient) -> None:
+    from src.backup_service import try_begin_restore
+
+    _admin_client(client)
+    with SessionLocal() as db:
+        payload = build_payload(db, [CATEGORY_SETTINGS, CATEGORY_APPLICATION_SECRETS])
+        raw = serialize_backup(payload, encrypt=True, password="password1")
+        assert try_begin_restore(db) is True
+    response = client.post(
+        "/settings/backup/import-async",
+        data={
+            "categories": [CATEGORY_SETTINGS, CATEGORY_APPLICATION_SECRETS],
+            "password": "password1",
+            "confirm_replace": "1",
+        },
+        files={"backup_file": ("test.atdb", raw, "application/octet-stream")},
+    )
+    assert response.status_code == 409
+    with SessionLocal() as db:
+        from src.backup_service import clear_restore_progress
+
+        clear_restore_progress(db)
+
+
+def test_try_begin_restore_is_exclusive(client: TestClient) -> None:
+    from src.backup_service import clear_restore_progress, try_begin_restore, write_restore_progress
+
+    with SessionLocal() as db:
+        clear_restore_progress(db)
+        assert try_begin_restore(db) is True
+        assert try_begin_restore(db) is False
+        write_restore_progress(
+            db,
+            phase="complete",
+            percent=100,
+            message="Restore complete.",
+            done=True,
+            result_status="success",
+        )
+        assert try_begin_restore(db) is True
+        clear_restore_progress(db)
+
+
 def test_import_requires_confirm(client: TestClient) -> None:
     _admin_client(client)
     with SessionLocal() as db:

@@ -262,9 +262,6 @@ def settings_regenerate_ssl(
     )
 
 
-_le_enrollment_in_progress = False
-
-
 def _emit_ssl_audit(
     db,
     *,
@@ -399,11 +396,11 @@ def _run_le_auto_enrollment_sync(kwargs: dict[str, Any], *, user: str) -> None:
 
 
 async def _run_le_auto_enrollment(kwargs: dict[str, Any], *, user: str) -> None:
-    global _le_enrollment_in_progress
     try:
         await asyncio.to_thread(_run_le_auto_enrollment_sync, kwargs, user=user)
     finally:
-        _le_enrollment_in_progress = False
+        with SessionLocal() as db:
+            letsencrypt.mark_enrollment_worker_finished(db)
 
 
 @router.get("/settings/system/ssl-letsencrypt/progress", include_in_schema=False)
@@ -430,7 +427,6 @@ async def settings_letsencrypt_start_async(
     scheduled_restart_time: str = Form(letsencrypt.DEFAULT_SCHEDULED_RESTART_TIME),
     user: str = Depends(require_role(ROLE_SYSTEM_UPDATE)),
 ):
-    global _le_enrollment_in_progress
     if challenge_type != letsencrypt.CHALLENGE_DNS or not str(zone_id).strip():
         with SessionLocal() as db:
             _emit_ssl_audit(
@@ -445,18 +441,6 @@ async def settings_letsencrypt_start_async(
             {"detail": "Async enrollment requires DNS-01 with an API configured zone."},
             status_code=400,
         )
-    if _le_enrollment_in_progress:
-        with SessionLocal() as db:
-            _emit_ssl_audit(
-                db,
-                action="letsencrypt_start_failed",
-                user=user,
-                status="error",
-                message="Let's Encrypt async enrollment rejected: already in progress",
-            )
-        return JSONResponse(
-            {"detail": "Let's Encrypt enrollment is already in progress."}, status_code=HTTP_409_CONFLICT
-        )
     kwargs = _le_start_form_kwargs(
         email=email,
         root_dns_domain=root_dns_domain,
@@ -470,15 +454,17 @@ async def settings_letsencrypt_start_async(
         scheduled_restart_time=scheduled_restart_time,
     )
     with SessionLocal() as db:
-        letsencrypt.clear_enrollment_progress(db)
-        letsencrypt.write_enrollment_progress(
-            db,
-            phase="starting",
-            percent=0,
-            message="Starting enrollment...",
-        )
-    _le_enrollment_in_progress = True
-    with SessionLocal() as db:
+        if not letsencrypt.try_begin_enrollment(db):
+            _emit_ssl_audit(
+                db,
+                action="letsencrypt_start_failed",
+                user=user,
+                status="error",
+                message="Let's Encrypt async enrollment rejected: already in progress",
+            )
+            return JSONResponse(
+                {"detail": "Let's Encrypt enrollment is already in progress."}, status_code=HTTP_409_CONFLICT
+            )
         _emit_ssl_audit(
             db,
             action="letsencrypt_start_async",

@@ -28,6 +28,7 @@ from .utils import (
 # fewer than ``limit`` matched the browse/glob filter.
 _AXFR_MAX_RRSETS_SCANNED = 5_000
 # Cap concurrent BIND transfers process-wide so browse storms cannot open unbounded TCP AXFRs.
+# Process-local semaphore; multi-worker uvicorn is unsupported.
 _AXFR_MAX_CONCURRENT = 2
 _AXFR_SLOTS = threading.BoundedSemaphore(_AXFR_MAX_CONCURRENT)
 
