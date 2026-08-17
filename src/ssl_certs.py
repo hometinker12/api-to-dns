@@ -27,10 +27,10 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, rsa
 from cryptography.x509.oid import NameOID
 
-from .activity_logging import get_app_dns_name
 from .db import SessionLocal, init_db
 from .hostnames import validate_dns_hostname
 from .settings_store import get_typed_setting_by_key, set_typed_setting_by_key
+from .system_identity import get_app_dns_name
 
 LOGGER = logging.getLogger("api_to_dns")
 

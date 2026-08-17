@@ -4,22 +4,17 @@ from typing import Any
 from fastapi import Request
 from sqlmodel import select
 
-from . import activity_logging
 from .activity_logging import (
-    DEFAULT_BODY_TEMPLATE,
-    DEFAULT_SUBJECT_TEMPLATE,
     get_log_level,
-    get_remote_syslog_config,
     get_retention_days,
-    get_smtp_config,
-    is_running_in_docker,
     query_activity_logs,
-    system_identity,
 )
+from .alerting import DEFAULT_BODY_TEMPLATE, DEFAULT_SMTP_SECURITY, DEFAULT_SUBJECT_TEMPLATE, get_smtp_config
 from .db import SessionLocal
 from .letsencrypt import config_view as letsencrypt_config_view
 from .log_constants import LOG_CATEGORY_VALUES, LOG_LEVEL_VALUES
 from .models import AlertRule, User
+from .operational_logging import SETTING_LOG_BACKUP_COUNT, SETTING_LOG_FILE, SETTING_LOG_MAX_BYTES
 from .rbac import (
     BACKUP_SECTIONS,
     ROLE_ACCOUNT_RESET_PASSWORD,
@@ -38,6 +33,7 @@ from .rbac import (
     role_catalog_for_actor,
     user_public_dict,
 )
+from .remote_syslog import get_remote_syslog_config
 from .restart import is_restart_required
 from .settings_store import get_typed_setting_by_key
 from .ssl_certs import (
@@ -52,6 +48,7 @@ from .ssl_certs import (
     is_ssl_enabled,
     tls_port,
 )
+from .system_identity import is_running_in_docker, system_identity
 from .web import nav_context, templates
 from .zone_service import dns_provider_options_with_state
 
@@ -184,7 +181,7 @@ def settings_context(
                     "anonymous": bool(smtp.get("anonymous")),
                     "username": smtp.get("username") or "",
                     "from_address": smtp.get("from_address") or "",
-                    "security": smtp.get("security") or activity_logging.DEFAULT_SMTP_SECURITY,
+                    "security": smtp.get("security") or DEFAULT_SMTP_SECURITY,
                     "timeout": smtp.get("timeout"),
                     "allow_insecure_auth": bool(smtp.get("allow_insecure_auth")),
                     "password_set": bool(smtp.get("password_set") or smtp.get("password")),
@@ -204,9 +201,9 @@ def settings_context(
                 },
                 "ssl": ssl_status,
                 "operational_log": {
-                    "log_file": str(get_typed_setting_by_key(db, activity_logging.SETTING_LOG_FILE) or ""),
-                    "max_bytes": int(get_typed_setting_by_key(db, activity_logging.SETTING_LOG_MAX_BYTES)),
-                    "backup_count": int(get_typed_setting_by_key(db, activity_logging.SETTING_LOG_BACKUP_COUNT)),
+                    "log_file": str(get_typed_setting_by_key(db, SETTING_LOG_FILE) or ""),
+                    "max_bytes": int(get_typed_setting_by_key(db, SETTING_LOG_MAX_BYTES)),
+                    "backup_count": int(get_typed_setting_by_key(db, SETTING_LOG_BACKUP_COUNT)),
                 },
             }
 

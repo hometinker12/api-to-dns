@@ -12,12 +12,11 @@ from src.activity_logging import (
     emit_activity_event,
     infer_event_category,
     query_activity_logs,
-    render_alert_template,
     run_retention_cleanup,
     set_log_level,
     set_retention_days,
-    set_smtp_config,
 )
+from src.alerting import render_alert_template, set_smtp_config
 from src.app import app
 from src.auth import SESSION_IDLE_TIMEOUT_SECONDS, create_session_cookie
 from src.db import SessionLocal, init_db
@@ -2829,7 +2828,7 @@ def test_settings_app_dns_name_post_persists(client: TestClient) -> None:
     assert response.status_code == 200
     assert "App DNS name saved as my-dns.example" in response.text
     with SessionLocal() as db:
-        from src.activity_logging import get_app_dns_name
+        from src.system_identity import get_app_dns_name
 
         assert get_app_dns_name(db) == "my-dns.example"
 
@@ -3348,8 +3347,8 @@ def test_settings_remote_syslog_post_persists_and_emits_audit(client: TestClient
         assert "checked" in response.text.split('name="syslog_enabled"')[1].split(">")[0]
 
         with SessionLocal() as db:
-            from src.activity_logging import get_remote_syslog_config
             from src.models import ActivityLog
+            from src.remote_syslog import get_remote_syslog_config
 
             config = get_remote_syslog_config(db)
             assert config["enabled"] is True
@@ -3391,8 +3390,7 @@ def test_settings_remote_syslog_rejects_plaintext_without_opt_in(client: TestCli
 
 
 def test_settings_remote_syslog_requires_system_update(client: TestClient) -> None:
-    from src.activity_logging import get_remote_syslog_config, set_remote_syslog_config
-    from src.remote_syslog import REMOTE_SYSLOG, SyslogConfig
+    from src.remote_syslog import REMOTE_SYSLOG, SyslogConfig, get_remote_syslog_config, set_remote_syslog_config
 
     with SessionLocal() as db:
         _delete_users(db)
@@ -3490,7 +3488,7 @@ def test_settings_remote_syslog_can_be_disabled(client: TestClient) -> None:
         assert response.status_code == 200
         assert "Remote syslog settings saved." in response.text
         with SessionLocal() as db:
-            from src.activity_logging import get_remote_syslog_config
+            from src.remote_syslog import get_remote_syslog_config
 
             config = get_remote_syslog_config(db)
             assert config["enabled"] is False

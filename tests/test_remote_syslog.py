@@ -323,9 +323,8 @@ def test_emit_redacts_secrets_before_forward(client: TestClient, monkeypatch: py
 
 
 def test_apply_remote_syslog_config_rehydrates_worker(client: TestClient) -> None:
-    from src.activity_logging import apply_remote_syslog_config, set_remote_syslog_config
     from src.db import SessionLocal
-    from src.remote_syslog import REMOTE_SYSLOG
+    from src.remote_syslog import REMOTE_SYSLOG, apply_remote_syslog_config, set_remote_syslog_config
 
     try:
         with SessionLocal() as db:

@@ -8,7 +8,6 @@ from starlette.status import HTTP_202_ACCEPTED, HTTP_404_NOT_FOUND, HTTP_409_CON
 
 from .. import letsencrypt
 from ..activity_logging import (
-    LOGGER,
     emit_activity_event,
 )
 from ..db import SessionLocal, get_db
@@ -17,6 +16,7 @@ from ..log_constants import (
     LOG_CATEGORY_SECURITY,
     LOG_LEVEL_WARNING,
 )
+from ..operational_logging import LOGGER
 from ..rbac import (
     ROLE_SYSTEM_UPDATE,
     require_role,

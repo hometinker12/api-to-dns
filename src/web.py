@@ -6,8 +6,9 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
-from .activity_logging import LOGGER, emit_activity_event
+from .activity_logging import emit_activity_event
 from .db import SessionLocal
+from .operational_logging import LOGGER
 from .paths import TEMPLATES_DIR
 from .rbac import (
     ROLE_API_KEYS_READ,

@@ -2,19 +2,13 @@ from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse
 from sqlmodel import Session
 
-from .. import activity_logging
 from ..activity_logging import (
-    apply_remote_syslog_config,
-    configure_operational_logging,
     emit_activity_event,
     get_log_level,
-    is_running_in_docker,
-    set_app_dns_name,
     set_log_level,
-    set_remote_syslog_config,
     set_retention_days,
-    set_smtp_config,
 )
+from ..alerting import DEFAULT_SMTP_PORT, DEFAULT_SMTP_SECURITY, DEFAULT_SMTP_TIMEOUT, set_smtp_config
 from ..db import get_db
 from ..event_types import (
     EVENT_SYSTEM_SYSLOG_UPDATED,
@@ -22,12 +16,20 @@ from ..event_types import (
 from ..log_constants import (
     LOG_LEVEL_INFORMATIONAL,
 )
+from ..operational_logging import (
+    SETTING_LOG_BACKUP_COUNT,
+    SETTING_LOG_FILE,
+    SETTING_LOG_MAX_BYTES,
+    configure_operational_logging,
+)
 from ..rbac import (
     ROLE_SYSTEM_UPDATE,
     require_role,
 )
+from ..remote_syslog import apply_remote_syslog_config, set_remote_syslog_config
 from ..settings_context import render_settings
 from ..settings_store import set_typed_setting_by_key
+from ..system_identity import is_running_in_docker, set_app_dns_name
 
 router = APIRouter(tags=["settings"], include_in_schema=False)
 
@@ -152,13 +154,13 @@ def settings_update_retention(
 def settings_update_smtp(
     request: Request,
     smtp_servers: str = Form(""),
-    smtp_port: int = Form(activity_logging.DEFAULT_SMTP_PORT),
-    smtp_security: str = Form(activity_logging.DEFAULT_SMTP_SECURITY),
+    smtp_port: int = Form(DEFAULT_SMTP_PORT),
+    smtp_security: str = Form(DEFAULT_SMTP_SECURITY),
     smtp_anonymous: str | None = Form(None),
     smtp_username: str = Form(""),
     smtp_password: str = Form(""),
     smtp_from: str = Form(""),
-    smtp_timeout: int = Form(activity_logging.DEFAULT_SMTP_TIMEOUT),
+    smtp_timeout: int = Form(DEFAULT_SMTP_TIMEOUT),
     smtp_allow_insecure_auth: str | None = Form(None),
     redirect_section: str = Form("smtp_delivery"),
     db: Session = Depends(get_db),
@@ -301,9 +303,9 @@ def settings_update_log_rotation(
             message_kind="error",
             section=redirect_section,
         )
-    set_typed_setting_by_key(db, activity_logging.SETTING_LOG_FILE, log_file or "")
-    set_typed_setting_by_key(db, activity_logging.SETTING_LOG_MAX_BYTES, max(1024, int(max_bytes)))
-    set_typed_setting_by_key(db, activity_logging.SETTING_LOG_BACKUP_COUNT, max(0, int(backup_count)))
+    set_typed_setting_by_key(db, SETTING_LOG_FILE, log_file or "")
+    set_typed_setting_by_key(db, SETTING_LOG_MAX_BYTES, max(1024, int(max_bytes)))
+    set_typed_setting_by_key(db, SETTING_LOG_BACKUP_COUNT, max(0, int(backup_count)))
     configure_operational_logging(
         level=get_log_level(db),
         log_file=log_file or None,
