@@ -110,7 +110,8 @@ Create a `.env` file using `.env.example` and configure the following values:
 | `ENCRYPTION_KEY` | Key for encrypting settings in the database (must be a valid Fernet key)                          |
 | `ADMIN_USER`     | Initial admin username                                                                            |
 | `ADMIN_PASSWORD` | Initial admin password                                                                            |
-| `DATABASE_URL`   | Optional database URL (default: `sqlite:///./data/app.db`). **SQLite is the supported engine**; other SQLAlchemy URLs are not a supported deployment. |
+| `DATABASE_URL`   | Optional database URL (default: `sqlite:///./data/app.db`). **SQLite is the supported engine**; schema migrations are SQLite-only. Other SQLAlchemy URLs are not a supported deployment. |
+| `API_TO_DNS_ALLOW_NON_SQLITE` | When `1`, silence the startup warning for a non-SQLite `DATABASE_URL`. This is **not** a support claim. |
 | `LOG_FILE`       | Optional file path for rotating operational logs (Docker Compose sets `/app/logs/api-to-dns.log`) |
 | `APP_SSL_DIR`    | Directory holding `server.key` / `server.crt` (default `/app/data/ssl` in Docker, `./data/ssl` locally). Do not use `SSL_CERT_DIR` — OpenSSL uses that name for CA lookup and breaks outbound HTTPS. |
 | `HTTP_PORT`      | Listener port when SSL is disabled (default `8000`)                                               |

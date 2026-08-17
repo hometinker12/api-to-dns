@@ -1,3 +1,4 @@
+import logging
 import os
 from collections.abc import Iterator
 
@@ -5,6 +6,12 @@ from sqlalchemy.orm import sessionmaker
 from sqlmodel import Session, SQLModel, create_engine
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/app.db")
+ALLOW_NON_SQLITE_ENV = "API_TO_DNS_ALLOW_NON_SQLITE"
+NON_SQLITE_WARNING = (
+    "DATABASE_URL is not SQLite. SQLite is the only supported engine; "
+    "schema migrations are SQLite-only. Other SQLAlchemy URLs are unsupported. "
+    "Set API_TO_DNS_ALLOW_NON_SQLITE=1 only to silence this warning; it does not enable support."
+)
 
 if DATABASE_URL.startswith("sqlite:///"):
     data_dir = os.path.dirname(DATABASE_URL.replace("sqlite:///", ""))
@@ -25,9 +32,35 @@ def get_db() -> Iterator[Session]:
         yield db
 
 
+def is_sqlite_database_url(url: str) -> bool:
+    """True for SQLite SQLAlchemy URLs, including ``sqlite+pysqlite``."""
+    scheme = (url or "").strip().lower().split(":", 1)[0]
+    return scheme == "sqlite" or scheme.startswith("sqlite+")
+
+
+def allow_non_sqlite_database() -> bool:
+    """True when the operator opted to silence the non-SQLite warning."""
+    return os.getenv(ALLOW_NON_SQLITE_ENV, "").strip().lower() in {"1", "true", "yes"}
+
+
+def warn_if_non_sqlite_database(
+    url: str | None = None,
+    *,
+    logger: logging.Logger | None = None,
+) -> bool:
+    """Warn when ``DATABASE_URL`` is not SQLite. Does not crash. Returns True if a warning was logged."""
+    target = DATABASE_URL if url is None else url
+    if is_sqlite_database_url(target) or allow_non_sqlite_database():
+        return False
+    log = logger or logging.getLogger("api_to_dns")
+    log.warning(NON_SQLITE_WARNING)
+    return True
+
+
 def init_db() -> None:
     from . import models  # noqa: F401 — register SQLModel subclasses before create_all
 
+    warn_if_non_sqlite_database()
     SQLModel.metadata.create_all(engine)
     _migrate_add_user_roles_column()
     _migrate_normalize_empty_user_roles()

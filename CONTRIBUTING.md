@@ -62,6 +62,21 @@ Avoid adding more routes directly to `src/app.py` when they can be placed in a f
 
 When mocking DNS clients in tests, patch `src.zone_service.create_dns_client_from_settings`, not `src.app`.
 
+## Database schema changes
+
+SQLite is the supported production engine. Do not add Alembic. After `SQLModel.metadata.create_all`, add an idempotent `_migrate_*` helper in `src/db.py` and call it from `init_db()`.
+
+Typical sequence:
+
+1. `inspect(engine)` the table.
+2. Return early if the table is missing (`create_all` adds new tables).
+3. Return early if the column or index already exists.
+4. `ALTER TABLE ... ADD COLUMN` or create the index.
+5. Backfill existing rows when a column default would otherwise leave legacy data incorrect.
+6. Cover the helper in tests (`tests/test_security.py` or a focused test module). Running the helper twice must be a no-op.
+
+Use SQLite SQL only. Postgres and other engines are unsupported; `API_TO_DNS_ALLOW_NON_SQLITE=1` only silences the startup warning.
+
 ## Coding standards
 
 Python code is checked with Ruff:
