@@ -23,6 +23,7 @@
 - Operational Python logging and system identity helpers live in `src/operational_logging.py` and `src/system_identity.py`. SMTP alerting lives in `src/alerting.py`; remote syslog get/set/apply lives in `src/remote_syslog.py`. Callers import from those owner modules; `src/activity_logging.py` still re-exports the names for compatibility.
 - Public DNS request/response models live in `src/schemas/dns.py`. Callers import them from that module; SQLModel tables stay in `src/models.py`.
 - Startup warns when `DATABASE_URL` is not SQLite. `API_TO_DNS_ALLOW_NON_SQLITE=1` only silences that warning; it is not a support claim. Schema migrations stay hand-rolled and SQLite-only (no Alembic).
+- Admin HTML errors (access denied, CSRF failure, and unexpected 500s) share `templates/error.html` with the same theme, favicon, brand mark, and version footer as other pages. JSON CSRF and API error envelopes are unchanged.
 
 ## [0.8.1] - 2026-08-11
 
