@@ -11,7 +11,7 @@ import dns.update
 import dns.xfr
 
 from ..dns_record_types import MUTABLE_RECORD_TYPES, normalize_record_values
-from ..models import DnsRecordInfo, DnsRecordListResult, DnsRecordRequest
+from ..schemas.dns import DnsRecordInfo, DnsRecordListResult, DnsRecordRequest
 from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
 from .utils import (
     LOOKUP_RECORD_TYPES,

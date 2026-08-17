@@ -12,7 +12,7 @@ from src.dns_mutation import (
     merge_patch,
     prepare_mutation,
 )
-from src.models import DnsRecordInfo
+from src.schemas.dns import DnsRecordInfo
 
 
 def test_prepare_mutation_normalizes_and_defaults_ttl() -> None:

@@ -99,7 +99,7 @@ def apply_rrset_mutation(
     mode: Literal["create", "replace", "delete"],
 ) -> DnsMutationOutcome:
     """Create, replace, or delete an RRset with shared 409/404 semantics."""
-    from .models import DnsRecordRequest
+    from .schemas.dns import DnsRecordRequest
 
     rt_upper = record_type.strip().upper()
     provider_domain = provider_dns_zone(settings)
@@ -180,7 +180,7 @@ def apply_patch_mutation(
     patch_values: list[str] | None,
 ) -> DnsMutationOutcome:
     """GET existing RRset, merge PATCH fields, then replace. Missing records are 404."""
-    from .models import DnsRecordRequest
+    from .schemas.dns import DnsRecordRequest
 
     rt_upper = record_type.strip().upper()
     provider_domain = provider_dns_zone(settings)

@@ -34,8 +34,6 @@ from src.models import (
     AlertRule,
     ApiKey,
     ApiKeyAllowedZone,
-    DnsRecordInfo,
-    DnsRecordListResult,
     DnsZoneConfig,
     User,
 )
@@ -58,6 +56,7 @@ from src.rbac import (
 from src.rbac import (
     serialize_roles as _serialize_roles,
 )
+from src.schemas.dns import DnsRecordInfo, DnsRecordListResult
 from src.security import hash_api_key, hash_password
 from src.time_utils import utc_now
 from src.zone_service import decode_zone_config, encode_zone_config_dict, normalize_zone_name, provider_dns_zone
@@ -300,7 +299,7 @@ def test_zone_test_requires_auth(client: TestClient) -> None:
 
 def test_zone_test_success(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     monkeypatch.setattr(
         "src.zone_service.test_zone_record_lookup",
@@ -394,7 +393,7 @@ def test_zones_json_request_returns_zone_ids(client: TestClient) -> None:
 def test_read_only_api_key_allows_read_endpoints(
     client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     with SessionLocal() as db:
         key = db.exec(select(ApiKey).where(ApiKey.key == hash_api_key(api_key_value))).first()
@@ -807,7 +806,7 @@ def test_dns_record_get_requires_api_key(client: TestClient) -> None:
 def test_dns_record_get_with_mock_client(
     client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     monkeypatch.setattr(
         "src.zone_service.test_zone_record_lookup",
@@ -834,7 +833,7 @@ def test_dns_record_get_with_mock_client(
 def test_dns_record_get_untyped_multi_type(
     client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     monkeypatch.setattr(
         "src.zone_service.test_zone_record_lookup",
@@ -1022,7 +1021,7 @@ def test_dns_record_audit_message_uses_provider_dns_zone(
 def test_dns_record_post_conflict_returns_409(
     client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     fake = MagicMock()
     fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A")]
@@ -1055,7 +1054,7 @@ def test_dns_record_post_conflict_returns_409(
 def test_dns_record_put_replaces_existing_record(
     client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     fake = MagicMock()
     fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A")]
@@ -1123,7 +1122,7 @@ def test_dns_record_put_requires_ttl(client: TestClient, api_key_value: str) -> 
 def test_dns_record_patch_updates_values(
     client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     fake = MagicMock()
     fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])]
@@ -1152,7 +1151,7 @@ def test_dns_record_patch_updates_values(
 
 
 def test_dns_record_patch_ttl_only(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     fake = MagicMock()
     fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])]
@@ -1176,7 +1175,7 @@ def test_dns_record_patch_ttl_only(client: TestClient, api_key_value: str, monke
 
 
 def test_dns_record_patch_both_fields(client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     fake = MagicMock()
     fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A", ttl=300, values=["192.0.2.1"])]
@@ -1254,7 +1253,7 @@ def test_dns_record_patch_missing_returns_404(
 def test_dns_record_delete_with_mock_client(
     client: TestClient, api_key_value: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from src.models import DnsRecordInfo
+    from src.schemas.dns import DnsRecordInfo
 
     fake = MagicMock()
     fake.get_record.return_value = [DnsRecordInfo(record_name="www", record_type="A")]

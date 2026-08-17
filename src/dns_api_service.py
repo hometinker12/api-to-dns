@@ -26,9 +26,9 @@ from .models import (
     API_KEY_ACCESS_READ_WRITE,
     ApiKey,
     ApiKeyAllowedZone,
-    DnsRecordResponse,
     DnsZoneConfig,
 )
+from .schemas.dns import DnsRecordResponse
 from .web import record_activity
 from .zone_service import (
     DnsProviderDisabledError,

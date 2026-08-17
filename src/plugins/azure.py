@@ -10,7 +10,7 @@ from ..dns_record_types import (
     parse_mx,
     parse_srv,
 )
-from ..models import DnsRecordInfo, DnsRecordListResult, DnsRecordRequest
+from ..schemas.dns import DnsRecordInfo, DnsRecordListResult, DnsRecordRequest
 from .base import DNS_ZONE_DOMAIN_FIELD, DnsProviderPlugin, PluginField
 from .utils import dns_relative_name, lookup_record_types_to_query, record_name_matches
 

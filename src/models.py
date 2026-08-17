@@ -23,17 +23,6 @@ from .log_constants import (  # noqa: F401
     LOG_LEVEL_WARNING,
     SECURITY_EVENT_PREFIXES,
 )
-from .schemas.dns import (  # noqa: F401
-    DnsRecordCreateRequest,
-    DnsRecordGetResponse,
-    DnsRecordInfo,
-    DnsRecordListResult,
-    DnsRecordPatchRequest,
-    DnsRecordReplaceRequest,
-    DnsRecordRequest,
-    DnsRecordResponse,
-    DnsZoneSummary,
-)
 from .time_utils import utc_now
 
 

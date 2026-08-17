@@ -38,7 +38,8 @@ __all__ = [
     "test_zone_record_lookup",
     "zones_using_dns_provider",
 ]
-from .models import ActivityLog, ApiKey, ApiKeyAllowedZone, DnsRecordInfo, DnsZoneConfig
+from .models import ActivityLog, ApiKey, ApiKeyAllowedZone, DnsZoneConfig
+from .schemas.dns import DnsRecordInfo
 from .security import decrypt_value, encrypt_value
 from .settings_store import delete_setting, get_setting, get_typed_setting_by_key, set_typed_setting_by_key
 

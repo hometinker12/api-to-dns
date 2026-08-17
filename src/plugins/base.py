@@ -2,7 +2,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from ..models import DnsRecordInfo, DnsRecordListResult, DnsRecordRequest
+from ..schemas.dns import DnsRecordInfo, DnsRecordListResult, DnsRecordRequest
 
 
 @dataclass(frozen=True)
