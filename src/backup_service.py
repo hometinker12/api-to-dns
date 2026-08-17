@@ -11,6 +11,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
+from cryptography.fernet import InvalidToken
 from sqlmodel import select
 
 from . import env_bootstrap
@@ -33,7 +34,7 @@ from .models import (
     User,
 )
 from .rbac import ROLE_GLOBAL_ADMIN, effective_roles, parse_roles, serialize_roles
-from .security import pwd_context
+from .security import decrypt_value, pwd_context
 from .settings_store import begin_immediate, delete_setting, get_typed_setting_by_key, set_typed_setting_by_key
 from .ssl_certs import CERT_FILENAME, KEY_FILENAME, SOURCE_FILENAME, cert_dir
 from .time_utils import utc_now
@@ -148,7 +149,7 @@ def write_restore_progress(
 def get_restore_progress(db) -> dict[str, Any]:
     try:
         data = get_typed_setting_by_key(db, SETTING_BACKUP_PROGRESS)
-    except ValueError:
+    except (ValueError, InvalidToken):
         data = {}
     if not isinstance(data, dict):
         data = {}
@@ -198,6 +199,16 @@ def mark_restore_worker_finished(db) -> None:
 
 
 def clear_stale_restore_progress(db) -> None:
+    """Drop in-progress or unreadable restore rows (e.g. after ENCRYPTION_KEY restore)."""
+    row = db.exec(select(Setting).where(Setting.name == SETTING_BACKUP_PROGRESS)).first()
+    if row is None:
+        return
+    try:
+        decrypt_value(row.value)
+    except Exception:
+        LOGGER.warning("Restore progress could not be decrypted after startup; dropping the row")
+        delete_setting(db, SETTING_BACKUP_PROGRESS)
+        return
     if is_restore_in_progress(db):
         clear_restore_progress(db)
 

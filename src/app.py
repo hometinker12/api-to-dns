@@ -90,7 +90,10 @@ def _startup_init() -> None:
         letsencrypt.clear_enrollment_progress(db)
         from . import backup_service
 
-        backup_service.clear_stale_restore_progress(db)
+        try:
+            backup_service.clear_stale_restore_progress(db)
+        except Exception:
+            LOGGER.exception("startup restore-progress cleanup failed")
         try:
             run_retention_cleanup(db, force=True)
         except Exception:

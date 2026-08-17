@@ -328,6 +328,28 @@ def test_try_begin_restore_is_exclusive(client: TestClient) -> None:
         clear_restore_progress(db)
 
 
+def test_clear_stale_restore_progress_drops_undecryptable_row(client: TestClient) -> None:
+    from cryptography.fernet import Fernet
+    from sqlmodel import select
+
+    from src.backup_service import SETTING_BACKUP_PROGRESS, clear_stale_restore_progress, get_restore_progress
+    from src.models import Setting
+
+    foreign = Fernet(Fernet.generate_key()).encrypt(b'{"phase":"complete","done":true}').decode()
+    with SessionLocal() as db:
+        row = db.exec(select(Setting).where(Setting.name == SETTING_BACKUP_PROGRESS)).first()
+        if row:
+            row.value = foreign
+            db.add(row)
+        else:
+            db.add(Setting(name=SETTING_BACKUP_PROGRESS, value=foreign))
+        db.commit()
+        clear_stale_restore_progress(db)
+        leftover = db.exec(select(Setting).where(Setting.name == SETTING_BACKUP_PROGRESS)).first()
+        assert leftover is None
+        assert get_restore_progress(db)["phase"] == "idle"
+
+
 def test_import_requires_confirm(client: TestClient) -> None:
     _admin_client(client)
     with SessionLocal() as db:
