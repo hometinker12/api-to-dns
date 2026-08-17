@@ -16,7 +16,7 @@ def test_get_app_version_matches_version_file() -> None:
     get_app_version.cache_clear()
     expected = (Path(__file__).resolve().parents[1] / "VERSION").read_text(encoding="utf-8").strip()
     assert get_app_version() == expected
-    assert expected == "0.8.1"
+    assert expected == "0.8.5"
 
 
 def test_fastapi_app_version_matches_version_file() -> None:
@@ -422,7 +422,12 @@ def test_enabled_openapi_requires_dashboard_session(client: TestClient) -> None:
     assert oauth_redirect.headers["location"] == "/login"
 
     client.cookies.set("session", create_session_cookie("admin"))
-    assert client.get("/openapi.json").status_code == 200
+    from src.version import get_app_version
+
+    get_app_version.cache_clear()
+    schema = client.get("/openapi.json")
+    assert schema.status_code == 200
+    assert schema.json()["info"]["version"] == get_app_version()
     assert client.get("/docs").status_code == 200
     assert client.get("/redoc").status_code == 200
     assert client.get("/docs/oauth2-redirect").status_code == 200

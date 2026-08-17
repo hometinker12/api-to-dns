@@ -76,6 +76,13 @@ jobs:
           IMAGE_TAG="api-to-dns-bind-smoke:$(date +%s)"
           docker build . --file Dockerfile --tag "$IMAGE_TAG"
           echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+          EXPECTED_VERSION="$(tr -d '\r\n' < VERSION)"
+          OCI_VERSION="$(docker image inspect "$IMAGE_TAG" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')"
+          if [ "$OCI_VERSION" != "$EXPECTED_VERSION" ]; then
+            echo "Expected org.opencontainers.image.version=${EXPECTED_VERSION}; got ${OCI_VERSION}"
+            exit 1
+          fi
+          echo "OCI version label ${OCI_VERSION} matches VERSION"
 
       - name: Scan smoke image with Trivy
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -428,10 +435,12 @@ jobs:
           from pathlib import Path
 
           schema = json.loads(Path("/tmp/openapi.json").read_text(encoding="utf-8"))
+          version = Path("VERSION").read_text(encoding="utf-8").strip()
+          assert schema["info"]["version"] == version, schema.get("info")
           desc = schema["components"]["schemas"]["DnsRecordInfo"]["properties"]["record_type"]["description"]
           for token in ("MX", "NS", "SRV", "CAA", "PTR", "SOA"):
               assert token in desc, (token, desc)
-          print("DnsRecordInfo lookup-type description assertion passed")
+          print("OpenAPI version + DnsRecordInfo lookup-type description assertions passed")
           PY
           docs_code="$(curl --silent --show-error -o /dev/null -w "%{http_code}" -b /tmp/cookies http://127.0.0.1:8000/docs)"
           if [ "${docs_code}" != "200" ]; then
@@ -467,12 +476,12 @@ jobs:
           nav = html.split('<nav class="nav-links">', 1)[1].split("</nav>", 1)[0]
           assert nav.index('href="/api-keys"') < nav.index('href="/admin"') < nav.index('href="/settings"') < nav.index('action="/logout"'), nav
           version = Path("VERSION").read_text(encoding="utf-8").strip()
-          assert version == "0.8.1", version
+          assert version == "0.8.5", version
           assert f"api-to-dns v{version}" in html, html[-400:]
-          assert 'version = "0.8.1"' in Path("pyproject.toml").read_text(encoding="utf-8")
-          assert "ARG VERSION=0.8.1" in Path("Dockerfile").read_text(encoding="utf-8")
-          assert "hometinker12/api-to-dns:0.8.1" in Path("docker-compose.yml").read_text(encoding="utf-8")
-          print("admin nav + 0.8.1 metadata assertions passed")
+          assert 'version = "0.8.5"' in Path("pyproject.toml").read_text(encoding="utf-8")
+          assert "ARG VERSION=0.8.5" in Path("Dockerfile").read_text(encoding="utf-8")
+          assert "hometinker12/api-to-dns:0.8.5" in Path("docker-compose.yml").read_text(encoding="utf-8")
+          print("admin nav + 0.8.5 metadata assertions passed")
           PY
 
           echo "[bind] Static brand assets (favicon + logo mark)"
@@ -1203,7 +1212,7 @@ jobs:
           import os
           import subprocess
 
-          assert os.environ["APP_VERSION"] == "0.8.1", os.environ["APP_VERSION"]
+          assert os.environ["APP_VERSION"] == "0.8.5", os.environ["APP_VERSION"]
           expected_image = f"hometinker12/api-to-dns:{os.environ['APP_VERSION']}"
           cfg = json.loads(subprocess.check_output(["docker", "compose", "config", "--format", "json"], text=True))
           svc = cfg["services"]["dns-api"]
@@ -1680,7 +1689,7 @@ jobs:
               throw 'Admin header navigation order is not API Keys, Dashboard, Settings, Logout'
             }
             $appVersion = (Get-Content -Raw VERSION).Trim()
-            if ($appVersion -ne '0.8.1') { throw "Expected VERSION 0.8.1; got $appVersion" }
+            if ($appVersion -ne '0.8.5') { throw "Expected VERSION 0.8.5; got $appVersion" }
             if ($admin.Content -notmatch [regex]::Escape("api-to-dns v$appVersion")) {
               throw 'Admin page missing version footer'
             }

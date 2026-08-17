@@ -1,6 +1,6 @@
 # DNS REST Service
 
-[![License: MIT + Commons Clause](https://img.shields.io/badge/License-MIT%20+%20Commons%20Clause-orange)](LICENSE.md) [![Release](https://img.shields.io/badge/release-0.8.1-blue)](VERSION) [![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/) [![Python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/) [![AI Assisted](https://img.shields.io/badge/AI%20Assisted-yes-blue)](https://cursor.com)
+[![License: MIT + Commons Clause](https://img.shields.io/badge/License-MIT%20+%20Commons%20Clause-orange)](LICENSE.md) [![Release](https://img.shields.io/badge/release-0.8.5-blue)](VERSION) [![Docker](https://img.shields.io/badge/docker-ready-blue)](https://www.docker.com/) [![Python](https://img.shields.io/badge/python-3.12-green)](https://www.python.org/) [![AI Assisted](https://img.shields.io/badge/AI%20Assisted-yes-blue)](https://cursor.com)
 
 
 A Dockerized FastAPI service to manage DNS records through a protected admin web UI and secure API key authentication.
@@ -76,7 +76,7 @@ http://127.0.0.1:8001/login
 
 > SSL is **off by default**; the container listens on plain HTTP on port `8000` (mapped to host `127.0.0.1:8001`). See **Optional: HTTPS with self-signed or uploaded certificates** below for the enable workflow.
 >
-> The image runs as non-root uid/gid **10001**. Compose pins `hometinker12/api-to-dns:0.8.1`, enables `read_only`, drops capabilities, and binds published ports to **localhost** (`127.0.0.1:8001` and `127.0.0.1:8443`). If you upgrade from a root-owned named volume, fix ownership once (do not start the app as root):
+> The image runs as non-root uid/gid **10001**. Compose pins `hometinker12/api-to-dns:0.8.5`, enables `read_only`, drops capabilities, and binds published ports to **localhost** (`127.0.0.1:8001` and `127.0.0.1:8443`). If you upgrade from a root-owned named volume, fix ownership once (do not start the app as root):
 >
 > ```bash
 > docker run --rm -v api-to-dns_api-to-dns-data:/vol alpine chown -R 10001:10001 /vol
