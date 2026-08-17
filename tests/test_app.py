@@ -2835,14 +2835,18 @@ def test_settings_app_dns_name_post_persists(client: TestClient) -> None:
 
 
 def test_default_app_dns_name_uses_docker_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(activity_logging, "is_running_in_docker", lambda: True)
-    assert activity_logging.default_app_dns_name() == "apitodns.local"
+    from src import system_identity
+
+    monkeypatch.setattr(system_identity, "is_running_in_docker", lambda: True)
+    assert system_identity.default_app_dns_name() == "apitodns.local"
 
 
 def test_default_app_dns_name_uses_hostname_off_docker(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(activity_logging, "is_running_in_docker", lambda: False)
-    monkeypatch.setattr(activity_logging, "_host_system_dns_name", lambda: "host.example")
-    assert activity_logging.default_app_dns_name() == "host.example"
+    from src import system_identity
+
+    monkeypatch.setattr(system_identity, "is_running_in_docker", lambda: False)
+    monkeypatch.setattr(system_identity, "_host_system_dns_name", lambda: "host.example")
+    assert system_identity.default_app_dns_name() == "host.example"
 
 
 def test_settings_operational_log_rotation_docker_shows_message_only(

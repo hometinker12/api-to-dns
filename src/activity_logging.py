@@ -1,7 +1,9 @@
-"""Activity/audit logging, SMTP alerting, retention, and system identity helpers.
+"""Activity/audit logging, SMTP alerting, and retention.
 
 This module owns the database-backed activity log surface used by the admin UI
-and email alerting. It deliberately keeps a narrow, focused API:
+and email alerting. Operational logging and system identity live in
+``operational_logging`` and ``system_identity``; this module re-exports them
+for one-release compatibility.
 
 - ``emit_activity_event`` writes a normalized event row, applies redaction,
   and opportunistically triggers retention and alert evaluation.
@@ -14,21 +16,14 @@ and email alerting. It deliberately keeps a narrow, focused API:
   storing security-category events.
 - ``run_retention_cleanup`` deletes rows older than the configured retention
   window, throttled to no more than once per day per process.
-
-Operational logging configuration (Python ``logging``) is intentionally kept
-separate from the searchable audit events. See ``configure_operational_logging``.
 """
 
 from __future__ import annotations
 
 import json
-import logging
-import os
 import smtplib
-import socket
 from datetime import datetime, timedelta
 from email.message import EmailMessage
-from logging.handlers import RotatingFileHandler
 from typing import Any
 
 from sqlmodel import select
@@ -41,7 +36,6 @@ from .log_constants import (
     LOG_LEVEL_INFORMATIONAL,
     LOG_LEVEL_ORDER,
     LOG_LEVEL_VALUES,
-    LOG_LEVEL_VERBOSE,
     LOG_LEVEL_WARNING,
     SECURITY_EVENT_PREFIXES,
 )
@@ -49,10 +43,25 @@ from .models import (
     ActivityLog,
     AlertRule,
 )
+from .operational_logging import (
+    LOGGER,
+    SETTING_LOG_BACKUP_COUNT,
+    SETTING_LOG_FILE,
+    SETTING_LOG_MAX_BYTES,
+    configure_operational_logging,
+)
 from .settings_store import get_typed_setting_by_key, set_typed_setting_by_key
+from .system_identity import (
+    SETTING_APP_DNS_NAME,
+    default_app_dns_name,
+    detect_system_dns_name,
+    detect_system_ip_address,
+    get_app_dns_name,
+    is_running_in_docker,
+    set_app_dns_name,
+    system_identity,
+)
 from .time_utils import utc_now
-
-LOGGER = logging.getLogger("api_to_dns")
 
 DETAILS_BYTE_CAP = 4096
 
@@ -71,11 +80,6 @@ SETTING_SMTP_SECURITY = "smtp_security"  # one of "none", "starttls", "ssl"
 SETTING_SMTP_TIMEOUT = "smtp_timeout"
 SETTING_SMTP_ALLOW_INSECURE_AUTH = "smtp_allow_insecure_auth"
 
-SETTING_LOG_FILE = "operational_log_file"
-SETTING_LOG_MAX_BYTES = "operational_log_max_bytes"
-SETTING_LOG_BACKUP_COUNT = "operational_log_backup_count"
-SETTING_APP_DNS_NAME = "app_dns_name"
-
 SETTING_SYSLOG_ENABLED = "remote_syslog_enabled"
 SETTING_SYSLOG_HOST = "remote_syslog_host"
 SETTING_SYSLOG_PORT = "remote_syslog_port"
@@ -86,8 +90,6 @@ SETTING_SYSLOG_TIMEOUT = "remote_syslog_timeout"
 SETTING_SYSLOG_QUEUE_SIZE = "remote_syslog_queue_size"
 SETTING_SYSLOG_ALLOW_INSECURE = "remote_syslog_allow_insecure_plaintext"
 
-DEFAULT_APP_DNS_NAME_DOCKER = "apitodns.local"
-DOCKER_RUNTIME_LABEL = "Detected Docker container runtime."
 DEFAULT_LOG_LEVEL = LOG_LEVEL_INFORMATIONAL
 DEFAULT_RETENTION_DAYS = 90
 DEFAULT_SMTP_PORT = 587
@@ -260,88 +262,6 @@ def should_store_event(event_level: str, configured_level: str, category: str | 
     event_rank = LOG_LEVEL_ORDER.get(_normalize_level(event_level), LOG_LEVEL_ORDER[LOG_LEVEL_INFORMATIONAL])
     threshold = LOG_LEVEL_ORDER.get(_normalize_level(configured_level), LOG_LEVEL_ORDER[LOG_LEVEL_INFORMATIONAL])
     return event_rank >= threshold
-
-
-# ---------------------------------------------------------------------------
-# System identity
-# ---------------------------------------------------------------------------
-
-
-def is_running_in_docker() -> bool:
-    if os.path.exists("/.dockerenv"):
-        return True
-    try:
-        with open("/proc/1/cgroup", encoding="utf-8") as handle:
-            return any("docker" in line or "kubepods" in line or "containerd" in line for line in handle)
-    except OSError:
-        return False
-
-
-_host_system_dns_name_cache: str | None = None
-
-
-def _host_system_dns_name() -> str:
-    global _host_system_dns_name_cache
-    if _host_system_dns_name_cache is not None:
-        return _host_system_dns_name_cache
-    try:
-        hostname = socket.gethostname()
-        try:
-            resolved = socket.getfqdn(hostname) or hostname
-        except OSError:
-            resolved = hostname
-    except OSError:
-        resolved = "unknown"
-    _host_system_dns_name_cache = resolved
-    return resolved
-
-
-def detect_system_dns_name() -> str:
-    if is_running_in_docker():
-        return "Docker Container"
-    return _host_system_dns_name()
-
-
-def default_app_dns_name() -> str:
-    if is_running_in_docker():
-        return DEFAULT_APP_DNS_NAME_DOCKER
-    return _host_system_dns_name()
-
-
-def get_app_dns_name(db) -> str:
-    stored = _typed_str(db, SETTING_APP_DNS_NAME).strip()
-    if stored:
-        return stored
-    return default_app_dns_name()
-
-
-def set_app_dns_name(db, name: str) -> str:
-    from .hostnames import validate_dns_hostname
-
-    cleaned = validate_dns_hostname(name)
-    set_typed_setting_by_key(db, SETTING_APP_DNS_NAME, cleaned)
-    return cleaned
-
-
-def detect_system_ip_address() -> str:
-    if is_running_in_docker():
-        return DOCKER_RUNTIME_LABEL
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.settimeout(0.5)
-        sock.connect(("203.0.113.1", 1))
-        return sock.getsockname()[0]
-    except OSError:
-        try:
-            return socket.gethostbyname(socket.gethostname())
-        except OSError:
-            return "unknown"
-    finally:
-        sock.close()
-
-
-def system_identity(db) -> dict[str, str]:
-    return {"system_dns_name": get_app_dns_name(db), "system_ip_address": detect_system_ip_address()}
 
 
 # ---------------------------------------------------------------------------
@@ -947,52 +867,6 @@ def evaluate_alert_rules(db, row: ActivityLog) -> list[AlertRule]:
     return triggered
 
 
-# ---------------------------------------------------------------------------
-# Operational logger setup
-# ---------------------------------------------------------------------------
-
-
-def configure_operational_logging(
-    *,
-    level: str = LOG_LEVEL_INFORMATIONAL,
-    log_file: str | None = None,
-    max_bytes: int = 1_048_576,
-    backup_count: int = 5,
-) -> None:
-    """Configure the Python ``api_to_dns`` logger.
-
-    This is intentionally separate from the database-backed audit log; it
-    powers stdout/stderr for container deployments and an optional rotating
-    file handler for non-Docker installs.
-    """
-    py_level = {
-        LOG_LEVEL_VERBOSE: logging.DEBUG,
-        LOG_LEVEL_INFORMATIONAL: logging.INFO,
-        LOG_LEVEL_WARNING: logging.WARNING,
-        LOG_LEVEL_ERROR: logging.ERROR,
-    }.get(_normalize_level(level), logging.INFO)
-
-    LOGGER.setLevel(py_level)
-    for handler in list(LOGGER.handlers):
-        LOGGER.removeHandler(handler)
-
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    LOGGER.addHandler(stream_handler)
-
-    target_file = log_file or os.getenv("LOG_FILE")
-    if target_file:
-        try:
-            os.makedirs(os.path.dirname(target_file) or ".", exist_ok=True)
-            file_handler = RotatingFileHandler(
-                target_file, maxBytes=max(1024, int(max_bytes)), backupCount=max(0, int(backup_count))
-            )
-            file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-            LOGGER.addHandler(file_handler)
-        except OSError:  # pragma: no cover - best-effort file logging only
-            LOGGER.exception("could not configure rotating file handler for %s", target_file)
-
-
 __all__ = [
     "DEFAULT_BODY_TEMPLATE",
     "DEFAULT_RETENTION_DAYS",
@@ -1000,7 +874,10 @@ __all__ = [
     "DEFAULT_SMTP_TIMEOUT",
     "DEFAULT_SUBJECT_TEMPLATE",
     "LOGGER",
+    "SETTING_LOG_BACKUP_COUNT",
+    "SETTING_LOG_FILE",
     "SETTING_LOG_LEVEL",
+    "SETTING_LOG_MAX_BYTES",
     "SETTING_RETENTION_DAYS",
     "SETTING_SYSLOG_ENABLED",
     "SETTING_SYSLOG_HOST",
