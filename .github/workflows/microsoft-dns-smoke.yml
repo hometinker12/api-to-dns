@@ -330,6 +330,9 @@ jobs:
             sleep 2
           done
 
+          curl --fail --silent http://127.0.0.1:8000/ready \
+            | python3 -c "import json,sys; assert json.load(sys.stdin)=={'status':'ready'}"
+
           # Read /proc/1/cmdline inside the container (host-side < redirects to the runner).
           API_CMDLINE="$(docker exec dns-api-test sh -c 'tr "\0" " " < /proc/1/cmdline')"
           echo "dns-api-test cmdline: ${API_CMDLINE}"
@@ -1231,6 +1234,8 @@ jobs:
             sleep 2
           done
           curl --fail --silent http://127.0.0.1:8001/health >/dev/null
+          curl --fail --silent http://127.0.0.1:8001/ready \
+            | python3 -c "import json,sys; assert json.load(sys.stdin)=={'status':'ready'}"
           COMPOSE_UID="$(docker compose exec -T dns-api id -u | tr -d '\r')"
           if [ "${COMPOSE_UID}" = "0" ]; then
             echo "Compose service process is running as root"

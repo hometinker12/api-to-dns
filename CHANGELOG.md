@@ -18,7 +18,7 @@
 - Public `/dns-record` mutations and the admin DNS browser share one validation/PATCH-merge core (`src.dns_mutation`). OpenAPI `DnsRecordInfo.record_type` now lists lookup types returned by GET. Public create/replace/patch/delete remain limited to A/AAAA/CNAME/TXT.
 - Persistent encrypted settings use a typed registry (`src.settings_registry`) with bool/int/JSON accessors. Unknown restored keys still read; unregistered writes log at DEBUG. Startup logs unknown `Setting` row names without deleting them.
 - Let's Encrypt renewal runs in a worker thread with its own DB session so ACME/DNS work cannot stall the asyncio loop. Enrollment and backup restore concurrency gates are stored in the encrypted settings table. Run a single uvicorn worker (entrypoint and `serve` pass `--workers 1`); shutdown signaling, the remote syslog queue, and BIND AXFR slots remain process-local. Startup drops an unreadable restore-progress row so an application-secrets restore cannot brick the next boot.
-- Authenticated requests load the user once via a request-scoped DB session (`Depends(get_db)`). `require_role` uses roles cached on `request.state` instead of opening a second session. Middleware, rate limits, and background workers keep their own sessions.
+- Authenticated requests load the user once via a request-scoped DB session (`Depends(get_db)`). `require_role` uses roles cached on `request.state` instead of opening a second session. Middleware, rate limits, and background workers keep their own sessions. `/ready` and `/system/restart` use the request session.
 
 ## [0.8.1] - 2026-08-11
 
