@@ -1167,8 +1167,7 @@ jobs:
                   isinstance(port, dict)
                   and str(port.get("published")) == published
                   and int(port.get("target") or 0) == target
-                  # host_ip may be omitted (all interfaces) or set to 127.0.0.1
-                  and str(port.get("host_ip") or "") in {"", "0.0.0.0", "127.0.0.1"}
+                  and str(port.get("host_ip") or "") == "127.0.0.1"
                   for port in ports
               )
 
