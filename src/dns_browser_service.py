@@ -10,7 +10,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
 from .activity_logging import emit_activity_event
-from .db import SessionLocal
 from .dns_mutation import apply_rrset_mutation, prepare_mutation
 from .dns_record_types import (
     normalize_lookup_record_type,
@@ -113,6 +112,7 @@ def browser_page_context(db, zone_id: int, *, user: str, can_update: bool) -> di
 
 
 def lookup_admin_records(
+    db,
     zone_id: int,
     *,
     record_name: str | None,
@@ -128,92 +128,92 @@ def lookup_admin_records(
             detail={"status": "error", "message": str(exc)},
         ) from exc
 
-    with SessionLocal() as db:
-        ctx = resolve_admin_zone(db, zone_id)
-        provider = (ctx.settings.get("dns_provider_type") or "azure").strip().lower()
-        dns_zone = provider_dns_zone(ctx.settings)
-        match_mode = "browse" if not name else ("glob" if has_dns_glob(name) else "exact")
-        try:
-            truncated = False
-            if match_mode == "exact":
-                records: list[DnsRecordInfo] = ctx.client.get_record(
-                    record_name=name,
-                    record_type=lookup_type,
-                    dns_server=ctx.settings.get("dns_server"),
-                    dns_zone=dns_zone,
-                )
-            else:
-                result = ctx.client.list_records(
-                    name_pattern=name or None,
-                    record_type=lookup_type,
-                    limit=DNS_BROWSER_RECORD_LIMIT,
-                    dns_server=ctx.settings.get("dns_server"),
-                    dns_zone=dns_zone,
-                )
-                records = result.records
-                truncated = result.truncated
-        except Exception as exc:
-            sanitized = sanitize_client_error_message(exc, fallback="DNS provider error")
-            emit_activity_event(
-                db,
-                event_type="dns.browser_lookup_failed",
-                level=LOG_LEVEL_ERROR,
-                status="error",
-                actor_type="user",
-                actor_label=actor,
-                zone_name=ctx.row.zone_name,
+    ctx = resolve_admin_zone(db, zone_id)
+    provider = (ctx.settings.get("dns_provider_type") or "azure").strip().lower()
+    dns_zone = provider_dns_zone(ctx.settings)
+    match_mode = "browse" if not name else ("glob" if has_dns_glob(name) else "exact")
+    try:
+        truncated = False
+        if match_mode == "exact":
+            records: list[DnsRecordInfo] = ctx.client.get_record(
                 record_name=name,
-                message=sanitized,
-                details={
-                    "provider": provider,
-                    "record_type": lookup_type,
-                    "dns_zone": dns_zone,
-                    "match_mode": match_mode,
-                    "exception_type": type(exc).__name__,
-                },
+                record_type=lookup_type,
+                dns_server=ctx.settings.get("dns_server"),
+                dns_zone=dns_zone,
             )
-            raise http_exception_from_dns_error(exc) from exc
-
-        status = "success" if records else "not_found"
+        else:
+            result = ctx.client.list_records(
+                name_pattern=name or None,
+                record_type=lookup_type,
+                limit=DNS_BROWSER_RECORD_LIMIT,
+                dns_server=ctx.settings.get("dns_server"),
+                dns_zone=dns_zone,
+            )
+            records = result.records
+            truncated = result.truncated
+    except Exception as exc:
+        sanitized = sanitize_client_error_message(exc, fallback="DNS provider error")
         emit_activity_event(
             db,
-            event_type="dns.browser_lookup",
-            level=LOG_LEVEL_INFORMATIONAL,
-            status=status,
+            event_type="dns.browser_lookup_failed",
+            level=LOG_LEVEL_ERROR,
+            status="error",
             actor_type="user",
             actor_label=actor,
             zone_name=ctx.row.zone_name,
             record_name=name,
-            message=f"DNS browser {match_mode} lookup for {name or '*'} in {ctx.row.zone_name}",
+            message=sanitized,
             details={
                 "provider": provider,
-                "dns_zone": dns_zone,
                 "record_type": lookup_type,
-                "record_count": len(records),
+                "dns_zone": dns_zone,
                 "match_mode": match_mode,
-                "truncated": truncated,
+                "exception_type": type(exc).__name__,
             },
         )
-        if records:
-            message = None
-        elif match_mode == "browse":
-            message = "No records found in this zone."
-        else:
-            message = "No matching records found."
-        return {
-            "status": status,
-            "zone_name": ctx.row.zone_name,
+        raise http_exception_from_dns_error(exc) from exc
+
+    status = "success" if records else "not_found"
+    emit_activity_event(
+        db,
+        event_type="dns.browser_lookup",
+        level=LOG_LEVEL_INFORMATIONAL,
+        status=status,
+        actor_type="user",
+        actor_label=actor,
+        zone_name=ctx.row.zone_name,
+        record_name=name,
+        message=f"DNS browser {match_mode} lookup for {name or '*'} in {ctx.row.zone_name}",
+        details={
+            "provider": provider,
             "dns_zone": dns_zone,
-            "record_name": name,
             "record_type": lookup_type,
-            "records": [r.model_dump() for r in records],
-            "truncated": truncated,
+            "record_count": len(records),
             "match_mode": match_mode,
-            "message": message,
-        }
+            "truncated": truncated,
+        },
+    )
+    if records:
+        message = None
+    elif match_mode == "browse":
+        message = "No records found in this zone."
+    else:
+        message = "No matching records found."
+    return {
+        "status": status,
+        "zone_name": ctx.row.zone_name,
+        "dns_zone": dns_zone,
+        "record_name": name,
+        "record_type": lookup_type,
+        "records": [r.model_dump() for r in records],
+        "truncated": truncated,
+        "match_mode": match_mode,
+        "message": message,
+    }
 
 
 def mutate_admin_record(
+    db,
     zone_id: int,
     *,
     mode: Literal["create", "replace", "delete"],
@@ -223,110 +223,109 @@ def mutate_admin_record(
     values: list[str] | None = None,
     actor: str,
 ):
-    with SessionLocal() as db:
-        row = db.get(DnsZoneConfig, zone_id)
-        if row is None:
-            raise HTTPException(status_code=404, detail="DNS zone not found")
-        settings = decode_zone_config(row)
-        provider = (settings.get("dns_provider_type") or "azure").strip().lower()
-        dns_zone = provider_dns_zone(settings)
-        try:
-            prepared = prepare_mutation(
-                record_name=record_name,
-                record_type=record_type,
-                ttl=ttl,
-                values=list(values or []),
-                dns_zone=dns_zone,
-                require_values=mode != "delete",
-            )
-            client = create_dns_client_from_settings(settings, db=db)
-            outcome = apply_rrset_mutation(
-                client,
-                settings=settings,
-                zone_name=row.zone_name,
-                record_name=prepared.record_name,
-                record_type=prepared.record_type,
-                ttl=prepared.ttl,
-                values=list(prepared.values),
-                mode=mode,
-            )
-        except HTTPException:
-            raise
-        except ValueError as exc:
-            emit_activity_event(
-                db,
-                event_type="dns.browser_invalid_request",
-                level=LOG_LEVEL_WARNING,
-                status="error",
-                actor_type="user",
-                actor_label=actor,
-                zone_name=row.zone_name,
-                record_name=record_name,
-                message=str(exc),
-                details={"provider": provider, "record_type": record_type, "mode": mode},
-            )
-            raise HTTPException(
-                status_code=400,
-                detail={"status": "error", "message": str(exc)},
-            ) from exc
-        except Exception as exc:
-            sanitized = sanitize_client_error_message(exc, fallback="DNS provider error")
-            emit_activity_event(
-                db,
-                event_type="dns.browser_provider_failed",
-                level=LOG_LEVEL_ERROR,
-                status="error",
-                actor_type="user",
-                actor_label=actor,
-                zone_name=row.zone_name,
-                record_name=record_name,
-                message=sanitized,
-                details={
-                    "provider": provider,
-                    "record_type": record_type,
-                    "mode": mode,
-                    "exception_type": type(exc).__name__,
-                },
-            )
-            raise http_exception_from_dns_error(exc) from exc
-
-        body = {
-            "status": outcome.status,
-            "action": outcome.action,
-            "zone_name": row.zone_name,
-            "dns_zone": outcome.dns_zone,
-            "record_name": outcome.record_name,
-            "record_type": outcome.record_type,
-            "values": outcome.values,
-            "message": None
-            if outcome.status == "success"
-            else ("Record already exists." if outcome.action == "record_already_exists" else "Record not found."),
-        }
-        event_suffix = {
-            "created": "created",
-            "updated": "updated",
-            "deleted": "deleted",
-            "record_already_exists": "already_exists",
-            "not_found": "not_found",
-        }.get(outcome.action, outcome.action)
+    row = db.get(DnsZoneConfig, zone_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="DNS zone not found")
+    settings = decode_zone_config(row)
+    provider = (settings.get("dns_provider_type") or "azure").strip().lower()
+    dns_zone = provider_dns_zone(settings)
+    try:
+        prepared = prepare_mutation(
+            record_name=record_name,
+            record_type=record_type,
+            ttl=ttl,
+            values=list(values or []),
+            dns_zone=dns_zone,
+            require_values=mode != "delete",
+        )
+        client = create_dns_client_from_settings(settings, db=db)
+        outcome = apply_rrset_mutation(
+            client,
+            settings=settings,
+            zone_name=row.zone_name,
+            record_name=prepared.record_name,
+            record_type=prepared.record_type,
+            ttl=prepared.ttl,
+            values=list(prepared.values),
+            mode=mode,
+        )
+    except HTTPException:
+        raise
+    except ValueError as exc:
         emit_activity_event(
             db,
-            event_type=f"dns.browser_record_{event_suffix}",
-            level=LOG_LEVEL_INFORMATIONAL if outcome.status == "success" else LOG_LEVEL_WARNING,
-            status=outcome.status,
+            event_type="dns.browser_invalid_request",
+            level=LOG_LEVEL_WARNING,
+            status="error",
             actor_type="user",
             actor_label=actor,
             zone_name=row.zone_name,
-            record_name=outcome.record_name,
-            message=(f"DNS browser {outcome.action} {outcome.record_name}/{outcome.record_type} in {row.zone_name}"),
+            record_name=record_name,
+            message=str(exc),
+            details={"provider": provider, "record_type": record_type, "mode": mode},
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={"status": "error", "message": str(exc)},
+        ) from exc
+    except Exception as exc:
+        sanitized = sanitize_client_error_message(exc, fallback="DNS provider error")
+        emit_activity_event(
+            db,
+            event_type="dns.browser_provider_failed",
+            level=LOG_LEVEL_ERROR,
+            status="error",
+            actor_type="user",
+            actor_label=actor,
+            zone_name=row.zone_name,
+            record_name=record_name,
+            message=sanitized,
             details={
                 "provider": provider,
-                "dns_zone": dns_zone,
-                "record_type": outcome.record_type,
-                "provider_label": dns_provider_display_name(provider),
-                "values_count": len(outcome.values),
+                "record_type": record_type,
+                "mode": mode,
+                "exception_type": type(exc).__name__,
             },
         )
-        if outcome.http_status != 200:
-            return JSONResponse(status_code=outcome.http_status, content=body)
-        return body
+        raise http_exception_from_dns_error(exc) from exc
+
+    body = {
+        "status": outcome.status,
+        "action": outcome.action,
+        "zone_name": row.zone_name,
+        "dns_zone": outcome.dns_zone,
+        "record_name": outcome.record_name,
+        "record_type": outcome.record_type,
+        "values": outcome.values,
+        "message": None
+        if outcome.status == "success"
+        else ("Record already exists." if outcome.action == "record_already_exists" else "Record not found."),
+    }
+    event_suffix = {
+        "created": "created",
+        "updated": "updated",
+        "deleted": "deleted",
+        "record_already_exists": "already_exists",
+        "not_found": "not_found",
+    }.get(outcome.action, outcome.action)
+    emit_activity_event(
+        db,
+        event_type=f"dns.browser_record_{event_suffix}",
+        level=LOG_LEVEL_INFORMATIONAL if outcome.status == "success" else LOG_LEVEL_WARNING,
+        status=outcome.status,
+        actor_type="user",
+        actor_label=actor,
+        zone_name=row.zone_name,
+        record_name=outcome.record_name,
+        message=(f"DNS browser {outcome.action} {outcome.record_name}/{outcome.record_type} in {row.zone_name}"),
+        details={
+            "provider": provider,
+            "dns_zone": dns_zone,
+            "record_type": outcome.record_type,
+            "provider_label": dns_provider_display_name(provider),
+            "values_count": len(outcome.values),
+        },
+    )
+    if outcome.http_status != 200:
+        return JSONResponse(status_code=outcome.http_status, content=body)
+    return body
