@@ -109,6 +109,68 @@ def test_azure_create_or_update_uses_dns_zone_not_payload_zone_name(mock_get) ->
 
 
 @patch.object(AzureDnsClient, "_get_existing_record_set")
+def test_azure_create_or_update_maps_apex_fqdn_to_at(mock_get) -> None:
+    client = AzureDnsClient(
+        tenant_id="t",
+        client_id="c",
+        client_secret="s",
+        subscription_id="sub",
+        resource_group="rg",
+    )
+    client.DnsManagementClient = MagicMock()
+    mock_get.return_value = None
+    payload = DnsRecordRequest(
+        zone_name="example.com",
+        record_type="A",
+        record_name="example.com",
+        ttl=300,
+        values=["192.0.2.10"],
+    )
+    existed = client.create_or_update_record(payload, dns_zone="example.com")
+    assert existed is False
+    mock_get.assert_called_with(
+        client.DnsManagementClient.return_value,
+        "rg",
+        "example.com",
+        "@",
+        "A",
+    )
+    client.DnsManagementClient.return_value.record_sets.create_or_update.assert_called_once()
+    args, _kwargs = client.DnsManagementClient.return_value.record_sets.create_or_update.call_args
+    assert args[2] == "@"
+
+
+def test_azure_create_or_update_rejects_soa_and_unknown_types() -> None:
+    client = AzureDnsClient(
+        tenant_id="t",
+        client_id="c",
+        client_secret="s",
+        subscription_id="sub",
+        resource_group="rg",
+    )
+    client.DnsManagementClient = MagicMock()
+    soa = DnsRecordRequest(
+        zone_name="example.com",
+        record_type="SOA",
+        record_name="@",
+        ttl=300,
+        values=["ns1.example.com hostmaster.example.com 1 3600 600 86400 3600"],
+    )
+    unknown = DnsRecordRequest(
+        zone_name="example.com",
+        record_type="SPF",
+        record_name="www",
+        ttl=300,
+        values=["v=spf1 -all"],
+    )
+    with pytest.raises(ValueError, match="Unsupported record type for Azure DNS"):
+        client.create_or_update_record(soa, dns_zone="example.com")
+    with pytest.raises(ValueError, match="Unsupported record type for Azure DNS"):
+        client.create_or_update_record(unknown, dns_zone="example.com")
+    client.DnsManagementClient.return_value.record_sets.create_or_update.assert_not_called()
+
+
+@patch.object(AzureDnsClient, "_get_existing_record_set")
 def test_azure_get_record_single_type(mock_get) -> None:
     client = AzureDnsClient(
         tenant_id="t",

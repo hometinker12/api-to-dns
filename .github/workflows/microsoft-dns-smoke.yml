@@ -992,6 +992,15 @@ jobs:
           call_dns_api PUT 404 not_found "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"www","ttl":300,"values":["192.0.2.40"]}'
           call_dns_api POST 403 access_denied "${DNS_RECORD_URL}" '{"zone_name":"denied.test","record_type":"A","record_name":"blocked","ttl":300,"values":["192.0.2.55"]}'
 
+          echo "[bind] Apex FQDN record_name maps to the zone apex A"
+          call_dns_api POST 200 created "${DNS_RECORD_URL}" '{"zone_name":"smoke.test","record_type":"A","record_name":"smoke.test","ttl":300,"values":["192.0.2.80"]}'
+          wait_for_record_value smoke.test 192.0.2.80
+          curl --fail --silent -H "X-API-Key: ${API_KEY}" \
+            "${DNS_RECORD_URL}?zone_name=smoke.test&record_name=smoke.test&record_type=A" \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); assert b['status']=='success'; assert b['records'][0]['record_name'] in ('@','smoke.test'); assert b['records'][0]['values']==['192.0.2.80'], b"
+          call_dns_api DELETE 200 deleted "${DNS_RECORD_URL}?zone_name=smoke.test&record_name=smoke.test&record_type=A" ''
+          wait_for_record_absent smoke.test
+
           echo "[bind] Admin DNS browser session CRUD for temporary A record"
           browser_page="$(curl --fail --silent -b /tmp/cookies "http://127.0.0.1:8000/zones/${SMOKE_ZONE_ID}/records")"
           echo "${browser_page}" | python3 -c "import sys; html=sys.stdin.read(); assert 'dns-browser-search' in html; assert 'dns-browser-results' in html and 'hidden' in html"
@@ -1770,6 +1779,17 @@ jobs:
 
             $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 404 -Method PUT -JsonBody $jReplace
             Assert-DnsRecordAction -Json $x -ExpectedAction 'not_found'
+
+            Write-Host '[microsoft-local] Apex FQDN record_name maps to the zone apex A'
+            $jApex = @{ zone_name = $la; record_type = 'A'; record_name = $la; ttl = 300; values = @('192.0.2.80') }
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -Method POST -JsonBody $jApex
+            Assert-DnsRecordAction -Json $x -ExpectedAction 'created'
+            Wait-LocalA -Fqdn $la -ExpectedIp '192.0.2.80'
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -Method GET -Query @{ zone_name = $la; record_name = $la; record_type = 'A' }
+            if ($x.status -ne 'success') { throw "apex FQDN lookup failed: $($x | ConvertTo-Json -Compress)" }
+            $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 200 -Method DELETE -Query @{ zone_name = $la; record_name = $la; record_type = 'A' }
+            Assert-DnsRecordAction -Json $x -ExpectedAction 'deleted'
+            Wait-LocalAbsent -Fqdn $la
 
             $x = Invoke-DnsRecord -ApiKey $msLocalKey -ExpectedStatus 403 -Method POST -JsonBody $jDenied
             Assert-DnsRecordAction -Json $x -ExpectedAction 'access_denied'
