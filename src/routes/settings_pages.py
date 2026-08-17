@@ -3,10 +3,12 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse
+from sqlmodel import Session
 
 from ..auth import (
-    get_current_user,
+    get_current_user_db,
 )
+from ..db import get_db
 from ..rbac import (
     LEGACY_SETTINGS_AREA_ALIASES,
 )
@@ -30,7 +32,8 @@ def settings_page(
     start: str | None = None,
     end: str | None = None,
     offset: int = 0,
-    user: str = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    user: str = Depends(get_current_user_db),
 ):
     normalized_area = (area or "").strip().lower()
     if normalized_area in LEGACY_SETTINGS_AREA_ALIASES:
@@ -49,7 +52,7 @@ def settings_page(
             "end": _parse_iso_datetime(end),
             "offset": offset,
         }
-    return render_settings(request, user, normalized_area, log_search_params=log_search_params, section=section)
+    return render_settings(request, user, normalized_area, db=db, log_search_params=log_search_params, section=section)
 
 
 def _parse_iso_datetime(value: str | None) -> datetime | None:

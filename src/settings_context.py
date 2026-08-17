@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from typing import Any
 
 from fastapi import Request
@@ -85,8 +86,10 @@ def settings_context(
     auth_form_selected_roles: list[str] | None = None,
     log_search_params: dict[str, Any] | None = None,
     section: str | None = None,
+    db=None,
 ) -> dict[str, Any]:
-    with SessionLocal() as db:
+    cm = SessionLocal() if db is None else nullcontext(db)
+    with cm as db:
         user_roles = get_user_roles(db, user)
         can_view_accounts = bool(
             {ROLE_GLOBAL_READ, ROLE_ACCOUNT_UPDATE, ROLE_ACCOUNT_RESET_PASSWORD}.intersection(user_roles)
@@ -320,9 +323,9 @@ def settings_context(
     }
 
 
-def render_settings(request: Request, user: str, area: str | None, **kwargs: Any):
+def render_settings(request: Request, user: str, area: str | None, db=None, **kwargs: Any):
     return templates.TemplateResponse(
         request=request,
         name="settings.html",
-        context=settings_context(request, user, area, **kwargs),
+        context=settings_context(request, user, area, db=db, **kwargs),
     )
