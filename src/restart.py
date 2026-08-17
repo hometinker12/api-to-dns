@@ -12,7 +12,7 @@ import os
 import signal
 from datetime import datetime
 
-from .settings_store import delete_setting, get_setting, set_setting
+from .settings_store import delete_setting, get_typed_setting_by_key, set_typed_setting_by_key
 from .ssl_certs import access_url
 
 SETTING_RESTART_REQUIRED = "restart_required"
@@ -21,9 +21,16 @@ SETTING_LAST_SCHEDULED_RESTART_DATE = "last_scheduled_restart_date"
 SETTING_LE_RENEWAL_PENDING_RESTART = "letsencrypt_renewal_pending_restart"
 
 
+def _typed_bool(db, key: str) -> bool:
+    try:
+        return bool(get_typed_setting_by_key(db, key))
+    except ValueError:
+        return False
+
+
 def mark_restart_required(db, *, reason: str) -> None:
-    set_setting(db, SETTING_RESTART_REQUIRED, "true")
-    set_setting(db, SETTING_RESTART_REASON, reason.strip() or "Application restart required.")
+    set_typed_setting_by_key(db, SETTING_RESTART_REQUIRED, True)
+    set_typed_setting_by_key(db, SETTING_RESTART_REASON, reason.strip() or "Application restart required.")
 
 
 def clear_restart_required(db) -> None:
@@ -32,15 +39,16 @@ def clear_restart_required(db) -> None:
 
 
 def is_restart_required(db) -> bool:
-    return (get_setting(db, SETTING_RESTART_REQUIRED) or "").strip().lower() in {"1", "true", "yes", "on"}
+    return _typed_bool(db, SETTING_RESTART_REQUIRED)
 
 
 def restart_reason(db) -> str:
-    return get_setting(db, SETTING_RESTART_REASON) or "Application restart required."
+    value = get_typed_setting_by_key(db, SETTING_RESTART_REASON)
+    return value or "Application restart required."
 
 
 def mark_le_renewal_pending_restart(db) -> None:
-    set_setting(db, SETTING_LE_RENEWAL_PENDING_RESTART, "true")
+    set_typed_setting_by_key(db, SETTING_LE_RENEWAL_PENDING_RESTART, True)
 
 
 def clear_le_renewal_pending_restart(db) -> None:
@@ -48,12 +56,7 @@ def clear_le_renewal_pending_restart(db) -> None:
 
 
 def is_le_renewal_pending_restart(db) -> bool:
-    return (get_setting(db, SETTING_LE_RENEWAL_PENDING_RESTART) or "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return _typed_bool(db, SETTING_LE_RENEWAL_PENDING_RESTART)
 
 
 def preview_restart_urls(db) -> dict[str, str]:
@@ -83,7 +86,7 @@ def scheduled_restart_due(db, *, configured_time: str, now: datetime | None = No
     if current.strftime("%H:%M") != configured_time:
         return False
     today = current.date().isoformat()
-    if get_setting(db, SETTING_LAST_SCHEDULED_RESTART_DATE) == today:
+    if get_typed_setting_by_key(db, SETTING_LAST_SCHEDULED_RESTART_DATE) == today:
         return False
-    set_setting(db, SETTING_LAST_SCHEDULED_RESTART_DATE, today)
+    set_typed_setting_by_key(db, SETTING_LAST_SCHEDULED_RESTART_DATE, today)
     return True

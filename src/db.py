@@ -33,6 +33,14 @@ def init_db() -> None:
     _migrate_add_api_key_access_mode_column()
     _migrate_hash_plaintext_api_keys()
     _migrate_rate_limit_bucket_table()
+    _log_unknown_settings()
+
+
+def _log_unknown_settings() -> None:
+    from .settings_store import log_unknown_settings
+
+    with SessionLocal() as db:
+        log_unknown_settings(db)
 
 
 def _migrate_add_api_key_prefix_column() -> None:

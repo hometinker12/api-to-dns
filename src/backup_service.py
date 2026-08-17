@@ -34,7 +34,7 @@ from .models import (
 )
 from .rbac import ROLE_GLOBAL_ADMIN, effective_roles, parse_roles, serialize_roles
 from .security import pwd_context
-from .settings_store import delete_setting, get_setting, set_setting
+from .settings_store import delete_setting, get_typed_setting_by_key, set_typed_setting_by_key
 from .ssl_certs import CERT_FILENAME, KEY_FILENAME, SOURCE_FILENAME, cert_dir
 from .time_utils import utc_now
 from .version import get_app_version
@@ -152,25 +152,16 @@ def write_restore_progress(
         "result_status": result_status,
         "restarting": bool(restarting),
     }
-    set_setting(db, SETTING_BACKUP_PROGRESS, json.dumps(payload))
+    set_typed_setting_by_key(db, SETTING_BACKUP_PROGRESS, payload)
     db.commit()
 
 
 def get_restore_progress(db) -> dict[str, Any]:
-    raw = get_setting(db, SETTING_BACKUP_PROGRESS)
-    if not raw:
-        return {
-            "phase": "idle",
-            "percent": 0,
-            "message": "Idle",
-            "done": False,
-            "error": None,
-            "result_status": None,
-            "restarting": False,
-        }
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
+        data = get_typed_setting_by_key(db, SETTING_BACKUP_PROGRESS)
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
         data = {}
     return {
         "phase": data.get("phase") or "idle",

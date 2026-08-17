@@ -37,7 +37,7 @@ from .rbac import (
     user_public_dict,
 )
 from .restart import is_restart_required
-from .settings_store import get_setting
+from .settings_store import get_typed_setting_by_key
 from .ssl_certs import (
     DEFAULT_HTTP_PORT,
     DEFAULT_TLS_PORT,
@@ -200,9 +200,9 @@ def settings_context(
                 },
                 "ssl": ssl_status,
                 "operational_log": {
-                    "log_file": get_setting(db, activity_logging.SETTING_LOG_FILE) or "",
-                    "max_bytes": int(get_setting(db, activity_logging.SETTING_LOG_MAX_BYTES) or 1_048_576),
-                    "backup_count": int(get_setting(db, activity_logging.SETTING_LOG_BACKUP_COUNT) or 5),
+                    "log_file": str(get_typed_setting_by_key(db, activity_logging.SETTING_LOG_FILE) or ""),
+                    "max_bytes": int(get_typed_setting_by_key(db, activity_logging.SETTING_LOG_MAX_BYTES)),
+                    "backup_count": int(get_typed_setting_by_key(db, activity_logging.SETTING_LOG_BACKUP_COUNT)),
                 },
             }
 
