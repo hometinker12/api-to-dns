@@ -137,3 +137,14 @@ def test_request_state_roles_are_not_reused_across_requests(client: TestClient) 
 
     second = client.get("/api-keys", follow_redirects=False)
     assert second.status_code == 403
+
+
+def test_settings_page_does_not_open_a_second_session(client: TestClient, monkeypatch) -> None:
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("settings_context must reuse the request session")
+
+    monkeypatch.setattr("src.settings_context.SessionLocal", _boom)
+    client.cookies.set("session", create_session_cookie("admin"))
+    response = client.get("/settings")
+    assert response.status_code == 200
+    assert "Settings" in response.text or "settings" in response.text.lower()
