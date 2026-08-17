@@ -7,7 +7,7 @@ description: Add or modify DNS provider plugins in api-to-dns (Azure, Cloudflare
 
 ## Plugin contract
 
-1. Implement a client class in `src/plugins/<name>.py` that satisfies the duck-typed interface used by `src/dns_client.py` (get/create/update/delete record operations).
+1. Implement a client class in `src/plugins/<name>.py` that satisfies `DnsProviderClient` in `src/plugins/base.py` (structural `typing.Protocol`; no inheritance required). `create_client` and `src/dns_client.py` are typed to that Protocol: `get_record`, `list_records`, and `create_or_update_record` (including synthetic `DELETE`).
 2. Register via auto-discovery in `src/plugins/__init__.py` — follow existing providers as templates.
 3. Zone credentials are stored encrypted in `DnsZoneConfig.encrypted_config`; decode/encode through `src/zone_service.py`.
 4. Use canonical value formats from `src/dns_record_types.py` for all lookup/mutation paths (admin DNS browser + public API):
