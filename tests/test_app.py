@@ -4118,9 +4118,11 @@ def test_alert_rules_trigger_render_templates_and_respect_cooldown(
         sent_messages.append({"recipients": recipients, "subject": subject, "body": body})
         return True, []
 
-    monkeypatch.setattr(activity_logging, "send_alert_email", fake_send_alert_email)
+    from src import alerting
+
+    monkeypatch.setattr(alerting, "send_alert_email", fake_send_alert_email)
     monkeypatch.setattr(
-        activity_logging,
+        alerting,
         "system_identity",
         lambda db: {"system_dns_name": "dns-host.example", "system_ip_address": "192.0.2.44"},
     )
@@ -4192,7 +4194,9 @@ def test_smtp_alert_delivery_tries_csv_servers_in_order(client: TestClient, monk
             raise OSError("connection refused")
         return FakeSmtp()
 
-    monkeypatch.setattr(activity_logging, "_build_smtp_client", fake_build_smtp_client)
+    from src import alerting
+
+    monkeypatch.setattr(alerting, "_build_smtp_client", fake_build_smtp_client)
     with SessionLocal() as db:
         _delete_activity_logs(db)
         set_smtp_config(
