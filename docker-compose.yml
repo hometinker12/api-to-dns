@@ -10,9 +10,12 @@ services:
       - no-new-privileges:true
     tmpfs:
       - /tmp:size=64M,mode=1777
+    # Bind to loopback so the unauthenticated-by-default HTTP admin UI is not
+    # published on every host interface. Override to 0.0.0.0 only when a
+    # reverse proxy on another host must reach this container (see README).
     ports:
-      - "8001:8000"
-      - "8443:8443"
+      - "127.0.0.1:8001:8000"
+      - "127.0.0.1:8443:8443"
     # Secrets and optional knobs come from .env (copy from .env.example).
     # Do not duplicate live values here — Compose environment: below only
     # overrides paths/ports that must differ inside the container.

@@ -18,7 +18,7 @@ A Dockerized FastAPI service to manage DNS records through a protected admin web
 - [Activity Logs, Operational Logs, And Alerts](#activity-logs-operational-logs-and-alerts)
   - [Logging Level And Retention](#logging-level-and-retention)
   - [Email Alerting](#email-alerting)
-  - [Planned Infrastructure Settings](#planned-infrastructure-settings)
+  - [Remote Syslog](#remote-syslog)
   - [Optional: HTTPS with self-signed or uploaded certificates](#optional-https-with-self-signed-or-uploaded-certificates)
   - [Local development (HTTP or HTTPS)](#local-development-http-or-https)
   - [Logging Security](#logging-security)
@@ -76,12 +76,23 @@ http://127.0.0.1:8001/login
 
 > SSL is **off by default**; the container listens on plain HTTP on port `8000` (mapped to host `127.0.0.1:8001`). See **Optional: HTTPS with self-signed or uploaded certificates** below for the enable workflow.
 >
-> The image runs as non-root uid/gid **10001**. Compose pins `hometinker12/api-to-dns:0.8.1`, enables `read_only`, drops capabilities, and binds published ports to localhost. If you upgrade from a root-owned named volume, fix ownership once (do not start the app as root):
+> The image runs as non-root uid/gid **10001**. Compose pins `hometinker12/api-to-dns:0.8.1`, enables `read_only`, drops capabilities, and binds published ports to **localhost** (`127.0.0.1:8001` and `127.0.0.1:8443`). If you upgrade from a root-owned named volume, fix ownership once (do not start the app as root):
 >
 > ```bash
 > docker run --rm -v api-to-dns_api-to-dns-data:/vol alpine chown -R 10001:10001 /vol
 > docker run --rm -v api-to-dns_api-to-dns-ssl:/vol alpine chown -R 10001:10001 /vol
 > docker run --rm -v api-to-dns_api-to-dns-logs:/vol alpine chown -R 10001:10001 /vol
+> ```
+>
+> To publish on all host interfaces (for a reverse proxy on another machine), override the ports in a Compose override file — do not change the default:
+>
+> ```yaml
+> # docker-compose.override.yml (local only; not the shipped default)
+> services:
+>   dns-api:
+>     ports:
+>       - "0.0.0.0:8001:8000"
+>       - "0.0.0.0:8443:8443"
 > ```
 
 After login, the **Dashboard** shows configured DNS zones. Add one row per zone configuration (each row has a **unique configuration name**, its own provider, a **DNS zone (domain)** for that provider, and credentials). You can add multiple configurations with different names that all target the same DNS domain (for example `example-azure` and `example-cloudflare`, both with domain `example.com`). Use **API Keys** in the top navigation to create or edit a key, select which configurations it may use, and choose its access mode. New keys default to **read-only**; use **read/write** only for clients that need to mutate DNS records. Every `/dns-record` request requires a `zone_name` (in the JSON body for `POST`/`PUT`/`PATCH`, in the query string for `GET`/`DELETE`); it must match a configured zone **name** **and** be allowed for that API key, or the API returns **403** with `error: access_denied`. The `zone_name` on API requests is the configuration name, not the provider DNS domain.
@@ -97,7 +108,7 @@ Create a `.env` file using `.env.example` and configure the following values:
 | `ENCRYPTION_KEY` | Key for encrypting settings in the database (must be a valid Fernet key)                          |
 | `ADMIN_USER`     | Initial admin username                                                                            |
 | `ADMIN_PASSWORD` | Initial admin password                                                                            |
-| `DATABASE_URL`   | Optional database URL (default: `sqlite:///./data/app.db`)                                        |
+| `DATABASE_URL`   | Optional database URL (default: `sqlite:///./data/app.db`). **SQLite is the supported engine**; other SQLAlchemy URLs are not a supported deployment. |
 | `LOG_FILE`       | Optional file path for rotating operational logs (Docker Compose sets `/app/logs/api-to-dns.log`) |
 | `APP_SSL_DIR`    | Directory holding `server.key` / `server.crt` (default `/app/data/ssl` in Docker, `./data/ssl` locally). Do not use `SSL_CERT_DIR` — OpenSSL uses that name for CA lookup and breaks outbound HTTPS. |
 | `HTTP_PORT`      | Listener port when SSL is disabled (default `8000`)                                               |
