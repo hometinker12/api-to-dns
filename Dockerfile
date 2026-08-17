@@ -23,7 +23,7 @@
 
 FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
 
-ARG VERSION=0.8.5
+ARG VERSION=0.8.6
 
 LABEL org.opencontainers.image.title="api-to-dns" \
       org.opencontainers.image.description="DNS REST API and admin UI (Azure, Cloudflare, Microsoft DNS, BIND/TSIG)" \

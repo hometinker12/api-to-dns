@@ -148,4 +148,6 @@ A successful AXFR prints every record in the zone. A `Transfer failed.` / `REFUS
 | `DNS UPDATE failed: NOTAUTH` | Wrong TSIG key name/secret/algorithm, or clock skew (`BADTIME`) |
 | `DNS UPDATE failed: SERVFAIL` | Zone file directory not writable by BIND (journal file cannot be created) |
 | Browse / wildcard search fails but exact lookup works | Zone missing `allow-transfer { key ...; };` |
+| BIND logs `tsig verify failure (BADKEY)` on browse/wildcard | TSIG key name in api-to-dns zone settings does not match a loaded `key` block. The example name `api-to-dns` in this guide must be replaced with your actual key name (and algorithm) |
+| BIND logs `tsig verify failure (BADSIG)` | TSIG secret in api-to-dns does not match the BIND key `secret` |
 | Connection timeout | TCP 53 blocked between api-to-dns and the BIND server, or wrong `listen-on` |

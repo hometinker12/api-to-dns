@@ -3743,6 +3743,29 @@ def test_dns_browser_browse_reports_bind_transfer_refused(
     assert "allow-transfer" in response.json()["message"]
 
 
+def test_dns_browser_browse_reports_bind_tsig_badkey(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client.cookies.set("session", create_session_cookie("admin"))
+    with SessionLocal() as db:
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+        zone_id = zone.id
+
+    fake = MagicMock()
+    fake.list_records.side_effect = ValueError(
+        'BIND does not recognize TSIG key "dev-api-to-dns" (hmac-sha256) (BADKEY). '
+        "The key name and algorithm in this zone's settings must match a "
+        'key "dev-api-to-dns" block loaded in named.conf.'
+    )
+    monkeypatch.setattr("src.dns_browser_service.create_dns_client_from_settings", lambda *_a, **_k: fake)
+
+    response = client.get(f"/zones/{zone_id}/records/search")
+    assert response.status_code == 400
+    assert "BADKEY" in response.json()["message"]
+
+
 def test_dns_browser_requires_dns_zones_update(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,

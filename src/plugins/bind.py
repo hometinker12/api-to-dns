@@ -180,10 +180,6 @@ class BindTsigDnsClient:
                     timeout=30,
                     lifetime=60,
                 )
-            except dns.xfr.TransferError as e:
-                raise self._map_transfer_error(e) from e
-
-            try:
                 for msg in xfr:
                     for rrset in msg.answer:
                         if rrset.rdtype == dns.rdatatype.SOA:
@@ -196,6 +192,8 @@ class BindTsigDnsClient:
                         yield relative, rrset
             except dns.xfr.TransferError as e:
                 raise self._map_transfer_error(e) from e
+            except dns.tsig.PeerError as e:
+                raise self._map_tsig_peer_error(e) from e
         finally:
             close = getattr(xfr, "close", None)
             if callable(close):
@@ -215,6 +213,31 @@ class BindTsigDnsClient:
                 "on the BIND zone — see BINDCONFIG.md. Exact record names still work."
             )
         return RuntimeError(f"Zone transfer (AXFR) failed: {rcode_text}")
+
+    def _map_tsig_peer_error(self, e: dns.tsig.PeerError) -> Exception:
+        key_label = self._keyname.to_text().rstrip(".")
+        algo_label = self._key.algorithm.to_text().rstrip(".")
+        if isinstance(e, dns.tsig.PeerBadKey):
+            return ValueError(
+                f'BIND does not recognize TSIG key "{key_label}" ({algo_label}) (BADKEY). '
+                "The key name and algorithm in this zone's settings must match a "
+                f'key "{key_label}" block loaded in named.conf. Browse and wildcard '
+                "search sign the zone transfer with this key — see BINDCONFIG.md. "
+                "Exact record names still work."
+            )
+        if isinstance(e, dns.tsig.PeerBadSignature):
+            return ValueError(
+                f'TSIG signature was rejected for key "{key_label}" (BADSIG). '
+                "Check that the base64 secret matches the BIND key block. "
+                "Exact record names still work."
+            )
+        if isinstance(e, dns.tsig.PeerBadTime):
+            return ValueError(
+                f'TSIG time check failed for key "{key_label}" (BADTIME). '
+                "Synchronize clocks on api-to-dns and the BIND server. "
+                "Exact record names still work."
+            )
+        return ValueError(f"Zone transfer (AXFR) TSIG failed: {e}")
 
 
 def create_client(settings: dict[str, str | None]) -> BindTsigDnsClient:
