@@ -148,3 +148,16 @@ def test_settings_page_does_not_open_a_second_session(client: TestClient, monkey
     response = client.get("/settings")
     assert response.status_code == 200
     assert "Settings" in response.text or "settings" in response.text.lower()
+
+
+def test_backup_and_le_progress_use_request_session(client: TestClient, monkeypatch) -> None:
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("progress handlers must reuse the request session")
+
+    monkeypatch.setattr("src.routes.settings_backup.SessionLocal", _boom)
+    monkeypatch.setattr("src.routes.settings_ssl.SessionLocal", _boom)
+    client.cookies.set("session", create_session_cookie("admin"))
+    backup = client.get("/settings/backup/import/progress")
+    assert backup.status_code == 200
+    le = client.get("/settings/system/ssl-letsencrypt/progress")
+    assert le.status_code == 200
