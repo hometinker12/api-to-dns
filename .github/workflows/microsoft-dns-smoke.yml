@@ -476,12 +476,12 @@ jobs:
           nav = html.split('<nav class="nav-links">', 1)[1].split("</nav>", 1)[0]
           assert nav.index('href="/api-keys"') < nav.index('href="/admin"') < nav.index('href="/settings"') < nav.index('action="/logout"'), nav
           version = Path("VERSION").read_text(encoding="utf-8").strip()
-          assert version == "0.8.6", version
+          assert version == "0.8.7", version
           assert f"api-to-dns v{version}" in html, html[-400:]
-          assert 'version = "0.8.6"' in Path("pyproject.toml").read_text(encoding="utf-8")
-          assert "ARG VERSION=0.8.6" in Path("Dockerfile").read_text(encoding="utf-8")
-          assert "hometinker12/api-to-dns:0.8.6" in Path("docker-compose.yml").read_text(encoding="utf-8")
-          print("admin nav + 0.8.6 metadata assertions passed")
+          assert 'version = "0.8.7"' in Path("pyproject.toml").read_text(encoding="utf-8")
+          assert "ARG VERSION=0.8.7" in Path("Dockerfile").read_text(encoding="utf-8")
+          assert "hometinker12/api-to-dns:0.8.7" in Path("docker-compose.yml").read_text(encoding="utf-8")
+          print("admin nav + 0.8.7 metadata assertions passed")
           PY
 
           echo "[bind] Static brand assets (favicon + logo mark)"
@@ -1252,7 +1252,7 @@ jobs:
           import os
           import subprocess
 
-          assert os.environ["APP_VERSION"] == "0.8.6", os.environ["APP_VERSION"]
+          assert os.environ["APP_VERSION"] == "0.8.7", os.environ["APP_VERSION"]
           expected_image = f"hometinker12/api-to-dns:{os.environ['APP_VERSION']}"
           cfg = json.loads(subprocess.check_output(["docker", "compose", "config", "--format", "json"], text=True))
           svc = cfg["services"]["dns-api"]
@@ -1729,7 +1729,7 @@ jobs:
               throw 'Admin header navigation order is not API Keys, Dashboard, Settings, Logout'
             }
             $appVersion = (Get-Content -Raw VERSION).Trim()
-            if ($appVersion -ne '0.8.6') { throw "Expected VERSION 0.8.6; got $appVersion" }
+            if ($appVersion -ne '0.8.7') { throw "Expected VERSION 0.8.7; got $appVersion" }
             if ($admin.Content -notmatch [regex]::Escape("api-to-dns v$appVersion")) {
               throw 'Admin page missing version footer'
             }
