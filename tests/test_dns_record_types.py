@@ -54,6 +54,14 @@ def test_parse_structured_values() -> None:
         parse_srv("1 2 target")
 
 
+def test_cname_allows_underscore_dns_labels() -> None:
+    target = "selector1-bedards-net._domainkey.bedardsnet.onmicrosoft.com"
+    assert normalize_record_value("CNAME", target) == target
+    assert normalize_record_value("NS", "_sip._tcp.example.com") == "_sip._tcp.example.com"
+    with pytest.raises(ValueError, match="Invalid hostname"):
+        normalize_record_value("CNAME", "bad hostname.example.com")
+
+
 def test_cname_requires_single_value() -> None:
     with pytest.raises(ValueError, match="exactly one"):
         normalize_record_values("CNAME", ["a.example.com", "b.example.com"])

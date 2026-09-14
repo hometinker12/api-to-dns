@@ -140,3 +140,10 @@ def test_unauthenticated_admin_still_redirects_to_login(client: TestClient) -> N
     response = client.get("/admin", follow_redirects=False)
     assert response.status_code == 303
     assert response.headers["location"] == "/login"
+
+
+def test_json_unauthenticated_admin_fetch_returns_401(client: TestClient) -> None:
+    response = client.get("/admin", headers={"Accept": "application/json"}, follow_redirects=False)
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Authentication required"
+    assert "location" not in response.headers
