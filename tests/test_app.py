@@ -3575,6 +3575,49 @@ def test_dns_browser_requires_session(client: TestClient) -> None:
     assert response.headers["location"] == "/login"
 
 
+def test_dns_browser_json_mutations_return_401_when_logged_out(client: TestClient) -> None:
+    with SessionLocal() as db:
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+        zone_id = zone.id
+    headers = {"Accept": "application/json"}
+    search = client.get(
+        f"/zones/{zone_id}/records/search",
+        headers=headers,
+        follow_redirects=False,
+    )
+    assert search.status_code == 401
+    assert search.json()["detail"] == "Authentication required"
+    assert "location" not in search.headers
+
+    created = client.post(
+        f"/zones/{zone_id}/records",
+        json={"record_name": "www", "record_type": "A", "ttl": 300, "values": ["192.0.2.10"]},
+        headers=headers,
+        follow_redirects=False,
+    )
+    assert created.status_code == 401
+    assert created.json()["detail"] == "Authentication required"
+    assert "location" not in created.headers
+
+
+def test_dns_browser_json_invalid_session_returns_401(client: TestClient) -> None:
+    client.cookies.set("session", "not-a-valid-session-cookie")
+    with SessionLocal() as db:
+        zone = db.exec(select(DnsZoneConfig)).first()
+        assert zone is not None
+        zone_id = zone.id
+    response = client.post(
+        f"/zones/{zone_id}/records",
+        json={"record_name": "www", "record_type": "A", "ttl": 300, "values": ["192.0.2.10"]},
+        headers={"Accept": "application/json"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid or expired session"
+    assert "location" not in response.headers
+
+
 def test_dns_browser_page_blank_until_search(client: TestClient) -> None:
     client.cookies.set("session", create_session_cookie("admin"))
     with SessionLocal() as db:
@@ -3591,9 +3634,14 @@ def test_dns_browser_page_blank_until_search(client: TestClient) -> None:
     assert "<h1>DNS Browser</h1>" in response.text
     assert 'class="page-subtitle"' in response.text
     assert 'src="/static/dns-browser.js"' in response.text
+    assert 'src="/static/page-header.js"' in response.text
     dns_browser_js = client.get("/static/dns-browser.js").text
     assert "IP Address" in dns_browser_js
     assert "Adding new record..." in dns_browser_js
+    assert "readAdminJson" in dns_browser_js
+    page_header_js = client.get("/static/page-header.js").text
+    assert "readAdminJson" in page_header_js
+    assert "sessionExpired" in page_header_js
 
 
 def test_dns_browser_page_shows_cloudflare_zone_proxy_indicator(client: TestClient) -> None:

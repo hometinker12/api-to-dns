@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Expired admin sessions no longer surface as `Unexpected token '<', "<!DOCTYPE "... is not valid JSON` when adding or editing DNS records. JSON fetches now receive HTTP 401, and the admin UI redirects to `/login`.
+- DNS record lookup and write now accept underscore labels in hostname values (CNAME/NS/PTR/MX/SRV), such as Microsoft 365 DKIM CNAMEs (`selector1._domainkey` → `…._domainkey.…onmicrosoft.com`). Those names were previously rejected as invalid.
+
 ## [0.8.6] - 2026-08-17
 
 ### Fixed

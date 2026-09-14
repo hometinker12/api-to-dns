@@ -644,6 +644,34 @@ def test_cloudflare_list_records_completes_open_rrset_across_page_after_cap() ->
     assert [request.url.params["page"] for request in fake.requests] == ["1", "2"]
 
 
+def test_cloudflare_list_records_accepts_underscore_cname_target() -> None:
+    page = {
+        "success": True,
+        "errors": [],
+        "result": [
+            {
+                "id": "r1",
+                "name": "selector1._domainkey.example.com",
+                "type": "CNAME",
+                "content": "selector1-example-com._domainkey.contoso.onmicrosoft.com",
+                "ttl": 3600,
+            }
+        ],
+        "result_info": {"page": 1, "per_page": 100, "total_pages": 1},
+    }
+    client, _fake = _cloudflare_client([(200, page)], zone_id="zone-from-config")
+    result = client.list_records(record_type="CNAME", dns_zone="example.com")
+    assert result.truncated is False
+    assert result.records == [
+        DnsRecordInfo(
+            record_name="selector1._domainkey",
+            record_type="CNAME",
+            ttl=3600,
+            values=["selector1-example-com._domainkey.contoso.onmicrosoft.com"],
+        )
+    ]
+
+
 def test_cloudflare_get_record_skips_zone_lookup_when_zone_id_set() -> None:
     client, fake = _cloudflare_client(
         [

@@ -35,7 +35,7 @@ zoneTestBtn?.addEventListener("click", async () => {
       body: new FormData(zoneForm),
       credentials: "same-origin",
     });
-    const payload = await response.json();
+    const payload = await window.readAdminJson(response);
     if (payload.status === "success") {
       showZoneTestResult("success", "Authentication test successful. Found matching records.");
     } else if (payload.status === "not_found") {
@@ -43,7 +43,8 @@ zoneTestBtn?.addEventListener("click", async () => {
     } else {
       showZoneTestResult("error", payload.message || "DNS test failed.");
     }
-  } catch (_error) {
+  } catch (error) {
+    if (error?.sessionExpired) return;
     showZoneTestResult("error", "DNS test failed.");
   } finally {
     zoneTestBtn.disabled = false;
