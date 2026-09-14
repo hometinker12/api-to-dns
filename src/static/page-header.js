@@ -1,4 +1,40 @@
 (() => {
+  const loginPath = "/login";
+  const sessionExpiredError = () => {
+    const error = new Error("Session expired");
+    error.sessionExpired = true;
+    return error;
+  };
+  const isLoginUrl = (url) => {
+    try {
+      return new URL(url, window.location.origin).pathname === loginPath;
+    } catch (_error) {
+      return false;
+    }
+  };
+  const redirectToLogin = () => {
+    if (window.location.pathname !== loginPath) {
+      window.location.assign(loginPath);
+    }
+  };
+  window.readAdminJson = async (response) => {
+    if (response.status === 401 || isLoginUrl(response.url)) {
+      redirectToLogin();
+      throw sessionExpiredError();
+    }
+    const contentType = (response.headers.get("content-type") || "").toLowerCase();
+    if (contentType.includes("application/json")) {
+      return response.json();
+    }
+    if (response.ok) {
+      redirectToLogin();
+      throw sessionExpiredError();
+    }
+    throw new Error("Request failed.");
+  };
+})();
+
+(() => {
   const key = "api-to-dns-theme";
   const toggle = document.getElementById("theme-toggle");
   if (!toggle) {

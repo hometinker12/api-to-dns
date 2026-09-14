@@ -130,7 +130,7 @@
     setBusy(true);
     try {
       const response = await fetch(url, { headers: { Accept: "application/json" }, credentials: "same-origin", signal: controller.signal });
-      const payload = await response.json();
+      const payload = await window.readAdminJson(response);
       if (currentId !== requestId) return;
       if (!response.ok) {
         setStatus("error", errorMessage(payload, "DNS lookup failed."));
@@ -161,6 +161,7 @@
       });
       results.hidden = false;
     } catch (error) {
+      if (error?.sessionExpired) return;
       if (error?.name !== "AbortError" && currentId === requestId) setStatus("error", "DNS lookup failed.");
     } finally {
       if (currentId === requestId) setBusy(false);
@@ -168,7 +169,7 @@
   };
   const mutate = async (method, payload) => {
     const response = await fetch(`/zones/${zoneId}/records`, { method, headers: { "Content-Type": "application/json", Accept: "application/json" }, credentials: "same-origin", body: JSON.stringify(payload) });
-    const result = await response.json();
+    const result = await window.readAdminJson(response);
     if (!response.ok) throw new Error(errorMessage(result, "DNS operation failed."));
     if (lastSearch) await renderSearch(lastSearch);
     return result;
@@ -211,6 +212,7 @@
       recordDialog.close();
       setStatus("success", mode === "replace" ? "Record updated." : "Record created.");
     } catch (error) {
+      if (error?.sessionExpired) return;
       formError.hidden = false;
       formError.textContent = error.message || "DNS operation failed.";
     } finally {
@@ -224,6 +226,7 @@
       deleteDialog.close();
       setStatus("success", "Record deleted.");
     } catch (error) {
+      if (error?.sessionExpired) return;
       deleteDialog.close();
       setStatus("error", error.message || "Delete failed.");
     }

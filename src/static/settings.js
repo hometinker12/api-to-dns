@@ -147,8 +147,8 @@ const pollLeProgress = async () => {
       credentials: "same-origin",
       headers: { accept: "application/json" },
     });
+    const payload = await window.readAdminJson(response);
     if (!response.ok) return;
-    const payload = await response.json();
     if (leProgress && typeof payload.percent === "number") leProgress.value = payload.percent;
     if (leStatus && payload.message) leStatus.textContent = payload.message;
     if (!payload.done) return;
@@ -161,7 +161,8 @@ const pollLeProgress = async () => {
     }
     if (leProgress) leProgress.value = 100;
     window.location.reload();
-  } catch (_error) {
+  } catch (error) {
+    if (error?.sessionExpired) return;
     stopLePoll();
     leAutoEnrollDialog?.close();
     if (leSubmit) leSubmit.disabled = false;
@@ -182,10 +183,12 @@ leStartForm?.addEventListener("submit", async (event) => {
       credentials: "same-origin",
       headers: { accept: "application/json" },
     });
-    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).detail);
+    const startPayload = await window.readAdminJson(response);
+    if (!response.ok) throw new Error(startPayload?.detail || "Failed to start Let's Encrypt enrollment.");
     await pollLeProgress();
     lePollTimer = window.setInterval(pollLeProgress, 1000);
   } catch (error) {
+    if (error?.sessionExpired) return;
     leAutoEnrollDialog?.close();
     if (leSubmit) leSubmit.disabled = false;
     window.alert(error.message || "Failed to start Let's Encrypt enrollment.");
@@ -274,14 +277,14 @@ const pollBackupProgress = async () => {
       credentials: "same-origin",
       headers: { accept: "application/json" },
     });
+    const payload = await window.readAdminJson(response);
     if (!response.ok) {
-      if (response.status === 401 || response.status === 403) {
+      if (response.status === 403) {
         stopBackupPoll();
         window.setTimeout(() => { window.location.href = "/login"; }, 1500);
       }
       return;
     }
-    const payload = await response.json();
     if (backupRestoreProgress && typeof payload.percent === "number") backupRestoreProgress.value = payload.percent;
     if (backupRestoreStatus && payload.message) backupRestoreStatus.textContent = payload.message;
     if (!payload.done) return;
@@ -297,7 +300,8 @@ const pollBackupProgress = async () => {
     window.setTimeout(() => {
       window.location.href = "/settings?area=backup&section=import";
     }, payload.restarting ? 2500 : 0);
-  } catch (_error) {
+  } catch (error) {
+    if (error?.sessionExpired) return;
     if (backupRestoreStatus) backupRestoreStatus.textContent = "Waiting for application restart…";
     window.setTimeout(() => { window.location.href = "/login"; }, 3000);
   }
@@ -320,10 +324,12 @@ backupImportForm?.addEventListener("submit", async (event) => {
       credentials: "same-origin",
       headers: { accept: "application/json" },
     });
-    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).detail);
+    const startPayload = await window.readAdminJson(response);
+    if (!response.ok) throw new Error(startPayload?.detail || "Failed to start restore.");
     await pollBackupProgress();
     backupPollTimer = window.setInterval(pollBackupProgress, 1000);
   } catch (error) {
+    if (error?.sessionExpired) return;
     backupRestoreDialog?.close();
     if (backupImportSubmit) backupImportSubmit.disabled = false;
     window.alert(error.message || "Failed to start restore.");

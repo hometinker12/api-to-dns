@@ -24,7 +24,9 @@ MUTABLE_RECORD_TYPES: frozenset[str] = frozenset(LOOKUP_RECORD_TYPES) - {"SOA"}
 MIN_TTL = 0
 MAX_TTL = 2_147_483_647
 
-_HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*\.?$")
+# DNS names in RDATA (CNAME/NS/PTR/MX/SRV). Underscore labels are valid
+# (RFC 2181; DKIM _domainkey, SRV _service._proto).
+_HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)(?!-)[A-Za-z0-9_-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9_-]{1,63}(?<!-))*\.?$")
 _CAA_TAG_RE = re.compile(r"^[A-Za-z0-9]+$")
 
 

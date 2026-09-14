@@ -26,6 +26,7 @@ from .auth import (
 )
 from .csrf import csrf_origin_allowed, csrf_rejection_response
 from .db import SessionLocal, init_db
+from .http_utils import wants_json_response
 from .log_constants import LOG_LEVEL_VERBOSE
 from .models import User
 from .operational_logging import LOGGER, configure_operational_logging
@@ -349,6 +350,7 @@ def http_exception_handler(request: Request, exc: HTTPException):
         exc.status_code == 401
         and exc.detail in AUTH_REDIRECT_DETAILS
         and request.url.path.startswith(WEB_AUTH_PATH_PREFIXES)
+        and not wants_json_response(request)
     ):
         return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
     if (
