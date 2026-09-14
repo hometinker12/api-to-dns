@@ -40,9 +40,18 @@ ENV PYTHONUNBUFFERED=1 \
     TLS_PORT=8443
 
 # openssl is used by the self-signed cert generator in src/ssl_certs.py.
-# Upgrade util-linux/libblkid for CVE-2026-53615 (Debian trixie 2.41.5-0+deb13u1).
+# Upgrade Debian trixie packages for Trivy High/Critical CVEs:
+#   gzip CVE-2026-41992, pcre2 CVE-2026-86145/89161, sqlite3 CVE-2026-11822/11824,
+#   openssl CVE-2026-14456, perl CVE-2026-13221/42496/8376/42497/48962/57432/57433,
+#   util-linux/libblkid CVE-2026-53615.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends openssl \
+        openssl-provider-legacy \
+        gzip \
+        libpcre2-8-0 \
+        libsqlite3-0 \
+        libssl3t64 \
+        perl-base \
         bsdutils \
         libblkid1 \
         liblastlog2-2 \

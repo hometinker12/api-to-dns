@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Security
+
+- Upgrade Debian trixie image packages to close High/Critical CVEs: `gzip` (`CVE-2026-41992`), `libpcre2-8-0` (`CVE-2026-86145`, `CVE-2026-89161`), `libsqlite3-0` (`CVE-2026-11822`, `CVE-2026-11824`), `openssl` / `libssl3t64` (`CVE-2026-14456`), and `perl-base` (`CVE-2026-13221`, `CVE-2026-42496`, `CVE-2026-8376`, `CVE-2026-42497`, `CVE-2026-48962`, `CVE-2026-57432`, `CVE-2026-57433`).
+
 ### Fixed
 
 - Expired admin sessions no longer surface as `Unexpected token '<', "<!DOCTYPE "... is not valid JSON` when adding or editing DNS records. JSON fetches now receive HTTP 401, and the admin UI redirects to `/login`.
