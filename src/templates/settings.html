@@ -1221,8 +1221,10 @@
             <h2>Backup Import</h2>
             <p class="help">
               Restore replaces the selected categories on this installation. Fernet-backed data
-              (settings, zones, SSL ACME key) requires Application secrets. Restoring Application
-              secrets writes durable secrets and <strong>automatically restarts</strong> the application.
+              (settings, zones, SSL ACME key) requires Application secrets so the archive can be
+              decrypted and re-encrypted with this installation's <code>ENCRYPTION_KEY</code>.
+              Restoring Application secrets alone still writes durable secrets and
+              <strong>automatically restarts</strong> the application.
             </p>
             <section class="form-card">
               <form id="backup-import-form" action="/settings/backup/import-async" method="post" enctype="multipart/form-data">
@@ -1278,6 +1280,7 @@
                   <label class="inline-check"><input type="checkbox" name="categories" value="application_secrets" checked id="backup-export-secrets" /> Application secrets (<code>SECRET_KEY</code>, <code>ENCRYPTION_KEY</code>)</label>
                   <label class="inline-check"><input type="checkbox" name="categories" value="activity_logs" /> Include audit logs</label>
                 </fieldset>
+                <input type="hidden" name="encrypt" value="1" id="backup-encrypt-forced" disabled />
                 <label class="inline-check">
                   <input type="checkbox" name="encrypt" value="1" id="backup-encrypt" checked />
                   Encrypt backup with a password

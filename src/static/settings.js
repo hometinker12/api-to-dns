@@ -228,6 +228,7 @@ document.getElementById("remote-syslog-form")?.addEventListener("submit", () => 
 });
 
 const backupEncrypt = document.getElementById("backup-encrypt");
+const backupEncryptForced = document.getElementById("backup-encrypt-forced");
 const backupEncryptFields = document.getElementById("backup-encrypt-fields");
 const backupWarning = document.getElementById("backup-unencrypted-warning");
 const backupPassword = document.getElementById("backup-password");
@@ -240,6 +241,8 @@ const syncBackupEncryptUi = () => {
   const required = backupSensitiveCategoriesSelected();
   if (required && backupEncrypt && !backupEncrypt.checked) backupEncrypt.checked = true;
   if (backupEncrypt) backupEncrypt.disabled = required;
+  // Disabled checkboxes are omitted from form posts; submit encrypt=1 via hidden input.
+  if (backupEncryptForced) backupEncryptForced.disabled = !required;
   const enabled = !backupEncrypt || backupEncrypt.checked;
   if (backupEncryptFields) backupEncryptFields.hidden = !enabled;
   if (backupWarning) backupWarning.hidden = enabled;

@@ -13,6 +13,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
+from sqlmodel import select
 
 from src import ssl_certs
 from src.db import SessionLocal, init_db
@@ -94,6 +95,25 @@ def test_cert_paths_under_configured_dir(ssl_workspace: Path) -> None:
 def test_bootstrap_returns_http_when_disabled(ssl_workspace: Path) -> None:
     with SessionLocal() as db:
         ssl_certs.set_ssl_enabled(db, False)
+    assert ssl_certs.bootstrap() == "http"
+
+
+def test_bootstrap_returns_http_when_ssl_enabled_cannot_be_decrypted(ssl_workspace: Path) -> None:
+    from cryptography.fernet import Fernet
+
+    from src.models import Setting
+
+    other = Fernet(Fernet.generate_key())
+    with SessionLocal() as db:
+        row = db.exec(select(Setting).where(Setting.name == ssl_certs.SETTING_SSL_ENABLED)).first()
+        token = other.encrypt(b"true").decode()
+        if row is None:
+            db.add(Setting(name=ssl_certs.SETTING_SSL_ENABLED, value=token))
+        else:
+            row.value = token
+            db.add(row)
+        db.commit()
+        assert ssl_certs.is_ssl_enabled(db) is False
     assert ssl_certs.bootstrap() == "http"
 
 

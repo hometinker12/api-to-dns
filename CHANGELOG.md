@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [0.8.8] - 2026-09-15
+
+### Fixed
+
+- Backup export no longer rejects a password-protected archive because the encrypt checkbox is omitted from the form when sensitive categories are selected. The server encrypts those categories whenever a matching password is provided.
+- Restoring a backup onto a new Docker host with a different `ENCRYPTION_KEY` no longer crash-loops SSL bootstrap (`InvalidToken` on `ssl_enabled`). Settings, DNS zone configs, and the ACME account key are re-encrypted to this installation's key instead of requiring the archive key to replace Compose `.env` values.
+
+### Changed
+
+- Application version metadata aligned to **0.8.8** (`VERSION`, OpenAPI, `pyproject.toml`, Docker label, Compose pin).
+
 ## [0.8.7] - 2026-09-13
 
 ### Security

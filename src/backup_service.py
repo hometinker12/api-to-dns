@@ -1,4 +1,9 @@
-"""Configuration backup export/import (ciphertext as-is + outer password envelope)."""
+"""Configuration backup export/import (Fernet ciphertext + outer password envelope).
+
+Settings, zone configs, and the ACME account key are stored as Fernet tokens in the
+archive. Restore decrypts them with the backup ENCRYPTION_KEY and re-encrypts with
+this installation's key so a new Docker host with a different .env still boots.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +16,7 @@ from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
-from cryptography.fernet import InvalidToken
+from cryptography.fernet import Fernet, InvalidToken
 from sqlmodel import select
 
 from . import env_bootstrap
@@ -34,7 +39,16 @@ from .models import (
     User,
 )
 from .rbac import ROLE_GLOBAL_ADMIN, effective_roles, parse_roles, serialize_roles
-from .security import decrypt_value, pwd_context
+from .security import (
+    ENCRYPTION_KEY as PROCESS_ENCRYPTION_KEY,
+)
+from .security import (
+    decrypt_value,
+    pwd_context,
+)
+from .security import (
+    fernet as process_fernet,
+)
 from .settings_store import begin_immediate, delete_setting, get_typed_setting_by_key, set_typed_setting_by_key
 from .ssl_certs import CERT_FILENAME, KEY_FILENAME, SOURCE_FILENAME, cert_dir
 from .time_utils import utc_now
@@ -99,6 +113,11 @@ ENCRYPTION_REQUIRED_EXPORT_CATEGORIES = frozenset(
     }
 )
 
+
+def categories_require_encryption(categories: list[str]) -> bool:
+    return bool(set(categories) & ENCRYPTION_REQUIRED_EXPORT_CATEGORIES)
+
+
 # Ephemeral / in-progress settings that should not round-trip in backups.
 _EXCLUDED_SETTING_NAMES = frozenset(
     {
@@ -120,6 +139,39 @@ ProgressCallback = Callable[[str, int, str], None]
 
 class BackupError(RuntimeError):
     """Raised when backup export or import cannot proceed."""
+
+
+def _payload_encryption_key(payload: dict[str, Any]) -> str:
+    secrets_block = payload.get(CATEGORY_APPLICATION_SECRETS) or {}
+    if not isinstance(secrets_block, dict):
+        return ""
+    return str(secrets_block.get("ENCRYPTION_KEY") or "").strip()
+
+
+def _rewrap_fernet_token(token: str, *, source_key: str, label: str) -> str:
+    """Decrypt a Fernet token with the archive key and encrypt with this process key."""
+    if not token:
+        return token
+    dest_key = (PROCESS_ENCRYPTION_KEY or "").strip()
+    if source_key == dest_key:
+        return token
+    try:
+        source_fernet = Fernet(source_key.encode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 — normalize Fernet constructor errors
+        raise BackupError("Backup ENCRYPTION_KEY is not a valid Fernet key.") from exc
+    try:
+        plaintext = source_fernet.decrypt(token.encode("utf-8"))
+    except InvalidToken as exc:
+        raise BackupError(
+            f"{label} could not be decrypted with the backup ENCRYPTION_KEY. "
+            "The archive secrets do not match the encrypted data."
+        ) from exc
+    return process_fernet.encrypt(plaintext).decode("utf-8")
+
+
+def _looks_like_pem_private_key(raw: bytes) -> bool:
+    text = raw.decode("utf-8", errors="ignore")
+    return "BEGIN" in text and "PRIVATE KEY" in text
 
 
 def write_restore_progress(
@@ -255,7 +307,7 @@ def validate_import_categories(categories: list[str], payload: dict[str, Any]) -
     if needs_secrets and CATEGORY_APPLICATION_SECRETS not in categories:
         raise BackupError(
             "Restoring settings, DNS zones, or SSL files requires Application secrets "
-            "(ENCRYPTION_KEY) so Fernet ciphertext remains readable after restart."
+            "(ENCRYPTION_KEY) so encrypted data can be re-wrapped for this installation."
         )
 
 
@@ -362,7 +414,7 @@ def build_payload(db, categories: list[str]) -> dict[str, Any]:
     if CATEGORY_APPLICATION_SECRETS in cats:
         payload[CATEGORY_APPLICATION_SECRETS] = {
             "SECRET_KEY": os.environ.get("SECRET_KEY") or "",
-            "ENCRYPTION_KEY": os.environ.get("ENCRYPTION_KEY") or "",
+            "ENCRYPTION_KEY": PROCESS_ENCRYPTION_KEY or "",
         }
 
     if CATEGORY_ACTIVITY_LOGS in cats:
@@ -635,6 +687,13 @@ def validate_restore_records(categories: list[str], payload: dict[str, Any]) -> 
             env_bootstrap._validate_persisted_secret("ENCRYPTION_KEY", encryption_key)
         except ValueError as exc:
             raise BackupError(str(exc)) from exc
+        dest_key = (PROCESS_ENCRYPTION_KEY or "").strip()
+        if not FERNET_BACKED_CATEGORIES.intersection(cats) and encryption_key != dest_key:
+            raise BackupError(
+                "Restoring Application secrets alone cannot replace ENCRYPTION_KEY when it "
+                "differs from this installation. Also restore settings, DNS zones, or SSL files "
+                "so encrypted data can be re-wrapped."
+            )
 
 
 def restore_payload(
@@ -652,6 +711,7 @@ def restore_payload(
     _progress(progress_cb, "validate", 5, "Validating backup archive…")
     # Full structural validation before any wipe so a bad archive cannot lock out admins.
     validate_restore_records(cats, payload)
+    source_key = _payload_encryption_key(payload) if CATEGORY_APPLICATION_SECRETS in cats else ""
 
     db_categories = {
         CATEGORY_SETTINGS,
@@ -695,7 +755,10 @@ def restore_payload(
                 name = (item.get("name") or "").strip()
                 if not name or name in _EXCLUDED_SETTING_NAMES:
                     continue
-                db.add(Setting(name=name, value=item.get("value") or ""))
+                value = item.get("value") or ""
+                if source_key:
+                    value = _rewrap_fernet_token(value, source_key=source_key, label=f"Setting '{name}'")
+                db.add(Setting(name=name, value=value))
             summary[CATEGORY_SETTINGS] = len(payload.get(CATEGORY_SETTINGS) or [])
 
         if CATEGORY_USERS in cats:
@@ -718,9 +781,16 @@ def restore_payload(
         if CATEGORY_ZONES in cats:
             zones = payload.get(CATEGORY_ZONES) or []
             for item in zones:
+                encrypted_config = item["encrypted_config"]
+                if source_key:
+                    encrypted_config = _rewrap_fernet_token(
+                        encrypted_config,
+                        source_key=source_key,
+                        label=f"Zone '{item['zone_name']}'",
+                    )
                 row = DnsZoneConfig(
                     zone_name=item["zone_name"],
-                    encrypted_config=item["encrypted_config"],
+                    encrypted_config=encrypted_config,
                 )
                 db.add(row)
                 db.flush()
@@ -828,8 +898,13 @@ def restore_payload(
         for name, b64 in files.items():
             if name not in SSL_FILE_NAMES:
                 continue
+            raw = base64.b64decode(b64)
+            if name == ACME_ACCOUNT_KEY_FILENAME and source_key and not _looks_like_pem_private_key(raw):
+                token = raw.decode("utf-8")
+                token = _rewrap_fernet_token(token, source_key=source_key, label="ACME account key")
+                raw = token.encode("utf-8")
             path = directory / name
-            path.write_bytes(base64.b64decode(b64))
+            path.write_bytes(raw)
             try:
                 os.chmod(path, 0o600 if name.endswith(".key") else 0o644)
             except OSError:
@@ -839,21 +914,32 @@ def restore_payload(
 
     restarting = False
     if CATEGORY_APPLICATION_SECRETS in cats:
-        _progress(progress_cb, "application_secrets", 95, "Writing application secrets…")
-        secrets = payload.get(CATEGORY_APPLICATION_SECRETS) or {}
-        secret_key = (secrets.get("SECRET_KEY") or "").strip()
-        encryption_key = (secrets.get("ENCRYPTION_KEY") or "").strip()
+        secrets_block = payload.get(CATEGORY_APPLICATION_SECRETS) or {}
+        secret_key = (secrets_block.get("SECRET_KEY") or "").strip()
+        encryption_key = (secrets_block.get("ENCRYPTION_KEY") or "").strip()
         if not secret_key or not encryption_key:
             raise BackupError("Backup application secrets are incomplete.")
-        # Secrets-only restore keeps existing users; assign fresh session versions
-        # so source cookies signed with the restored SECRET_KEY cannot be replayed.
-        if CATEGORY_USERS not in cats:
-            for user_row in list(db.exec(select(User)).all()):
-                user_row.session_version = _fresh_session_version()
-                db.add(user_row)
-            db.commit()
-        env_bootstrap.write_application_secrets(secret_key=secret_key, encryption_key=encryption_key)
+        fernet_restored = bool(FERNET_BACKED_CATEGORIES.intersection(cats))
+        dest_key = (PROCESS_ENCRYPTION_KEY or "").strip()
+        # Rewrapped ciphertext is bound to this installation's ENCRYPTION_KEY.
+        # Do not overlay the archive key — that bricks a new Docker host whose
+        # Compose env_file still injects a different key on every restart.
+        adopt_archive_keys = not fernet_restored or encryption_key == dest_key
+        if adopt_archive_keys:
+            _progress(progress_cb, "application_secrets", 95, "Writing application secrets…")
+            # Secrets-only restore keeps existing users; assign fresh session versions
+            # so source cookies signed with the restored SECRET_KEY cannot be replayed.
+            if CATEGORY_USERS not in cats:
+                for user_row in list(db.exec(select(User)).all()):
+                    user_row.session_version = _fresh_session_version()
+                    db.add(user_row)
+                db.commit()
+            env_bootstrap.write_application_secrets(secret_key=secret_key, encryption_key=encryption_key)
+            restarting = True
+        else:
+            _progress(progress_cb, "application_secrets", 95, "Re-encrypting backup secrets for this installation…")
         summary[CATEGORY_APPLICATION_SECRETS] = 2
+    if CATEGORY_SSL_FILES in cats or CATEGORY_SETTINGS in cats:
         restarting = True
 
     return {"summary": summary, "restarting": restarting, "categories": cats}
