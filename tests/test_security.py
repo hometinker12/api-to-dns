@@ -16,7 +16,7 @@ def test_get_app_version_matches_version_file() -> None:
     get_app_version.cache_clear()
     expected = (Path(__file__).resolve().parents[1] / "VERSION").read_text(encoding="utf-8").strip()
     assert get_app_version() == expected
-    assert expected == "0.8.7"
+    assert expected == "0.8.8"
 
 
 def test_fastapi_app_version_matches_version_file() -> None:

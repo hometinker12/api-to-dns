@@ -20,6 +20,7 @@ from src.backup_service import (
     CATEGORY_USERS,
     CATEGORY_ZONES,
     DEFAULT_EXPORT_CATEGORIES,
+    MANIFEST_ENVELOPE_ENCRYPTED,
     BackupError,
     build_payload,
     load_backup_bytes,
@@ -63,6 +64,10 @@ def test_backup_nav_visible_for_global_admin(client: TestClient) -> None:
     assert response.status_code == 200
     assert "Backup Export" in response.text
     assert "Encrypt backup with a password" in response.text
+    assert 'id="backup-encrypt-forced"' in response.text
+    settings_js = client.get("/static/settings.js")
+    assert settings_js.status_code == 200
+    assert "backupEncryptForced.disabled = !required" in settings_js.text
     assert 'href="/settings?area=backup&section=export"' in response.text
     assert 'href="/settings?area=backup&section=import"' in response.text
     # Backup appears before System Settings in the sidebar markup.
@@ -601,6 +606,17 @@ def test_low_risk_backup_categories_allow_unencrypted_archive(client: TestClient
     assert envelope["encrypted"] is False
 
 
+def test_export_route_allows_unencrypted_alert_rules(client: TestClient) -> None:
+    _admin_client(client)
+    response = client.post(
+        "/settings/backup/export",
+        data={"categories": CATEGORY_ALERT_RULES},
+    )
+    assert response.status_code == 200
+    envelope = json.loads(response.content.decode("utf-8"))
+    assert envelope["encrypted"] is False
+
+
 def test_export_route_rejects_unencrypted_sensitive_category(client: TestClient) -> None:
     _admin_client(client)
     response = client.post(
@@ -608,7 +624,34 @@ def test_export_route_rejects_unencrypted_sensitive_category(client: TestClient)
         data={"categories": CATEGORY_SSL_FILES},
     )
     assert response.status_code == 200
-    assert "password-encrypted backup" in response.text
+    assert "Password is required when encryption is enabled" in response.text
+
+
+def test_export_encrypts_when_password_posted_without_encrypt_flag(client: TestClient) -> None:
+    """Browsers omit disabled encrypt checkboxes; a matching password must still encrypt."""
+    _admin_client(client)
+    response = client.post(
+        "/settings/backup/export",
+        data={
+            "categories": [
+                CATEGORY_SETTINGS,
+                CATEGORY_USERS,
+                CATEGORY_ZONES,
+                CATEGORY_API_KEYS,
+                CATEGORY_SSL_FILES,
+                CATEGORY_APPLICATION_SECRETS,
+            ],
+            "password": "password1",
+            "password_confirm": "password1",
+        },
+    )
+    assert response.status_code == 200
+    assert "password-encrypted backup" not in response.text
+    envelope = json.loads(response.content.decode("utf-8"))
+    assert envelope["encrypted"] is True
+    payload = load_backup_bytes(response.content, "password1")
+    assert CATEGORY_SETTINGS in payload
+    assert CATEGORY_APPLICATION_SECRETS in payload
 
 
 def test_restore_secrets_rejects_unencrypted_envelope() -> None:
@@ -687,3 +730,108 @@ def test_secrets_only_restore_assigns_fresh_sessions() -> None:
                 admin.session_version = previous
                 db.add(admin)
                 db.commit()
+
+
+def test_restore_rewrapping_settings_onto_destination_encryption_key(client: TestClient) -> None:
+    """A backup from another host must decrypt on this installation's ENCRYPTION_KEY."""
+    from cryptography.fernet import Fernet
+
+    from src.backup_service import _rewrap_fernet_token
+    from src.models import Setting
+    from src.security import ENCRYPTION_KEY, fernet
+
+    source_key = Fernet.generate_key().decode()
+    source = Fernet(source_key.encode())
+    assert source_key != ENCRYPTION_KEY
+
+    zone_json = json.dumps({"dns_provider_type": "bind", "dns_zone": "rewrapped.test", "dns_password": "dGVzdA=="})
+    rewritten_zone = _rewrap_fernet_token(
+        source.encrypt(zone_json.encode()).decode(),
+        source_key=source_key,
+        label="Zone 'rewrapped.test'",
+    )
+    assert json.loads(fernet.decrypt(rewritten_zone.encode()).decode())["dns_password"] == "dGVzdA=="
+
+    payload = {
+        "manifest": {
+            MANIFEST_ENVELOPE_ENCRYPTED: True,
+            "categories": [CATEGORY_SETTINGS, CATEGORY_APPLICATION_SECRETS],
+        },
+        CATEGORY_SETTINGS: [
+            {"name": "app_dns_name", "value": source.encrypt(b"migrated.example.com").decode()},
+            {"name": "ssl_enabled", "value": source.encrypt(b"false").decode()},
+        ],
+        CATEGORY_APPLICATION_SECRETS: {
+            "SECRET_KEY": "source-secret-key-for-restore-test",
+            "ENCRYPTION_KEY": source_key,
+        },
+    }
+    with SessionLocal() as db:
+        saved_settings = [(row.name, row.value) for row in db.exec(select(Setting)).all()]
+        try:
+            with patch("src.backup_service.env_bootstrap.write_application_secrets") as write_mock:
+                result = restore_payload(
+                    db,
+                    payload,
+                    [CATEGORY_SETTINGS, CATEGORY_APPLICATION_SECRETS],
+                )
+                write_mock.assert_not_called()
+            assert result["restarting"] is True
+            assert get_setting(db, "app_dns_name") == "migrated.example.com"
+            assert get_setting(db, "ssl_enabled") == "false"
+            ssl_row = db.exec(select(Setting).where(Setting.name == "ssl_enabled")).one()
+            dest = Fernet(ENCRYPTION_KEY.encode())
+            assert dest.decrypt(ssl_row.value.encode()).decode() == "false"
+        finally:
+            for row in list(db.exec(select(Setting)).all()):
+                db.delete(row)
+            db.flush()
+            for name, value in saved_settings:
+                db.add(Setting(name=name, value=value))
+            db.commit()
+
+
+def test_restore_rejects_settings_when_archive_encryption_key_does_not_match() -> None:
+    from cryptography.fernet import Fernet
+
+    from src.security import ENCRYPTION_KEY
+
+    source = Fernet(Fernet.generate_key())
+    other_key = Fernet.generate_key().decode()
+    assert other_key != ENCRYPTION_KEY
+    payload = {
+        "manifest": {
+            MANIFEST_ENVELOPE_ENCRYPTED: True,
+            "categories": [CATEGORY_SETTINGS, CATEGORY_APPLICATION_SECRETS],
+        },
+        CATEGORY_SETTINGS: [{"name": "app_dns_name", "value": source.encrypt(b"x.example.com").decode()}],
+        CATEGORY_APPLICATION_SECRETS: {
+            "SECRET_KEY": "source-secret-key-for-restore-test",
+            "ENCRYPTION_KEY": other_key,
+        },
+    }
+    with SessionLocal() as db:
+        with pytest.raises(BackupError, match="could not be decrypted"):
+            restore_payload(db, payload, [CATEGORY_SETTINGS, CATEGORY_APPLICATION_SECRETS])
+
+
+def test_secrets_only_restore_rejects_foreign_encryption_key() -> None:
+    from cryptography.fernet import Fernet
+
+    from src.security import ENCRYPTION_KEY
+
+    foreign_key = Fernet.generate_key().decode()
+    assert foreign_key != ENCRYPTION_KEY
+    payload = {
+        "manifest": {
+            MANIFEST_ENVELOPE_ENCRYPTED: True,
+            "categories": [CATEGORY_APPLICATION_SECRETS],
+        },
+        CATEGORY_APPLICATION_SECRETS: {
+            "SECRET_KEY": "source-secret-key-for-restore-test",
+            "ENCRYPTION_KEY": foreign_key,
+        },
+    }
+    with SessionLocal() as db:
+        with pytest.raises(BackupError, match="cannot replace ENCRYPTION_KEY"):
+            restore_payload(db, payload, [CATEGORY_APPLICATION_SECRETS])
