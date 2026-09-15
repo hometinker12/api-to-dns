@@ -13,6 +13,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
+from sqlmodel import select
 
 from src import ssl_certs
 from src.db import SessionLocal, init_db
@@ -94,6 +95,54 @@ def test_cert_paths_under_configured_dir(ssl_workspace: Path) -> None:
 def test_bootstrap_returns_http_when_disabled(ssl_workspace: Path) -> None:
     with SessionLocal() as db:
         ssl_certs.set_ssl_enabled(db, False)
+    assert ssl_certs.bootstrap() == "http"
+
+
+def test_bootstrap_exits_when_ssl_enabled_cannot_be_decrypted(
+    ssl_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from cryptography.fernet import Fernet, InvalidToken
+
+    from src.models import Setting
+
+    other = Fernet(Fernet.generate_key())
+    with SessionLocal() as db:
+        row = db.exec(select(Setting).where(Setting.name == ssl_certs.SETTING_SSL_ENABLED)).first()
+        token = other.encrypt(b"true").decode()
+        if row is None:
+            db.add(Setting(name=ssl_certs.SETTING_SSL_ENABLED, value=token))
+        else:
+            row.value = token
+            db.add(row)
+        db.commit()
+        with pytest.raises(InvalidToken):
+            ssl_certs.is_ssl_enabled(db)
+    with pytest.raises(SystemExit) as exc_info:
+        ssl_certs.bootstrap()
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "ENCRYPTION_KEY" in captured.err
+    assert "SSL_ENABLED=0" in captured.err
+
+
+def test_bootstrap_ssl_enabled_override_recovers_undecryptable_row(
+    ssl_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cryptography.fernet import Fernet
+
+    from src.models import Setting
+
+    monkeypatch.setenv("SSL_ENABLED", "0")
+    other = Fernet(Fernet.generate_key())
+    with SessionLocal() as db:
+        row = db.exec(select(Setting).where(Setting.name == ssl_certs.SETTING_SSL_ENABLED)).first()
+        token = other.encrypt(b"true").decode()
+        if row is None:
+            db.add(Setting(name=ssl_certs.SETTING_SSL_ENABLED, value=token))
+        else:
+            row.value = token
+            db.add(row)
+        db.commit()
     assert ssl_certs.bootstrap() == "http"
 
 

@@ -62,7 +62,9 @@ def settings_backup_export(
             message="Select at least one category to export.",
             message_kind="error",
         )
-    do_encrypt = (encrypt or "").strip().lower() in {"1", "true", "on", "yes"}
+    form_encrypt = (encrypt or "").strip().lower() in {"1", "true", "on", "yes"}
+    # Disabled encrypt checkboxes are omitted from HTML form posts.
+    do_encrypt = form_encrypt or backup_service.categories_require_encryption(selected)
     if do_encrypt:
         if password != password_confirm:
             return render_settings(

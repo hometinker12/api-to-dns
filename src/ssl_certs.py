@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from cryptography import x509
+from cryptography.fernet import InvalidToken
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import dsa, ec, rsa
 from cryptography.x509.oid import NameOID
@@ -491,6 +492,12 @@ def access_url(db, *, use_env_override: bool = False) -> str:
     return _format_url("http", _display_host(db), http_port())
 
 
+_UNREADABLE_SSL_ENABLED_MESSAGE = (
+    "ssl_enabled could not be decrypted with the current ENCRYPTION_KEY.\n"
+    "Set SSL_ENABLED=0 to start HTTP for recovery, or restore a matching ENCRYPTION_KEY."
+)
+
+
 def bootstrap() -> str:
     """Return the listener mode for this process: ``"http"`` or ``"https"``.
 
@@ -501,8 +508,12 @@ def bootstrap() -> str:
     """
     init_db()
     cert_dir()  # ensure directory exists for downstream readers
-    with SessionLocal() as db:
-        enabled = _resolved_ssl_enabled(db)
+    try:
+        with SessionLocal() as db:
+            enabled = _resolved_ssl_enabled(db)
+    except InvalidToken:
+        print(_UNREADABLE_SSL_ENABLED_MESSAGE, file=sys.stderr)
+        sys.exit(2)
     if not enabled:
         return "http"
     if not cert_exists():
@@ -551,8 +562,12 @@ def healthcheck() -> int:
     import urllib.request
 
     init_db()
-    with SessionLocal() as db:
-        enabled = _resolved_ssl_enabled(db)
+    try:
+        with SessionLocal() as db:
+            enabled = _resolved_ssl_enabled(db)
+    except InvalidToken:
+        print(f"healthcheck failed: {_UNREADABLE_SSL_ENABLED_MESSAGE}", file=sys.stderr)
+        return 1
     if enabled and cert_exists():
         port = tls_port()
         scheme = "https"
