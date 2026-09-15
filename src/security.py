@@ -2,7 +2,7 @@ import os
 import secrets
 import sys
 
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet
 from passlib.context import CryptContext
 
 from . import env_bootstrap as _env_bootstrap  # noqa: F401 — load persisted secrets first
@@ -111,7 +111,4 @@ def encrypt_value(value: str) -> str:
 
 
 def decrypt_value(value: str) -> str:
-    try:
-        return fernet.decrypt(value.encode()).decode()
-    except InvalidToken as exc:
-        raise ValueError("Encrypted value could not be decrypted with the current ENCRYPTION_KEY.") from exc
+    return fernet.decrypt(value.encode()).decode()

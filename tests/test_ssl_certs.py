@@ -98,8 +98,10 @@ def test_bootstrap_returns_http_when_disabled(ssl_workspace: Path) -> None:
     assert ssl_certs.bootstrap() == "http"
 
 
-def test_bootstrap_returns_http_when_ssl_enabled_cannot_be_decrypted(ssl_workspace: Path) -> None:
-    from cryptography.fernet import Fernet
+def test_bootstrap_exits_when_ssl_enabled_cannot_be_decrypted(
+    ssl_workspace: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from cryptography.fernet import Fernet, InvalidToken
 
     from src.models import Setting
 
@@ -113,7 +115,34 @@ def test_bootstrap_returns_http_when_ssl_enabled_cannot_be_decrypted(ssl_workspa
             row.value = token
             db.add(row)
         db.commit()
-        assert ssl_certs.is_ssl_enabled(db) is False
+        with pytest.raises(InvalidToken):
+            ssl_certs.is_ssl_enabled(db)
+    with pytest.raises(SystemExit) as exc_info:
+        ssl_certs.bootstrap()
+    assert exc_info.value.code == 2
+    captured = capsys.readouterr()
+    assert "ENCRYPTION_KEY" in captured.err
+    assert "SSL_ENABLED=0" in captured.err
+
+
+def test_bootstrap_ssl_enabled_override_recovers_undecryptable_row(
+    ssl_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cryptography.fernet import Fernet
+
+    from src.models import Setting
+
+    monkeypatch.setenv("SSL_ENABLED", "0")
+    other = Fernet(Fernet.generate_key())
+    with SessionLocal() as db:
+        row = db.exec(select(Setting).where(Setting.name == ssl_certs.SETTING_SSL_ENABLED)).first()
+        token = other.encrypt(b"true").decode()
+        if row is None:
+            db.add(Setting(name=ssl_certs.SETTING_SSL_ENABLED, value=token))
+        else:
+            row.value = token
+            db.add(row)
+        db.commit()
     assert ssl_certs.bootstrap() == "http"
 
 
